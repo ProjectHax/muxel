@@ -17310,6 +17310,9 @@ impl MuxelApp {
         closed.worktree = worktree;
         let closed = closed.clone();
         if !self.try_persist() {
+            // The worktree now looks kept, as after a failed kill. A retry that
+            // later finds the session gone must not run the answer over it.
+            self.drop_answers_behind_kill(project_id, iid);
             self.keep_closed_worktree(iid, &cleanup);
             muxel_store::append_event_log(
                 "close: local tmux kill deferred; couldn't save its ledger",
@@ -17384,10 +17387,31 @@ impl MuxelApp {
                 self.cancel_local_close(pid, closed.instance);
                 continue;
             }
+            // Settle the worktree its pane ran in, as the first attempt would
+            // have. A sibling's kill that confirmed meanwhile left that to this one.
+            // A legacy pane still on that path counts only by path, which the
+            // registered cleanup can't see, so that worktree is left alone.
+            let cleanup = match &closed.worktree {
+                muxel_core::tmux::ClosedWorktree::In(path)
+                    if !self.workspace.instances.iter().any(|instance| {
+                        instance.worktree_id.is_none()
+                            && instance.worktree_path.as_ref() == Some(path)
+                    }) =>
+                {
+                    self.workspace
+                        .worktrees
+                        .iter()
+                        .find(|w| w.project_id == pid && w.path == *path)
+                        .map_or(muxel_core::WorktreeCleanup::None, |w| {
+                            muxel_core::WorktreeCleanup::Registered(w.id)
+                        })
+                }
+                _ => muxel_core::WorktreeCleanup::None,
+            };
             self.start_local_close(
                 pid,
                 closed,
-                muxel_core::WorktreeCleanup::None,
+                cleanup,
                 false,
                 Instant::now() + Duration::from_secs(10),
                 cx,
@@ -18094,10 +18118,15 @@ impl MuxelApp {
     /// kill. Busy confirmation and the Undo hold still own the close.
     fn choose_worktree_dispose(
         &mut self,
-        d: WorktreeDispose,
+        mut d: WorktreeDispose,
         action: WorktreeDisposeAction,
         cx: &mut Context<Self>,
     ) {
+        // A pane gone before the answer was given isn't waiting on it. Keeping
+        // only those still here lets acceptance treat any that go missing later
+        // as having left first.
+        d.close_after
+            .retain(|iid| self.workspace.instance(*iid).is_some());
         let live = d
             .close_after
             .iter()

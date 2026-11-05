@@ -117,8 +117,8 @@ feature is added or changed, update the matching entry here in the same change**
   report asks, and any turn a report finishes during the countdown is changed
   work. Batch closes offer Close all, Close only the idle ones, or Cancel; a
   file answer needs the close to take every pane of its worktree, so leaving
-  one open, or one exiting before the close is accepted, drops the answer and
-  that worktree asks again later.
+  one open, or one exiting or closed by a peer before the close is accepted,
+  drops the answer and that worktree asks again later.
   Queued input, written to the terminal or sent through tmux, is cancelled
   across close and Undo, and hidden panes leave ctl listings; writes refuse
   with `closing`. Reads by id or name (`status`, `show`, `screen`, `wait`)

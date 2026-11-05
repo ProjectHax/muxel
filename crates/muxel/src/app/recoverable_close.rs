@@ -456,6 +456,18 @@ impl MuxelApp {
         let mut ended = Vec::new();
         for (&project, answers) in &mut self.deferred_worktree_dispose {
             for (&wid, answer) in answers.iter_mut().filter(|(_, answer)| !answer.accepted) {
+                // A captured pane removed since the answer without a local close
+                // (a peer closed it through the shared layout) left first. The
+                // panes still open can't cover what it wrote.
+                if answer
+                    .choice
+                    .close_after
+                    .iter()
+                    .any(|&iid| self.workspace.instance(iid).is_none())
+                {
+                    ended.push((project, wid));
+                    continue;
+                }
                 let open: Vec<_> = answer
                     .choice
                     .close_after
@@ -487,7 +499,7 @@ impl MuxelApp {
         for (project, wid) in ended {
             self.take_deferred_worktree_dispose(project, wid);
             muxel_store::append_event_log(&format!(
-                "close: dropped the file answer for worktree [{wid}]; this close leaves a pane open"
+                "close: dropped the file answer for worktree [{wid}]; this close doesn't take every pane it counted"
             ));
         }
     }

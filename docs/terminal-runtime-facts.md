@@ -57,19 +57,21 @@ keeps the worktree and logs why.
 Worktree choices still pass through busy confirmation and the Undo countdown.
 A file answer runs only if the close it was given for is accepted and takes every
 captured pane. Close only the idle ones leaving one open, a replaced prompt, a
-newer close, a cancelled client check, or any captured pane exiting before
-acceptance, even with others still open, each drop the answer, and the worktree
-asks again when its last pane goes.
+newer close, a cancelled client check, or any captured pane leaving before
+acceptance (exiting, or closed by a peer through the shared layout), even with
+others still open, each drop the answer, and the worktree asks again when its
+last pane goes.
 
 The selected file action waits until the captured panes have closed and the kills
 for that worktree's panes are confirmed. Each ledger entry records the worktree its
 pane ran in, so another pane's kill holds nothing back; an entry saved before that
 was recorded counts as any worktree. A worktree with its own kill still running
-waits without a notice. A local one whose kill fails or can't be confirmed is kept
-and detached, so the sidebar still lists it. A remote one is never removed on close.
+waits without a notice. A local one whose kill fails, can't be saved to the ledger
+or can't be confirmed is kept and detached, so the sidebar still lists it; an
+activation retry settles it as the first attempt would have. A remote one is never removed on close.
 It stays on the host and attached, since a peer's panes may use it. Undo, Cancel, a new worktree member, or a
-failed kill or preserved session for that worktree cancels the pending file action, so a retry that confirms
-the kill later leaves the files alone. Dirty,
+failed or unsaved kill or preserved session for that worktree cancels the pending file action, so a retry that
+confirms the kill later leaves the files alone. Dirty,
 unmerged or shared legacy worktrees are kept rather than force-removed.
 
 Project removal never waits on the ledger, which goes with the project. Kills

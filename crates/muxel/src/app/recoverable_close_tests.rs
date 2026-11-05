@@ -2661,10 +2661,16 @@ fn an_answer_never_outlives_the_close_that_asked_for_it() {
 /// Ryan's report: the "pane exits" ending with a sibling still open. The busy
 /// agent exits while "Close terminals?" waits, so Close only the idle ones then
 /// takes every pane still open. The answer was never accepted for the agent's
-/// later work and must not run over it.
+/// later work and must not run over it. A peer closing the agent through the
+/// shared layout removes it without a local close, and must end it the same way.
 #[test]
 fn an_answer_never_outlives_a_pane_that_exits_before_acceptance() {
-    for choice in ["discard", "commit", "merge"] {
+    for (departure, choice) in [
+        ("exits", "discard"),
+        ("exits", "commit"),
+        ("exits", "merge"),
+        ("peer closes it", "discard"),
+    ] {
         with_app(|cx, window| {
             let pid = project(cx, window);
             let (quiet, quiet_view, quiet_child) =
@@ -2694,15 +2700,33 @@ fn an_answer_never_outlives_a_pane_that_exits_before_acceptance() {
                         app.confirm.as_ref().map(|pending| &pending.action),
                         Some(ConfirmAction::CloseBatch(_))
                     ));
-                    // The agent finishes its work and exits. Close-on-exit closes
-                    // it while the prompt still waits.
+                    // The agent finishes its work and leaves while the prompt
+                    // still waits.
                     std::fs::write(&draft, "written after the answer\n").unwrap();
-                    app.close_instance_inner(busy, "close (exited)", cx);
+                    match departure {
+                        // Close-on-exit.
+                        "exits" => app.close_instance_inner(busy, "close (exited)", cx),
+                        _ => {
+                            let project = app.workspace.project(pid).unwrap();
+                            let mut peer = muxel_core::RemoteLayout::capture(
+                                project,
+                                &app.workspace,
+                                project.layout_updated_at.unwrap_or(0) + 1,
+                            );
+                            peer.instances.retain(|instance| instance.id != busy);
+                            assert!(muxel_core::remove(&mut peer.layout, busy));
+                            app.adopt_peer_layout(pid, peer, window, cx);
+                            assert!(app.workspace.instance(busy).is_none());
+                        }
+                    }
                     app.run_close_alternative(cx);
                     assert!(app.is_closing(quiet));
                     app.expire_closes(Instant::now() + Duration::from_secs(16), cx);
                     assert!(app.workspace.instance(quiet).is_none());
-                    assert!(path.is_dir(), "{choice} ran over the exited pane's work");
+                    assert!(
+                        path.is_dir(),
+                        "{departure}: {choice} ran over the departed pane's work"
+                    );
                     assert_eq!(
                         std::fs::read_to_string(&draft).unwrap(),
                         "written after the answer\n"
@@ -2710,12 +2734,12 @@ fn an_answer_never_outlives_a_pane_that_exits_before_acceptance() {
                     assert_eq!(
                         super::integrations::repo_head(&path).unwrap(),
                         before,
-                        "{choice} committed the exited pane's work without asking"
+                        "{departure}: {choice} committed the departed pane's work"
                     );
                     assert_eq!(
                         app.pending_worktree_dispose.len(),
                         1,
-                        "the exited pane's work needs a new file decision"
+                        "{departure}: the departed pane's work needs a new decision"
                     );
                 })
                 .unwrap();
@@ -2767,6 +2791,24 @@ fn tmux_pane_fixture(app: &mut MuxelApp, pane: Uuid) -> muxel_core::tmux::Sessio
     instance.tmux_session = Some(name.clone());
     instance.tmux_socket = Some(socket.clone());
     muxel_core::tmux::SessionTarget::new(name, Some(socket))
+}
+
+/// Run every local tmux close job to completion.
+fn wait_for_kill_jobs(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        let done = window
+            .update(cx, |app, _, _| {
+                app.close_tmux_kills.iter().all(gpui::Task::is_ready)
+            })
+            .unwrap();
+        if done {
+            return;
+        }
+        assert!(Instant::now() < deadline, "a tmux close job never finished");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// What a kill's confirmation does in `start_local_close`.
@@ -2978,11 +3020,135 @@ fn a_kill_that_cannot_confirm_keeps_its_worktree_listed() {
     }
 }
 
+/// A kill fails while a sibling keeps the worktree in use. The sibling's later
+/// kill confirms while activation's retry of the first is still running, so it
+/// leaves the worktree to that retry. However the retry ends, the worktree must
+/// not stay attached with no panes, where the sidebar can't reach it.
+#[test]
+fn a_retried_kill_settles_the_worktree_its_sibling_left_to_it() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (first, _, _first_child) = terminal(cx, window, pid);
+        let (sibling, _, _sibling_child) = terminal(cx, window, pid);
+        let (wid, _) = clean_worktree(cx, window, pid, first);
+        let sibling_target = window
+            .update(cx, |app, _, cx| {
+                app._status_timer = gpui::Task::ready(());
+                let path = app.workspace.worktree(wid).unwrap().path.clone();
+                join_worktree(app, sibling, wid, &path);
+                tmux_pane_fixture(app, first);
+                let sibling_target = tmux_pane_fixture(app, sibling);
+                app.close_instance_inner(first, "close (first)", cx);
+                app.local_closes_inflight.remove(&first);
+                app.finish_local_close(
+                    pid,
+                    first,
+                    muxel_core::WorktreeCleanup::Registered(wid),
+                    Err(anyhow::anyhow!("no answer from tmux")),
+                    cx,
+                );
+                assert!(!app.workspace.worktree(wid).unwrap().detached);
+                app.close_instance_inner(sibling, "close (sibling)", cx);
+                app.local_closes_inflight.remove(&sibling);
+                sibling_target
+            })
+            .unwrap();
+        // Let both first attempts finish first. One still running when the
+        // retry restamps its token would finish the close in the retry's place.
+        wait_for_kill_jobs(cx, window);
+        window
+            .update(cx, |app, _, cx| {
+                app.retry_local_closes(pid, cx);
+                assert!(app.local_closes_inflight.contains_key(&first));
+                confirm_local_kill(
+                    app,
+                    pid,
+                    sibling,
+                    &sibling_target,
+                    muxel_core::WorktreeCleanup::Registered(wid),
+                    cx,
+                );
+                assert!(
+                    !app.workspace.worktree(wid).unwrap().detached,
+                    "the sibling waits for the retry still running"
+                );
+            })
+            .unwrap();
+        // The retry really runs. Without tmux it fails; with it, the fixture's
+        // server doesn't exist and the session confirms gone.
+        wait_for_kill_jobs(cx, window);
+        window
+            .update(cx, |app, _, _| {
+                assert!(!app.local_closes_inflight.contains_key(&first));
+                assert!(
+                    app.workspace.worktree(wid).is_none_or(|w| w.detached),
+                    "the worktree was left attached with no panes"
+                );
+            })
+            .unwrap();
+    });
+}
+
+/// Legacy panes name a directory, not a worktree record, and one can share its
+/// path with a registered worktree. A retry must treat a legacy pane's kill as
+/// its first attempt did, and leave that worktree to the legacy pane still in it.
+#[test]
+fn a_retried_legacy_kill_leaves_a_worktree_another_legacy_pane_uses() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (closed, _, _closed_child) = terminal(cx, window, pid);
+        let (open, _, _open_child) = terminal(cx, window, pid);
+        let (wid, path) = clean_worktree(cx, window, pid, closed);
+        window
+            .update(cx, |app, _, cx| {
+                app._status_timer = gpui::Task::ready(());
+                for iid in [closed, open] {
+                    let instance = app.workspace.instance_mut(iid).unwrap();
+                    instance.worktree_id = None;
+                    instance.worktree_path = Some(path.clone());
+                }
+                tmux_pane_fixture(app, closed);
+                tmux_pane_fixture(app, open);
+                app.close_instance_inner(closed, "close (legacy)", cx);
+                app.local_closes_inflight.remove(&closed);
+                app.finish_local_close(
+                    pid,
+                    closed,
+                    muxel_core::WorktreeCleanup::Legacy(path.clone()),
+                    Err(anyhow::anyhow!("no answer from tmux")),
+                    cx,
+                );
+            })
+            .unwrap();
+        wait_for_kill_jobs(cx, window);
+        window
+            .update(cx, |app, _, cx| app.retry_local_closes(pid, cx))
+            .unwrap();
+        wait_for_kill_jobs(cx, window);
+        window
+            .update(cx, |app, _, _| {
+                assert!(app.workspace.instance(open).is_some());
+                assert!(path.is_dir(), "the retry removed a directory still in use");
+                let worktree = app.workspace.worktree(wid).expect("the record stays");
+                assert!(
+                    !worktree.detached,
+                    "the retry settled the worktree as if the closed pane were registered"
+                );
+            })
+            .unwrap();
+    });
+}
+
 /// Ryan's report: a failed kill shows the worktree as kept. Activation's retry
-/// confirming that kill much later must not run the answer over it.
+/// confirming that kill much later must not run the answer over it. A kill whose
+/// ledger couldn't be saved never starts, and keeps the worktree the same way.
 #[test]
 fn a_failed_kill_keeps_its_worktree_through_a_later_retry() {
-    for choice in ["discard", "merge"] {
+    for (failure, choice) in [
+        ("kill fails", "discard"),
+        ("kill fails", "merge"),
+        ("ledger save fails", "discard"),
+    ] {
         with_app(|cx, window| {
             let pid = project(cx, window);
             let (pane, _, _child) = terminal(cx, window, pid);
@@ -2999,15 +3165,28 @@ fn a_failed_kill_keeps_its_worktree_through_a_later_retry() {
                     assert!(app.is_closing(pane), "the close was accepted");
                     // The countdown's own close, under tmux.
                     let target = tmux_pane_fixture(app, pane);
-                    app.close_instance_inner(pane, "close (countdown)", cx);
-                    app.local_closes_inflight.remove(&pane);
-                    app.finish_local_close(
-                        pid,
-                        pane,
-                        muxel_core::WorktreeCleanup::Registered(wid),
-                        Err(anyhow::anyhow!("no answer from tmux")),
-                        cx,
-                    );
+                    if failure == "kill fails" {
+                        app.close_instance_inner(pane, "close (countdown)", cx);
+                        app.local_closes_inflight.remove(&pane);
+                        app.finish_local_close(
+                            pid,
+                            pane,
+                            muxel_core::WorktreeCleanup::Registered(wid),
+                            Err(anyhow::anyhow!("no answer from tmux")),
+                            cx,
+                        );
+                    } else {
+                        // Replace only this isolated fixture document with a
+                        // directory, so the ledger save fails.
+                        let document =
+                            muxel_store::workspace_doc_path(app.current_workspace.unwrap())
+                                .unwrap();
+                        let _ = std::fs::remove_file(&document);
+                        std::fs::create_dir(&document).unwrap();
+                        app.close_instance_inner(pane, "close (countdown)", cx);
+                        assert!(!app.local_closes_inflight.contains_key(&pane));
+                        std::fs::remove_dir(&document).unwrap();
+                    }
                     assert!(app.workspace.worktree(wid).unwrap().detached);
                     // Edited outside muxel while it looked kept.
                     std::fs::write(&draft, "edited while it looked kept\n").unwrap();
@@ -3019,7 +3198,10 @@ fn a_failed_kill_keeps_its_worktree_through_a_later_retry() {
                         muxel_core::WorktreeCleanup::None,
                         cx,
                     );
-                    assert!(path.is_dir(), "{choice} ran on a worktree shown as kept");
+                    assert!(
+                        path.is_dir(),
+                        "{failure}: {choice} ran on a worktree shown as kept"
+                    );
                     assert_eq!(
                         std::fs::read_to_string(&draft).unwrap(),
                         "edited while it looked kept\n"
