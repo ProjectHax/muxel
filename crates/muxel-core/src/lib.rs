@@ -22,6 +22,7 @@ pub mod muse;
 pub mod outage;
 mod pane;
 pub mod path_paste;
+pub mod placement;
 pub mod readaloud;
 pub mod recoverable_close;
 pub mod refresh_gate;

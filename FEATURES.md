@@ -734,7 +734,7 @@ feature is added or changed, update the matching entry here in the same change**
   locally hosted dev site) without leaving muxel. Uses the OS engine (WKWebView on
   macOS, WebView2 on Windows, WebKitGTK on Linux), so it's light on disk and memory.
 - **macOS/Windows: an embedded pane** — ctrl+click a URL and it opens as a browser
-  pane beside the terminal, with an address bar and Back / Forward / Reload buttons;
+  tab beside the terminal, with an address bar and Back / Forward / Reload buttons;
   Reload refreshes the page you are actually on (several links deep, if that's where
   you are), not the pane's original URL. The URL persists and restores with the
   workspace. Clicking into the page makes it the active pane — so paste and the
@@ -1288,10 +1288,16 @@ feature is added or changed, update the matching entry here in the same change**
   position. Dirty buffers show **Reload / Keep mine** instead of being overwritten;
   deleted or unreadable files remain open with a warning. The same behavior works in
   main, secondary, and popped-out editor windows.
-- **Resource tab grouping** — files, diffs, and browser pages opened by default join
-  the nearest pane of the same type; explicit New Tab and New Pane commands still
-  use the requested tab or split placement. Opening another resource as a tab
-  preserves the surrounding split geometry, including narrow resource columns.
+- **Resources open beside their pane** — a file, diff or web page opened from a
+  pane (a terminal link, a pane's diff button, an HTML **Preview**, a page's
+  new-window link) opens as a tab in the pane next to it: the one on its right,
+  or on its left when it sits at the right edge. A pane with no neighbour in its
+  row splits once, and its later opens join that new column. Files opened from
+  the file browser, palette, find panel, sidebar or git panel join the nearest
+  pane of the same type instead. An already-open file or page is focused and
+  refreshed wherever it is, and explicit New Tab and New Pane commands still use
+  the requested placement. Opening a resource as a tab preserves the surrounding
+  split geometry, including narrow resource columns.
 - **Resize preferences** — project, file/memory, and right-hand tool sidebars keep
   their preferred logical-pixel widths as the window changes size. The center
   splits redistribute proportionally at every level. Temporary minimum-size
@@ -1315,8 +1321,9 @@ feature is added or changed, update the matching entry here in the same change**
     worktree + its branch (enabled only when no instance is loaded in it).
   Works for local and remote (SSH) projects; panel width persists per workspace.
 - **Git diff pane** — a simpler read-only pane showing the working-tree diff for a
-  directory; opens as a **new tab** in the pane it's diffing (from a pane's "View
-  changes", the project menu, or a worktree) rather than splitting off a new pane.
+  directory. From a pane's diff button it opens as a tab beside that pane; from
+  the project menu or a worktree's **View changes** it joins the nearest diff
+  tab, if there is one.
 - **Command palette / global search** — quick navigation and search across the
   workspace.
 - **Find in project** — search within the active project.
