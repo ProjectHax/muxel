@@ -117,7 +117,8 @@ feature is added or changed, update the matching entry here in the same change**
   report asks, and any turn a report finishes during the countdown is changed
   work. Batch closes offer Close all, Close only the idle ones, or Cancel; a
   file answer needs the close to take every pane of its worktree, so leaving
-  one open drops the answer and that worktree asks again later.
+  one open, or one exiting before the close is accepted, drops the answer and
+  that worktree asks again later.
   Queued input, written to the terminal or sent through tmux, is cancelled
   across close and Undo, and hidden panes leave ctl listings; writes refuse
   with `closing`. Reads by id or name (`status`, `show`, `screen`, `wait`)
@@ -145,8 +146,9 @@ feature is added or changed, update the matching entry here in the same change**
   a muxel worktree with changes or unmerged commits asks what to do with its files,
   then follows the same busy confirmation and countdown with Undo as other
   terminals. Commit / Merge / Discard / Keep run only after the close finishes
-  and tmux teardown is confirmed; Undo, Cancel, Quit or switching workspace cancels
-  the file action and keeps the files, with the worktree listed in the sidebar. A
+  and tmux teardown is confirmed; Undo, Cancel, Quit, switching workspace or a
+  failed tmux kill cancels the file action and keeps the files, with the worktree
+  listed in the sidebar. A
   pane opened in that worktree while its question is showing gets its own
   prompt and countdown, and a pane brought back by Undo leaves the question.
   Client checks show progress, beside any running countdown, with their own
