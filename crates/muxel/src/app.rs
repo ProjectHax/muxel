@@ -769,6 +769,26 @@ fn status_hsla(status: AgentStatus, cx: &App) -> Hsla {
     }
 }
 
+/// Opacity of a Done icon once its pane has been focused: still green, but faint
+/// enough that unread finishes stand out.
+const READ_DONE_OPACITY: f32 = 0.45;
+
+/// Whether a shown Done is one the user has already seen. It mirrors attention
+/// navigation: a Done that `attention_rank` would still visit is unread.
+fn done_is_read(status: AgentStatus, activity: Option<&AgentActivity>) -> bool {
+    status == AgentStatus::Done && attention_rank(Some(status), activity).is_none()
+}
+
+/// A pane's status icon color: `status_hsla`, dimmed for a Done already read.
+fn pane_status_hsla(status: AgentStatus, activity: Option<&AgentActivity>, cx: &App) -> Hsla {
+    let color = status_hsla(status, cx);
+    if done_is_read(status, activity) {
+        color.opacity(READ_DONE_OPACITY)
+    } else {
+        color
+    }
+}
+
 fn activity_state(status: AgentStatus) -> AgentActivityState {
     match status {
         AgentStatus::Working => AgentActivityState::Working,
@@ -894,8 +914,9 @@ fn attend_agent_activity(
 mod restored_activity_tests {
     use super::{
         AgentActivityState, AgentPreset, AgentStatus, Instance, activity_needs_observation,
-        attend_agent_activity, attention_rank, is_restored_transition, persisted_status,
-        restore_activity_guard_active, restored_activity_sample, unprompted_report_working,
+        attend_agent_activity, attention_rank, done_is_read, is_restored_transition,
+        persisted_status, restore_activity_guard_active, restored_activity_sample,
+        unprompted_report_working,
     };
     use std::time::Duration;
     use uuid::Uuid;
@@ -1201,6 +1222,26 @@ mod restored_activity_tests {
             blocked.activity.current_state(),
             Some(AgentActivityState::Idle)
         );
+    }
+
+    #[test]
+    fn only_an_attended_done_reads_as_read() {
+        let read = attended_completion();
+        assert!(done_is_read(AgentStatus::Done, Some(&read.activity)));
+
+        // A finish after the last focus is unread again.
+        let mut unread = attended_completion();
+        unread.activity.last_attended_at = Some(100);
+        assert!(!done_is_read(AgentStatus::Done, Some(&unread.activity)));
+
+        // Runtime Done ahead of the durable record, or no record, is unread.
+        let fresh = Instance::from_preset(Uuid::new_v4(), &AgentPreset::codex());
+        assert!(!done_is_read(AgentStatus::Done, Some(&fresh.activity)));
+        assert!(!done_is_read(AgentStatus::Done, None));
+
+        // Other states are never dimmed.
+        assert!(!done_is_read(AgentStatus::Idle, Some(&read.activity)));
+        assert!(!done_is_read(AgentStatus::Working, Some(&read.activity)));
     }
 
     #[test]
@@ -25270,7 +25311,7 @@ impl MuxelApp {
                     shown_terminal_status(v.read(cx), inst, self.restoring_activity.contains(&iid))
                 });
                 let color = status
-                    .map(|s| status_hsla(s, cx))
+                    .map(|s| pane_status_hsla(s, inst.map(|i| &i.activity), cx))
                     .unwrap_or(cx.theme().muted_foreground);
                 card = card.child(
                     div()
@@ -26826,6 +26867,14 @@ impl MuxelApp {
                     };
                     let status =
                         persisted_status(status, inst, self.restoring_activity.contains(&iid));
+                    let pill_opacity = if !loading
+                        && !stopped
+                        && done_is_read(status, inst.map(|i| &i.activity))
+                    {
+                        READ_DONE_OPACITY
+                    } else {
+                        1.0
+                    };
                     // A user-assigned name fully replaces the agent's own title
                     // (no "custom — title" composite).
                     let display = match custom {
@@ -26856,12 +26905,13 @@ impl MuxelApp {
                         .child(agent_icon(
                             program.as_deref(),
                             px(15.0),
-                            status_hsla(
+                            pane_status_hsla(
                                 if loading {
                                     AgentStatus::Working
                                 } else {
                                     status
                                 },
+                                inst.map(|i| &i.activity),
                                 cx,
                             ),
                         ))
@@ -26916,7 +26966,7 @@ impl MuxelApp {
                                     .text_color(cx.theme().sidebar_foreground)
                                     .child(display),
                             )
-                            .child(div().flex_none().child(if loading {
+                            .child(div().flex_none().opacity(pill_opacity).child(if loading {
                                 status_tag(AgentStatus::Working, t("loading").to_string())
                             } else if stopped {
                                 status_tag(AgentStatus::Idle, t("stopped").to_string())
