@@ -504,6 +504,7 @@ mod tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![key.pane],
             active: 0,
+            split_from: None,
         }));
         discoveries.reconcile(&workspace);
         assert!(discoveries.begin(key.clone(), now).is_none());

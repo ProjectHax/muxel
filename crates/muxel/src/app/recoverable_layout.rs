@@ -29,7 +29,13 @@ pub(super) fn restore_layout(
             remove(&mut expected, id);
         }
     }
-    if *current == expected {
+    // Closing hands each pane's size to a sibling, so closing the same panes
+    // in another order can round differently. Compare up to that rounding.
+    let unchanged = match (current.as_ref(), expected.as_ref()) {
+        (Some(current), Some(expected)) => current.same_layout(expected),
+        (current, expected) => current.is_none() && expected.is_none(),
+    };
+    if unchanged {
         let mut restored = original.clone();
         for id in original_root.collect_instances() {
             if !present.contains(&id) && !restoring.contains(&id) {
@@ -103,6 +109,7 @@ fn restore_leaves(
         pane_id: leaf.pane_id,
         tabs: missing,
         active,
+        split_from: leaf.split_from,
     });
     let Some(root) = current.as_mut() else {
         *current = Some(restored);
@@ -226,6 +233,7 @@ mod tests {
             pane_id: id(100 + tabs[0]),
             tabs: tabs.iter().copied().map(id).collect(),
             active,
+            split_from: None,
         })
     }
 
@@ -404,17 +412,44 @@ mod tests {
     }
 
     #[test]
+    fn a_group_closed_out_of_reading_order_restores_exact_sizes() {
+        // Closing 3 and then 2 hands their widths to 1 in a different order than
+        // removing them in reading order does, and f32 addition rounds the two
+        // sums differently (1027.8999 against 1027.9). Undo must still see that
+        // nothing else changed and restore the layout exactly.
+        let original = Some(PaneNode::Split {
+            direction: SplitDirection::Horizontal,
+            sizes: vec![412.7, 333.3, 281.9, 500.0],
+            children: vec![leaf(&[1], 0), leaf(&[2], 0), leaf(&[3], 0), leaf(&[4], 0)],
+        });
+        let mut current = original.clone();
+        let restoring = close(&mut current, &[3, 2]);
+        restore_layout(&mut current, &original, &restoring);
+        assert_same(&current, &original);
+    }
+
+    #[test]
     fn separate_groups_restore_flat_split_sizes_in_either_order() {
         let original = Some(branch(
             SplitDirection::Horizontal,
             vec![leaf(&[1], 0), leaf(&[2], 0), leaf(&[3], 0)],
         ));
-        let mut current = original.clone();
-        let first = close(&mut current, &[2]);
-        let second_original = current.clone();
-        let second = close(&mut current, &[1]);
-        restore_layout(&mut current, &original, &first);
-        restore_layout(&mut current, &second_original, &second);
-        assert_same(&current, &original);
+        for reverse in [false, true] {
+            let mut current = original.clone();
+            let first = close(&mut current, &[2]);
+            // A group captures the durable layout, where an earlier held pane
+            // is still in place (`hold_closes` → `workspace_with_closes_restored`).
+            let mut second_original = current.clone();
+            restore_layout(&mut second_original, &original, &first);
+            let second = close(&mut current, &[1]);
+            if reverse {
+                restore_layout(&mut current, &second_original, &second);
+                restore_layout(&mut current, &original, &first);
+            } else {
+                restore_layout(&mut current, &original, &first);
+                restore_layout(&mut current, &second_original, &second);
+            }
+            assert_same(&current, &original);
+        }
     }
 }

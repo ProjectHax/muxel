@@ -36040,6 +36040,7 @@ mod split_resize_tests {
                 pane_id: Uuid::new_v4(),
                 tabs: vec![terminal_a, editor],
                 active: 0,
+                split_from: None,
             }),
             PaneNode::Split {
                 direction: SplitDirection::Vertical,
