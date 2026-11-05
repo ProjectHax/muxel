@@ -21,6 +21,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # add dependency edges, not new crates.
 toml = "1"
 unicode-properties = { version = "0.1.4", default-features = false, features = ["general-category"] }
+# "Copy as rich text" (`rich_copy`): the same Markdown parser gpui-component's
+# rendered view uses, already in the tree, so this adds an edge, not a crate.
+markdown = "1"
 
 [dev-dependencies]
 serde_json.workspace = true

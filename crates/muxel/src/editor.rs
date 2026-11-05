@@ -55,6 +55,10 @@ pub struct EditorView {
     is_markdown: bool,
     /// Show the rendered view (image / markdown) vs the raw text editor.
     show_rendered: bool,
+    /// "Copy as rich text" just succeeded: the header shows a check briefly.
+    rich_copied: bool,
+    /// Counts copies, so an earlier copy's timer can't clear a later one's check.
+    rich_copy_count: u64,
     /// Latest external change that could not be applied without discarding edits.
     external_change: Option<ExternalChange>,
     /// Last observed on-disk revision; polled off the UI thread.
@@ -221,6 +225,8 @@ impl EditorView {
             is_image,
             is_markdown,
             show_rendered: is_markdown || is_image,
+            rich_copied: false,
+            rich_copy_count: 0,
             external_change: None,
             disk_stamp: stamp,
         }
@@ -253,6 +259,8 @@ impl EditorView {
             is_image: false,
             is_markdown: false,
             show_rendered: false,
+            rich_copied: false,
+            rich_copy_count: 0,
             external_change: None,
             disk_stamp: None,
         }
@@ -290,6 +298,36 @@ impl EditorView {
             self.show_rendered = !self.show_rendered;
             cx.notify();
         }
+    }
+
+    /// Whether "Copy as rich text" is offered: rendered Markdown only.
+    pub fn can_copy_rich_text(&self) -> bool {
+        self.is_markdown && self.show_rendered
+    }
+
+    /// Whether a rich-text copy just succeeded (the header shows a check).
+    pub fn rich_text_copied(&self) -> bool {
+        self.rich_copied
+    }
+
+    /// Show the copied check for a moment.
+    pub fn flash_rich_text_copied(&mut self, cx: &mut Context<Self>) {
+        self.rich_copy_count += 1;
+        let count = self.rich_copy_count;
+        self.rich_copied = true;
+        cx.notify();
+        cx.spawn(async move |this: WeakEntity<Self>, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1500))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.rich_copy_count == count {
+                    this.rich_copied = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// The directory a diff pane is showing (for dedup), if any.
