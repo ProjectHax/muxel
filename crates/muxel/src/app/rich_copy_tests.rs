@@ -14,7 +14,7 @@ fn offers_copy(app: &MuxelApp, cx: &App) -> bool {
         .any(|cmd| matches!(cmd, PaletteCommand::CopyRichText))
 }
 
-/// Open `path` in an editor pane of project `pid`, the way Ctrl+P does.
+/// Open `path` in an editor pane of project `pid`, the way the file browser does.
 fn open(
     app: &mut MuxelApp,
     pid: Uuid,
@@ -22,10 +22,16 @@ fn open(
     window: &mut Window,
     cx: &mut Context<MuxelApp>,
 ) -> Uuid {
-    let iid = app
-        .open_editor_at(pid, Some(path.to_path_buf()), None, window, cx)
-        .unwrap();
-    assert_eq!(app.active_instance, Some(iid), "{path:?} is focused");
+    app.file_browser_pid = Some(pid);
+    app.open_browser_file(path.to_path_buf(), window, cx);
+    let iid = app.active_instance.expect("an editor opened");
+    assert_eq!(
+        app.workspace
+            .instance(iid)
+            .and_then(|i| i.editor_path.as_deref()),
+        Some(path),
+        "{path:?} is focused"
+    );
     iid
 }
 
