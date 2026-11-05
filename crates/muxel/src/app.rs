@@ -789,6 +789,117 @@ fn pane_status_hsla(status: AgentStatus, activity: Option<&AgentActivity>, cx: &
     }
 }
 
+#[cfg(test)]
+mod read_done_contrast_tests {
+    use super::READ_DONE_OPACITY;
+    use crate::theme;
+    use gpui::{Hsla, Rgba, TestAppContext};
+    use gpui_component::{Theme, ThemeRegistry};
+
+    fn luminance(c: Rgba) -> f32 {
+        let lin = |v: f32| {
+            if v <= 0.039_28 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+    }
+
+    /// `fg` composited over an opaque `bg`.
+    fn over(fg: Hsla, bg: Hsla) -> Rgba {
+        let (f, b) = (fg.to_rgb(), bg.to_rgb());
+        let a = f.a;
+        Rgba {
+            r: f.r * a + b.r * (1.0 - a),
+            g: f.g * a + b.g * (1.0 - a),
+            b: f.b * a + b.b * (1.0 - a),
+            a: 1.0,
+        }
+    }
+
+    fn contrast(a: Rgba, b: Rgba) -> f32 {
+        let (x, y) = (luminance(a), luminance(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    fn hex(c: Rgba) -> String {
+        let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        format!("#{:02x}{:02x}{:02x}", b(c.r), b(c.g), b(c.b))
+    }
+
+    /// Every bundled theme keeps a read finish visible: the outline pill's label
+    /// stays at least as legible as the theme's weakest green text, and the
+    /// dimmed icon stays visible yet fainter than an unread one. Set
+    /// `MUXEL_READ_DONE_SWATCHES=<file>` to dump each theme's colors for review.
+    #[test]
+    fn read_done_stays_legible_in_every_bundled_theme() {
+        let cx = TestAppContext::single();
+        let swatches = std::env::var_os("MUXEL_READ_DONE_SWATCHES");
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            theme::register_bundled_themes(cx);
+            let configs: Vec<_> = ThemeRegistry::global(cx)
+                .sorted_themes()
+                .into_iter()
+                .cloned()
+                .collect();
+            assert!(!configs.is_empty());
+            let mut rows = Vec::new();
+            for config in configs {
+                Theme::global_mut(cx).apply_config(&config);
+                let t = Theme::global(cx);
+                let bg = over(t.sidebar, t.background);
+                let on_bg = |c: Hsla| over(c, bg.into());
+                let unread_icon = on_bg(t.success);
+                let read_icon = on_bg(t.success.opacity(READ_DONE_OPACITY));
+                let filled = on_bg(t.success);
+                let filled_text = over(t.success_foreground, filled.into());
+                // The read pill's label is the unread icon's green on the sidebar.
+                let (label, read) = (contrast(unread_icon, bg), contrast(read_icon, bg));
+                let name = &config.name;
+                assert!(label >= 1.8, "{name}: read pill label contrast {label:.2}");
+                assert!(read >= 1.3, "{name}: read icon contrast {read:.2}");
+                assert!(label > read, "{name}: read icon is not fainter than unread");
+                rows.push(format!(
+                    concat!(
+                        r#"{{"name":"{}","bg":"{}","fg":"{}","muted":"{}","success":"{}","#,
+                        r#""successFg":"{}","readIcon":"{}","secondary":"{}","secondaryFg":"{}","#,
+                        r#""border":"{}","outline":{:.2},"filled":{:.2},"readIconC":{:.2}}}"#
+                    ),
+                    name,
+                    hex(bg),
+                    hex(on_bg(t.sidebar_foreground)),
+                    hex(on_bg(t.muted_foreground)),
+                    hex(filled),
+                    hex(filled_text),
+                    hex(read_icon),
+                    hex(on_bg(t.secondary)),
+                    hex(over(t.secondary_foreground, on_bg(t.secondary).into())),
+                    hex(on_bg(t.border)),
+                    label,
+                    contrast(filled_text, filled),
+                    read,
+                ));
+            }
+            if let Some(path) = &swatches {
+                std::fs::write(
+                    path,
+                    format!(
+                        "[{}]",
+                        rows.join(
+                            ",
+"
+                        )
+                    ),
+                )
+                .unwrap();
+            }
+        });
+    }
+}
+
 fn activity_state(status: AgentStatus) -> AgentActivityState {
     match status {
         AgentStatus::Working => AgentActivityState::Working,
@@ -26867,14 +26978,7 @@ impl MuxelApp {
                     };
                     let status =
                         persisted_status(status, inst, self.restoring_activity.contains(&iid));
-                    let pill_opacity = if !loading
-                        && !stopped
-                        && done_is_read(status, inst.map(|i| &i.activity))
-                    {
-                        READ_DONE_OPACITY
-                    } else {
-                        1.0
-                    };
+                    let read_done = done_is_read(status, inst.map(|i| &i.activity));
                     // A user-assigned name fully replaces the agent's own title
                     // (no "custom — title" composite).
                     let display = match custom {
@@ -26966,12 +27070,12 @@ impl MuxelApp {
                                     .text_color(cx.theme().sidebar_foreground)
                                     .child(display),
                             )
-                            .child(div().flex_none().opacity(pill_opacity).child(if loading {
+                            .child(div().flex_none().child(if loading {
                                 status_tag(AgentStatus::Working, t("loading").to_string())
                             } else if stopped {
                                 status_tag(AgentStatus::Idle, t("stopped").to_string())
                             } else {
-                                status_tag(
+                                let tag = status_tag(
                                     status,
                                     inst.map(|instance| {
                                         localized_activity_label(
@@ -26981,7 +27085,10 @@ impl MuxelApp {
                                         )
                                     })
                                     .unwrap_or_else(|| status_label(Some(status)).to_string()),
-                                )
+                                );
+                                // A read finish keeps its green as an outline, so
+                                // the label stays legible on the sidebar.
+                                if read_done { tag.outline() } else { tag }
                             }))
                             .on_drag(DragInstance { iid }, move |_, offset, _, cx| {
                                 let label = ghost_label.clone();
