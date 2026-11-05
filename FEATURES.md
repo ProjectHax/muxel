@@ -25,6 +25,8 @@ feature is added or changed, update the matching entry here in the same change**
   space returns to the pane it came from, so every other pane is left exactly as
   it was. A pane dragged next to another pane takes half of that pane the same way.
 - **Resizable splits** — drag the divider between panes; sizes persist per project.
+  When the pane you're shrinking reaches its minimum, the drag keeps going and
+  shrinks the next pane along, until every pane on that side is at its minimum.
   Cached terminals receive the final size after the drag, so responsive TUIs redraw
   without requiring a keypress or scroll.
 - **Minimum pane width** — panes can't shrink so narrow that an agent TUI becomes
