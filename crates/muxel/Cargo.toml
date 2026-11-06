@@ -168,6 +168,8 @@ windows = { version = "0.57", features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    # `QueryThreadCycleTime` for the opt-in UI frame profiler (`ui_profile/frame.rs`).
+    "Win32_System_WindowsProgramming",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

@@ -42,7 +42,9 @@ use gpui::{
 use uuid::Uuid;
 
 mod focus;
+mod frame;
 mod lookups;
+pub(crate) use frame::Region;
 use muxel_terminal::profile_log::{ProfileLog, ProfileLogLimits};
 
 #[cfg(target_os = "windows")]
@@ -209,6 +211,14 @@ enum DeferredRecord {
         reason: &'static str,
         generation: u64,
         transitions: usize,
+    },
+    Frame {
+        at: SystemTime,
+        frame: Box<frame::FrameData>,
+    },
+    FrameSummary {
+        at: SystemTime,
+        summary: Box<frame::Summary>,
     },
 }
 
@@ -442,6 +452,8 @@ pub struct RenderWatch {
     view: RenderView,
     stage: RenderStage,
     started: Instant,
+    /// The frame a build watch opened (`frame.rs`); 0 for stage watches.
+    frame: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -533,6 +545,9 @@ struct ProfiledElement {
     inner: AnyElement,
     view: RenderView,
     frame: Option<RenderWatch>,
+    /// Frame attribution token (`frame.rs`); its close runs at arena clear.
+    frame_token: u64,
+    _close: frame::FrameClose,
 }
 
 impl Drop for PhaseSpan {
@@ -645,10 +660,12 @@ impl Element for ProfiledElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        frame::mark(self.frame_token, frame::Mark::LayoutStart);
         let layout = {
             let _watch = watch_render(self.view, RenderStage::RequestLayout);
             self.inner.request_layout(window, cx)
         };
+        frame::mark(self.frame_token, frame::Mark::LayoutEnd);
         if let Some(frame) = &self.frame {
             // gpui-component's thin Root still finishes its own request-layout
             // callback before GPUI computes the window layout. This stage names
@@ -667,10 +684,16 @@ impl Element for ProfiledElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        frame::mark(self.frame_token, frame::Mark::PrepaintStart);
+        frame::set_window(
+            self.frame_token,
+            window.window_handle().window_id().as_u64(),
+        );
         {
             let _watch = watch_render(self.view, RenderStage::Prepaint);
             self.inner.prepaint(window, cx);
         }
+        frame::mark(self.frame_token, frame::Mark::PrepaintEnd);
         if let Some(frame) = &self.frame {
             frame.mark_stage(RenderStage::Frame);
         }
@@ -686,10 +709,12 @@ impl Element for ProfiledElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        frame::mark(self.frame_token, frame::Mark::PaintStart);
         {
             let _watch = watch_render(self.view, RenderStage::Paint);
             self.inner.paint(window, cx);
         }
+        frame::mark(self.frame_token, frame::Mark::PaintEnd);
         if let Some(frame) = &self.frame {
             // gpui-component's Root may still paint after this child returns;
             // GPUI then finalizes the scene and presents before clearing the
@@ -816,6 +841,14 @@ fn deferred_sender() -> &'static SyncSender<DeferredRecord> {
 
 fn deferred_writer(rx: Receiver<DeferredRecord>) {
     let mut lookups = lookups::Lookups::default();
+    let cycles_per_us = frame::calibrate_cycles_per_us();
+    emit_at(
+        SystemTime::now(),
+        &cycles_per_us.map_or_else(
+            || "ui-frame[v1 start] cycles_per_us=unavailable".to_string(),
+            |rate| format!("ui-frame[v1 start] cycles_per_us={rate:.1}"),
+        ),
+    );
     let mut last_summary = Instant::now();
     loop {
         // Check even during a sustained queue flood. All summary formatting and
@@ -911,8 +944,28 @@ fn deferred_writer(rx: Receiver<DeferredRecord>) {
                     "ui-prof[root notify v1] reason={reason} generation={generation} transitions={transitions}"
                 ),
             ),
+            DeferredRecord::Frame { at, frame } => {
+                emit_at(at, &frame::frame_line(&frame, cycles_per_us))
+            }
+            DeferredRecord::FrameSummary { at, summary } => {
+                emit_at(at, &frame::summary_line(&summary, cycles_per_us))
+            }
         }
     }
+}
+
+fn defer_frame(frame: Box<frame::FrameData>) {
+    defer_record(DeferredRecord::Frame {
+        at: SystemTime::now(),
+        frame,
+    });
+}
+
+fn defer_frame_summary(summary: Box<frame::Summary>) {
+    defer_record(DeferredRecord::FrameSummary {
+        at: SystemTime::now(),
+        summary,
+    });
 }
 
 fn try_defer_to(tx: Option<&SyncSender<DeferredRecord>>, record: DeferredRecord) -> bool {
@@ -1402,13 +1455,58 @@ fn watch_render(view: RenderView, stage: RenderStage) -> Option<RenderWatch> {
         view,
         stage,
         started,
+        frame: 0,
     })
 }
 
-/// Mark root-view element construction as the current UI-thread render stage.
-/// Normal frames touch atomics only and produce no log record.
+/// Mark root-view element construction as the current UI-thread render stage
+/// and open this draw's frame attribution (`frame.rs`). Normal frames touch
+/// atomics and thread-local counters only and produce no log record.
 pub fn watch_render_build(view: RenderView) -> Option<RenderWatch> {
-    watch_render(view, RenderStage::Build)
+    let mut watch = watch_render(view, RenderStage::Build)?;
+    frame::begin(view, watch.token);
+    watch.frame = watch.token;
+    Some(watch)
+}
+
+/// Build one region of a window and attribute its frame cost: `build` covers
+/// this call, and the returned layout-transparent wrapper times the region's
+/// request-layout, prepaint and paint. Nested regions are subtracted. With
+/// profiling off this is `build().into_any_element()`.
+pub(crate) fn region<E: IntoElement>(region: Region, build: impl FnOnce() -> E) -> AnyElement {
+    if !is_enabled() {
+        return build().into_any_element();
+    }
+    let scope = frame::open(region, frame::Phase::Build);
+    let inner = build().into_any_element();
+    drop(scope);
+    frame::ProfiledRegion { inner, region }.into_any_element()
+}
+
+/// Attribute build work up to the guard's drop to `region`, for code that
+/// builds a region in pieces. Pair it with [`wrap_region`].
+pub(crate) fn region_scope(region: Region) -> Option<frame::RegionScope> {
+    if !is_enabled() {
+        return None;
+    }
+    frame::open(region, frame::Phase::Build)
+}
+
+/// The element half of [`region`], for a region built under [`region_scope`].
+pub(crate) fn wrap_region(region: Region, element: impl IntoElement) -> AnyElement {
+    let inner = element.into_any_element();
+    if !is_enabled() {
+        return inner;
+    }
+    frame::ProfiledRegion { inner, region }.into_any_element()
+}
+
+/// The next tab-group slot of the frame being built (leaf render order).
+pub(crate) fn frame_group(tabs: usize) -> usize {
+    if !is_enabled() {
+        return 0;
+    }
+    frame::next_group(tabs)
 }
 
 /// Wrap the application element beneath gpui-component's thin window Root so
@@ -1420,6 +1518,8 @@ pub fn finish_render(
     element: impl IntoElement,
 ) -> AnyElement {
     let inner = element.into_any_element();
+    let frame_token = build.as_ref().map_or(0, |build| build.frame);
+    frame::mark(frame_token, frame::Mark::BuildEnd);
     drop(build);
     if !is_enabled() {
         inner
@@ -1428,6 +1528,8 @@ pub fn finish_render(
             inner,
             view,
             frame: watch_render(view, RenderStage::Frame),
+            frame_token,
+            _close: frame::FrameClose(frame_token),
         }
         .into_any_element()
     }

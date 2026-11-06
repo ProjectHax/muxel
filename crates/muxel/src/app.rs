@@ -20059,10 +20059,12 @@ impl MuxelApp {
         let main_content: AnyElement = if let Some(msg) = failed_remote {
             self.render_remote_connect_failed(pid, &msg, cx)
         } else if let Some(leaf) = maximized_here {
-            self.render_pane(&leaf, cx)
+            ui_profile::region(ui_profile::Region::Panes, || self.render_pane(&leaf, cx))
         } else {
             match layout {
-                Some(root) => self.render_pane_root(pid, &root, cx),
+                Some(root) => ui_profile::region(ui_profile::Region::Panes, || {
+                    self.render_pane_root(pid, &root, cx)
+                }),
                 None => div()
                     .size_full()
                     .flex()
@@ -20080,7 +20082,9 @@ impl MuxelApp {
             .min_w_0()
             .flex()
             .flex_col()
-            .child(self.render_toolbar(cx))
+            .child(ui_profile::region(ui_profile::Region::Toolbar, || {
+                self.render_toolbar(cx)
+            }))
             .child(div().flex_1().min_h_0().child(main_content));
         let body: AnyElement = if sidebar_hidden {
             main_column.into_any_element()
@@ -20097,7 +20101,9 @@ impl MuxelApp {
                     resizable_panel()
                         .fixed_size(px(saved))
                         .size_range(px(160.0)..px(half))
-                        .child(self.render_sidebar(cx)),
+                        .child(ui_profile::region(ui_profile::Region::Sidebar, || {
+                            self.render_sidebar(cx)
+                        })),
                 )
                 .child(resizable_panel().child(main_column))
                 .on_resize(|state, _window, cx| {
@@ -20120,48 +20126,53 @@ impl MuxelApp {
             .track_focus(root_focus)
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground);
+        let actions = ui_profile::region_scope(ui_profile::Region::Actions);
         let root = self.attach_workspace_actions(root, cx);
-        root.child(self.render_secondary_titlebar(sidebar_hidden, cx))
-            .child(div().flex_1().min_h_0().flex().child(body))
-            .children((window.is_fullscreen() && sidebar_hidden).then(|| {
-                div()
-                    .absolute()
-                    .left_0()
-                    .top_0()
-                    .bottom_0()
-                    .w(px(26.0))
-                    .flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .py_2()
-                            .bg(cx.theme().sidebar)
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .rounded_r(cx.theme().radius)
-                            .shadow_md()
-                            .child(
-                                Button::new("fullscreen-reveal-sidebar-secondary")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::ChevronRight)
-                                    .tooltip(t("Show sidebar"))
-                                    .on_click(cx.listener(|this, _e, window, cx| {
-                                        this.toggle_sidebar(window, cx)
-                                    })),
-                            ),
-                    )
-            }))
-            // "Close terminal?" and friends act on a pane in *this* window, so the
-            // dialog has to appear here, not over on the main window's monitor.
-            .children(
-                (self.confirm_window_pid() == Some(pid)).then(|| self.render_confirm_modal(cx)),
-            )
-            .children(
-                (self.auto_message_window_pid() == Some(pid))
-                    .then(|| self.render_auto_message_popup(cx)),
-            )
-            .into_any_element()
+        drop(actions);
+        root.child(ui_profile::region(ui_profile::Region::Titlebar, || {
+            self.render_secondary_titlebar(sidebar_hidden, cx)
+        }))
+        .child(ui_profile::wrap_region(
+            ui_profile::Region::Shell,
+            div().flex_1().min_h_0().flex().child(body),
+        ))
+        .children((window.is_fullscreen() && sidebar_hidden).then(|| {
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .bottom_0()
+                .w(px(26.0))
+                .flex()
+                .items_center()
+                .child(
+                    div()
+                        .py_2()
+                        .bg(cx.theme().sidebar)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .rounded_r(cx.theme().radius)
+                        .shadow_md()
+                        .child(
+                            Button::new("fullscreen-reveal-sidebar-secondary")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::ChevronRight)
+                                .tooltip(t("Show sidebar"))
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    this.toggle_sidebar(window, cx)
+                                })),
+                        ),
+                )
+        }))
+        // "Close terminal?" and friends act on a pane in *this* window, so the
+        // dialog has to appear here, not over on the main window's monitor.
+        .children((self.confirm_window_pid() == Some(pid)).then(|| self.render_confirm_modal(cx)))
+        .children(
+            (self.auto_message_window_pid() == Some(pid))
+                .then(|| self.render_auto_message_popup(cx)),
+        )
+        .into_any_element()
     }
 
     /// Detach a pane into its own OS window (kept alive). Closing that window
@@ -23711,13 +23722,16 @@ impl MuxelApp {
                     // are left with no body at all.
                     .child(div().h_full().flex_1().min_w(min_w).child(panes)),
             )
-            .child(
-                div().absolute().inset_0().child(
-                    Scrollbar::new(&scroll)
-                        .id("panes-sb")
-                        .axis(ScrollbarAxis::Horizontal),
-                ),
-            )
+            .child(ui_profile::region(
+                ui_profile::Region::PaneScrollbar,
+                || {
+                    div().absolute().inset_0().child(
+                        Scrollbar::new(&scroll)
+                            .id("panes-sb")
+                            .axis(ScrollbarAxis::Horizontal),
+                    )
+                },
+            ))
             .into_any_element()
     }
 
@@ -23825,6 +23839,11 @@ impl MuxelApp {
                     tabs[leaf_active]
                 };
                 let is_active = pane_has_focus;
+                // Frame attribution: the group's card (`Body`) encloses its
+                // strip and content regions, which are subtracted from it.
+                let group = ui_profile::frame_group(tabs.len());
+                let body_scope = ui_profile::region_scope(ui_profile::Region::Body(group));
+                let content_scope = ui_profile::region_scope(ui_profile::Region::Content(group));
                 let content: AnyElement = if let Some(view) = self.terminals.get(&iid) {
                     let v = view.read(cx);
                     if v.exited() {
@@ -23982,6 +24001,8 @@ impl MuxelApp {
                 } else {
                     self.terminal_starting(iid, cx)
                 };
+                drop(content_scope);
+                let content = ui_profile::wrap_region(ui_profile::Region::Content(group), content);
                 // Each pane is a rounded card with a thin header that doubles as
                 // the drag handle — so the terminal body stays free for text
                 // selection. The active card gets an accent ring + glow.
@@ -24022,6 +24043,7 @@ impl MuxelApp {
                 } else {
                     IconName::Maximize
                 };
+                let strip_scope = ui_profile::region_scope(ui_profile::Region::Strip(group));
                 let controls = div()
                     .flex_none()
                     .flex()
@@ -24775,6 +24797,8 @@ impl MuxelApp {
                         }
                     }))
                     .child(controls);
+                drop(strip_scope);
+                let strip = ui_profile::wrap_region(ui_profile::Region::Strip(group), strip);
 
                 let mut card = div()
                     .id(SharedString::from(format!("pane-{}", anchor.simple())))
@@ -24849,13 +24873,9 @@ impl MuxelApp {
                         inset: false,
                     }]);
                 }
-                div()
-                    .size_full()
-                    .min_w_0()
-                    .min_h_0()
-                    .p(px(3.0))
-                    .child(card)
-                    .into_any_element()
+                let leaf = div().size_full().min_w_0().min_h_0().p(px(3.0)).child(card);
+                drop(body_scope);
+                ui_profile::wrap_region(ui_profile::Region::Body(group), leaf)
             }
             PaneNode::Split {
                 direction,
@@ -34164,6 +34184,7 @@ impl Focusable for MuxelApp {
 impl Render for MuxelApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _render = ui_profile::watch_render_build(ui_profile::RenderView::Main);
+        let prep = ui_profile::region_scope(ui_profile::Region::Prep);
         // Native browser webviews draw above all gpui content in their bounds —
         // keep them shown/hidden in lockstep with what this frame displays.
         self.sync_browser_visibility(cx);
@@ -34172,6 +34193,7 @@ impl Render for MuxelApp {
         if self.show_settings {
             self.settings_pane_w = self.settings_content_w(window);
         }
+        drop(prep);
         // First-run Terms acceptance gates everything else. These screens still
         // need a draggable title bar (with window controls) to move the window.
         if self.show_terms {
@@ -34214,8 +34236,10 @@ impl Render for MuxelApp {
             return ui_profile::finish_render(ui_profile::RenderView::Main, _render, root);
         }
         // Rebuild any editors/browsers awaiting re-dock (needs the main window).
+        let prep = ui_profile::region_scope(ui_profile::Region::Prep);
         self.drain_editor_redocks(window, cx);
         self.drain_browser_redocks(window, cx);
+        drop(prep);
 
         // The title bar shows the active *workspace* name (next to "muxel"), not
         // the highlighted project.
@@ -34256,10 +34280,12 @@ impl Render for MuxelApp {
         } else if let Some((fpid, msg)) = failed_remote {
             self.render_remote_connect_failed(fpid, &msg, cx)
         } else if let Some(leaf) = maximized_here {
-            self.render_pane(&leaf, cx)
+            ui_profile::region(ui_profile::Region::Panes, || self.render_pane(&leaf, cx))
         } else {
             match (active_layout, self.workspace.active_project) {
-                (Some(root), Some(pid)) => self.render_pane_root(pid, &root, cx),
+                (Some(root), Some(pid)) => ui_profile::region(ui_profile::Region::Panes, || {
+                    self.render_pane_root(pid, &root, cx)
+                }),
                 // A workspace with zero projects gets the full get-started state;
                 // projects-with-no-panes keeps the small transient hint (the
                 // toolbar affordances already cover that case).
@@ -34285,7 +34311,9 @@ impl Render for MuxelApp {
             .min_w_0()
             .flex()
             .flex_col()
-            .child(self.render_toolbar(cx))
+            .child(ui_profile::region(ui_profile::Region::Toolbar, || {
+                self.render_toolbar(cx)
+            }))
             .child(div().flex_1().min_h_0().child(main_content));
         // The file browser (second sidebar) nests its own resizable so its width
         // persists independently of the project sidebar.
@@ -34423,7 +34451,9 @@ impl Render for MuxelApp {
                     resizable_panel()
                         .fixed_size(px(saved))
                         .size_range(px(160.0)..px(half))
-                        .child(self.render_sidebar(cx)),
+                        .child(ui_profile::region(ui_profile::Region::Sidebar, || {
+                            self.render_sidebar(cx)
+                        })),
                 )
                 .child(
                     resizable_panel()
@@ -34493,74 +34523,109 @@ impl Render for MuxelApp {
             .track_focus(&self.focus_handle)
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground);
+        let actions = ui_profile::region_scope(ui_profile::Region::Actions);
         let root = self.attach_workspace_actions(root, cx);
+        drop(actions);
+        fn ov<E: IntoElement>(build: impl FnOnce() -> E) -> AnyElement {
+            ui_profile::region(ui_profile::Region::Overlay, build)
+        }
         let root = root
-            .child(self.render_titlebar(active_name, cx))
-            .child(div().flex_1().min_h_0().flex().child(outer))
-            .child(self.render_hotbar(cx))
+            .child(ui_profile::region(ui_profile::Region::Titlebar, || {
+                self.render_titlebar(active_name, cx)
+            }))
+            .child(ui_profile::wrap_region(
+                ui_profile::Region::Shell,
+                div().flex_1().min_h_0().flex().child(outer),
+            ))
+            .child(ui_profile::region(ui_profile::Region::Hotbar, || {
+                self.render_hotbar(cx)
+            }))
             .children(
                 self.show_settings
-                    .then(|| self.render_settings_modal(window, cx)),
+                    .then(|| ov(|| self.render_settings_modal(window, cx))),
             )
             .children(
                 self.show_search_palette
-                    .then(|| self.render_search_palette(cx)),
+                    .then(|| ov(|| self.render_search_palette(cx))),
             )
-            .children(self.show_find_panel.then(|| self.render_find_panel(cx)))
-            .children(self.show_update_modal.then(|| self.render_update_modal(cx)))
+            .children(
+                self.show_find_panel
+                    .then(|| ov(|| self.render_find_panel(cx))),
+            )
+            .children(
+                self.show_update_modal
+                    .then(|| ov(|| self.render_update_modal(cx))),
+            )
             .children(
                 self.tmux_install_shown()
-                    .then(|| self.render_tmux_install(window, cx)),
+                    .then(|| ov(|| self.render_tmux_install(window, cx))),
             )
-            .children(self.show_quit_confirm.then(|| self.render_quit_modal(cx)))
-            .children(self.git_modal.is_some().then(|| self.render_git_modal(cx)))
+            .children(
+                self.show_quit_confirm
+                    .then(|| ov(|| self.render_quit_modal(cx))),
+            )
+            .children(
+                self.git_modal
+                    .is_some()
+                    .then(|| ov(|| self.render_git_modal(cx))),
+            )
             .children(
                 self.show_new_remote
-                    .then(|| self.render_remote_project_modal(cx)),
+                    .then(|| ov(|| self.render_remote_project_modal(cx))),
             )
-            .children(self.import.is_some().then(|| self.render_import_modal(cx)))
+            .children(
+                self.import
+                    .is_some()
+                    .then(|| ov(|| self.render_import_modal(cx))),
+            )
             .children(
                 self.password_prompt
                     .is_some()
-                    .then(|| self.render_password_prompt(cx)),
+                    .then(|| ov(|| self.render_password_prompt(cx))),
             )
-            .children(self.show_keys.then(|| self.render_keys_overlay(cx)))
+            .children(self.show_keys.then(|| ov(|| self.render_keys_overlay(cx))))
             .children(
                 self.term_search
                     .is_some()
-                    .then(|| self.render_term_search_bar(cx)),
+                    .then(|| ov(|| self.render_term_search_bar(cx))),
             )
-            .children(self.broadcasting.then(|| self.render_broadcast_bar(cx)))
-            .children((self.stt_state != SttState::Idle).then(|| self.render_stt_bar(cx)))
+            .children(
+                self.broadcasting
+                    .then(|| ov(|| self.render_broadcast_bar(cx))),
+            )
+            .children((self.stt_state != SttState::Idle).then(|| ov(|| self.render_stt_bar(cx))))
             .children(
                 (!self.pending_worktree_dispose.is_empty())
-                    .then(|| self.render_worktree_dispose_modal(cx)),
+                    .then(|| ov(|| self.render_worktree_dispose_modal(cx))),
             )
             .children(
                 self.place_menu
                     .is_some()
-                    .then(|| self.render_place_menu(cx)),
+                    .then(|| ov(|| self.render_place_menu(cx))),
             )
             .children(
                 self.runners_menu
                     .is_some()
-                    .then(|| self.render_runners_menu(window, cx)),
+                    .then(|| ov(|| self.render_runners_menu(window, cx))),
             )
             .children(
                 self.loops_menu
                     .is_some()
-                    .then(|| self.render_loops_menu(window, cx)),
+                    .then(|| ov(|| self.render_loops_menu(window, cx))),
             )
             .children(
                 self.snippets_menu
                     .is_some()
-                    .then(|| self.render_snippets_menu(window, cx)),
+                    .then(|| ov(|| self.render_snippets_menu(window, cx))),
             )
-            .children(self.show_run_dialog.then(|| self.render_run_dialog(cx)))
+            .children(
+                self.show_run_dialog
+                    .then(|| ov(|| self.render_run_dialog(cx))),
+            )
             .children(
                 self.library_dialog
                     .is_some()
-                    .then(|| self.render_library_dialog(cx)),
+                    .then(|| ov(|| self.render_library_dialog(cx))),
             )
             // A pane-scoped confirm belongs to the window showing that pane; when
             // that's a project window on another monitor, it draws there instead.
@@ -34568,14 +34633,23 @@ impl Render for MuxelApp {
                 (self.confirm.is_some()
                     && self.confirm_window_pid().is_none()
                     && self.confirm_popout_iid().is_none())
-                .then(|| self.render_confirm_modal(cx)),
+                .then(|| ov(|| self.render_confirm_modal(cx))),
             )
-            .children(self.show_close_list.then(|| self.render_close_list(cx)))
+            .children(
+                self.show_close_list
+                    .then(|| ov(|| self.render_close_list(cx))),
+            )
             .children(
                 (self.auto_message_popup.is_some() && self.auto_message_window_pid().is_none())
-                    .then(|| self.render_auto_message_popup(cx)),
+                    .then(|| ov(|| self.render_auto_message_popup(cx))),
             )
-            .children(self.render_control_approval(cx))
+            .children(
+                {
+                    let _scope = ui_profile::region_scope(ui_profile::Region::Overlay);
+                    self.render_control_approval(cx)
+                }
+                .map(|approval| ui_profile::wrap_region(ui_profile::Region::Overlay, approval)),
+            )
             // Fullscreen with the sidebar hidden: a floating left-edge pill
             // brings it back without leaving fullscreen (F11's escape hatch).
             .children((window.is_fullscreen() && sidebar_hidden).then(|| {

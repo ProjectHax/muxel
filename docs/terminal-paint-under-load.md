@@ -195,6 +195,27 @@ Periodic summaries are best effort: the unfinished interval is not persisted on
 process exit (up to 30 seconds of quiet terminal work or 60 seconds of discovery
 counts). Detailed input and slow-event records keep their usual flush cadence.
 
+**Frame attribution** (`ui-frame`, `ui_profile/frame.rs`): every root-view
+draw is one frame, from its build to GPUI's arena clear after presenting. A
+frame of at least 50 ms writes `ui-frame[v1 slow]`; every ten seconds
+`ui-frame[v1 sum]` totals all frames. Both split the frame into GPUI-ordered
+intervals (`pre` invalidation and Root render, `build`, `layout`
+request-layout, `compute` taffy, `prepaint`, `paint`, `tail` draw
+finalization, `present` platform present and arena clear; without GPUI's frame
+trace `tail` and `present` are one `post`), then into window regions: `prep`,
+`actions`, `titlebar`, `sidebar`, `toolbar`, `hotbar`, `panes` (split
+containers), `panes_sb` (the pane row's scrollbar), `shell` (the body's
+sidebar and side-panel resizable groups and main column), `overlay`, and per
+tab group `stripN`, `bodyN` (the card) and `contentN` (the shown tab). Region
+values are self times per phase (`build/layout/prepaint/paint`); `other` is
+the rest of each phase. `cpu` is the
+UI thread's cycle count over the frame (Windows), so `wall` minus `cpu` is time
+the thread did not run; `faults` is the process page-fault count. The summary
+adds `duty` (frame wall time over the interval), UI-thread CPU inside and
+outside frames, `queue` (first invalidation to draw start) and a frame-time
+histogram. `ui-frame[v1 start]` records the calibrated cycles per microsecond.
+Records hold fixed labels, counts and durations only.
+
 When GPUI reports that nothing in the newly rendered dispatch tree owns focus,
 `ui-prof[focus path v2]` records fixed owner classes and pane UUIDs for the
 retained handle and active target, whether each handle was present in that
