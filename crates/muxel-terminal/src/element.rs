@@ -1410,11 +1410,12 @@ impl TerminalElement {
 
         // ---- Ctrl/Cmd+click: open the link (OSC 8 / URL / file path) under the
         // cursor. Dispatched as an action so the app decides where it opens
-        // (built-in browser vs the OS).
+        // (built-in browser vs the OS, beside this pane).
         {
             let session = self.session.clone();
             let hitbox = hitbox.clone();
             let focus = self.focus_handle.clone();
+            let pane = self.instance_id;
             window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble
                     || e.button != MouseButton::Left
@@ -1433,7 +1434,11 @@ impl TerminalElement {
                     cols,
                     rows,
                 ) {
-                    focus.dispatch_action(&crate::view::OpenLink(link.url), window, cx);
+                    let open = crate::view::OpenLink {
+                        url: link.url,
+                        pane,
+                    };
+                    focus.dispatch_action(&open, window, cx);
                 }
             });
         }
@@ -1442,6 +1447,7 @@ impl TerminalElement {
             let session = self.session.clone();
             let hitbox = hitbox.clone();
             let focus = self.focus_handle.clone();
+            let pane = self.instance_id;
             window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble
                     || e.button != MouseButton::Middle
@@ -1457,7 +1463,11 @@ impl TerminalElement {
                     cols,
                     rows,
                 ) {
-                    focus.dispatch_action(&crate::view::OpenLinkBackground(link.url), window, cx);
+                    let open = crate::view::OpenLinkBackground {
+                        url: link.url,
+                        pane,
+                    };
+                    focus.dispatch_action(&open, window, cx);
                     cx.stop_propagation();
                 }
             });

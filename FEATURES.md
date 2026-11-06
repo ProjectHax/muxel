@@ -65,7 +65,8 @@ feature is added or changed, update the matching entry here in the same change**
   pane maximized, as does closing or popping out the tab being shown while others
   remain. While a pane is maximized, selecting another agent (sidebar,
   notification, tray) moves the maximize to it, so that agent comes up full-size
-  instead of hiding behind.
+  instead of hiding behind. A file, diff or page that opens in another pane ends
+  the maximize, so it shows beside the pane that opened it.
 - **Pane cards** — rounded "card" panes with an accent ring + glow on the active
   pane, hover highlight, and a configurable border style.
 
@@ -76,7 +77,9 @@ feature is added or changed, update the matching entry here in the same change**
 - **New agents open as tabs** — the toolbar's agent button and `Ctrl+Alt+1–9`
   add the new agent as a tab in the focused pane, so starting an agent never adds
   a column. An empty project gets its first pane. New Pane, Split Right/Down, the
-  split buttons and dragging a tab to an edge still make a new pane.
+  split buttons and dragging a tab to an edge still make a new pane. In a
+  per-monitor project window, the toolbar and shortcuts act on that window's
+  project.
 - **Non-blocking agent creation** — a new agent tab paints and focuses first; PTY
   creation and child startup run on a worker, with stale launches discarded if the
   tab closes or is replaced before startup completes.
@@ -1291,13 +1294,14 @@ feature is added or changed, update the matching entry here in the same change**
 - **Resources open beside their pane** — a file, diff or web page opened from a
   pane (a terminal link, a pane's diff button, an HTML **Preview**, a page's
   new-window link) opens as a tab in the pane next to it: the one on its right,
-  or on its left when it sits at the right edge. A pane with no neighbour in its
-  row splits once, and its later opens join that new column. Files opened from
-  the file browser, palette, find panel, sidebar or git panel join the nearest
-  pane of the same type instead. An already-open file or page is focused and
-  refreshed wherever it is, and explicit New Tab and New Pane commands still use
-  the requested placement. Opening a resource as a tab preserves the surrounding
-  split geometry, including narrow resource columns.
+  or on its left when it sits at the right edge. A link goes beside the pane it
+  was clicked in, even one that didn't have focus. A pane with no neighbour in
+  its row splits once, and its later opens join that new column. Files opened
+  from the file browser, palette, find panel, sidebar or git panel join the
+  nearest pane of the same type instead. An already-open file or page is focused
+  and refreshed wherever it is, and explicit New Tab and New Pane commands still
+  use the requested placement. Opening a resource as a tab preserves the
+  surrounding split geometry, including narrow resource columns.
 - **Resize preferences** — project, file/memory, and right-hand tool sidebars keep
   their preferred logical-pixel widths as the window changes size. The center
   splits redistribute proportionally at every level. Temporary minimum-size

@@ -246,8 +246,8 @@ mod tests {
     }
 
     #[test]
-    fn a_stacked_neighbour_column_takes_the_resource_in_its_top_pane() {
-        // A | (B over C)
+    fn an_evenly_stacked_neighbour_column_takes_the_resource_in_its_top_pane() {
+        // A | (B over C), B and C the same height.
         let (mut f, a) = Fixture::with(Terminal);
         let b = f.split(a, SplitDirection::Horizontal, Terminal);
         let c = f.split(b, SplitDirection::Vertical, Terminal);
@@ -257,6 +257,68 @@ mod tests {
         // C is at the right edge, so its neighbour is A on the left.
         let from_c = f.open(Editor, ResourceOrigin::Pane(c));
         assert_eq!(f.group(from_c), [a, from_c]);
+    }
+
+    /// A split of `children` sized `sizes`.
+    fn sized(direction: SplitDirection, sizes: [f32; 2], children: [PaneNode; 2]) -> PaneNode {
+        PaneNode::Split {
+            direction,
+            sizes: sizes.to_vec(),
+            children: children.to_vec(),
+        }
+    }
+
+    #[test]
+    fn the_neighbour_sharing_the_longest_edge_wins() {
+        // A | (B over C), with C three times B's height.
+        let mut f = Fixture::default();
+        let [a, b, c] = [(); 3].map(|_| f.instance(Terminal));
+        f.layout = Some(sized(
+            SplitDirection::Horizontal,
+            [1.0, 1.0],
+            [
+                PaneNode::leaf(a),
+                sized(
+                    SplitDirection::Vertical,
+                    [1.0, 3.0],
+                    [PaneNode::leaf(b), PaneNode::leaf(c)],
+                ),
+            ],
+        ));
+
+        let from_a = f.open(Editor, ResourceOrigin::Pane(a));
+        assert_eq!(f.group(from_a), [c, from_a]);
+    }
+
+    #[test]
+    fn edges_that_meet_on_screen_border_each_other_despite_rounding() {
+        // [ (A | B) over C ] | D at 2:3, with A | B at 1:2. B's right edge and
+        // D's left edge are both 0.4 but come out of different float sums
+        // (they differ by 3e-8 in f32), and still meet.
+        let mut f = Fixture::default();
+        let [a, b, c, d] = [(); 4].map(|_| f.instance(Terminal));
+        f.layout = Some(sized(
+            SplitDirection::Horizontal,
+            [2.0, 3.0],
+            [
+                sized(
+                    SplitDirection::Vertical,
+                    [1.0, 1.0],
+                    [
+                        sized(
+                            SplitDirection::Horizontal,
+                            [1.0, 2.0],
+                            [PaneNode::leaf(a), PaneNode::leaf(b)],
+                        ),
+                        PaneNode::leaf(c),
+                    ],
+                ),
+                PaneNode::leaf(d),
+            ],
+        ));
+
+        let from_b = f.open(Browser, ResourceOrigin::Pane(b));
+        assert_eq!(f.group(from_b), [d, from_b]);
     }
 
     #[test]

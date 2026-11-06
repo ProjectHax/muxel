@@ -152,12 +152,21 @@ const TERM_INSET: Pixels = px(6.0);
 /// enabled) or the OS.
 #[derive(Action, Clone, PartialEq)]
 #[action(namespace = terminal, no_json)]
-pub struct OpenLink(pub String);
+pub struct OpenLink {
+    pub url: String,
+    /// The terminal's instance id. The click that raises the link hasn't
+    /// moved focus to its pane yet, so the focused pane can't stand in for it.
+    pub pane: Uuid,
+}
 
 /// Open a terminal link without moving focus away from the terminal.
 #[derive(Action, Clone, PartialEq)]
 #[action(namespace = terminal, no_json)]
-pub struct OpenLinkBackground(pub String);
+pub struct OpenLinkBackground {
+    pub url: String,
+    /// The terminal's instance id, as in [`OpenLink`].
+    pub pane: Uuid,
+}
 
 /// Lifecycle state of a terminal/agent, shown as a badge. Inferred from the
 /// agent's TUI (per-agent markers), the bell, output activity, and process exit.
@@ -3797,6 +3806,11 @@ impl TerminalView {
     /// The active mouse copy/paste mode.
     pub fn mouse_mode(&self) -> TerminalMouseMode {
         self.mouse_mode
+    }
+
+    /// The pane (instance) this terminal belongs to.
+    pub fn instance_id(&self) -> Uuid {
+        self.instance_id
     }
 
     /// Link under the last pointer position, if the terminal grid can resolve one.
