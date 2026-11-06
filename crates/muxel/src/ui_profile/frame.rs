@@ -4,9 +4,11 @@
 //! one frame on the UI thread. The frame closes when GPUI clears its element
 //! arena, after presenting. The root wrapper marks the phase boundaries, and
 //! regions wrapped with `ui_profile::region` add their *self* time (their
-//! work minus nested wrapped regions) per phase, so region and `other` values
-//! in one phase sum to that phase. A frame of at least 50 ms emits one
-//! `ui-frame[v1 slow]` record. Every frame feeds a ten-second
+//! work minus nested wrapped regions) per element phase. `other` is each root
+//! interval minus the region time that ran in it, so nothing is counted twice
+//! when GPUI lays a subtree out inside an ancestor's prepaint; `layout_late`
+//! reports how much region request-layout ran there. A frame of at least
+//! 50 ms emits one `ui-frame[v1 slow]` record. Every frame feeds a ten-second
 //! `ui-frame[v1 sum]` summary, which also reports the UI thread's CPU time
 //! inside and outside frames.
 //!
@@ -167,6 +169,12 @@ pub(super) struct FrameData {
     cycles: Option<u64>,
     faults: Option<u64>,
     region_ns: [[u64; PHASES]; REGIONS],
+    /// Region self time by the root interval it ran in, which `other`
+    /// subtracts. It differs from `region_ns`'s phase columns when GPUI lays a
+    /// subtree out inside an ancestor's prepaint.
+    ran_in_ns: [u64; PHASES],
+    /// Region request-layout self time that ran outside the root's layout.
+    layout_late_ns: u64,
     group_tabs: [u16; MAX_GROUPS],
     groups: usize,
 }
@@ -184,6 +192,8 @@ impl FrameData {
             cycles: None,
             faults: None,
             region_ns: [[0; PHASES]; REGIONS],
+            ran_in_ns: [0; PHASES],
+            layout_late_ns: 0,
             group_tabs: [0; MAX_GROUPS],
             groups: 0,
         }
@@ -228,6 +238,8 @@ pub(super) struct Summary {
     frame_cycles: u64,
     faults: u64,
     region_ns: [[u64; PHASES]; REGIONS],
+    ran_in_ns: [u64; PHASES],
+    layout_late_ns: u64,
     group_tabs: [u16; MAX_GROUPS],
     groups: usize,
 }
@@ -253,6 +265,8 @@ impl Summary {
             frame_cycles: 0,
             faults: 0,
             region_ns: [[0; PHASES]; REGIONS],
+            ran_in_ns: [0; PHASES],
+            layout_late_ns: 0,
             group_tabs: [0; MAX_GROUPS],
             groups: 0,
         }
@@ -286,6 +300,10 @@ impl Summary {
                 *sum += ns;
             }
         }
+        for (sum, ns) in self.ran_in_ns.iter_mut().zip(frame.ran_in_ns) {
+            *sum += ns;
+        }
+        self.layout_late_ns += frame.layout_late_ns;
         if frame.view == RenderView::Main && frame.groups > 0 {
             self.group_tabs = frame.group_tabs;
             self.groups = frame.groups;
@@ -458,12 +476,37 @@ impl Drop for RegionScope {
                 return;
             };
             let elapsed = now.saturating_duration_since(scope.started).as_nanos() as u64;
-            frame.data.region_ns[scope.region][scope.phase] +=
-                elapsed.saturating_sub(scope.child_ns);
+            let self_ns = elapsed.saturating_sub(scope.child_ns);
+            frame.data.region_ns[scope.region][scope.phase] += self_ns;
+            let running = running_phase(&frame.marks);
+            if let Some(phase) = running {
+                frame.data.ran_in_ns[phase] += self_ns;
+            }
+            if scope.phase == Phase::Layout as usize && running != Some(Phase::Layout as usize) {
+                frame.data.layout_late_ns += self_ns;
+            }
             if let Some(parent) = frame.scopes.last_mut() {
                 parent.child_ns += elapsed;
             }
         });
+    }
+}
+
+/// The root interval running now, from the marks set so far, or `None` in a
+/// gap between them (taffy's compute, the tail after paint). Scopes close
+/// inside the root's callbacks, so this names the interval a scope ran in.
+fn running_phase(marks: &[Option<Instant>; 7]) -> Option<usize> {
+    let set = |mark: Mark| marks[mark as usize].is_some();
+    if set(Mark::PaintStart) {
+        (!set(Mark::PaintEnd)).then_some(Phase::Paint as usize)
+    } else if set(Mark::PrepaintStart) {
+        (!set(Mark::PrepaintEnd)).then_some(Phase::Prepaint as usize)
+    } else if set(Mark::LayoutStart) {
+        (!set(Mark::LayoutEnd)).then_some(Phase::Layout as usize)
+    } else if set(Mark::BuildEnd) {
+        None
+    } else {
+        Some(Phase::Build as usize)
     }
 }
 
@@ -767,20 +810,20 @@ fn group_tabs(out: &mut String, tabs: &[u16; MAX_GROUPS], groups: usize) {
 }
 
 /// Region self times (`build/layout/prepaint/paint`) in `unit` nanoseconds,
-/// then `other`: each phase's total minus every region's self time.
+/// then `other`: each interval's total minus the region self time that ran
+/// in it, and `layout_late`: region request-layout that ran outside the
+/// root's layout interval (inside an ancestor's prepaint).
 fn region_fields(
     out: &mut String,
     region_ns: &[[u64; PHASES]; REGIONS],
+    ran_in_ns: [u64; PHASES],
+    layout_late_ns: u64,
     phase_us: [u64; PHASES],
     unit_ns: u64,
     min_ns: u64,
 ) {
     use std::fmt::Write as _;
-    let mut attributed = [0u64; PHASES];
     for (index, phases) in region_ns.iter().enumerate() {
-        for (sum, ns) in attributed.iter_mut().zip(phases) {
-            *sum += ns;
-        }
         if phases.iter().sum::<u64>() < min_ns {
             continue;
         }
@@ -794,14 +837,15 @@ fn region_fields(
             phases[3] / unit_ns,
         );
     }
-    let other = |phase: usize| (phase_us[phase] * 1000).saturating_sub(attributed[phase]) / unit_ns;
+    let other = |phase: usize| (phase_us[phase] * 1000).saturating_sub(ran_in_ns[phase]) / unit_ns;
     let _ = write!(
         out,
-        " other={}/{}/{}/{}",
+        " other={}/{}/{}/{} layout_late={}",
         other(0),
         other(1),
         other(2),
-        other(3)
+        other(3),
+        layout_late_ns / unit_ns,
     );
 }
 
@@ -846,6 +890,8 @@ pub(super) fn frame_line(frame: &FrameData, rate: Option<f64>) -> String {
     region_fields(
         &mut out,
         &frame.region_ns,
+        frame.ran_in_ns,
+        frame.layout_late_ns,
         phase_totals(&frame.intervals_us),
         1000,
         50_000,
@@ -926,6 +972,8 @@ pub(super) fn summary_line(summary: &Summary, rate: Option<f64>) -> String {
     region_fields(
         &mut out,
         &summary.region_ns,
+        summary.ran_in_ns,
+        summary.layout_late_ns,
         phase_totals(&summary.intervals_sum_us),
         1_000_000,
         500_000,
@@ -936,10 +984,64 @@ pub(super) fn summary_line(summary: &Summary, rate: Option<f64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FrameData, IV_BUILD, IV_LAYOUT, IV_PAINT, IV_PREPAINT, MAX_GROUPS, REGIONS, Region,
-        Summary, frame_line, region_label, summary_line,
+        FRAMES, FrameAcc, FrameData, IV_BUILD, IV_LAYOUT, IV_PAINT, IV_PREPAINT, MAX_GROUPS, Mark,
+        Phase, REGIONS, Region, Summary, frame_line, mark, open, region_label, summary_line,
     };
     use crate::ui_profile::RenderView;
+    use std::time::{Duration, Instant};
+
+    /// A region laid out inside an ancestor's prepaint (GPUI does this for
+    /// some subtrees) must leave `other`'s prepaint share: every interval is
+    /// its regions' self time plus `other`, with nothing counted twice.
+    #[test]
+    fn layout_run_during_prepaint_leaves_the_prepaint_remainder() {
+        let token = 9_001;
+        FRAMES.with(|frames| {
+            frames.borrow_mut().push(FrameAcc {
+                data: Box::new(FrameData::new(RenderView::Main, token)),
+                started: Instant::now(),
+                marks: [None; 7],
+                window: None,
+                cycles_start: None,
+                faults_start: None,
+                scopes: Vec::new(),
+            });
+        });
+        for at in [
+            Mark::BuildEnd,
+            Mark::LayoutStart,
+            Mark::LayoutEnd,
+            Mark::PrepaintStart,
+        ] {
+            mark(token, at);
+        }
+        let prepaint = Instant::now();
+        {
+            let _scope = open(Region::Sidebar, Phase::Layout);
+            let spin = Instant::now();
+            while spin.elapsed() < Duration::from_millis(3) {
+                std::hint::spin_loop();
+            }
+        }
+        let prepaint_us = prepaint.elapsed().as_micros() as u64;
+        mark(token, Mark::PrepaintEnd);
+        let mut data = FRAMES.with(|frames| {
+            let mut frames = frames.borrow_mut();
+            let index = frames
+                .iter()
+                .position(|frame| frame.data.token == token)
+                .unwrap();
+            frames.remove(index).data
+        });
+        data.intervals_us[IV_PREPAINT] = prepaint_us;
+        let line = frame_line(&data, None);
+        let other = line.rsplit(" other=").next().unwrap();
+        let other_prepaint: u64 = other.split('/').nth(2).unwrap().parse().unwrap();
+        assert!(
+            other_prepaint < prepaint_us / 2,
+            "the sidebar's {prepaint_us} µs of layout stayed in other: {line}"
+        );
+    }
 
     #[test]
     fn region_slots_are_distinct_and_fold_late_groups() {
@@ -988,6 +1090,9 @@ mod tests {
         frame.intervals_us[IV_PAINT] = 4_000;
         frame.region_ns[Region::Sidebar.index()] = [20_000_000, 6_000_000, 1_000_000, 1_000_000];
         frame.region_ns[Region::Strip(1).index()] = [40_000, 0, 0, 0];
+        // Half the sidebar's layout ran inside the root's prepaint.
+        frame.ran_in_ns = [20_040_000, 3_000_000, 4_000_000, 1_000_000];
+        frame.layout_late_ns = 3_000_000;
         frame.groups = 2;
         frame.group_tabs[0] = 5;
         frame.group_tabs[1] = 12;
@@ -996,7 +1101,7 @@ mod tests {
             "ui-frame[v1 slow] view=main token=7 wall=80000µs cpu=unavailable faults=unavailable \
              build=30000µs layout=10000µs compute=0µs prepaint=5000µs paint=4000µs post=0µs \
              groups=2 tabs=5/12 regions_us(build/layout/prepaint/paint): \
-             sidebar=20000/6000/1000/1000 other=9960/4000/4000/3000"
+             sidebar=20000/6000/1000/1000 other=9960/7000/1000/3000 layout_late=3000"
         );
     }
 

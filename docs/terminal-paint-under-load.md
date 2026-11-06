@@ -207,8 +207,11 @@ trace `tail` and `present` are one `post`), then into window regions: `prep`,
 containers), `panes_sb` (the pane row's scrollbar), `shell` (the body's
 sidebar and side-panel resizable groups and main column), `overlay`, and per
 tab group `stripN`, `bodyN` (the card) and `contentN` (the shown tab). Region
-values are self times per phase (`build/layout/prepaint/paint`); `other` is
-the rest of each phase. `cpu` is the
+values are self times per element phase (`build/layout/prepaint/paint`).
+`other` is the rest of each interval: the interval minus the region time that
+ran in it. GPUI lays some subtrees out inside an ancestor's prepaint, so a
+region's request-layout can run in the prepaint interval; `layout_late` is
+that time, and `other` doesn't count it twice. `cpu` is the
 UI thread's cycle count over the frame (Windows), so `wall` minus `cpu` is time
 the thread did not run; `faults` is the process page-fault count. The summary
 adds `duty` (frame wall time over the interval), UI-thread CPU inside and
