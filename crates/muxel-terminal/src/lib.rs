@@ -39,7 +39,7 @@ pub use session::{
     literal_program_for_spawn, muse_config_supported,
 };
 pub use view::{
-    AgentStatus, LocalPaste, LocalPasteHandler, OpenLink, OpenLinkBackground,
+    AgentStatus, DisplayEpoch, LocalPaste, LocalPasteHandler, OpenLink, OpenLinkBackground,
     PathPasteErrorHandler, PromptSubmission, PromptSubmissionState, TerminalFocusObserver,
     TerminalFocusProfile, TerminalLaunch, TerminalMouseMode, TerminalNotifyCause,
     TerminalRuntimeSnapshot, TerminalStatusCoverage, TerminalStatusReason, TerminalView,

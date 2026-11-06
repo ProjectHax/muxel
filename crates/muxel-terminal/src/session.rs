@@ -2183,6 +2183,17 @@ impl TerminalSession {
         }
     }
 
+    /// Whether the latest paint drew the screen as it is now. For app tests,
+    /// which can't see the generation the paint path checks.
+    #[doc(hidden)]
+    pub fn painted_current_screen(&self) -> bool {
+        let current = self.content_generation();
+        self.paint_list
+            .lock()
+            .as_ref()
+            .is_some_and(|list| list.content_gen == current)
+    }
+
     /// Whether the child has produced any output yet.
     pub fn has_output(&self) -> bool {
         self.output_seen.load(Ordering::Relaxed)
