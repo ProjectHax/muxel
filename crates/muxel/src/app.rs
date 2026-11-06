@@ -23931,7 +23931,10 @@ impl MuxelApp {
                                     .child(action),
                             )
                             .into_any_element()
-                    } else if !v.has_visible_content() {
+                    } else if !v.has_visible_content() && self.terminal_is_loading(iid, cx) {
+                        // The spinner animates the whole window every frame, so
+                        // it gets the sidebar's startup window: a program that
+                        // never prints shows its blank screen after that.
                         self.terminal_starting(iid, cx)
                     } else {
                         terminal_pane_element(view, !is_active, cx)

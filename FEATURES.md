@@ -57,7 +57,9 @@ feature is added or changed, update the matching entry here in the same change**
   silent command cannot stall the rest. A launch still running after 20 seconds
   stops holding back the others and keeps showing "Starting terminal…" until its
   process comes up, or until Restart, closing the pane or leaving the project
-  supersedes it. Editors, diffs and browsers open
+  supersedes it. Once the process is up, a terminal that has printed nothing
+  keeps the spinner for at most a minute and then shows its blank screen, so a
+  silent program can't keep the window redrawing. Editors, diffs and browsers open
   without waiting on terminals, and switching projects cancels the old project's
   pending waves.
 - **Maximize** — temporarily expand one pane to fill the work area. The whole tab
