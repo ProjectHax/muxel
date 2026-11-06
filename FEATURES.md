@@ -24,6 +24,8 @@ feature is added or changed, update the matching entry here in the same change**
   from, and when it goes (closed, its last tab closed, or dragged elsewhere) that
   space returns to the pane it came from, so every other pane is left exactly as
   it was. A pane dragged next to another pane takes half of that pane the same way.
+  A pane from a layout saved before this existed gives its space to the pane before
+  it (or after it, if it was first).
 - **Resizable splits** — drag the divider between panes; sizes persist per project.
   When the pane you're shrinking reaches its minimum, the drag keeps going and
   shrinks the next pane along, until every pane on that side is at its minimum.

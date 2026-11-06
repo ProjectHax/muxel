@@ -7,6 +7,7 @@
 //! Adapted from okena's `LayoutNode` (MIT).
 
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 /// How a split arranges its children.
@@ -637,6 +638,44 @@ impl PaneNode {
         match self {
             PaneNode::Leaf(leaf) => leaf.pane_id == pane_id,
             PaneNode::Split { children, .. } => children.iter().any(|c| c.holds_pane(pane_id)),
+        }
+    }
+
+    /// Re-point split history that names a pane no longer in this layout, as
+    /// removing that pane would have (see [`Self::detach_at_path`]): to the pane
+    /// it was split from in `earlier`, and so on until one is here, else none.
+    pub fn repoint_missing_origins(&mut self, earlier: &PaneNode) {
+        let mut history = HashMap::new();
+        earlier.visit_leaves(&mut |leaf| {
+            history.insert(leaf.pane_id, leaf.split_from);
+        });
+        let mut here = HashSet::new();
+        self.visit_leaves(&mut |leaf| {
+            here.insert(leaf.pane_id);
+        });
+        self.for_each_split_origin(&mut |from| {
+            // Each step moves to another recorded pane, so a walk longer than
+            // the history has gone round a loop.
+            for _ in 0..=history.len() {
+                match *from {
+                    Some(gone) if !here.contains(&gone) => {
+                        *from = history.get(&gone).copied().flatten();
+                    }
+                    _ => return,
+                }
+            }
+            *from = None;
+        });
+    }
+
+    fn visit_leaves(&self, f: &mut impl FnMut(&LeafData)) {
+        match self {
+            PaneNode::Leaf(leaf) => f(leaf),
+            PaneNode::Split { children, .. } => {
+                for child in children {
+                    child.visit_leaves(f);
+                }
+            }
         }
     }
 
@@ -2748,5 +2787,131 @@ mod tests {
         // CONTROL: the rounding really differs, so an exact comparison fails.
         assert_ne!(forward, backward);
         assert!(forward.same_layout(&backward));
+    }
+
+    #[test]
+    fn same_layout_sees_every_change_beyond_rounding() {
+        // Undo restores the old layout outright only when nothing but rounding
+        // changed, so anything else must count as a different layout.
+        let (a, b, c, d) = (id(), id(), id(), id());
+        let tabs = |tabs: Vec<Uuid>, active: usize| {
+            PaneNode::Leaf(LeafData {
+                tabs,
+                active,
+                ..LeafData::new(a)
+            })
+        };
+        let layout = |outer: SplitDirection, sizes: Vec<f32>, right: PaneNode| PaneNode::Split {
+            direction: outer,
+            sizes,
+            children: vec![tabs(vec![a, b], 0), right],
+        };
+        let column = |children: Vec<PaneNode>| PaneNode::Split {
+            direction: SplitDirection::Vertical,
+            sizes: vec![1.0; children.len()],
+            children,
+        };
+        let base = layout(
+            SplitDirection::Horizontal,
+            vec![400.0, 600.0],
+            column(vec![PaneNode::leaf(c), PaneNode::leaf(d)]),
+        );
+        assert!(base.same_layout(&base.clone()));
+        let PaneNode::Split { children, .. } = &base else {
+            unreachable!()
+        };
+        let right = children[1].clone();
+        let changed = [
+            (
+                "tab order",
+                PaneNode::Split {
+                    direction: SplitDirection::Horizontal,
+                    sizes: vec![400.0, 600.0],
+                    children: vec![tabs(vec![b, a], 0), right.clone()],
+                },
+            ),
+            (
+                "active tab",
+                PaneNode::Split {
+                    direction: SplitDirection::Horizontal,
+                    sizes: vec![400.0, 600.0],
+                    children: vec![tabs(vec![a, b], 1), right.clone()],
+                },
+            ),
+            (
+                "direction",
+                layout(SplitDirection::Vertical, vec![400.0, 600.0], right.clone()),
+            ),
+            (
+                "a size",
+                layout(
+                    SplitDirection::Horizontal,
+                    vec![400.1, 600.0],
+                    right.clone(),
+                ),
+            ),
+            (
+                "pane count",
+                layout(
+                    SplitDirection::Horizontal,
+                    vec![400.0, 600.0],
+                    column(vec![
+                        PaneNode::leaf(c),
+                        PaneNode::leaf(d),
+                        PaneNode::leaf(id()),
+                    ]),
+                ),
+            ),
+            (
+                "nesting",
+                layout(
+                    SplitDirection::Horizontal,
+                    vec![400.0, 600.0],
+                    column(vec![PaneNode::leaf(c), column(vec![PaneNode::leaf(d)])]),
+                ),
+            ),
+        ];
+        for (what, other) in changed {
+            assert!(!base.same_layout(&other), "a changed {what} went unseen");
+        }
+    }
+
+    #[test]
+    fn a_pane_whose_origin_sits_outside_its_split_gives_its_width_to_a_neighbour() {
+        // Moves, swaps and undo can leave a pane's origin in another part of the
+        // layout. Its width stays inside its own split: the pane before it there
+        // takes it, and nothing outside that split moves.
+        let left = LeafData::new(id());
+        let pane = |from: Option<Uuid>| LeafData {
+            split_from: from,
+            ..LeafData::new(id())
+        };
+        let (top, middle, bottom) = (pane(None), pane(Some(left.pane_id)), pane(None));
+        let gone = middle.tabs[0];
+        let mut tree = Some(PaneNode::Split {
+            direction: SplitDirection::Horizontal,
+            sizes: vec![1000.0, 1000.0],
+            children: vec![
+                PaneNode::Leaf(left),
+                PaneNode::Split {
+                    direction: SplitDirection::Vertical,
+                    sizes: vec![300.0, 300.0, 400.0],
+                    children: vec![
+                        PaneNode::Leaf(top),
+                        PaneNode::Leaf(middle),
+                        PaneNode::Leaf(bottom),
+                    ],
+                },
+            ],
+        });
+        assert!(remove(&mut tree, gone));
+        assert_eq!(root_sizes(&tree), [1000.0, 1000.0]);
+        let Some(PaneNode::Split { children, .. }) = &tree else {
+            unreachable!()
+        };
+        let PaneNode::Split { sizes, .. } = &children[1] else {
+            panic!("the right column should still be split: {tree:?}");
+        };
+        assert_eq!(sizes, &[600.0, 400.0]);
     }
 }

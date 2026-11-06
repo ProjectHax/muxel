@@ -515,6 +515,7 @@ impl MuxelApp {
     /// Put every held pane of project `pid` back into `layout`, where the
     /// durable document keeps it until its close is final.
     fn restore_held_layout(&self, pid: Uuid, layout: &mut Option<PaneNode>) {
+        let closed = self.closed_in_order();
         for group in self.close_groups.iter().rev() {
             let Some(original) = group.layouts.get(&pid) else {
                 continue;
@@ -527,8 +528,16 @@ impl MuxelApp {
                 })
                 .copied()
                 .collect();
-            recoverable_layout::restore_layout(layout, original, &ids);
+            recoverable_layout::restore_layout(layout, original, &ids, &closed);
         }
+    }
+
+    /// Every held pane, oldest close first: the order they left their layouts.
+    fn closed_in_order(&self) -> Vec<Uuid> {
+        self.close_groups
+            .iter()
+            .flat_map(|group| group.members.iter().copied())
+            .collect()
     }
 
     /// The project as the saved and shared documents hold it: a held pane is
@@ -706,6 +715,7 @@ impl MuxelApp {
         index: usize,
         cx: &mut Context<Self>,
     ) -> (Option<Uuid>, Vec<(Uuid, HeldClose)>) {
+        let closed = self.closed_in_order();
         let group = self.close_groups.remove(index);
         let ids: HashSet<_> = group
             .members
@@ -719,7 +729,7 @@ impl MuxelApp {
             .or_else(|| group.members.iter().copied().find(|iid| ids.contains(iid)));
         for (&pid, original) in &group.layouts {
             if let Some(project) = self.workspace.project_mut(pid) {
-                recoverable_layout::restore_layout(&mut project.layout, original, &ids);
+                recoverable_layout::restore_layout(&mut project.layout, original, &ids, &closed);
             }
         }
         let mut restored = Vec::new();

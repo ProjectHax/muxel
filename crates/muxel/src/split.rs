@@ -558,6 +558,10 @@ mod tests {
         // Coming back within the same drag releases the pushed panes in order.
         assert!(split.drag_to(px(500.0), &ranges, false));
         assert_eq!(allocate(&split), [500.0, 400.0, 700.0]);
+        // Back past where it started: now the left column gives, down to its
+        // minimum, and the middle takes it. The right column is back untouched.
+        assert!(split.drag_to(px(200.0), &ranges, false));
+        assert_eq!(allocate(&split), [340.0, 560.0, 700.0]);
 
         let start = vec![px(700.0), px(500.0), px(400.0)];
         let mut split = SplitState {
