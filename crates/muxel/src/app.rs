@@ -2220,10 +2220,11 @@ fn program_stamp(presets: &[AgentPreset]) -> ProgramStamp {
     (programs, dirs)
 }
 
-/// How long an unchanged project's branch waits before git is asked anyway, for
+/// How long an unchanged project's branches wait before git is asked anyway, for
 /// what [`integrations::GitRefStamp`] can't see (git config, `safe.directory`,
-/// git installed later).
-const BRANCH_BACKSTOP: Duration = Duration::from_secs(60);
+/// git installed later). The current branch is read from the HEAD file, so this
+/// only re-lists the branches, one `git` launch per project.
+const BRANCH_BACKSTOP: Duration = Duration::from_secs(300);
 /// How often worktrees' uncommitted changes are recounted (a `git status` each;
 /// nothing cheaper sees a file edit). Adding or removing a worktree, or a git
 /// action run from muxel, recounts at once.
