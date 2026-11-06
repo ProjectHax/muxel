@@ -470,7 +470,9 @@ feature is added or changed, update the matching entry here in the same change**
   supplying lifecycle status; a title in the current root report takes precedence.
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
-  icon, dashboard, and notification dots. Screen checks, markers included, skip
+  icon, dashboard, and notification dots. A **done** you haven't looked at stays
+  bright green; once you focus its pane, its sidebar and dashboard icons dim and
+  its sidebar pill turns to a green outline, so unread finishes stand out. Screen checks, markers included, skip
   Claude's input box, so a typed or pasted draft doesn't set a Claude pane's
   status, while permission forms and hints outside the box still do. A draft can
   still count, as before, where muxel can't pick out the box whole: a rule drawn
