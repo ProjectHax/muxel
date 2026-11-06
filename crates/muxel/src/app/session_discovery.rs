@@ -10,10 +10,11 @@ use super::{
     MuxelApp, home_dir, is_claude_program, is_codex_program, is_grok_program,
     validated_codex_session_id,
 };
+use crate::binding_watch::ClaudeBindingWatch;
 use crate::{session_binding, ui_profile};
 use gpui::{App, AsyncApp, Context, WeakEntity};
 use muxel_core::session_discovery::{
-    CodexLookupEvidence, SessionDiscoveryKey, SessionDiscoveryRequest, SessionProvider,
+    LookupEvidence, SessionDiscoveryKey, SessionDiscoveryRequest, SessionProvider,
 };
 use muxel_core::tmux::{SessionTarget, Socket};
 use muxel_core::{AgentPreset, CodexHintMiss, Workspace};
@@ -846,6 +847,16 @@ impl MuxelApp {
             .iter()
             .filter_map(|instance| self.session_discovery_key_for_instance(instance, cx))
             .collect();
+        // Before the first Claude lookup, so none can miss a write the watcher
+        // would have reported.
+        if self.claude_binding_watch.is_none()
+            && keys
+                .iter()
+                .any(|key| key.provider == SessionProvider::Claude)
+            && let Some(data_dir) = data_dir.as_deref()
+        {
+            self.start_claude_binding_watch(data_dir, cx);
+        }
         self.session_discoveries.reconcile(&self.workspace);
         let requests: Vec<_> = keys
             .into_iter()
@@ -895,6 +906,64 @@ impl MuxelApp {
         }
     }
 
+    /// Watch the Claude hook directory, once. A write it reports runs
+    /// discovery at once instead of at the next tick. Failing to start leaves
+    /// Claude panes polling as they would without it.
+    fn start_claude_binding_watch(&mut self, data_dir: &Path, cx: &mut Context<Self>) {
+        let dir = session_binding::claude_binding_dir(data_dir);
+        let (watch, signal) = match ClaudeBindingWatch::start(&dir) {
+            Ok(started) => started,
+            Err(error) => {
+                log::warn!(
+                    "could not watch Claude session hook records in {}; polling instead: {error:#}",
+                    dir.display()
+                );
+                ui_profile::session_watch(SessionProvider::Claude, "failed");
+                self.claude_binding_watch = Some(None);
+                return;
+            }
+        };
+        self.claude_binding_watch = Some(Some(watch));
+        self.session_discoveries
+            .set_watched(SessionProvider::Claude, true);
+        ui_profile::session_watch(SessionProvider::Claude, "watching");
+        cx.spawn(async move |this, cx| {
+            // Ends when the watcher, and with it the signal's sender, is dropped.
+            while signal.recv().await.is_ok() {
+                if this
+                    .update(cx, |this, cx| this.apply_claude_binding_changes(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn apply_claude_binding_changes(&mut self, cx: &mut Context<Self>) {
+        let Some(Some(watch)) = &self.claude_binding_watch else {
+            return;
+        };
+        let changes = watch.take();
+        if changes.failed {
+            // Not trusted again in this run: back to polling, and every quiet
+            // pane looks now.
+            self.claude_binding_watch = Some(None);
+            self.session_discoveries
+                .set_watched(SessionProvider::Claude, false);
+            ui_profile::session_watch(SessionProvider::Claude, "failed");
+        } else if changes.rescan {
+            self.session_discoveries
+                .wake_provider(SessionProvider::Claude);
+            ui_profile::session_watch(SessionProvider::Claude, "rescan");
+        }
+        for pane in changes.panes {
+            self.session_discoveries.wake(pane);
+        }
+        self.sync_provider_session_ids(cx);
+    }
+
     fn apply_discovery_batch(
         &mut self,
         batch: DiscoveryBatch,
@@ -931,16 +1000,17 @@ impl MuxelApp {
                         })
                         .map(|instance| (instance.id, id.to_string()))
                 });
-            let valid = self.session_discoveries.finish_with_codex_evidence(
+            let valid = self.session_discoveries.finish_with_evidence(
                 &request,
                 current.as_ref(),
                 Instant::now(),
                 unowned,
-                CodexLookupEvidence {
+                LookupEvidence {
                     miss,
                     rejected_owner,
                     observed_hint,
                     cached_rejection: cached_rejection.is_some(),
+                    hook_record: matches!(candidate, DiscoveryCandidate::Claude { .. }),
                 },
             );
             if !valid {
@@ -2291,6 +2361,89 @@ mod grok_regressions {
     }
 }
 
+#[cfg(all(test, windows))]
+mod claude_watch_regressions {
+    use super::super::{MuxelApp, claude_test_home, popout_lifecycle_tests::with_app};
+    use crate::session_binding;
+    use gpui::AppContext as _;
+    use muxel_core::{Instance, Project};
+    use muxel_terminal::{CommandSpec, TerminalLaunch, TerminalView};
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    /// `/clear` in a live Claude pane, played by its hook, rebinds the pane
+    /// with no discovery poll after the write: the status tick is stopped.
+    #[test]
+    fn claude_hook_write_rebinds_without_waiting_for_a_poll() {
+        with_app(|cx, window| {
+            let data = muxel_store::data_dir().unwrap();
+            let home = data.join("home");
+            let project = home.join(".claude/projects/fixture");
+            std::fs::create_dir_all(&project).unwrap();
+            let _home = claude_test_home(Some(home));
+            let (pane, session) = window
+                .update(cx, |app: &mut MuxelApp, window, cx| {
+                    app._status_timer = gpui::Task::ready(());
+                    app.current_workspace = Some(Uuid::new_v4());
+                    let project_id = app.workspace.add_project(Project::new("claude", &data));
+                    let mut instance = Instance::shell(project_id);
+                    instance.program = Some("claude.exe".into());
+                    instance.session_id = Some(Uuid::new_v4().to_string());
+                    instance.session_started = true;
+                    let pane = instance.id;
+                    app.workspace.add_instance(instance);
+                    let launch = TerminalLaunch::spawn(
+                        CommandSpec::program(
+                            "cmd.exe",
+                            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+                        ),
+                        (80, 24),
+                    )
+                    .unwrap();
+                    let view =
+                        cx.new(|cx| TerminalView::new(launch, pane, Instant::now(), window, cx));
+                    let session = view.read(cx).session().clone();
+                    app.terminals.insert(pane, view);
+                    app.terminal_launches.insert(pane, (Instant::now(), false));
+                    // The pane's first lookup finds no record.
+                    app.sync_provider_session_ids(cx);
+                    (pane, session)
+                })
+                .unwrap();
+            cx.run_until_parked();
+            let next = Uuid::new_v4().to_string();
+            let event = serde_json::json!({
+                "hook_event_name": "SessionStart",
+                "source": "clear",
+                "session_id": next,
+                "cwd": project,
+                "transcript_path": project.join(format!("{next}.jsonl")),
+            });
+            session_binding::write_claude_binding_from_reader(
+                &data,
+                pane,
+                event.to_string().as_bytes(),
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let bound = loop {
+                cx.run_until_parked();
+                let bound = window
+                    .update(cx, |app, _, _| {
+                        app.workspace.instance(pane).unwrap().session_id.clone()
+                    })
+                    .unwrap();
+                if bound.as_deref() == Some(next.as_str()) || Instant::now() >= deadline {
+                    break bound;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            session.kill();
+            assert_eq!(bound.as_deref(), Some(next.as_str()));
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2618,7 +2771,7 @@ mod w8lm_tests {
         codex_tmux_capture_session, discover_sessions, inject_codex_tmux_title_reader,
     };
     use muxel_core::session_discovery::{
-        CodexLookupEvidence, SessionDiscoveries, SessionDiscoveryKey, SessionProvider,
+        LookupEvidence, SessionDiscoveries, SessionDiscoveryKey, SessionProvider,
     };
     use muxel_core::tmux::Socket;
     use muxel_core::{AgentPreset, Instance, Project, Workspace};
@@ -2909,16 +3062,17 @@ mod w8lm_tests {
                 _ => panic!("unexpected candidate state for sibling-owned title"),
             }
             assert!(miss.is_none());
-            assert!(discoveries.finish_with_codex_evidence(
+            assert!(discoveries.finish_with_evidence(
                 &request,
                 Some(&key),
                 at,
                 false,
-                CodexLookupEvidence {
+                LookupEvidence {
                     miss,
                     rejected_owner: Some((owner_id, owned_id.clone())),
                     observed_hint,
                     cached_rejection,
+                    hook_record: false,
                 }
             ));
             if seconds == 0 {
@@ -2935,16 +3089,17 @@ mod w8lm_tests {
         let candidate = validated(candidate).expect("new title should be validated and captured");
         assert_eq!(candidate.id, new_id);
         assert_eq!(candidate.path, Some(new_path));
-        assert!(discoveries.finish_with_codex_evidence(
+        assert!(discoveries.finish_with_evidence(
             &request,
             Some(&key),
             at,
             true,
-            CodexLookupEvidence {
+            LookupEvidence {
                 miss,
                 rejected_owner: None,
                 observed_hint,
                 cached_rejection: false,
+                hook_record: false,
             }
         ));
         assert_eq!(calls.load(Ordering::Relaxed), 3);
@@ -2991,16 +3146,17 @@ mod w8lm_tests {
             validated(discovered).unwrap().path,
             Some(owned_path.clone())
         );
-        assert!(discoveries.finish_with_codex_evidence(
+        assert!(discoveries.finish_with_evidence(
             &first,
             Some(&key),
             now,
             false,
-            CodexLookupEvidence {
+            LookupEvidence {
                 miss,
                 rejected_owner: Some((owner_id, owned_id.clone())),
                 observed_hint,
                 cached_rejection: false,
+                hook_record: false,
             }
         ));
 
@@ -3019,16 +3175,17 @@ mod w8lm_tests {
         // Ownership changes after the worker reused A, before completion.
         workspace.instances[0].session_id = None;
         discoveries.reconcile(&workspace);
-        assert!(discoveries.finish_with_codex_evidence(
+        assert!(discoveries.finish_with_evidence(
             &cached,
             Some(&key),
             at,
             false,
-            CodexLookupEvidence {
+            LookupEvidence {
                 miss,
                 rejected_owner: None,
                 observed_hint,
                 cached_rejection: true,
+                hook_record: false,
             }
         ));
         assert!(workspace.instances[1].session_id.is_none());

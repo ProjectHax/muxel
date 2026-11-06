@@ -1088,10 +1088,13 @@ fn windows_batch_arg_is_safe(value: &str) -> bool {
         .any(|ch| matches!(ch, '"' | '%' | '&' | '|' | '<' | '>' | '^' | '\r' | '\n'))
 }
 
+/// Where the hook writes each pane's record (see [`claude_binding_path`]).
+pub(crate) fn claude_binding_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(CLAUDE_BINDING_DIR)
+}
+
 pub(crate) fn claude_binding_path(data_dir: &Path, instance_id: Uuid) -> PathBuf {
-    data_dir
-        .join(CLAUDE_BINDING_DIR)
-        .join(format!("{instance_id}.json"))
+    claude_binding_dir(data_dir).join(format!("{instance_id}.json"))
 }
 
 pub(crate) fn write_claude_binding_from_reader(

@@ -145,6 +145,22 @@ pub(crate) fn session_lookup_finished(
     });
 }
 
+/// A provider's hook-directory watcher started (`watching`), stopped being
+/// trusted (`failed`), or reported lost events (`rescan`).
+pub(crate) fn session_watch(
+    provider: muxel_core::session_discovery::SessionProvider,
+    state: &'static str,
+) {
+    if !is_enabled() {
+        return;
+    }
+    ensure_flusher();
+    let provider = format!("{provider:?}").to_ascii_lowercase();
+    emit(&format!(
+        "ui-prof[session-watch v1] provider={provider} state={state}"
+    ));
+}
+
 enum DeferredRecord {
     SessionLookup {
         at: SystemTime,

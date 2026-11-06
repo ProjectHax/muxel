@@ -5609,6 +5609,9 @@ pub struct MuxelApp {
     close_layout_poll: bool,
     /// Coalescing/backoff and stale-result guards for background provider scans.
     session_discoveries: muxel_core::session_discovery::SessionDiscoveries,
+    /// The Claude hook directory's watcher, started for the first Claude pane
+    /// discovery looks up. `Some(None)`: it failed, and Claude panes poll.
+    claude_binding_watch: Option<Option<crate::binding_watch::ClaudeBindingWatch>>,
     /// Accepted Grok identity and observation time belong to one pane launch.
     /// Keep live identity even when a workspace write is rolled back.
     #[cfg(windows)]
@@ -8047,6 +8050,7 @@ impl MuxelApp {
             layout_reads: HashMap::new(),
             close_layout_poll: false,
             session_discoveries: Default::default(),
+            claude_binding_watch: None,
             #[cfg(windows)]
             grok_observations: HashMap::new(),
             claude_hook_seen: HashMap::new(),

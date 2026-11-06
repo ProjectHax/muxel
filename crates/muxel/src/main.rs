@@ -9,6 +9,7 @@
 
 mod accomplishments_view;
 mod app;
+mod binding_watch;
 mod browser;
 #[cfg(target_os = "linux")]
 mod browser_helper;

@@ -7,7 +7,13 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// How long a pane waits between lookups for a hook record that isn't there,
+/// while a watcher on its provider's hook directory wakes the pane when its
+/// record is written. The poll is for events a watcher loses: some filesystems
+/// never deliver them, and on Windows a full change buffer is dropped silently.
+pub const WATCHED_HOOK_FALLBACK: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SessionProvider {
     Codex,
     Claude,
@@ -46,13 +52,17 @@ pub struct SessionDiscoveryRequest {
 }
 
 #[derive(Default)]
-pub struct CodexLookupEvidence {
+pub struct LookupEvidence {
     pub miss: Option<CodexHintMiss>,
     pub rejected_owner: Option<(Uuid, String)>,
     pub observed_hint: Option<String>,
     /// A previously validated sibling-owned hint was reused without a rollout
     /// read. It can never be adopted as a new binding.
     pub cached_rejection: bool,
+    /// The lookup read a hook record, adopted or not. One that waits (its
+    /// transcript isn't there yet, or another pane owns it) is retried at the
+    /// unwatched cadence, since no new event announces that it can be adopted.
+    pub hook_record: bool,
 }
 
 #[derive(Debug)]
@@ -73,6 +83,9 @@ pub struct SessionDiscovery {
     in_flight: Option<SessionDiscoveryRequest>,
     misses: u32,
     retry_at: Option<Instant>,
+    /// A watcher event arrived while a lookup was in flight. That lookup may
+    /// have read before the write, so the next one is due when it finishes.
+    woken: bool,
     codex_miss: Option<CodexHintMiss>,
     codex_owner: Option<CodexOwnershipRejection>,
 }
@@ -84,9 +97,52 @@ pub struct SessionDiscoveries {
     panes: HashMap<Uuid, SessionDiscovery>,
     binding_generations: HashMap<Uuid, u64>,
     bindings: HashMap<Uuid, String>,
+    /// Providers whose hook directory a running watcher reports changes in.
+    watched: HashSet<SessionProvider>,
 }
 
 impl SessionDiscoveries {
+    /// Record whether `provider`'s hook directory is watched. While it is, a
+    /// pane whose lookup found no record waits for [`Self::wake`] or
+    /// [`WATCHED_HOOK_FALLBACK`]. Either change wakes the provider's panes:
+    /// a new watcher may have missed writes made before it started, and
+    /// without one the quiet panes must go back to polling now.
+    pub fn set_watched(&mut self, provider: SessionProvider, watched: bool) {
+        let changed = if watched {
+            self.watched.insert(provider)
+        } else {
+            self.watched.remove(&provider)
+        };
+        if changed {
+            self.wake_provider(provider);
+        }
+    }
+
+    pub fn watched(&self, provider: SessionProvider) -> bool {
+        self.watched.contains(&provider)
+    }
+
+    /// The pane's hook record changed: its next lookup is due now, or as soon
+    /// as the one in flight finishes. Unknown panes start due anyway.
+    pub fn wake(&mut self, pane: Uuid) {
+        if let Some(state) = self.panes.get_mut(&pane) {
+            state.wake();
+        }
+    }
+
+    /// Every pane of `provider` is due: its watcher may have lost events.
+    pub fn wake_provider(&mut self, provider: SessionProvider) {
+        for state in self.panes.values_mut() {
+            if state
+                .key
+                .as_ref()
+                .is_some_and(|key| key.provider == provider)
+            {
+                state.wake();
+            }
+        }
+    }
+
     pub fn reconcile(&mut self, workspace: &Workspace) {
         let panes: HashSet<_> = workspace.instances.iter().map(|i| i.id).collect();
         self.panes.retain(|pane, _| panes.contains(pane));
@@ -160,9 +216,10 @@ impl SessionDiscoveries {
         now: Instant,
         found: bool,
     ) -> bool {
+        let quiet = !found && self.watched(request.key.provider);
         self.panes
             .get_mut(&request.key.pane)
-            .is_some_and(|state| state.finish(request, current, now, found))
+            .is_some_and(|state| state.finish_with_quiet(request, current, now, found, quiet))
     }
 
     pub fn finish_with_codex_miss(
@@ -173,28 +230,28 @@ impl SessionDiscoveries {
         found: bool,
         miss: Option<CodexHintMiss>,
     ) -> bool {
-        self.finish_with_codex_evidence(
+        self.finish_with_evidence(
             request,
             current,
             now,
             found,
-            CodexLookupEvidence {
+            LookupEvidence {
                 miss,
-                rejected_owner: None,
-                observed_hint: None,
-                cached_rejection: false,
+                ..LookupEvidence::default()
             },
         )
     }
 
-    pub fn finish_with_codex_evidence(
+    pub fn finish_with_evidence(
         &mut self,
         request: &SessionDiscoveryRequest,
         current: Option<&SessionDiscoveryKey>,
         now: Instant,
         found: bool,
-        evidence: CodexLookupEvidence,
+        evidence: LookupEvidence,
     ) -> bool {
+        // Only a miss with nothing waiting can rely on the watcher's wake.
+        let quiet = !found && !evidence.hook_record && self.watched(request.key.provider);
         let owner = evidence
             .rejected_owner
             .map(|(owner, session_id)| CodexOwnershipRejection {
@@ -207,7 +264,7 @@ impl SessionDiscoveries {
         let Some(state) = self.panes.get_mut(&request.key.pane) else {
             return false;
         };
-        if !state.finish(request, current, now, found) {
+        if !state.finish_with_quiet(request, current, now, found, quiet) {
             return false;
         }
         state.codex_miss = evidence.miss;
@@ -284,8 +341,17 @@ impl SessionDiscovery {
             self.generation = self.generation.wrapping_add(1);
             self.misses = 0;
             self.retry_at = None;
+            self.woken = false;
             self.codex_miss = None;
             self.codex_owner = None;
+        }
+    }
+
+    fn wake(&mut self) {
+        if self.in_flight.is_some() {
+            self.woken = true;
+        } else {
+            self.retry_at = None;
         }
     }
 
@@ -327,6 +393,20 @@ impl SessionDiscovery {
         now: Instant,
         found: bool,
     ) -> bool {
+        self.finish_with_quiet(request, current, now, found, false)
+    }
+
+    /// As [`Self::finish`]. A `quiet` miss (a watcher will wake the pane)
+    /// waits [`WATCHED_HOOK_FALLBACK`] instead. A wake during the lookup makes
+    /// the next one due at once.
+    fn finish_with_quiet(
+        &mut self,
+        request: &SessionDiscoveryRequest,
+        current: Option<&SessionDiscoveryKey>,
+        now: Instant,
+        found: bool,
+        quiet: bool,
+    ) -> bool {
         if self.in_flight.as_ref() != Some(request) {
             return false;
         }
@@ -345,7 +425,16 @@ impl SessionDiscovery {
                 SessionProvider::Codex => 30,
                 SessionProvider::Claude | SessionProvider::Grok | SessionProvider::Muse => 2,
             };
-            Duration::from_secs((1_u64 << (self.misses - 1).min(5)).min(cap))
+            if quiet {
+                WATCHED_HOOK_FALLBACK
+            } else {
+                Duration::from_secs((1_u64 << (self.misses - 1).min(5)).min(cap))
+            }
+        };
+        let delay = if std::mem::take(&mut self.woken) {
+            Duration::ZERO
+        } else {
+            delay
         };
         self.retry_at = Some(now + delay);
         true
@@ -355,8 +444,8 @@ impl SessionDiscovery {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodexRestoreLookups, SessionDiscoveries, SessionDiscovery, SessionDiscoveryKey,
-        SessionProvider,
+        CodexRestoreLookups, LookupEvidence, SessionDiscoveries, SessionDiscovery,
+        SessionDiscoveryKey, SessionProvider, WATCHED_HOOK_FALLBACK,
     };
     use crate::{AgentPreset, Instance, LeafData, PaneNode, Project, Workspace};
     use std::path::PathBuf;
@@ -446,7 +535,7 @@ mod tests {
 
     #[test]
     fn b9_r2_codex_ownership_cache_resets_when_the_target_context_changes() {
-        use super::CodexLookupEvidence;
+        use super::LookupEvidence;
         for change in ["launch", "cwd", "binding", "hint"] {
             let mut key = key();
             let mut workspace = workspace(key.pane);
@@ -459,16 +548,17 @@ mod tests {
             discoveries.reconcile(&workspace);
             let now = Instant::now();
             let request = discoveries.begin(key.clone(), now).unwrap();
-            assert!(discoveries.finish_with_codex_evidence(
+            assert!(discoveries.finish_with_evidence(
                 &request,
                 Some(&key),
                 now,
                 false,
-                CodexLookupEvidence {
+                LookupEvidence {
                     miss: None,
                     rejected_owner: Some((owner_id, "owned hint".into())),
                     observed_hint: key.hint.clone(),
                     cached_rejection: false,
+                    hook_record: false,
                 }
             ));
             assert!(
@@ -700,6 +790,139 @@ mod tests {
             }
             assert!(discovery.begin(key, now).is_some());
         }
+    }
+
+    fn claude_key() -> SessionDiscoveryKey {
+        SessionDiscoveryKey {
+            provider: SessionProvider::Claude,
+            hint: None,
+            ..key()
+        }
+    }
+
+    const SECOND: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn watched_claude_miss_waits_for_its_own_wake_instead_of_polling() {
+        let key = claude_key();
+        let mut discoveries = SessionDiscoveries::default();
+        discoveries.set_watched(SessionProvider::Claude, true);
+        let now = Instant::now();
+        let request = discoveries.begin(key.clone(), now).unwrap();
+        assert!(discoveries.finish(&request, Some(&key), now, false));
+        // Unwatched, the pane would look again within two seconds.
+        assert!(discoveries.begin(key.clone(), now + 2 * SECOND).is_none());
+        discoveries.wake(Uuid::new_v4());
+        assert!(
+            discoveries.begin(key.clone(), now + 3 * SECOND).is_none(),
+            "another pane's record"
+        );
+        discoveries.wake(key.pane);
+        let woken = now + 3 * SECOND;
+        let request = discoveries.begin(key.clone(), woken).unwrap();
+        assert!(discoveries.finish(&request, Some(&key), woken, false));
+        let fallback = woken + WATCHED_HOOK_FALLBACK;
+        assert!(
+            discoveries
+                .begin(key.clone(), fallback - Duration::from_millis(1))
+                .is_none()
+        );
+        assert!(
+            discoveries.begin(key, fallback).is_some(),
+            "a lost event still gets polled"
+        );
+    }
+
+    #[test]
+    fn a_wake_during_a_lookup_makes_the_next_one_due_when_it_lands() {
+        // The lookup in flight may have read before the write it announces.
+        let key = claude_key();
+        let mut discoveries = SessionDiscoveries::default();
+        discoveries.set_watched(SessionProvider::Claude, true);
+        let now = Instant::now();
+        let request = discoveries.begin(key.clone(), now).unwrap();
+        discoveries.wake(key.pane);
+        assert!(
+            discoveries.begin(key.clone(), now).is_none(),
+            "one at a time"
+        );
+        assert!(discoveries.finish(&request, Some(&key), now, false));
+        let request = discoveries.begin(key.clone(), now).unwrap();
+        assert!(discoveries.finish(&request, Some(&key), now, false));
+        assert!(
+            discoveries.begin(key, now + 2 * SECOND).is_none(),
+            "the wake is spent"
+        );
+    }
+
+    #[test]
+    fn a_waiting_hook_record_keeps_the_unwatched_cadence() {
+        // Its transcript can appear with no write to the hook directory.
+        let key = claude_key();
+        let mut discoveries = SessionDiscoveries::default();
+        discoveries.set_watched(SessionProvider::Claude, true);
+        let record = || LookupEvidence {
+            hook_record: true,
+            ..LookupEvidence::default()
+        };
+        let mut now = Instant::now();
+        for delay in [SECOND, 2 * SECOND, 2 * SECOND] {
+            let request = discoveries.begin(key.clone(), now).unwrap();
+            assert!(discoveries.finish_with_evidence(&request, Some(&key), now, false, record()));
+            assert!(
+                discoveries
+                    .begin(key.clone(), now + delay - Duration::from_millis(1))
+                    .is_none()
+            );
+            now += delay;
+        }
+        // An adopted record is confirmed a second later, as unwatched.
+        let request = discoveries.begin(key.clone(), now).unwrap();
+        assert!(discoveries.finish_with_evidence(&request, Some(&key), now, true, record()));
+        now += SECOND;
+        let request = discoveries.begin(key.clone(), now).unwrap();
+        assert!(discoveries.finish(&request, Some(&key), now, false));
+        assert!(
+            discoveries.begin(key, now + 2 * SECOND).is_none(),
+            "nothing waits now"
+        );
+    }
+
+    #[test]
+    fn watcher_changes_wake_only_their_provider() {
+        let claude = claude_key();
+        let grok = SessionDiscoveryKey {
+            pane: Uuid::new_v4(),
+            provider: SessionProvider::Grok,
+            ..claude_key()
+        };
+        let mut discoveries = SessionDiscoveries::default();
+        let now = Instant::now();
+        let before = discoveries.begin(claude.clone(), now).unwrap();
+        let request = discoveries.begin(grok.clone(), now).unwrap();
+        assert!(discoveries.finish(&request, Some(&grok), now, false));
+        // A lookup that began before the watcher may have missed a write.
+        discoveries.set_watched(SessionProvider::Claude, true);
+        assert!(discoveries.finish(&before, Some(&claude), now, false));
+        let request = discoveries.begin(claude.clone(), now).unwrap();
+        assert!(
+            discoveries.begin(grok.clone(), now).is_none(),
+            "Grok keeps its delay"
+        );
+        assert!(discoveries.finish(&request, Some(&claude), now, false));
+        discoveries.set_watched(SessionProvider::Claude, true);
+        assert!(
+            discoveries
+                .begin(claude.clone(), now + 2 * SECOND)
+                .is_none(),
+            "still watched: no wake"
+        );
+        // Unwatched, no event will come: poll now and at the usual cadence.
+        discoveries.set_watched(SessionProvider::Claude, false);
+        let later = now + 2 * SECOND;
+        let request = discoveries.begin(claude.clone(), later).unwrap();
+        assert!(discoveries.finish(&request, Some(&claude), later, false));
+        assert!(discoveries.begin(claude, later + 2 * SECOND).is_some());
     }
 
     #[test]
