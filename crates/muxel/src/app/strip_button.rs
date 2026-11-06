@@ -9,7 +9,6 @@
 
 use super::*;
 use gpui::accesskit::Role;
-use gpui::prelude::FluentBuilder as _;
 use gpui_component::GlobalState;
 use gpui_component::tooltip::Tooltip;
 
@@ -79,7 +78,7 @@ impl RenderOnce for StripIconButton {
         // No accessible name, like `Button` without a label. UAT drivers find
         // the title bar's Close by role and name, and a pane's Close named the
         // same would make that lookup ambiguous.
-        div()
+        let mut button = div()
             .id(self.id)
             .role(Role::Button)
             .track_focus(&focus.tab_stop(true))
@@ -101,29 +100,33 @@ impl RenderOnce for StripIconButton {
                 GlobalState::suppress_text_selection(cx);
                 cx.stop_propagation();
             })
-            .when_some(self.on_click, |this, on_click| {
-                this.on_click(move |event, window, cx| on_click(event, window, cx))
-            })
-            .when_some(self.on_right_mouse_down, |this, handler| {
-                this.on_mouse_down(MouseButton::Right, move |event, window, cx| {
-                    handler(event, window, cx)
-                })
-            })
             .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-            .child(self.icon.xsmall())
-            .when(focused, |this| {
-                this.child(
-                    div()
-                        .absolute()
-                        .top(-RING_WIDTH)
-                        .left(-RING_WIDTH)
-                        .right(-RING_WIDTH)
-                        .bottom(-RING_WIDTH)
-                        .border(RING_WIDTH)
-                        .border_color(ring.alpha(0.2))
-                        .rounded(radius + RING_WIDTH),
-                )
-            })
+            .child(self.icon.xsmall());
+        // Plain `if`s rather than FluentBuilder's `when`, so this file needn't
+        // import a trait that `super::*` brings in on some GPUI pins and not
+        // on others (a redundant import fails clippy).
+        if let Some(on_click) = self.on_click {
+            button = button.on_click(move |event, window, cx| on_click(event, window, cx));
+        }
+        if let Some(handler) = self.on_right_mouse_down {
+            button = button.on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                handler(event, window, cx)
+            });
+        }
+        if focused {
+            button = button.child(
+                div()
+                    .absolute()
+                    .top(-RING_WIDTH)
+                    .left(-RING_WIDTH)
+                    .right(-RING_WIDTH)
+                    .bottom(-RING_WIDTH)
+                    .border(RING_WIDTH)
+                    .border_color(ring.alpha(0.2))
+                    .rounded(radius + RING_WIDTH),
+            );
+        }
+        button
     }
 }
 
