@@ -128,13 +128,16 @@ fn basename(command: &str) -> &str {
 pub fn tmux_candidates(
     sessions: &[RemoteSession],
     owned: &[SessionTarget],
+    closed: &[crate::tmux::ClosedSession],
     root: &str,
     presets: &[AgentPreset],
 ) -> Vec<ImportCandidate> {
     let owned = crate::tmux::owned_session_keys(sessions, owned);
+    let closed = crate::tmux::closed_session_keys(sessions, closed);
     sessions
         .iter()
         .filter(|s| !owned.contains(&(s.name.as_str(), &s.socket)))
+        .filter(|s| !closed.contains(&(s.name.as_str(), &s.socket)))
         .map(|s| {
             let preset = preset_for_command(presets, &s.command);
             ImportCandidate {
@@ -617,7 +620,32 @@ mod tests {
         owned: &[SessionTarget],
         root: &str,
     ) -> Vec<ImportCandidate> {
-        super::tmux_candidates(sessions, owned, root, &presets())
+        super::tmux_candidates(sessions, owned, &[], root, &presets())
+    }
+
+    #[test]
+    fn review_close_import_excludes_pending_kills_on_their_recorded_server() {
+        let pending = session("muxel_proj_pending", "/home/u/proj", "claude");
+        let mut namesake = pending.clone();
+        namesake.socket = crate::tmux::Socket::Default;
+        let closed = serde_json::from_value(serde_json::json!({
+            "name": pending.name, "socket": "mxl", "instance": uuid::Uuid::new_v4()
+        }))
+        .unwrap();
+        let got = super::tmux_candidates(
+            &[pending, namesake.clone()],
+            &[],
+            &[closed],
+            "/home/u/proj",
+            &presets(),
+        );
+        assert_eq!(got.len(), 1, "Import offered a session pending teardown");
+        assert_eq!(
+            got[0].source,
+            ImportSource::TmuxSession {
+                session: namesake.target()
+            }
+        );
     }
 
     #[test]

@@ -115,10 +115,17 @@ feature is added or changed, update the matching entry here in the same change**
   binding, input and completion before expiry; changed work gets Close / Keep.
   An OSC 7501 report counts as quiet only while idle or finished; an `error`
   report asks, and any turn a report finishes during the countdown is changed
-  work. Batch closes offer Close all, Close only the idle ones, or Cancel.
+  work. Batch closes offer Close all, Close only the idle ones, or Cancel; a
+  file answer needs the close to take every pane of its worktree, so leaving
+  one open, or one exiting or closed by a peer before the close is accepted,
+  drops the answer and that worktree asks again later.
   Queued input, written to the terminal or sent through tmux, is cancelled
   across close and Undo, and hidden panes leave ctl listings; writes refuse
-  with `closing` and `undo_until`. A shell counts down only with prompt
+  with `closing`. Reads by id or name (`status`, `show`, `screen`, `wait`)
+  still work. `undo_until` is present only during the countdown; checks,
+  Close / Keep and restoration report their state without an expired deadline.
+  If the pane disappears while `wait` polls or collects its result, `wait`
+  returns `exited` with an explanation. A shell counts down only with prompt
   evidence, so local tmux shells on Unix, which can't pass OSC 133 through,
   always ask. A tmux pane that only looks dead here (never connected, a
   failed restart, a detached client) asks too, since closing it kills a
@@ -131,18 +138,41 @@ feature is added or changed, update the matching entry here in the same change**
   layout, showing "Checking before close…" until then, so edits a peer made
   while this machine slept are adopted, not overwritten. When that layout
   can't be read (its host is offline or reconnecting, or no read lands within
-  30 seconds), the close asks Close or Keep instead.
+  30 seconds), the close asks Close or Keep instead. Explicit Close also waits
+  for a read begun after the click; a Close offered because the layout cannot
+  be read explicitly proceeds without it.
 - **Resource and worktree close** — dirty editors offer Save / Don't Save /
   Cancel; clean editors, diffs and browsers close immediately. The last pane of
-  a muxel worktree with changes or unmerged commits uses its disposal choice
-  directly; a clean, landed worktree follows the terminal countdown policy. A
+  a muxel worktree with changes or unmerged commits asks what to do with its files,
+  then follows the same busy confirmation and countdown with Undo as other
+  terminals. Commit / Merge / Discard / Keep run only after the close finishes
+  and tmux teardown is confirmed; Undo, Cancel, Quit, switching workspace or a
+  failed tmux kill cancels the file action and keeps the files, with the worktree
+  listed in the sidebar. A
   pane opened in that worktree while its question is showing gets its own
   prompt and countdown, and a pane brought back by Undo leaves the question.
   Client checks show progress, beside any running countdown, with their own
   Cancel; a batch member closed during the check leaves the others to their
   decision. Ordinary saves preserve held panes for crash recovery; workspace
-  switch and quit (or logout) finish running countdowns, but keep a pane
+  switch and quit (or logout) finish unshared running countdowns, but keep shared
+  closes until a fresh layout read can run on the next visit. A layout is shared
+  for a remote project and whenever the tmux setting is on, which is the default,
+  so unshared means a local project with that setting off. An explicit Close of a
+  shared pane also waits for the next layout read. They also keep a pane
   still being checked or waiting for Close / Keep, which reopens next time.
+  Local tmux closes save a pending kill before teardown and retry it on project
+  activation after layout reconciliation. A pane that reappeared or now shows
+  that session cancels its retry. Retries match the original close's generation
+  token; a same-name replacement is kept, and unverified legacy closes are
+  cancelled without killing. The event log records the retained target; Import
+  keeps its existing server-discovery scope and excludes pending kills on that host.
+  Local worktree cleanup waits for confirmed session death. A remote close keeps
+  its worktree on the host and logs why. Legacy worktrees are kept when
+  dirty, unmerged or still shared by another pane.
+  Removing a project never waits on those kills. One already running finishes in
+  the background and an older unconfirmed one gets a last try, but nothing retries
+  after that. A session that survives keeps running, the removal says so, and
+  Import lists it. A held pane's file answer is dropped, and its files stay.
   Removing a project waits for that decision. If that save fails, the first
   switch stops with a notice and the next one leaves anyway; the pane reopens
   next time. Saving an untitled editor on close writes the path picked in the
