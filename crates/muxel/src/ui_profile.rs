@@ -818,6 +818,7 @@ fn emit_at(at: SystemTime, line: &str) {
         ))
     });
     if let Ok(mut g) = slot.lock() {
+        // The log names its first failure on stderr itself.
         let _ = g.append(&line);
     }
 }

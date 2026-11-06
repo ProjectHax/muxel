@@ -112,9 +112,13 @@ backup counts toward the budget and uses its modification date for age.
 Invalid or nonpositive retention settings use defaults. Separate terminal and
 UI paths each receive their own budget. Use a distinct live path per process.
 If rename fails (for example, a Windows tailer lacks delete sharing), truncate
-the live file; if truncation or required pruning fails, skip writes rather than
-grow beyond the bounds. This fallback can lose history; tailers should share
-read, write, and delete access.
+the live file; if truncation fails, skip writes rather than grow beyond the
+bounds. An archive that can't be removed (read-only, or held open without
+delete sharing) is skipped: the rest are still pruned, writes continue while
+the family fits its byte budget, and pruning tries it again at the next roll
+or date. Only a family still over budget skips writes. Each log names its
+first append or prune failure on stderr once. This fallback can lose history;
+tailers should share read, write, and delete access.
 
 **Terminal log** (`term-prof`): ~500 ms intervals while interesting work
 happens (keys, paint spikes, high felt latency). Fields: PTY writer queue/write,
