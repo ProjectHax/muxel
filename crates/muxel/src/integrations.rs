@@ -166,15 +166,34 @@ fn remote_ssh_command(c: &RemoteConn, remote_cmd: String) -> Command {
     }
 }
 
+/// `Command::output` for git, also recorded by the UI profiler when it's on
+/// (`ui_profile::git_launched`; the caller label comes from
+/// `ui_profile::git_caller`).
+trait ProfiledOutput {
+    fn profiled_output(&mut self) -> std::io::Result<std::process::Output>;
+}
+
+impl ProfiledOutput for Command {
+    fn profiled_output(&mut self) -> std::io::Result<std::process::Output> {
+        if !crate::ui_profile::is_enabled() {
+            return self.output();
+        }
+        let started = Instant::now();
+        let out = self.output();
+        crate::ui_profile::git_launched(self, started.elapsed(), &out);
+        out
+    }
+}
+
 /// Run `git <args>` at a [`RepoLoc`]: locally (`git -C <path>`) or on the host
 /// over SSH (`ssh … -- git -C <remote_path> …`, fed as one quoted command).
 fn git_output(loc: &RepoLoc, args: &[&str]) -> std::io::Result<std::process::Output> {
-    git_command_at(loc, args, true).output()
+    git_command_at(loc, args, true).profiled_output()
 }
 
 /// Mutations deliberately keep git's normal locking behavior.
 fn git_write_output(loc: &RepoLoc, args: &[&str]) -> std::io::Result<std::process::Output> {
-    git_command_at(loc, args, false).output()
+    git_command_at(loc, args, false).profiled_output()
 }
 
 const READ_ONLY_GIT_CONFIG: &str = "diff.autoRefreshIndex=false";
@@ -398,7 +417,7 @@ fn git_ignores(root: &Path, path: &str) -> bool {
         .arg("-C")
         .arg(root)
         .args(["check-ignore", "-q", "--", path])
-        .output()
+        .profiled_output()
         .is_ok_and(|o| o.status.success())
 }
 
@@ -1000,7 +1019,7 @@ pub fn is_git_repo(path: &Path) -> bool {
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "--is-inside-work-tree"])
-        .output()
+        .profiled_output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -1012,7 +1031,7 @@ pub fn create_worktree(repo: &Path, worktree_path: &Path, branch: &str) -> Resul
         .arg(repo)
         .args(["worktree", "add", "-b", branch])
         .arg(worktree_path)
-        .output()
+        .profiled_output()
         .context("running `git worktree add`")?;
     if !output.status.success() {
         bail!(
@@ -1033,7 +1052,7 @@ pub fn worktree_change_count(worktree_path: &Path) -> usize {
         .arg("-C")
         .arg(worktree_path)
         .args(["status", "--porcelain"])
-        .output()
+        .profiled_output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| {
@@ -1128,7 +1147,7 @@ fn git_line(dir: &Path, args: &[&str]) -> Option<String> {
         .arg("-C")
         .arg(dir)
         .args(args)
-        .output()
+        .profiled_output()
         .ok()
         .filter(|o| o.status.success())?;
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -1146,7 +1165,7 @@ pub fn worktree_unmerged_count(worktree_path: &Path, base: &str) -> usize {
         .arg("-C")
         .arg(worktree_path)
         .args(["rev-list", "--count", &format!("{base}..HEAD")])
-        .output()
+        .profiled_output()
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
@@ -1161,7 +1180,7 @@ pub fn merge_worktree_branch(repo: &Path, branch: &str) -> Result<()> {
         .arg("-C")
         .arg(repo)
         .args(["merge", "--no-edit", branch])
-        .output()
+        .profiled_output()
         .context("running `git merge`")?;
     if !out.status.success() {
         // Leave no half-finished merge behind.
@@ -1169,7 +1188,7 @@ pub fn merge_worktree_branch(repo: &Path, branch: &str) -> Result<()> {
             .arg("-C")
             .arg(repo)
             .args(["merge", "--abort"])
-            .output();
+            .profiled_output();
         bail!("git merge: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(())
@@ -1182,7 +1201,7 @@ pub fn delete_branch(repo: &Path, branch: &str) {
         .arg("-C")
         .arg(repo)
         .args(["branch", "-D", branch])
-        .output();
+        .profiled_output();
 }
 
 /// Stage **all** changes (tracked, untracked, and deletions) and commit them at
@@ -1367,7 +1386,7 @@ pub fn push_branch(worktree_path: &Path, branch: &str) -> Result<()> {
         .arg("-C")
         .arg(worktree_path)
         .args(["push", "-u", "origin", branch])
-        .output()
+        .profiled_output()
         .context("running `git push`")?;
     if !out.status.success() {
         bail!("git push: {}", String::from_utf8_lossy(&out.stderr).trim());
@@ -1412,7 +1431,7 @@ pub fn discard_worktree_changes(worktree_path: &Path, base_ref: &str) -> Result<
             .arg("-C")
             .arg(worktree_path)
             .args(args)
-            .output()
+            .profiled_output()
             .context("running git")
     };
     let reset = run(&["reset", "--hard", base_ref])?;
@@ -1434,12 +1453,12 @@ pub fn remove_worktree(repo: &Path, worktree_path: &Path) {
         .arg(repo)
         .args(["worktree", "remove", "--force"])
         .arg(worktree_path)
-        .output();
+        .profiled_output();
     let _ = command("git")
         .arg("-C")
         .arg(repo)
         .args(["worktree", "prune"])
-        .output();
+        .profiled_output();
 }
 
 /// Maximum diff text we load into the viewer (bytes), so a giant diff can't
@@ -1457,7 +1476,7 @@ pub fn git_diff(dir: &Path) -> String {
             .arg(dir)
             .arg("--no-pager")
             .args(args)
-            .output()
+            .profiled_output()
     };
 
     // Resolve the repo root (also our "is this a git repo?" check, in one call).

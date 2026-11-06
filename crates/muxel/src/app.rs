@@ -7598,6 +7598,7 @@ impl MuxelApp {
                 let results = cx
                     .background_executor()
                     .spawn(async move {
+                        let _git = ui_profile::git_caller("diff-pane");
                         jobs.into_iter()
                             .map(|(iid, dir)| (iid, crate::integrations::git_diff(&dir)))
                             .collect::<Vec<(Uuid, String)>>()
@@ -12550,7 +12551,10 @@ impl MuxelApp {
         cx.spawn(async move |this, cx| {
             let files = cx
                 .background_executor()
-                .spawn(async move { integrations::git_status_files(&loc) })
+                .spawn(async move {
+                    let _git = ui_profile::git_caller("git-panel");
+                    integrations::git_status_files(&loc)
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.git_diff_loading = false;
@@ -12773,6 +12777,7 @@ impl MuxelApp {
             let (results, branches): (Vec<(Uuid, Vec<integrations::GitChange>)>, Vec<String>) = cx
                 .background_executor()
                 .spawn(async move {
+                    let _git = ui_profile::git_caller("git-panel-worktrees");
                     let files = paths
                         .into_iter()
                         .map(|(wid, path)| {
@@ -13148,6 +13153,7 @@ impl MuxelApp {
                     });
                     // Only projects whose HEAD or branches moved (or whose backstop
                     // passed) run git; the rest keep their cached branch.
+                    let git_caller = ui_profile::git_caller("branch-poll");
                     let local_ids: HashSet<Uuid> = locals.iter().map(|(id, _)| *id).collect();
                     polls.branches.retain(|id| local_ids.contains(id));
                     let branches: Vec<(Uuid, Option<String>, Vec<String>)> = locals
@@ -13166,8 +13172,10 @@ impl MuxelApp {
                             ))
                         })
                         .collect();
+                    drop(git_caller);
                     let changes = (recount_worktrees || polls.worktrees.due(&(), &worktrees, now))
                         .then(|| {
+                            let _git = ui_profile::git_caller("worktree-changes");
                             let counts: Vec<(Uuid, usize)> = worktrees
                                 .iter()
                                 .map(|(id, path)| (*id, integrations::worktree_change_count(path)))
@@ -23150,6 +23158,7 @@ impl MuxelApp {
                     let Some(loc) = git_loc else {
                         return HashMap::new();
                     };
+                    let _git = ui_profile::git_caller("file-browser");
                     let changes: Vec<(PathBuf, String)> = integrations::git_status_files(&loc)
                         .into_iter()
                         .map(|c| (status_root.join(&c.path), c.status))

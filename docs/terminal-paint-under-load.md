@@ -195,6 +195,18 @@ Periodic summaries are best effort: the unfinished interval is not persisted on
 process exit (up to 30 seconds of quiet terminal work or 60 seconds of discovery
 counts). Detailed input and slow-event records keep their usual flush cadence.
 
+Every local `git` process muxel starts and waits for writes one
+`ui-prof[git v1]` record: `caller` (a fixed label for the poll or action that
+ran it, such as `branch-poll`, `git-panel` or `diff-pane`; one-off user actions
+read `unlabeled`), `sub` (the git subcommand), `dir` (a hash of the directory),
+`cmd` (a hash of the whole argument list), `status`, `elapsed`, `out` (a hash of
+the exit status and stdout) and `same`: `yes` when that exact command printed
+the same thing last time, `no` when it changed, `first` otherwise. Launches per
+minute by `caller` and `sub`, and the share of `same=yes`, show which polls
+re-ask git questions whose answers haven't moved. Hashes are 64-bit FNV-1a of
+the UTF-8 text, so a script can hash a known path to match `dir`. Remote reads
+(over ssh) and team-library jobs are not recorded.
+
 When GPUI reports that nothing in the newly rendered dispatch tree owns focus,
 `ui-prof[focus path v2]` records fixed owner classes and pane UUIDs for the
 retained handle and active target, whether each handle was present in that
