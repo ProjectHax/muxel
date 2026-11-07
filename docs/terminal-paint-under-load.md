@@ -201,13 +201,16 @@ process exit (up to 30 seconds of quiet terminal work or 60 seconds of discovery
 counts). Detailed input and slow-event records keep their usual flush cadence.
 
 **Frame attribution** (`ui-frame`, `ui_profile/frame.rs`): every root-view
-draw is one frame, from its build to GPUI's arena clear after presenting. A
-frame of at least 50 ms writes `ui-frame[v1 slow]`; every ten seconds
-`ui-frame[v1 sum]` totals all frames. Both split the frame into GPUI-ordered
-intervals (`pre` invalidation and Root render, `build`, `layout`
-request-layout, `compute` taffy, `prepaint`, `paint`, `tail` draw
-finalization, `present` platform present and arena clear; without GPUI's frame
-trace `tail` and `present` are one `post`), then into window regions: `prep`,
+draw is one frame, from `Window::draw` start (from its build, without GPUI's
+frame trace) to GPUI's arena clear after presenting. A frame of at least 50 ms
+writes `ui-frame[v1 slow]`; every ten seconds `ui-frame[v1 sum]` totals all
+frames. Both split the frame into GPUI-ordered intervals that add up to its
+`wall` (`pre` invalidation and Root render, `build`, `layout`
+request-layout, `compute` Root's request-layout around the app element plus
+taffy, `prepaint` through GPUI's deferred draws such as tooltips, `paint`,
+`tail` draw finalization, `present` platform present and arena clear; without
+GPUI's frame trace there is no `pre`, and `tail` and `present` are one
+`post`), then into window regions: `prep`,
 `actions`, `titlebar`, `sidebar`, `toolbar`, `hotbar`, `panes` (split
 containers), `panes_sb` (the pane row's scrollbar), `shell` (the body's
 sidebar and side-panel resizable groups and main column), `overlay`, and per
@@ -216,13 +219,22 @@ values are self times per element phase (`build/layout/prepaint/paint`).
 `other` is the rest of each interval: the interval minus the region time that
 ran in it. GPUI lays some subtrees out inside an ancestor's prepaint, so a
 region's request-layout can run in the prepaint interval; `layout_late` is
-that time, and `other` doesn't count it twice. `cpu` is the
-UI thread's cycle count over the frame (Windows), so `wall` minus `cpu` is time
-the thread did not run; `faults` is the process page-fault count. The summary
-adds `duty` (frame wall time over the interval), UI-thread CPU inside and
-outside frames, `queue` (first invalidation to draw start) and a frame-time
-histogram. `ui-frame[v1 start]` records the calibrated cycles per microsecond.
-Records hold fixed labels, counts and durations only.
+that time, and `other` doesn't count it twice. `cycles` is the UI thread's
+cycle count (Windows `QueryThreadCycleTime`) over `cpu_span`, which is the
+frame without `pre`. GPUI has no hook at draw start to read it sooner.
+Windows doesn't promise a fixed cycle rate, so `cpu_est` (cycles over the rate
+calibrated at start, recorded in `ui-frame[v1 start]`) is an estimate, and
+`cpu_span` minus `cpu_est` estimates the time the thread did not run.
+`faults` is the process page-fault count. The summary adds `duty` (frame wall
+time over the interval), `ui_cpu` (the thread's CPU time from
+`GetThreadTimes`, charged per scheduler tick, so usable over ten seconds
+though not per frame),
+`frame_cpu_est` and `outside_cpu_est` (`ui_cpu` split by the frames' share of
+the thread's cycles, with `pre` counted outside), `queue` (first invalidation
+to draw start) and a frame-time histogram. A counter that didn't read says
+`unavailable`. Its interval averages take `pre`, `tail` and `present` over
+traced frames (`traced=T/F`) and `post` over the rest. Records hold fixed
+labels, counts and durations only.
 
 When GPUI reports that nothing in the newly rendered dispatch tree owns focus,
 `ui-prof[focus path v2]` records fixed owner classes and pane UUIDs for the

@@ -9,18 +9,21 @@
 //! when GPUI lays a subtree out inside an ancestor's prepaint; `layout_late`
 //! reports how much region request-layout ran there. A frame of at least
 //! 50 ms emits one `ui-frame[v1 slow]` record. Every frame feeds a ten-second
-//! `ui-frame[v1 sum]` summary, which also reports the UI thread's CPU time
-//! inside and outside frames.
+//! `ui-frame[v1 sum]` summary, which also reports the UI thread's CPU time and
+//! estimates its split inside and outside frames.
 //!
-//! Intervals, in GPUI's order:
+//! Intervals, in GPUI's order. Each starts where the previous one ends, so a
+//! frame's intervals add up to its `wall`:
 //! - `pre`: `Window::draw` start to the root view's build (entity
 //!   invalidation, gpui-component's Root render). Needs GPUI's frame trace.
 //! - `build`: the wrapped view's `Render::render`.
 //! - `layout`: request-layout of the app element tree. RenderOnce components
 //!   (buttons, inputs) and uncached child views render here.
-//! - `compute`: the rest of Root's request-layout plus taffy's layout compute.
-//! - `prepaint`: includes the render, layout and prepaint of dirty cached
-//!   views (background terminals).
+//! - `compute`: Root's request-layout outside the app element (before and
+//!   after it) plus taffy's layout compute.
+//! - `prepaint`: the app's prepaint, including the render, layout and
+//!   prepaint of dirty cached views (background terminals), then GPUI's
+//!   deferred draws (tooltips, popovers) up to paint.
 //! - `paint`
 //! - `tail`: paint end to `Window::draw` end (scene finish, focus and
 //!   accessed-entity bookkeeping). Without GPUI's frame trace this interval
@@ -28,11 +31,25 @@
 //! - `present`: `Window::draw` end to arena clear: the platform present plus
 //!   dropping the elements allocated before the root wrapper.
 //!
-//! `cpu` counts the UI thread's own cycles over the frame (Windows
-//! `QueryThreadCycleTime`), so `wall - cpu` is time the thread did not run:
-//! blocked on the GPU, a lock or a hard page fault, or runnable but not
-//! scheduled. `faults` is the process-wide page-fault count over the frame,
-//! soft faults included. Neither is available off Windows.
+//! The summary's `per_frame_avg` averages `pre`, `tail` and `present` over
+//! traced frames (`traced=T/F`), `post` over the rest, and the others over
+//! every frame.
+//!
+//! `cycles` counts the UI thread's own cycles (Windows
+//! `QueryThreadCycleTime`) over `cpu_span`, the frame from its build to arena
+//! clear. `pre` is outside that span: GPUI gives no hook at draw start to
+//! read the counters. Microsoft doesn't promise a fixed cycle rate, so a slow
+//! record's `cpu_est` (cycles over the rate calibrated at start, in
+//! `ui-frame[v1 start]`) is an estimate, and `cpu_span - cpu_est` the
+//! estimated time the thread didn't run: blocked on the GPU, a lock or a
+//! hard page fault, or runnable but not scheduled. The summary's `ui_cpu` is
+//! the thread's CPU time from `GetThreadTimes`: 100 ns units, but charged per
+//! scheduler tick, so too coarse for one frame and usable over ten seconds.
+//! `frame_cpu_est` apportions it by the frames' share of the thread's cycles,
+//! which needs no cycle rate, and `outside_cpu_est` is the rest, frames' `pre`
+//! included; `frame_cpu_span` sums the frames' `cpu_span`. `faults` is the
+//! process-wide page-fault count, soft faults included. Off Windows, or when a
+//! read fails, these say `unavailable`.
 //!
 //! Records carry fixed labels, counts and durations only.
 
@@ -166,6 +183,8 @@ pub(super) struct FrameData {
     traced: bool,
     queue_us: Option<u64>,
     invalidations: u64,
+    /// The span `cycles` and `faults` cover: build start to arena clear.
+    cpu_span_us: u64,
     cycles: Option<u64>,
     faults: Option<u64>,
     region_ns: [[u64; PHASES]; REGIONS],
@@ -189,6 +208,7 @@ impl FrameData {
             traced: false,
             queue_us: None,
             invalidations: 0,
+            cpu_span_us: 0,
             cycles: None,
             faults: None,
             region_ns: [[0; PHASES]; REGIONS],
@@ -229,14 +249,22 @@ pub(super) struct Summary {
     wall_sum_us: u64,
     wall_max_us: u64,
     hist: [u32; HIST_BOUNDS_MS.len() + 1],
+    /// Traced frames' intervals, and every frame's build through paint. An
+    /// untraced frame's `post` goes to `post_sum_us` instead, since it spans
+    /// a traced frame's `tail` and `present`.
     intervals_sum_us: [u64; INTERVALS],
+    post_sum_us: u64,
     traced: u32,
     queue_sum_us: u64,
     queue_max_us: u64,
     queue_n: u32,
     invalidations: u64,
+    /// Cycles and `cpu_span` over the `cycles_n` frames whose counters read.
     frame_cycles: u64,
+    cpu_span_sum_us: u64,
+    cycles_n: u32,
     faults: u64,
+    faults_n: u32,
     region_ns: [[u64; PHASES]; REGIONS],
     ran_in_ns: [u64; PHASES],
     layout_late_ns: u64,
@@ -257,13 +285,17 @@ impl Summary {
             wall_max_us: 0,
             hist: [0; HIST_BOUNDS_MS.len() + 1],
             intervals_sum_us: [0; INTERVALS],
+            post_sum_us: 0,
             traced: 0,
             queue_sum_us: 0,
             queue_max_us: 0,
             queue_n: 0,
             invalidations: 0,
             frame_cycles: 0,
+            cpu_span_sum_us: 0,
+            cycles_n: 0,
             faults: 0,
+            faults_n: 0,
             region_ns: [[0; PHASES]; REGIONS],
             ran_in_ns: [0; PHASES],
             layout_late_ns: 0,
@@ -283,8 +315,19 @@ impl Summary {
             .position(|&ms| frame.wall_us < ms * 1000)
             .unwrap_or(HIST_BOUNDS_MS.len());
         self.hist[bucket] += 1;
-        for (sum, us) in self.intervals_sum_us.iter_mut().zip(frame.intervals_us) {
-            *sum += us;
+        for (index, (sum, us)) in self
+            .intervals_sum_us
+            .iter_mut()
+            .zip(frame.intervals_us)
+            .enumerate()
+        {
+            if frame.traced || !matches!(index, IV_PRE | IV_TAIL | IV_PRESENT) {
+                *sum += us;
+            }
+        }
+        if !frame.traced {
+            // An untraced frame's tail slot holds its post.
+            self.post_sum_us += frame.intervals_us[IV_TAIL];
         }
         self.traced += u32::from(frame.traced);
         if let Some(queue) = frame.queue_us {
@@ -293,8 +336,15 @@ impl Summary {
             self.queue_n += 1;
         }
         self.invalidations += frame.invalidations;
-        self.frame_cycles += frame.cycles.unwrap_or(0);
-        self.faults += frame.faults.unwrap_or(0);
+        if let Some(cycles) = frame.cycles {
+            self.frame_cycles += cycles;
+            self.cpu_span_sum_us += frame.cpu_span_us;
+            self.cycles_n += 1;
+        }
+        if let Some(faults) = frame.faults {
+            self.faults += faults;
+            self.faults_n += 1;
+        }
         for (sum, frame) in self.region_ns.iter_mut().zip(frame.region_ns.iter()) {
             for (sum, ns) in sum.iter_mut().zip(frame) {
                 *sum += ns;
@@ -404,6 +454,10 @@ pub(super) fn begin(view: RenderView, token: u64) {
 }
 
 pub(super) fn mark(token: u64, mark: Mark) {
+    // Token zero is a frame that was never opened (profiling off): no clock.
+    if token == 0 {
+        return;
+    }
     let now = Instant::now();
     with_frame(token, |frame| frame.marks[mark as usize] = Some(now));
 }
@@ -492,28 +546,22 @@ impl Drop for RegionScope {
     }
 }
 
-/// The root interval running now, from the marks set so far, or `None` in a
-/// gap between them (taffy's compute, the tail after paint). Scopes close
-/// inside the root's callbacks, so this names the interval a scope ran in.
+/// The root interval running now, from the marks set so far, or `None` in
+/// `compute` or after paint, which have no region phase. Scopes close inside
+/// the root's callbacks or GPUI's deferred draws, so this names the interval
+/// a scope ran in. `prepaint` runs on to paint start, as [`close`] counts it.
 fn running_phase(marks: &[Option<Instant>; 7]) -> Option<usize> {
     let set = |mark: Mark| marks[mark as usize].is_some();
     if set(Mark::PaintStart) {
         (!set(Mark::PaintEnd)).then_some(Phase::Paint as usize)
     } else if set(Mark::PrepaintStart) {
-        (!set(Mark::PrepaintEnd)).then_some(Phase::Prepaint as usize)
+        Some(Phase::Prepaint as usize)
     } else if set(Mark::LayoutStart) {
         (!set(Mark::LayoutEnd)).then_some(Phase::Layout as usize)
     } else if set(Mark::BuildEnd) {
         None
     } else {
         Some(Phase::Build as usize)
-    }
-}
-
-fn micros(from: Option<Instant>, to: Option<Instant>) -> u64 {
-    match (from, to) {
-        (Some(from), Some(to)) => to.saturating_duration_since(from).as_micros() as u64,
-        _ => 0,
     }
 }
 
@@ -539,53 +587,8 @@ pub(super) fn end(token: u64) {
     }) else {
         return;
     };
-    let FrameAcc {
-        mut data,
-        started,
-        marks,
-        window,
-        cycles_start,
-        faults_start,
-        ..
-    } = acc;
-    let at = |mark: Mark| marks[mark as usize];
-    let mut iv = [0u64; INTERVALS];
-    iv[IV_BUILD] = micros(Some(started), at(Mark::BuildEnd));
-    iv[IV_LAYOUT] = micros(at(Mark::LayoutStart), at(Mark::LayoutEnd));
-    iv[IV_COMPUTE] = micros(at(Mark::LayoutEnd), at(Mark::PrepaintStart));
-    iv[IV_PREPAINT] = micros(at(Mark::PrepaintStart), at(Mark::PrepaintEnd));
-    iv[IV_PAINT] = micros(at(Mark::PaintStart), at(Mark::PaintEnd));
-    let mut wall_from = started;
-    // GPUI records a draw's timing at the end of `Window::draw`; the one for
-    // this window that brackets our build and paint belongs to this frame.
-    let ours = |timing: &DrawTiming| {
-        timing.draw_start <= started && at(Mark::PaintEnd).is_none_or(|end| timing.draw_end >= end)
-    };
-    match take_trace(window).filter(ours) {
-        Some(timing) => {
-            iv[IV_PRE] = micros(Some(timing.draw_start), Some(started));
-            iv[IV_TAIL] = micros(at(Mark::PaintEnd), Some(timing.draw_end));
-            iv[IV_PRESENT] = micros(Some(timing.draw_end), Some(now));
-            wall_from = timing.draw_start;
-            data.traced = true;
-            data.queue_us = timing.dirty_at.map(|dirty| {
-                timing
-                    .draw_start
-                    .saturating_duration_since(dirty)
-                    .as_micros() as u64
-            });
-            data.invalidations = timing.invalidations;
-        }
-        None => iv[IV_TAIL] = micros(at(Mark::PaintEnd), Some(now)),
-    }
-    data.intervals_us = iv;
-    data.wall_us = now.saturating_duration_since(wall_from).as_micros() as u64;
-    data.cycles = cycles_start
-        .zip(cycles_end)
-        .map(|(start, end)| end.saturating_sub(start));
-    data.faults = faults_start
-        .zip(faults_end)
-        .map(|(start, end)| u64::from(end.wrapping_sub(start)));
+    let trace = take_trace(acc.window).filter(|timing| draws_frame(timing, &acc));
+    let data = close(acc, now, cycles_end, faults_end, trace.as_ref());
 
     let slow = data.wall_us >= super::SLOW_RENDER_US;
     INTERVAL.with(|interval| {
@@ -614,6 +617,90 @@ pub(super) fn end(token: u64) {
     if slow {
         super::defer_frame(data);
     }
+}
+
+/// GPUI records a draw's timing at the end of `Window::draw`; the one for
+/// this window that brackets our build and paint belongs to this frame.
+fn draws_frame(timing: &DrawTiming, acc: &FrameAcc) -> bool {
+    timing.draw_start <= acc.started
+        && acc.marks[Mark::PaintEnd as usize].is_none_or(|end| timing.draw_end >= end)
+}
+
+/// The record of a frame closed at `now`. Each interval runs from where the
+/// previous one ended to its own closing mark, so the intervals add up to
+/// `wall` exactly; a missing mark leaves its interval empty. `cpu_span` is
+/// `wall` minus `pre`.
+fn close(
+    acc: FrameAcc,
+    now: Instant,
+    cycles_end: Option<u64>,
+    faults_end: Option<u32>,
+    trace: Option<&DrawTiming>,
+) -> Box<FrameData> {
+    let FrameAcc {
+        mut data,
+        started,
+        marks,
+        cycles_start,
+        faults_start,
+        ..
+    } = acc;
+    let at = |mark: Mark| marks[mark as usize];
+    let wall_from = trace.map_or(started, |timing| timing.draw_start.min(started));
+    // Microseconds from `wall_from` to each boundary, never before the last.
+    let mut last = 0u64;
+    let mut upto = |boundary: Option<Instant>| {
+        if let Some(boundary) = boundary {
+            let us = boundary.saturating_duration_since(wall_from).as_micros() as u64;
+            last = last.max(us);
+        }
+        last
+    };
+    let build_start = upto(Some(started));
+    let build_end = upto(at(Mark::BuildEnd));
+    let layout_start = upto(at(Mark::LayoutStart));
+    let layout_end = upto(at(Mark::LayoutEnd));
+    let prepaint_start = upto(at(Mark::PrepaintStart));
+    // GPUI's deferred draws (tooltips, popovers) run after the app's prepaint
+    // and before paint; prepaint keeps them.
+    let paint_start = upto(at(Mark::PaintStart).or(at(Mark::PrepaintEnd)));
+    let paint_end = upto(at(Mark::PaintEnd));
+    let draw_end = upto(trace.map(|timing| timing.draw_end));
+    let wall = upto(Some(now));
+
+    let mut iv = [0u64; INTERVALS];
+    iv[IV_PRE] = build_start;
+    iv[IV_BUILD] = build_end - build_start;
+    iv[IV_LAYOUT] = layout_end - layout_start;
+    iv[IV_COMPUTE] = (layout_start - build_end) + (prepaint_start - layout_end);
+    iv[IV_PREPAINT] = paint_start - prepaint_start;
+    iv[IV_PAINT] = paint_end - paint_start;
+    match trace {
+        Some(timing) => {
+            iv[IV_TAIL] = draw_end - paint_end;
+            iv[IV_PRESENT] = wall - draw_end;
+            data.traced = true;
+            data.queue_us = timing.dirty_at.map(|dirty| {
+                timing
+                    .draw_start
+                    .saturating_duration_since(dirty)
+                    .as_micros() as u64
+            });
+            data.invalidations = timing.invalidations;
+        }
+        // `post`: paint end to arena clear.
+        None => iv[IV_TAIL] = wall - paint_end,
+    }
+    data.intervals_us = iv;
+    data.wall_us = wall;
+    data.cpu_span_us = wall - build_start;
+    data.cycles = cycles_start
+        .zip(cycles_end)
+        .map(|(start, end)| end.saturating_sub(start));
+    data.faults = faults_start
+        .zip(faults_end)
+        .map(|(start, end)| u64::from(end.wrapping_sub(start)));
+    data
 }
 
 /// Closes its frame when GPUI drops the root wrapper at arena clear.
@@ -786,7 +873,7 @@ fn cycles_us(cycles: u64, rate: Option<f64>) -> Option<u64> {
         .map(|rate| (cycles as f64 / rate) as u64)
 }
 
-fn interval_fields(out: &mut String, intervals_us: &[u64; INTERVALS], traced: bool, divisor: u64) {
+fn interval_fields(out: &mut String, intervals_us: &[u64; INTERVALS], traced: bool) {
     use std::fmt::Write as _;
     for (index, &us) in intervals_us.iter().enumerate() {
         let label = match (index, traced) {
@@ -794,7 +881,7 @@ fn interval_fields(out: &mut String, intervals_us: &[u64; INTERVALS], traced: bo
             (IV_TAIL, false) => "post",
             _ => INTERVAL_LABELS[index],
         };
-        let _ = write!(out, " {label}={}µs", us / divisor.max(1));
+        let _ = write!(out, " {label}={us}µs");
     }
 }
 
@@ -861,16 +948,20 @@ fn phase_totals(intervals_us: &[u64; INTERVALS]) -> [u64; PHASES] {
 pub(super) fn frame_line(frame: &FrameData, rate: Option<f64>) -> String {
     use std::fmt::Write as _;
     let mut out = format!(
-        "ui-frame[v1 slow] view={} token={} wall={}µs",
+        "ui-frame[v1 slow] view={} token={} wall={}µs cpu_span={}µs",
         frame.view.label(),
         frame.token,
         frame.wall_us,
+        frame.cpu_span_us,
     );
-    match frame.cycles.and_then(|cycles| cycles_us(cycles, rate)) {
-        Some(cpu) => {
-            let _ = write!(out, " cpu={cpu}µs");
+    match frame.cycles {
+        Some(cycles) => {
+            let _ = write!(out, " cycles={cycles}");
+            if let Some(cpu) = cycles_us(cycles, rate) {
+                let _ = write!(out, " cpu_est={cpu}µs");
+            }
         }
-        None => out.push_str(" cpu=unavailable"),
+        None => out.push_str(" cycles=unavailable"),
     }
     match frame.faults {
         Some(faults) => {
@@ -884,7 +975,7 @@ pub(super) fn frame_line(frame: &FrameData, rate: Option<f64>) -> String {
     if frame.traced {
         let _ = write!(out, " invalidations={}", frame.invalidations);
     }
-    interval_fields(&mut out, &frame.intervals_us, frame.traced, 1);
+    interval_fields(&mut out, &frame.intervals_us, frame.traced);
     group_tabs(&mut out, &frame.group_tabs, frame.groups);
     out.push_str(" regions_us(build/layout/prepaint/paint):");
     region_fields(
@@ -899,7 +990,27 @@ pub(super) fn frame_line(frame: &FrameData, rate: Option<f64>) -> String {
     out
 }
 
-pub(super) fn summary_line(summary: &Summary, rate: Option<f64>) -> String {
+/// Average intervals per frame. `pre`, `tail` and `present` need GPUI's
+/// frame trace, so they average over traced frames and `post` over the rest.
+fn summary_interval_fields(out: &mut String, summary: &Summary) {
+    use std::fmt::Write as _;
+    let untraced = summary.frames - summary.traced;
+    let mut field = |label: &str, sum_us: u64, frames: u32| {
+        if frames > 0 {
+            let _ = write!(out, " {label}={}µs", sum_us / u64::from(frames));
+        }
+    };
+    for (index, &sum_us) in summary.intervals_sum_us.iter().enumerate() {
+        let frames = match index {
+            IV_PRE | IV_TAIL | IV_PRESENT => summary.traced,
+            _ => summary.frames,
+        };
+        field(INTERVAL_LABELS[index], sum_us, frames);
+    }
+    field("post", summary.post_sum_us, untraced);
+}
+
+pub(super) fn summary_line(summary: &Summary) -> String {
     use std::fmt::Write as _;
     let span_ms = summary.span_us / 1000;
     let duty = (summary.wall_sum_us * 100)
@@ -924,26 +1035,44 @@ pub(super) fn summary_line(summary: &Summary, rate: Option<f64>) -> String {
         }
         let _ = write!(out, "{count}");
     }
-    let frame_cpu = cycles_us(summary.frame_cycles, rate);
-    match (summary.ui_cpu_us, frame_cpu) {
-        (Some(ui), Some(frames)) => {
+    match summary.ui_cpu_us {
+        Some(ui) => {
+            let _ = write!(out, " ui_cpu={}ms", ui / 1000);
+        }
+        None => out.push_str(" ui_cpu=unavailable"),
+    }
+    // Every frame's cycles must have read for the share to be the frames'. A
+    // frame open across the interval boundary can push it past the whole.
+    let ui_cycles = summary
+        .ui_cycles
+        .filter(|&cycles| cycles > 0 && summary.cycles_n == summary.frames);
+    match summary.ui_cpu_us.zip(ui_cycles) {
+        Some((ui, ui_cycles)) => {
+            let frame_cycles = summary.frame_cycles.min(ui_cycles);
+            let share = |of: u64| {
+                (u128::from(of) * u128::from(frame_cycles) / u128::from(ui_cycles)) as u64
+            };
+            let frames = share(ui);
             let _ = write!(
                 out,
-                " ui_cpu={}ms frame_cpu={}ms outside_cpu={}ms",
-                ui / 1000,
+                " frame_cpu_est={}ms outside_cpu_est={}ms frame_cycle_share={}% frame_cpu_span={}ms",
                 frames / 1000,
-                ui.saturating_sub(frames) / 1000,
+                (ui - frames) / 1000,
+                share(100),
+                summary.cpu_span_sum_us / 1000,
             );
         }
-        _ => out.push_str(" ui_cpu=unavailable"),
+        None => out.push_str(" frame_cpu_est=unavailable"),
     }
-    if let Some(cycles) = summary.ui_cycles {
-        let share = (summary.frame_cycles * 100)
-            .checked_div(cycles)
-            .unwrap_or(0);
-        let _ = write!(out, " frame_cycle_share={share}%");
+    match summary.faults_n {
+        0 => out.push_str(" faults=unavailable"),
+        n => {
+            let _ = write!(out, " faults={}", summary.faults);
+            if n < summary.frames {
+                let _ = write!(out, " faults_frames={n}");
+            }
+        }
     }
-    let _ = write!(out, " faults={}", summary.faults);
     if summary.queue_n > 0 {
         let _ = write!(
             out,
@@ -959,14 +1088,9 @@ pub(super) fn summary_line(summary: &Summary, rate: Option<f64>) -> String {
             summary.invalidations / u64::from(summary.traced)
         );
     }
+    let _ = write!(out, " traced={}/{}", summary.traced, summary.frames);
     out.push_str(" per_frame_avg:");
-    let traced = summary.traced > 0 && summary.traced == summary.frames;
-    interval_fields(
-        &mut out,
-        &summary.intervals_sum_us,
-        traced,
-        u64::from(summary.frames),
-    );
+    summary_interval_fields(&mut out, summary);
     group_tabs(&mut out, &summary.group_tabs, summary.groups);
     out.push_str(" regions_ms(build/layout/prepaint/paint):");
     region_fields(
@@ -984,8 +1108,9 @@ pub(super) fn summary_line(summary: &Summary, rate: Option<f64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FRAMES, FrameAcc, FrameData, IV_BUILD, IV_LAYOUT, IV_PAINT, IV_PREPAINT, MAX_GROUPS, Mark,
-        Phase, REGIONS, Region, Summary, frame_line, mark, open, region_label, summary_line,
+        DrawTiming, FRAMES, FrameAcc, FrameData, IV_BUILD, IV_COMPUTE, IV_LAYOUT, IV_PAINT, IV_PRE,
+        IV_PREPAINT, IV_PRESENT, IV_TAIL, MAX_GROUPS, Mark, Phase, REGIONS, Region, Summary, close,
+        frame_line, mark, open, region_label, running_phase, summary_line,
     };
     use crate::ui_profile::RenderView;
     use std::time::{Duration, Instant};
@@ -1098,7 +1223,8 @@ mod tests {
         frame.group_tabs[1] = 12;
         assert_eq!(
             frame_line(&frame, None),
-            "ui-frame[v1 slow] view=main token=7 wall=80000µs cpu=unavailable faults=unavailable \
+            "ui-frame[v1 slow] view=main token=7 wall=80000µs cpu_span=0µs cycles=unavailable \
+             faults=unavailable \
              build=30000µs layout=10000µs compute=0µs prepaint=5000µs paint=4000µs post=0µs \
              groups=2 tabs=5/12 regions_us(build/layout/prepaint/paint): \
              sidebar=20000/6000/1000/1000 other=9960/7000/1000/3000 layout_late=3000"
@@ -1110,17 +1236,143 @@ mod tests {
         let mut summary = Summary::new();
         let mut frame = FrameData::new(RenderView::Main, 1);
         frame.wall_us = 60_000;
+        frame.cpu_span_us = 55_000;
         frame.cycles = Some(30_000 * 3000);
         summary.add(&frame, true);
         summary.add(&frame, true);
         summary.span_us = 1_000_000;
         summary.ui_cpu_us = Some(100_000);
         summary.ui_cycles = Some(100_000 * 3000);
-        let line = summary_line(&summary, Some(3000.0));
+        let line = summary_line(&summary);
         assert!(line.contains(" frames=2 main=2 popout=0 other_views=0 slow=2 duty=12% "));
         assert!(line.contains(" hist_ms(<8/<16/<33/<50/<100/<250/<1000/more)=0/0/0/0/2/0/0/0"));
         assert!(
-            line.contains(" ui_cpu=100ms frame_cpu=60ms outside_cpu=40ms frame_cycle_share=60%")
+            line.contains(
+                " ui_cpu=100ms frame_cpu_est=60ms outside_cpu_est=40ms frame_cycle_share=60% \
+                 frame_cpu_span=110ms"
+            ),
+            "{line}"
+        );
+    }
+
+    /// Intervals telescope from draw start to arena clear, so a slow record
+    /// accounts for its whole `wall` (regions plus `other` inside the four
+    /// element phases), including the gaps between the root's marks: Root's
+    /// request-layout before the app element, and GPUI's deferred draws
+    /// (tooltips) after the app's prepaint. The counters' span is the same
+    /// frame without `pre`.
+    #[test]
+    fn intervals_cover_the_frame_and_the_counters_cover_all_but_pre() {
+        let draw_start = Instant::now();
+        let at = |ms: u64| draw_start + Duration::from_millis(ms);
+        let mut marks = [None; 7];
+        for (mark, ms) in [
+            (Mark::BuildEnd, 5),
+            (Mark::LayoutStart, 7),
+            (Mark::LayoutEnd, 11),
+            (Mark::PrepaintStart, 12),
+            (Mark::PrepaintEnd, 15),
+            (Mark::PaintStart, 18),
+            (Mark::PaintEnd, 20),
+        ] {
+            marks[mark as usize] = Some(at(ms));
+        }
+        // A tooltip's prepaint closes after the app's prepaint ended.
+        let mut deferred = marks;
+        deferred[Mark::PaintStart as usize] = None;
+        deferred[Mark::PaintEnd as usize] = None;
+        assert_eq!(running_phase(&deferred), Some(Phase::Prepaint as usize));
+
+        let acc = FrameAcc {
+            data: Box::new(FrameData::new(RenderView::Main, 3)),
+            started: at(1),
+            marks,
+            window: Some(1),
+            cycles_start: Some(1_000),
+            faults_start: Some(10),
+            scopes: Vec::new(),
+        };
+        let trace = DrawTiming {
+            window: 1,
+            draw_start,
+            draw_end: at(22),
+            dirty_at: None,
+            invalidations: 0,
+        };
+        let data = close(acc, at(25), Some(4_000), Some(12), Some(&trace));
+        let iv = data.intervals_us;
+        assert_eq!(iv.iter().sum::<u64>(), data.wall_us);
+        assert_eq!(data.wall_us, 25_000);
+        assert_eq!(
+            [
+                iv[IV_PRE],
+                iv[IV_BUILD],
+                iv[IV_LAYOUT],
+                iv[IV_COMPUTE],
+                iv[IV_PREPAINT],
+                iv[IV_PAINT],
+                iv[IV_TAIL],
+                iv[IV_PRESENT],
+            ],
+            [1_000, 4_000, 4_000, 3_000, 6_000, 2_000, 2_000, 3_000]
+        );
+        assert_eq!(data.cpu_span_us + iv[IV_PRE], data.wall_us);
+        assert_eq!((data.cycles, data.faults), (Some(3_000), Some(2)));
+
+        // An untraced frame starts at build; its `post` runs to arena clear.
+        let untraced = close(
+            FrameAcc {
+                data: Box::new(FrameData::new(RenderView::Main, 4)),
+                started: at(1),
+                marks,
+                window: None,
+                cycles_start: None,
+                faults_start: None,
+                scopes: Vec::new(),
+            },
+            at(25),
+            None,
+            None,
+            None,
+        );
+        let iv = untraced.intervals_us;
+        assert_eq!(iv.iter().sum::<u64>(), untraced.wall_us);
+        assert_eq!(untraced.wall_us, 24_000);
+        assert_eq!((iv[IV_PRE], iv[IV_TAIL], iv[IV_PRESENT]), (0, 5_000, 0));
+        assert_eq!(untraced.cpu_span_us, untraced.wall_us);
+    }
+
+    /// A counter that didn't read is `unavailable`, never zero, and a mix of
+    /// traced and untraced frames keeps each kind's own intervals.
+    #[test]
+    fn summary_reports_only_what_was_recorded() {
+        let mut summary = Summary::new();
+        let frame = FrameData::new(RenderView::Main, 1);
+        summary.add(&frame, false);
+        let line = summary_line(&summary);
+        assert!(line.contains(" faults=unavailable"), "{line}");
+        assert!(line.contains(" frame_cpu_est=unavailable"), "{line}");
+
+        let mut traced = FrameData::new(RenderView::Main, 2);
+        traced.traced = true;
+        traced.intervals_us[IV_PRE] = 2_000;
+        traced.intervals_us[IV_TAIL] = 1_000;
+        traced.intervals_us[IV_PRESENT] = 3_000;
+        traced.faults = Some(4);
+        let mut untraced = FrameData::new(RenderView::Main, 3);
+        untraced.intervals_us[IV_TAIL] = 5_000;
+        let mut summary = Summary::new();
+        summary.add(&traced, false);
+        summary.add(&untraced, false);
+        let line = summary_line(&summary);
+        assert!(line.contains(" faults=4 faults_frames=1"), "{line}");
+        assert!(
+            line.contains(" traced=1/2 per_frame_avg: pre=2000µs "),
+            "{line}"
+        );
+        assert!(
+            line.contains(" tail=1000µs present=3000µs post=5000µs "),
+            "{line}"
         );
     }
 }
