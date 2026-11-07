@@ -251,6 +251,8 @@ fn matching_leaf<'a>(node: &'a mut PaneNode, original: &LeafData) -> Option<&'a 
     }
 }
 
+/// Put `restored` beside `target`, taking `restored_size` against
+/// `survivor_size` of the place `target` fills. That place keeps its size.
 fn insert_beside(
     target: &mut PaneNode,
     restored: PaneNode,
@@ -266,9 +268,21 @@ fn insert_beside(
     } = target
         && *existing == direction
     {
+        // Already a row: its panes give up the restored pane's share and keep
+        // their proportions among themselves.
+        let pair = restored_size + survivor_size;
+        let share = if pair > 0.0 {
+            restored_size / pair
+        } else {
+            0.5
+        };
+        let width: f32 = sizes.iter().sum();
+        for size in sizes.iter_mut() {
+            *size *= 1.0 - share;
+        }
         let index = if before { 0 } else { children.len() };
         children.insert(index, restored);
-        sizes.insert(index, restored_size);
+        sizes.insert(index, width * share);
         return;
     }
     let survivor = std::mem::replace(
@@ -676,9 +690,13 @@ mod tests {
             current.as_ref().unwrap().collect_instances(),
             [id(4), id(5), id(3)]
         );
+        let restored = sizes(&current);
+        let [four, five, three] = restored[..] else {
+            panic!("expected three columns: {restored:?}");
+        };
         // 2 is still held, so 3's width belongs where 2's went: to 4, not to
         // the new pane beside it.
         assert!(remove(&mut current, id(3)));
-        assert_eq!(sizes(&current), [1.5, 1.0]);
+        assert_eq!(sizes(&current), [four + three, five]);
     }
 }

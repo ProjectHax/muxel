@@ -1971,6 +1971,8 @@ struct Row {
     y: Uuid,
     x: Uuid,
     b: Uuid,
+    /// Each pane's name in assertions, including any a test adds.
+    names: Vec<(Uuid, char)>,
     _children: Vec<OwnedChild>,
 }
 
@@ -2012,13 +2014,14 @@ impl Row {
             y,
             x,
             b,
+            names: vec![(a, 'A'), (y, 'Y'), (x, 'X'), (b, 'B')],
             _children: children,
         }
     }
 
     fn name(&self, iid: Uuid) -> char {
-        [(self.a, 'A'), (self.y, 'Y'), (self.x, 'X'), (self.b, 'B')]
-            .into_iter()
+        self.names
+            .iter()
             .find(|(id, _)| *id == iid)
             .expect("a pane of the row")
             .1
@@ -2054,21 +2057,32 @@ impl Row {
         self.columns(&durable.project(self.pid).unwrap().layout)
     }
 
-    /// Every pane in the live layout by name, sorted, and the row's total
-    /// width: what any undo must keep, however it puts panes back.
-    fn panes_and_width(&self, app: &MuxelApp) -> (Vec<char>, i32) {
-        let layout = app.workspace.project(self.pid).unwrap().layout.as_ref();
-        let Some(PaneNode::Split { sizes, .. }) = layout else {
+    /// Every pane in `layout` by name, sorted, and the row's total width to
+    /// three places: what any undo must keep, however it puts panes back.
+    fn panes_and_width(&self, layout: &Option<PaneNode>) -> (Vec<char>, String) {
+        let Some(root @ PaneNode::Split { sizes, .. }) = layout else {
             panic!("expected a row: {layout:?}");
         };
-        let mut panes: Vec<_> = layout
-            .unwrap()
+        let mut panes: Vec<_> = root
             .collect_instances()
             .into_iter()
             .map(|iid| self.name(iid))
             .collect();
         panes.sort_unstable();
-        (panes, sizes.iter().sum::<f32>().round() as i32)
+        (panes, format!("{:.3}", sizes.iter().sum::<f32>()))
+    }
+
+    /// Each column's share of the row, in thousandths.
+    fn shares(&self, layout: &Option<PaneNode>) -> Vec<(char, i32)> {
+        let Some(PaneNode::Split { sizes, .. }) = layout else {
+            panic!("expected a row: {layout:?}");
+        };
+        let width: f32 = sizes.iter().sum();
+        self.columns(layout)
+            .into_iter()
+            .zip(sizes)
+            .map(|((name, _), size)| (name, (size / width * 1000.0).round() as i32))
+            .collect()
     }
 }
 
@@ -2222,49 +2236,125 @@ fn two_held_closes_undone_straight_away_restore_exactly_in_either_order() {
     });
 }
 
+/// How the row changes while closes are held, so undo can't put back the
+/// layout a close hid and rebuilds it from the saved one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Edit {
+    /// Drag the divider between the two columns left once Y goes final.
+    DragADivider,
+    /// Split B, the one column left, into B and a new pane C.
+    SplitTheSurvivor,
+}
+
 #[test]
 fn undo_after_the_row_changed_keeps_every_pane_once_and_the_width() {
     with_app(|cx, window| {
-        for newest_first in [true, false] {
-            let row = Row::new(cx, window);
-            let (a, y, x, pid) = (row.a, row.y, row.x, row.pid);
-            window
-                .update(cx, |app, window, cx| {
-                    let mut got = Vec::new();
-                    let older = app.hold_closes(vec![(x, false)], None, cx).unwrap();
-                    let later = app.hold_closes(vec![(y, false)], None, cx).unwrap();
-                    app.finalize_close_group(later, cx);
-                    // A divider drag: [A400, B1200] becomes [A700, B900].
-                    let Some(PaneNode::Split { sizes, .. }) =
-                        &mut app.workspace.project_mut(pid).unwrap().layout
-                    else {
-                        panic!("expected a row");
-                    };
-                    *sizes = vec![700.0, 900.0];
-                    let newest = app.hold_closes(vec![(a, false)], None, cx).unwrap();
-                    let (first, second) = if newest_first {
-                        (newest, older)
-                    } else {
-                        (older, newest)
-                    };
-                    app.undo_close(first, window, cx);
-                    got.push(row.panes_and_width(app));
-                    app.undo_close(second, window, cx);
-                    got.push(row.panes_and_width(app));
-                    // Sizes after an edit are approximate. No pane may be lost
-                    // or doubled, and the row keeps its width.
-                    let between = if newest_first {
-                        vec!['A', 'B']
-                    } else {
-                        vec!['B', 'X']
-                    };
-                    assert_eq!(
-                        got,
-                        [(between, 1600), (vec!['A', 'B', 'X'], 1600)],
-                        "newest first: {newest_first}"
-                    );
-                })
-                .unwrap();
+        let mut got = Vec::new();
+        let mut shares = Vec::new();
+        for edit in [Edit::DragADivider, Edit::SplitTheSurvivor] {
+            for newest_first in [true, false] {
+                let mut row = Row::new(cx, window);
+                // `terminal` opens C as a tab beside the row's first pane.
+                let added = (edit == Edit::SplitTheSurvivor).then(|| terminal(cx, window, row.pid));
+                let c = added.as_ref().map(|(c, ..)| *c);
+                row.names.extend(c.map(|c| (c, 'C')));
+                let (a, y, x, b, pid) = (row.a, row.y, row.x, row.b, row.pid);
+                window
+                    .update(cx, |app, window, cx| {
+                        if let Some(c) = c {
+                            let layout = &mut app.workspace.project_mut(pid).unwrap().layout;
+                            assert!(muxel_core::remove(layout, c));
+                        }
+                        let older = app.hold_closes(vec![(x, false)], None, cx).unwrap();
+                        let later = app.hold_closes(vec![(y, false)], None, cx).unwrap();
+                        app.finalize_close_group(later, cx);
+                        if edit == Edit::DragADivider {
+                            // [A400, B1200] becomes [A700, B900].
+                            let Some(PaneNode::Split { sizes, .. }) =
+                                &mut app.workspace.project_mut(pid).unwrap().layout
+                            else {
+                                panic!("expected a row");
+                            };
+                            *sizes = vec![700.0, 900.0];
+                        }
+                        let newest = app.hold_closes(vec![(a, false)], None, cx).unwrap();
+                        if let Some(c) = c {
+                            // B is all that's left, so splitting it gives [B1, C1].
+                            let layout = &mut app.workspace.project_mut(pid).unwrap().layout;
+                            assert!(muxel_core::split(layout, b, SplitDirection::Horizontal, c));
+                        }
+                        let saved = app.workspace_with_closes_restored();
+                        let saved = row.panes_and_width(&saved.project(pid).unwrap().layout);
+                        let (first, second) = if newest_first {
+                            (newest, older)
+                        } else {
+                            (older, newest)
+                        };
+                        app.undo_close(first, window, cx);
+                        let live = &app.workspace.project(pid).unwrap().layout;
+                        let between = row.panes_and_width(live);
+                        if c.is_some() {
+                            shares.push((newest_first, row.shares(live)));
+                        }
+                        app.undo_close(second, window, cx);
+                        let live = &app.workspace.project(pid).unwrap().layout;
+                        got.push((
+                            edit,
+                            newest_first,
+                            saved,
+                            between,
+                            row.panes_and_width(live),
+                        ));
+                    })
+                    .unwrap();
+            }
         }
+        // Sizes after an edit are approximate. No pane may be lost or doubled,
+        // and the row keeps its width: 1600 after the drag, and 2 once B's
+        // split made a new row of its own.
+        let row = |panes: &[char], width: &str| (panes.to_vec(), width.to_string());
+        assert_eq!(
+            got,
+            [
+                (
+                    Edit::DragADivider,
+                    true,
+                    row(&['A', 'B', 'X'], "1600.000"),
+                    row(&['A', 'B'], "1600.000"),
+                    row(&['A', 'B', 'X'], "1600.000"),
+                ),
+                (
+                    Edit::DragADivider,
+                    false,
+                    row(&['A', 'B', 'X'], "1600.000"),
+                    row(&['B', 'X'], "1600.000"),
+                    row(&['A', 'B', 'X'], "1600.000"),
+                ),
+                (
+                    Edit::SplitTheSurvivor,
+                    true,
+                    row(&['A', 'B', 'C', 'X'], "2.000"),
+                    row(&['A', 'B', 'C'], "2.000"),
+                    row(&['A', 'B', 'C', 'X'], "2.000"),
+                ),
+                (
+                    Edit::SplitTheSurvivor,
+                    false,
+                    row(&['A', 'B', 'C', 'X'], "2.000"),
+                    row(&['B', 'C', 'X'], "2.000"),
+                    row(&['A', 'B', 'C', 'X'], "2.000"),
+                ),
+            ]
+        );
+        // The first pane back takes its saved share of the place B now fills,
+        // and B and C keep their 1:1. A, with X still held, had 400 against B's
+        // 800, so a third. X had 400 against B's 400, so half.
+        assert_eq!(
+            shares,
+            [
+                (true, vec![('A', 333), ('B', 333), ('C', 333)]),
+                (false, vec![('X', 500), ('B', 250), ('C', 250)]),
+            ]
+        );
     });
 }
