@@ -105,26 +105,39 @@ impl Drop for QueuedOutput {
 
 /// Record a finished `git` run. Called only while profiling is on; anything
 /// that isn't git (a remote read goes through `ssh`) is ignored. The caller's
-/// thread builds the record and copies stdout; hashing and formatting happen on
-/// the writer thread.
+/// thread builds the record (see [`launch_record`]); hashing and formatting
+/// happen on the writer thread.
 pub fn git_launched(cmd: &Command, elapsed: Duration, out: &std::io::Result<Output>) {
-    let Some(mut launch) = describe(cmd) else {
+    let Some(launch) = launch_record(cmd, elapsed, out, &PENDING_OUTPUT) else {
         return;
     };
-    launch.caller = CALLER.with(Cell::get);
-    launch.elapsed_us = elapsed.as_micros().min(u64::MAX as u128) as u64;
-    match out {
-        Ok(out) => {
-            launch.status = out.status.code();
-            launch.output = Printed::new(&PENDING_OUTPUT, launch.status, &out.stdout);
-        }
-        Err(_) => launch.output = Printed::Hashed(output_hash(None, &[])),
-    }
     super::ensure_flusher();
     super::defer_record(super::DeferredRecord::GitLaunch {
         at: SystemTime::now(),
         launch: Box::new(launch),
     });
+}
+
+/// The record of a finished `git` run, as its caller's thread builds it. stdout
+/// is copied for the writer to hash; only output that would take `pending` past
+/// [`MAX_PENDING_OUTPUT`] is hashed here, on the caller.
+fn launch_record(
+    cmd: &Command,
+    elapsed: Duration,
+    out: &std::io::Result<Output>,
+    pending: &'static AtomicUsize,
+) -> Option<GitLaunch> {
+    let mut launch = describe(cmd)?;
+    launch.caller = CALLER.with(Cell::get);
+    launch.elapsed_us = elapsed.as_micros().min(u64::MAX as u128) as u64;
+    match out {
+        Ok(out) => {
+            launch.status = out.status.code();
+            launch.output = Printed::new(pending, launch.status, &out.stdout);
+        }
+        Err(_) => launch.output = Printed::Hashed(output_hash(None, &[])),
+    }
+    Some(launch)
 }
 
 /// The subcommand, directory and argument hash of a git `Command`; the
@@ -266,12 +279,13 @@ impl Repeats {
 #[cfg(test)]
 mod tests {
     use super::{
-        Fnv, GitLaunch, MAX_PENDING_OUTPUT, Printed, Repeats, describe, output_hash,
+        Fnv, GitLaunch, MAX_PENDING_OUTPUT, Printed, Repeats, describe, launch_record, output_hash,
         subcommand_label,
     };
     use std::ffi::OsStr;
-    use std::process::Command;
+    use std::process::{Command, Output};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     #[test]
     fn fnv_matches_the_published_test_vectors() {
@@ -317,22 +331,48 @@ mod tests {
         assert_eq!(subcommand_label(OsStr::new("Secret")), "other");
     }
 
+    /// What `git_launched` hands the record queue: the caller copies stdout and
+    /// leaves the hash to the writer's `Repeats::line`, up to the bound on
+    /// queued bytes, past which the caller hashes it.
     #[test]
-    fn output_is_hashed_on_the_writer_within_a_bound_on_queued_bytes() {
+    fn a_launch_record_leaves_hashing_to_the_writer_up_to_a_bound() {
         static PENDING: AtomicUsize = AtomicUsize::new(0);
-        let printed = Printed::new(&PENDING, Some(0), b"main\n");
-        assert!(matches!(printed, Printed::Queued(_)), "copied, not hashed");
-        assert_eq!(printed.hash(Some(0)), output_hash(Some(0), b"main\n"));
+        let mut cmd = Command::new("git");
+        cmd.args(["-C", "/repo", "rev-parse", "--abbrev-ref", "HEAD"]);
+        let status = Command::new("git")
+            .arg("--version")
+            .output()
+            .unwrap()
+            .status;
+        let ran = |stdout: &[u8]| {
+            let out = Ok(Output {
+                status,
+                stdout: stdout.to_vec(),
+                stderr: Vec::new(),
+            });
+            launch_record(&cmd, Duration::from_millis(3), &out, &PENDING).expect("git")
+        };
+        let code = status.code();
+
+        let record = ran(b"main\n");
+        match &record.output {
+            Printed::Queued(output) => assert_eq!(output.bytes, b"main\n", "copied, not hashed"),
+            Printed::Hashed(_) => panic!("hashed by the caller"),
+        }
         assert_eq!(PENDING.load(Ordering::Relaxed), 5);
-        drop(printed);
+        let line = Repeats::default().line(&record);
+        let hash = output_hash(code, b"main\n");
+        assert!(line.contains(&format!("out={hash:016x}")), "{line}");
+        drop(record);
         assert_eq!(PENDING.load(Ordering::Relaxed), 0, "released when dropped");
 
-        let big = vec![b'x'; MAX_PENDING_OUTPUT];
-        let held = Printed::new(&PENDING, Some(0), &big);
-        assert!(matches!(held, Printed::Queued(_)), "up to the bound");
-        let over = Printed::new(&PENDING, Some(0), b"main\n");
-        assert!(matches!(over, Printed::Hashed(_)), "hashed by the caller");
-        assert_eq!(over.hash(Some(0)), output_hash(Some(0), b"main\n"));
+        let held = ran(&vec![b'x'; MAX_PENDING_OUTPUT]);
+        assert!(matches!(held.output, Printed::Queued(_)), "up to the bound");
+        let over = ran(b"main\n");
+        assert!(
+            matches!(over.output, Printed::Hashed(h) if h == hash),
+            "past it, hashed by the caller"
+        );
         drop(held);
         assert_eq!(PENDING.load(Ordering::Relaxed), 0);
     }
