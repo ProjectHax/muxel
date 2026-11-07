@@ -59,6 +59,8 @@ pub struct EditorView {
     rich_copied: bool,
     /// Counts copies, so an earlier copy's timer can't clear a later one's check.
     rich_copy_count: u64,
+    /// A rich-text copy is converting in the background.
+    rich_copy_converting: bool,
     /// Latest external change that could not be applied without discarding edits.
     external_change: Option<ExternalChange>,
     /// Last observed on-disk revision; polled off the UI thread.
@@ -227,6 +229,7 @@ impl EditorView {
             show_rendered: is_markdown || is_image,
             rich_copied: false,
             rich_copy_count: 0,
+            rich_copy_converting: false,
             external_change: None,
             disk_stamp: stamp,
         }
@@ -261,6 +264,7 @@ impl EditorView {
             show_rendered: false,
             rich_copied: false,
             rich_copy_count: 0,
+            rich_copy_converting: false,
             external_change: None,
             disk_stamp: None,
         }
@@ -308,6 +312,27 @@ impl EditorView {
     /// Whether a rich-text copy just succeeded (the header shows a check).
     pub fn rich_text_copied(&self) -> bool {
         self.rich_copied
+    }
+
+    /// Start a rich-text copy: the document to convert, or `None` while an
+    /// earlier copy is still converting, so a repeated click is ignored.
+    pub fn begin_rich_copy(&mut self, cx: &App) -> Option<String> {
+        if self.rich_copy_converting {
+            return None;
+        }
+        self.rich_copy_converting = true;
+        Some(self.text(cx))
+    }
+
+    /// The conversion `begin_rich_copy` started has finished.
+    pub fn end_rich_copy(&mut self) {
+        self.rich_copy_converting = false;
+    }
+
+    /// Whether a rich-text copy is converting in the background.
+    #[cfg(test)]
+    pub fn rich_copy_converting(&self) -> bool {
+        self.rich_copy_converting
     }
 
     /// Show the copied check for a moment.
