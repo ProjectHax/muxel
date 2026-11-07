@@ -329,12 +329,6 @@ impl EditorView {
         self.rich_copy_converting = false;
     }
 
-    /// Whether a rich-text copy is converting in the background.
-    #[cfg(test)]
-    pub fn rich_copy_converting(&self) -> bool {
-        self.rich_copy_converting
-    }
-
     /// Show the copied check for a moment.
     pub fn flash_rich_text_copied(&mut self, cx: &mut Context<Self>) {
         self.rich_copy_count += 1;

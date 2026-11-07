@@ -143,8 +143,7 @@ fn copy_converts_in_the_background_and_writes_afterwards() {
                 0,
                 "converted in the handler"
             );
-            let editor = app.editors[&notes].read(cx);
-            assert!(editor.rich_copy_converting() && !editor.rich_text_copied());
+            assert!(!app.editors[&notes].read(cx).rich_text_copied());
 
             // A second click while it converts is ignored, even after an edit.
             app.editors[&notes].update(cx, |editor, cx| {
@@ -171,12 +170,20 @@ fn copy_converts_in_the_background_and_writes_afterwards() {
     let (html, text) = &written[0];
     assert!(html.contains("<h1>Draft</h1>") && html.contains("<strong>there</strong>"));
     assert_eq!(text, draft, "the first click's document");
+
+    // The check shows, and the pane is no longer converting: a click now
+    // copies again, with the edit.
     window
         .update(&mut cx, |app, _, cx| {
-            let editor = app.editors[&notes].read(cx);
-            assert!(!editor.rich_copy_converting() && editor.rich_text_copied());
+            assert!(app.editors[&notes].read(cx).rich_text_copied());
+            app.copy_rich_text(notes, cx);
         })
         .unwrap();
+    while cx.executor().tick() {}
+    assert_eq!(CONVERSIONS.load(Ordering::SeqCst), 3);
+    let written = writes.0.borrow().clone();
+    assert_eq!(written.len(), 2, "{written:?}");
+    assert_eq!(written[1].1, "# Changed\n");
     drop(cx);
     let _ = std::fs::remove_dir_all(&root);
 }
