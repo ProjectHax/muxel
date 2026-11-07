@@ -242,6 +242,9 @@ impl ProfileLog {
             }
         };
         let mut archives = Vec::new();
+        // Expired archives that couldn't be removed are still on disk, so
+        // they count against the budget too.
+        let mut stuck = 0_u64;
         for entry in fs::read_dir(self.parent())? {
             let entry = entry?;
             if !entry.file_type()?.is_file() {
@@ -266,16 +269,19 @@ impl ProfileLog {
                 ),
                 None => continue,
             };
+            let bytes = entry.metadata()?.len();
             if u64::try_from(today.signed_duration_since(day).num_days())
                 .is_ok_and(|age| age >= self.limits.keep_days)
             {
-                remove(&entry.path());
+                if !remove(&entry.path()) {
+                    stuck = stuck.saturating_add(bytes);
+                }
             } else {
-                archives.push((day, sequence, entry.path(), entry.metadata()?.len()));
+                archives.push((day, sequence, entry.path(), bytes));
             }
         }
         archives.sort_unstable_by(|a, b| (&a.0, &a.1, &a.2).cmp(&(&b.0, &b.1, &b.2)));
-        let mut total = archives.iter().map(|entry| entry.3).sum::<u64>();
+        let mut total = stuck.saturating_add(archives.iter().map(|entry| entry.3).sum::<u64>());
         // Reserve a full live file, avoiding a directory walk for every line.
         let budget = self
             .limits
@@ -587,6 +593,34 @@ mod tests {
         assert!(
             log.append_on(day(15), day(15), "new", |from, to| fs::rename(from, to))
                 .is_err()
+        );
+        assert!(!log.path.exists());
+    }
+
+    /// The same bound when the held archive is past its keep days: a
+    /// failed delete leaves its bytes on disk, so they still count.
+    #[cfg(windows)]
+    #[test]
+    fn held_expired_archive_over_budget_still_refuses_the_record() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let fixture = Fixture::new();
+        let held = fixture.0.join("term.log.2026-11-01.000001");
+        fs::write(&held, "x".repeat(25)).unwrap();
+        // FILE_SHARE_READ | FILE_SHARE_WRITE, without FILE_SHARE_DELETE.
+        let _reader = File::options()
+            .read(true)
+            .share_mode(1 | 2)
+            .open(&held)
+            .unwrap();
+        // Budget: 24 total less an 8-byte live file leaves 16 for archives.
+        let mut log = fixture.log(ProfileLogLimits {
+            total_bytes: 24,
+            ..limits()
+        });
+        assert!(
+            log.append_on(day(15), day(15), "new", |from, to| fs::rename(from, to))
+                .is_err(),
+            "a 25-byte archive that can't be deleted leaves no room under a 24-byte family"
         );
         assert!(!log.path.exists());
     }

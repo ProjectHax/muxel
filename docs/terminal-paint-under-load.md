@@ -114,9 +114,10 @@ UI paths each receive their own budget. Use a distinct live path per process.
 If rename fails (for example, a Windows tailer lacks delete sharing), truncate
 the live file; if truncation fails, skip writes rather than grow beyond the
 bounds. An archive that can't be removed (read-only, or held open without
-delete sharing) is skipped: the rest are still pruned, writes continue while
-the family fits its byte budget, and pruning tries it again at the next roll
-or date. Only a family still over budget skips writes. Each log names its
+delete sharing) is skipped, and its bytes still count toward the budget, even
+past its keep days. The rest are still pruned, writes continue while the
+family fits its byte budget, and pruning tries it again at the next roll or
+date. Only a family still over budget skips writes. Each log names its
 first append or prune failure on stderr once. This fallback can lose history;
 tailers should share read, write, and delete access.
 
