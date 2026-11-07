@@ -167,8 +167,9 @@ in-process conversation switches.
 - Claude's `SessionStart` hook and Grok's session registry report a switch out
   of band, on a clock that can't be ordered exactly against PTY output. Muxel
   reads Grok's up to a tick later, and Claude's when its directory watcher
-  reports the write (up to a tick later without one; at worst thirty seconds
-  later when the watcher loses the event). The report places the switch in an
+  reports the write (up to two seconds later without one, or while the record
+  can't be read; at worst thirty seconds later when the watcher loses the
+  event). The report places the switch in an
   interval: the hook's own timestamp (for an older muxel's hook, its record's
   write time); Grok's registration time through the last instant it can stand
   for (a time written in whole seconds, to the end of that second); or, for a

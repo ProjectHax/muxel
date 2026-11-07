@@ -99,6 +99,9 @@ pub struct SessionDiscoveries {
     bindings: HashMap<Uuid, String>,
     /// Providers whose hook directory a running watcher reports changes in.
     watched: HashSet<SessionProvider>,
+    /// A finished lookup spent a wake that arrived while it ran, so its pane
+    /// is due now. See [`Self::take_redispatch`].
+    redispatch: bool,
 }
 
 impl SessionDiscoveries {
@@ -122,12 +125,25 @@ impl SessionDiscoveries {
         self.watched.contains(&provider)
     }
 
-    /// The pane's hook record changed: its next lookup is due now, or as soon
-    /// as the one in flight finishes. Unknown panes start due anyway.
-    pub fn wake(&mut self, pane: Uuid) {
-        if let Some(state) = self.panes.get_mut(&pane) {
+    /// `provider`'s hook record for the pane changed: its next lookup is due
+    /// now, or as soon as the one in flight finishes. A pane now running
+    /// another provider is left alone, and unknown panes start due anyway.
+    pub fn wake(&mut self, provider: SessionProvider, pane: Uuid) {
+        if let Some(state) = self.panes.get_mut(&pane)
+            && state
+                .key
+                .as_ref()
+                .is_some_and(|key| key.provider == provider)
+        {
             state.wake();
         }
+    }
+
+    /// Whether a lookup finished since the last call had been woken while it
+    /// ran. Its pane is due now, but nothing else asks for a lookup before the
+    /// next tick, so the caller should.
+    pub fn take_redispatch(&mut self) -> bool {
+        std::mem::take(&mut self.redispatch)
     }
 
     /// Every pane of `provider` is due: its watcher may have lost events.
@@ -217,9 +233,13 @@ impl SessionDiscoveries {
         found: bool,
     ) -> bool {
         let quiet = !found && self.watched(request.key.provider);
-        self.panes
-            .get_mut(&request.key.pane)
-            .is_some_and(|state| state.finish_with_quiet(request, current, now, found, quiet))
+        let Some(state) = self.panes.get_mut(&request.key.pane) else {
+            return false;
+        };
+        let woken = state.woken;
+        let valid = state.finish_with_quiet(request, current, now, found, quiet);
+        self.redispatch |= valid && woken;
+        valid
     }
 
     pub fn finish_with_codex_miss(
@@ -264,9 +284,11 @@ impl SessionDiscoveries {
         let Some(state) = self.panes.get_mut(&request.key.pane) else {
             return false;
         };
+        let woken = state.woken;
         if !state.finish_with_quiet(request, current, now, found, quiet) {
             return false;
         }
+        self.redispatch |= woken;
         state.codex_miss = evidence.miss;
         if !found && request.key.provider == SessionProvider::Codex {
             state.codex_owner = owner;
@@ -812,12 +834,12 @@ mod tests {
         assert!(discoveries.finish(&request, Some(&key), now, false));
         // Unwatched, the pane would look again within two seconds.
         assert!(discoveries.begin(key.clone(), now + 2 * SECOND).is_none());
-        discoveries.wake(Uuid::new_v4());
+        discoveries.wake(SessionProvider::Claude, Uuid::new_v4());
         assert!(
             discoveries.begin(key.clone(), now + 3 * SECOND).is_none(),
             "another pane's record"
         );
-        discoveries.wake(key.pane);
+        discoveries.wake(SessionProvider::Claude, key.pane);
         let woken = now + 3 * SECOND;
         let request = discoveries.begin(key.clone(), woken).unwrap();
         assert!(discoveries.finish(&request, Some(&key), woken, false));
@@ -841,18 +863,56 @@ mod tests {
         discoveries.set_watched(SessionProvider::Claude, true);
         let now = Instant::now();
         let request = discoveries.begin(key.clone(), now).unwrap();
-        discoveries.wake(key.pane);
+        discoveries.wake(SessionProvider::Claude, key.pane);
         assert!(
             discoveries.begin(key.clone(), now).is_none(),
             "one at a time"
         );
         assert!(discoveries.finish(&request, Some(&key), now, false));
+        assert!(discoveries.take_redispatch(), "the caller must ask now");
+        assert!(!discoveries.take_redispatch(), "once");
         let request = discoveries.begin(key.clone(), now).unwrap();
         assert!(discoveries.finish(&request, Some(&key), now, false));
+        assert!(!discoveries.take_redispatch(), "no wake, no extra lookup");
         assert!(
             discoveries.begin(key, now + 2 * SECOND).is_none(),
             "the wake is spent"
         );
+    }
+
+    #[test]
+    fn a_wake_between_lookups_needs_no_extra_dispatch() {
+        // The waking caller dispatches itself; nothing is in flight to hold it.
+        let key = claude_key();
+        let mut discoveries = SessionDiscoveries::default();
+        discoveries.set_watched(SessionProvider::Claude, true);
+        let now = Instant::now();
+        let request = discoveries.begin(key.clone(), now).unwrap();
+        assert!(discoveries.finish(&request, Some(&key), now, false));
+        discoveries.wake(SessionProvider::Claude, key.pane);
+        let request = discoveries.begin(key.clone(), now + SECOND).unwrap();
+        assert!(discoveries.finish(&request, Some(&key), now + SECOND, false));
+        assert!(!discoveries.take_redispatch());
+    }
+
+    #[test]
+    fn a_record_name_wakes_only_a_pane_of_its_provider() {
+        // A stale Claude record named for a pane now running Grok.
+        let grok = SessionDiscoveryKey {
+            provider: SessionProvider::Grok,
+            ..claude_key()
+        };
+        let mut discoveries = SessionDiscoveries::default();
+        discoveries.set_watched(SessionProvider::Claude, true);
+        let now = Instant::now();
+        let request = discoveries.begin(grok.clone(), now).unwrap();
+        assert!(discoveries.finish(&request, Some(&grok), now, false));
+        // Grok's first miss waits one second.
+        let half = now + Duration::from_millis(500);
+        discoveries.wake(SessionProvider::Claude, grok.pane);
+        assert!(discoveries.begin(grok.clone(), half).is_none());
+        discoveries.wake(SessionProvider::Grok, grok.pane);
+        assert!(discoveries.begin(grok, half).is_some());
     }
 
     #[test]
