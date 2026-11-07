@@ -24,6 +24,10 @@ unicode-properties = { version = "0.1.4", default-features = false, features = [
 # "Copy as rich text" (`rich_copy`): the same Markdown parser gpui-component's
 # rendered view uses, already in the tree, so this adds an edge, not a crate.
 markdown = "1"
+# Sanitizes the raw HTML that copy puts on the clipboard. 4.0.x is the line on
+# html5ever 0.27, which gpui-component already pulls in (4.1+ moves to 0.31/0.35);
+# 4.0.3 carries the backported fixes for RUSTSEC-2025-0071, 2026-0193 and 2026-0213.
+ammonia = "~4.0.3"
 
 [dev-dependencies]
 serde_json.workspace = true

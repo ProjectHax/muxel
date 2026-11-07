@@ -214,6 +214,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ammonia"
+version = "4.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2752b17bf7511b7fe637392892c8aaf1cd9814d666adc39f0fbd261a4e6858b4"
+dependencies = [
+ "html5ever 0.27.0",
+ "maplit",
+ "once_cell",
+ "tendril",
+ "url",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4800,6 +4813,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "maplit"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e2e65a1a2e43cfcb47a895c4c8b10d1f4a61097f9f254f183aee60cad9c651d"
+
+[[package]]
 name = "markdown"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5103,6 +5122,7 @@ dependencies = [
 name = "muxel-core"
 version = "0.3.5"
 dependencies = [
+ "ammonia",
  "base64",
  "chrono",
  "markdown",

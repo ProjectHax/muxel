@@ -2,41 +2,83 @@
 //! that survives a paste into a mail client (Outlook's Word engine, Gmail).
 //!
 //! Parsing matches the rendered view: GFM (tables, task lists, strikethrough,
-//! autolinks, footnotes), raw HTML included, minus the tags GFM disallows
-//! (`<script>`, `<style>`, …). Every tag of the compiled HTML is then parsed
-//! and written out again for mail. Mail clients drop stylesheets, classes and
-//! form controls, and a relative path points at nothing once pasted, so
-//! presentation goes inline and the rest gets a text stand-in.
+//! autolinks, footnotes) with raw HTML. ammonia then parses the compiled HTML
+//! as a browser would (html5ever) and writes back only the listed elements and
+//! attributes, URLs on the web or to a mail address, and links to a fragment of
+//! the document; any other element leaves its text. Mail clients drop
+//! stylesheets, classes and form controls, and a relative path points at
+//! nothing once pasted, so presentation goes inline and the rest gets a text
+//! stand-in.
 //!
-//! That rewrite is also what makes raw HTML safe to hand to another program.
-//! Only listed elements and attributes are written back, link and image URLs
-//! must be on the web or a mail address, and any other element loses its tags
-//! but keeps its text, as it does in the rendered view. A `<` that doesn't open
-//! a whole tag is written as text.
+//! The rendered view parses each piece of raw HTML on its own, but this parses
+//! the document whole, so a tag that makes what follows it text (`<title>`,
+//! `<script>`, `<select>`, …) would take the rest of the document with it.
+//! Those tags are written as text, as GFM's tag filter does on GitHub.
 
+use ammonia::{Builder, UrlRelative};
 use markdown::{CompileOptions, Options, ParseOptions};
-use std::fmt::Write as _;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
-/// One font stack for code, inline and in blocks.
-const MONO: &str = "font-family:Consolas,Menlo,'Courier New',monospace;font-size:90%";
-/// Outlook's Word engine honours the presentational `border`/`cellpadding`
-/// attributes more reliably than CSS, so tables carry both.
-const TABLE: &str = r#"<table border="1" cellspacing="0" cellpadding="6" style="border-collapse:collapse;border:1px solid #d0d7de">"#;
-const CELL: &str = "border:1px solid #d0d7de;padding:4px 8px";
-const HEADER_CELL_SHADE: &str = ";background-color:#f6f8fa";
-const BLOCKQUOTE: &str = r#"<blockquote style="margin:0 0 0 0.8ex;border-left:3px solid #d0d7de;padding-left:1ex;color:#57606a">"#;
+/// Inline styles mail keeps where it drops a stylesheet. Code in a block takes
+/// its size from the `<code>` inside the `<pre>`.
+const PRE_STYLE: &str = "font-family:Consolas,Menlo,'Courier New',monospace;\
+                         background-color:#f6f8fa;padding:8px 12px;white-space:pre-wrap";
+const CODE_STYLE: &str =
+    "font-family:Consolas,Menlo,'Courier New',monospace;font-size:90%;background-color:#f6f8fa";
+const TABLE_STYLE: &str = "border-collapse:collapse;border:1px solid #d0d7de";
+const TD_STYLE: &str = "border:1px solid #d0d7de;padding:4px 8px";
+const TH_STYLE: &str = "border:1px solid #d0d7de;padding:4px 8px;background-color:#f6f8fa";
+const BLOCKQUOTE_STYLE: &str =
+    "margin:0 0 0 0.8ex;border-left:3px solid #d0d7de;padding-left:1ex;color:#57606a";
+const MARK_STYLE: &str = "background-color:#fff8c5";
 
-/// Elements written back as themselves, keeping only an `id` (a fragment
-/// link's target) and, on the block ones HTML gave it to, `align`.
-const KEPT: &[&str] = &[
-    "b", "br", "caption", "dd", "div", "dl", "dt", "em", "h1", "h2", "h3", "h4", "h5", "h6", "hr",
-    "i", "li", "p", "strong", "sub", "sup", "tbody", "tfoot", "thead", "tr", "u", "ul",
+/// Elements written back as themselves (`del` and the containers below are
+/// renamed on the way out).
+const ELEMENTS: &[&str] = &[
+    "a",
+    "b",
+    "blockquote",
+    "br",
+    "caption",
+    "code",
+    "dd",
+    "del",
+    "div",
+    "dl",
+    "dt",
+    "em",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "hr",
+    "i",
+    "img",
+    "li",
+    "mark",
+    "ol",
+    "p",
+    "pre",
+    "s",
+    "strong",
+    "sub",
+    "sup",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "tr",
+    "u",
+    "ul",
 ];
-const ALIGNED: &[&str] = &["div", "h1", "h2", "h3", "h4", "h5", "h6", "p"];
-/// Elements the rewrite restyles, besides the kept ones.
-const RESTYLED: &[&str] = &["blockquote", "code", "mark", "ol", "table", "td", "th"];
 /// Block containers a mail client may not know, written as `<div>` so their
-/// content still starts on its own line.
+/// content still starts on its own line and an `id` still marks a target.
 const AS_DIV: &[&str] = &[
     "address",
     "article",
@@ -56,11 +98,55 @@ const AS_DIV: &[&str] = &[
     "section",
     "summary",
 ];
-/// Elements with no end tag.
-const VOID: &[&str] = &["br", "hr", "img", "input"];
-/// URL schemes a link keeps. An image keeps only the web ones.
-const LINK_SCHEMES: &[&str] = &["http", "https", "mailto"];
-const IMAGE_SCHEMES: &[&str] = &["http", "https"];
+/// Tags that change how the rest of the document parses and that GFM's tag
+/// filter leaves alone: `<noscript>` content is text when scripting is on,
+/// `<template>` content is never shown, and `<select>` ignores the markup
+/// inside it.
+const AS_TEXT: &[&str] = &["noscript", "select", "template"];
+/// What markdown-rs writes for a task's checkbox. Gmail strips form controls,
+/// which would lose the task's state.
+const UNCHECKED: &str = r#"<input type="checkbox" disabled="" />"#;
+const CHECKED: &str = r#"<input type="checkbox" disabled="" checked="" />"#;
+
+static SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|| {
+    let mut attributes: HashMap<&str, HashSet<&str>> = HashMap::from([
+        ("a", HashSet::from(["href", "name", "title"])),
+        (
+            "img",
+            HashSet::from(["src", "alt", "title", "width", "height"]),
+        ),
+        ("td", HashSet::from(["align", "colspan", "rowspan"])),
+        ("th", HashSet::from(["align", "colspan", "rowspan"])),
+        ("ol", HashSet::from(["start"])),
+    ]);
+    for aligned in ["div", "h1", "h2", "h3", "h4", "h5", "h6", "p"] {
+        attributes.insert(aligned, HashSet::from(["align"]));
+    }
+    let mut builder = Builder::empty();
+    builder
+        .tags(ELEMENTS.iter().chain(AS_DIV).copied().collect())
+        // An `id` is a fragment link's target, `<a name>` the older spelling.
+        .generic_attributes(HashSet::from(["id"]))
+        .tag_attributes(attributes)
+        .url_schemes(HashSet::from(["http", "https", "mailto"]))
+        .url_relative(UrlRelative::Custom(Box::new(fragment_only)))
+        .attribute_filter(checked_value)
+        .link_rel(None)
+        .strip_comments(true)
+        // Outlook's Word engine honours the presentational `border` and
+        // `cellpadding` attributes more reliably than CSS, so tables carry both.
+        .set_tag_attribute_value("table", "border", "1")
+        .set_tag_attribute_value("table", "cellspacing", "0")
+        .set_tag_attribute_value("table", "cellpadding", "6")
+        .set_tag_attribute_value("table", "style", TABLE_STYLE)
+        .set_tag_attribute_value("td", "style", TD_STYLE)
+        .set_tag_attribute_value("th", "style", TH_STYLE)
+        .set_tag_attribute_value("pre", "style", PRE_STYLE)
+        .set_tag_attribute_value("code", "style", CODE_STYLE)
+        .set_tag_attribute_value("blockquote", "style", BLOCKQUOTE_STYLE)
+        .set_tag_attribute_value("mark", "style", MARK_STYLE);
+    builder
+});
 
 /// The Markdown document as mail-safe HTML (a fragment, no `<html>` wrapper).
 ///
@@ -77,449 +163,189 @@ pub fn markdown_to_html(markdown: &str, image_label: &str) -> String {
     // markdown-rs only fails on MDX, which GFM leaves off.
     let html = markdown::to_html_with_options(markdown, &options)
         .unwrap_or_else(|_| format!("<pre>{}</pre>", escape_text(markdown)));
-    for_mail(&html, image_label)
+    let html = as_text(&html).replace(CHECKED, "☑").replace(UNCHECKED, "☐");
+    for_mail(&SANITIZER.clean(&html).to_string(), image_label)
 }
 
-/// Rebuild every tag for mail; the text between tags passes through.
-///
-/// markdown-rs encodes `&`, `"`, `<` and `>` in text and attribute values, so
-/// every `<` that starts a tag is markup it generated or raw HTML the author
-/// wrote, never document text.
-fn for_mail(html: &str, image_label: &str) -> String {
-    let mut mail = Mail {
-        out: String::with_capacity(html.len() + html.len() / 4),
-        image_label,
-        in_pre: false,
-        links: Vec::new(),
-    };
+/// `html` with the `<` of each [`AS_TEXT`] start or end tag written as `&lt;`,
+/// the way GFM's tag filter treats its own list. markdown-rs escapes `<` in
+/// document text, so these come only from raw HTML.
+fn as_text(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
     let mut rest = html;
     while let Some(lt) = rest.find('<') {
-        mail.out.push_str(&rest[..lt]);
-        rest = &rest[lt..];
-        if let Some(body) = rest.strip_prefix("<!--") {
-            // Comments never show in the rendered view. Dropping them also keeps
-            // an author's comment from posing as a CF_HTML fragment marker.
-            let end = if body.starts_with('>') {
-                Some(1)
-            } else if body.starts_with("->") {
-                Some(2)
-            } else {
-                body.find("-->").map(|end| end + 3)
-            };
-            rest = end.map_or("", |end| &body[end..]);
-            continue;
-        }
-        match Tag::scan(rest) {
-            Some((tag, len)) => {
-                if let Some(tag) = tag {
-                    mail.tag(&tag);
-                }
-                rest = &rest[len..];
-            }
-            None => {
-                mail.out.push_str("&lt;");
-                rest = &rest[1..];
-            }
-        }
-    }
-    mail.out.push_str(rest);
-    mail.out
-}
-
-struct Mail<'a> {
-    out: String,
-    image_label: &'a str,
-    /// Inside `<pre>`, whose style covers its `<code>`.
-    in_pre: bool,
-    /// For each open `<a>`, whether its start tag was written.
-    links: Vec<bool>,
-}
-
-impl Mail<'_> {
-    fn tag(&mut self, tag: &Tag) {
-        let name = tag.name.as_str();
-        if tag.end {
-            self.end(name);
-            return;
-        }
-        match name {
-            "a" => self.link(tag),
-            "img" => self.image(tag),
-            // Gmail strips form controls, which would lose a task's state.
-            "input"
-                if tag
-                    .attr("type")
-                    .is_some_and(|kind| kind.eq_ignore_ascii_case("checkbox")) =>
-            {
-                self.out.push(if tag.attr("checked").is_some() {
-                    '☑'
-                } else {
-                    '☐'
-                });
-            }
-            "table" => self.out.push_str(TABLE),
-            "th" | "td" => self.cell(tag),
-            "pre" => {
-                self.in_pre = true;
-                let _ = write!(
-                    self.out,
-                    r#"<pre style="{MONO};background-color:#f6f8fa;padding:8px 12px;white-space:pre-wrap">"#
-                );
-            }
-            // A fenced block's language class means nothing without a
-            // stylesheet; its `<pre>` carries the styling.
-            "code" if self.in_pre => self.out.push_str("<code>"),
-            "code" => {
-                let _ = write!(
-                    self.out,
-                    r#"<code style="{MONO};background-color:#f6f8fa;padding:1px 4px">"#
-                );
-            }
-            "blockquote" => self.out.push_str(BLOCKQUOTE),
-            // `<s>` is plain strikethrough; `<del>` marks an edit, which a word
-            // processor's HTML import may take as a tracked change instead.
-            "del" | "s" => self.out.push_str("<s>"),
-            "mark" => self
-                .out
-                .push_str(r#"<mark style="background-color:#fff8c5">"#),
-            "ol" => {
-                self.out.push_str("<ol");
-                let start = tag
-                    .attr("start")
-                    .filter(|n| is_number(n.strip_prefix('-').unwrap_or(n), 9));
-                if let Some(start) = start {
-                    let _ = write!(self.out, r#" start="{start}""#);
-                }
-                self.out.push('>');
-            }
-            _ if KEPT.contains(&name) => {
-                let _ = write!(self.out, "<{name}");
-                if let Some(id) = tag.attr("id") {
-                    push_attr(&mut self.out, "id", id);
-                }
-                if ALIGNED.contains(&name)
-                    && let Some(align) = tag.attr("align").and_then(alignment)
-                {
-                    let _ = write!(self.out, r#" align="{align}""#);
-                }
-                self.out
-                    .push_str(if VOID.contains(&name) { " />" } else { ">" });
-            }
-            _ if AS_DIV.contains(&name) => self.out.push_str("<div>"),
-            _ => {}
-        }
-    }
-
-    fn end(&mut self, name: &str) {
-        match name {
-            "a" => {
-                if self.links.pop() == Some(true) {
-                    self.out.push_str("</a>");
-                }
-            }
-            "pre" => {
-                self.in_pre = false;
-                self.out.push_str("</pre>");
-            }
-            "del" | "s" => self.out.push_str("</s>"),
-            _ if VOID.contains(&name) => {}
-            _ if KEPT.contains(&name) || RESTYLED.contains(&name) => {
-                let _ = write!(self.out, "</{name}>");
-            }
-            _ if AS_DIV.contains(&name) => self.out.push_str("</div>"),
-            _ => {}
-        }
-    }
-
-    /// A table cell with borders, keeping its alignment and span.
-    fn cell(&mut self, tag: &Tag) {
-        let _ = write!(self.out, "<{}", tag.name);
-        if let Some(align) = tag.attr("align").and_then(alignment) {
-            let _ = write!(self.out, r#" align="{align}""#);
-        }
-        for span in ["colspan", "rowspan"] {
-            if let Some(n) = tag.attr(span).filter(|n| is_number(n, 4)) {
-                let _ = write!(self.out, r#" {span}="{n}""#);
-            }
-        }
-        let shade = if tag.name == "th" {
-            HEADER_CELL_SHADE
-        } else {
-            ""
-        };
-        let _ = write!(self.out, r#" style="{CELL}{shade}">"#);
-    }
-
-    /// A link keeps its tag when the reader can follow it: a web or mail URL,
-    /// or a fragment of this document. Anything else (a path that resolves
-    /// only beside the Markdown file, a script, a `data:` URI) leaves its text,
-    /// the way a local image leaves its alt text. An `id` keeps the tag as a
-    /// fragment's target.
-    fn link(&mut self, tag: &Tag) {
-        let href = tag
-            .attr("href")
-            .map(clean_url)
-            .filter(|url| url.starts_with('#') || has_scheme(url, LINK_SCHEMES));
-        let id = tag.attr("id");
-        self.links.push(href.is_some() || id.is_some());
-        if href.is_none() && id.is_none() {
-            return;
-        }
-        self.out.push_str("<a");
-        if let Some(href) = &href {
-            let _ = write!(self.out, r#" href="{}""#, escape_text(href));
-            if let Some(title) = tag.attr("title") {
-                push_attr(&mut self.out, "title", title);
-            }
-        }
-        if let Some(id) = id {
-            push_attr(&mut self.out, "id", id);
-        }
-        self.out.push('>');
-    }
-
-    /// A web image stays: Outlook embeds it on paste and Gmail proxies it.
-    /// Anything else (a relative or absolute local path, a `data:` URI) becomes
-    /// its alt text, since neither client can show it and classic Outlook drops
-    /// `data:` images.
-    fn image(&mut self, tag: &Tag) {
-        let src = tag.attr("src").map(clean_url).unwrap_or_default();
-        if has_scheme(&src, IMAGE_SCHEMES) {
-            let _ = write!(self.out, r#"<img src="{}""#, escape_text(&src));
-            for attr in ["alt", "title"] {
-                if let Some(value) = tag.attr(attr) {
-                    push_attr(&mut self.out, attr, value);
-                }
-            }
-            for attr in ["width", "height"] {
-                let size = tag
-                    .attr(attr)
-                    .filter(|v| is_number(v.strip_suffix('%').unwrap_or(v), 5));
-                if let Some(size) = size {
-                    let _ = write!(self.out, r#" {attr}="{size}""#);
-                }
-            }
-            self.out.push_str(" />");
-            return;
-        }
-        let name = match tag.attr("alt").filter(|alt| !alt.trim().is_empty()) {
-            Some(alt) => Some(as_written(alt)),
-            None if scheme(&src).as_deref() == Some("data") => None,
-            None => src
-                .rsplit(['/', '\\'])
-                .next()
-                .filter(|file| !file.is_empty())
-                .map(escape_text),
-        };
-        let label = escape_text(self.image_label);
-        let _ = match name {
-            Some(name) => write!(self.out, "<em>[{label}: {name}]</em>"),
-            None => write!(self.out, "<em>[{label}]</em>"),
-        };
-    }
-}
-
-/// One tag as written: its lowercased name and its attributes in order, with
-/// quotes stripped and character references left alone.
-struct Tag<'a> {
-    name: String,
-    end: bool,
-    attrs: Vec<(&'a str, &'a str)>,
-}
-
-impl<'a> Tag<'a> {
-    /// The tag at the start of `s` (which starts with `<`) and its length.
-    /// `None` when the `<` is text: not followed by a name, or not closed by
-    /// `>` before the next `<`. The tag itself is `None` for a declaration or
-    /// processing instruction (`<!DOCTYPE …>`, `<?…?>`), which a browser hides.
-    ///
-    /// Stopping at the next `<` keeps the rewrite linear. Otherwise a run of
-    /// unfinished tags would have each one scan the rest of the document.
-    /// HTML allows a `<` inside a quoted attribute value; markdown-rs never
-    /// writes one, and an author who does gets the tag back as text.
-    fn scan(s: &'a str) -> Option<(Option<Self>, usize)> {
-        let b = s.as_bytes();
-        let end = b.get(1) == Some(&b'/');
-        let name_start = 1 + usize::from(end);
-        if !b.get(name_start).is_some_and(u8::is_ascii_alphabetic) {
-            if !matches!(b.get(1), Some(b'!' | b'?' | b'/')) {
-                return None;
-            }
-            let close = 1 + s[1..].find(['<', '>'])?;
-            return (b[close] == b'>').then_some((None, close + 1));
-        }
-        let stops = |c: u8| c.is_ascii_whitespace() || matches!(c, b'/' | b'>' | b'<');
-        let mut i = name_start;
-        while i < b.len() && !stops(b[i]) {
-            i += 1;
-        }
-        let name = s[name_start..i].to_ascii_lowercase();
-        let mut attrs = Vec::new();
-        loop {
-            while i < b.len() && (b[i].is_ascii_whitespace() || b[i] == b'/') {
-                i += 1;
-            }
-            match b.get(i) {
-                None | Some(b'<') => return None,
-                Some(b'>') => break,
-                Some(_) => {}
-            }
-            let attr_start = i;
-            while i < b.len() && !stops(b[i]) && b[i] != b'=' {
-                i += 1;
-            }
-            let attr = &s[attr_start..i];
-            while i < b.len() && b[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            let mut value = "";
-            if b.get(i) == Some(&b'=') {
-                i += 1;
-                while i < b.len() && b[i].is_ascii_whitespace() {
-                    i += 1;
-                }
-                if let Some(&quote @ (b'"' | b'\'')) = b.get(i) {
-                    let len = s[i + 1..].find([char::from(quote), '<'])?;
-                    if b[i + 1 + len] == b'<' {
-                        return None;
-                    }
-                    value = &s[i + 1..i + 1 + len];
-                    i += len + 2;
-                } else {
-                    let start = i;
-                    while i < b.len() && !b[i].is_ascii_whitespace() && !matches!(b[i], b'>' | b'<')
-                    {
-                        i += 1;
-                    }
-                    value = &s[start..i];
-                }
-            }
-            if !attr.is_empty() {
-                attrs.push((attr, value));
-            }
-        }
-        Some((Some(Tag { name, end, attrs }), i + 1))
-    }
-
-    /// An attribute's value as written. The first one counts, as in a browser.
-    fn attr(&self, want: &str) -> Option<&'a str> {
-        self.attrs
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(want))
-            .map(|&(_, value)| value)
-    }
-}
-
-/// ` name="value"` for a text value (`id`, `title`, `alt`) as written. Its
-/// character references stay for the reader to decode; in text they can't
-/// become markup.
-fn push_attr(out: &mut String, name: &str, value: &str) {
-    let _ = write!(out, r#" {name}="{}""#, as_written(value));
-}
-
-/// Text as written, safe inside a double-quoted attribute or between tags.
-fn as_written(value: &str) -> String {
-    value
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-fn escape_text(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-/// A URL attribute as a browser's URL parser reads it: character references
-/// decoded, surrounding spaces and control characters trimmed, tabs and line
-/// breaks taken out. The rewrite checks this form and writes it back escaped,
-/// so the reader follows exactly the URL that was checked.
-fn clean_url(value: &str) -> String {
-    decode_references(value)
-        .trim_matches(|c: char| c <= ' ')
-        .chars()
-        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
-        .collect()
-}
-
-/// `url`'s scheme, lowercased; `None` for a relative URL.
-fn scheme(url: &str) -> Option<String> {
-    let end = url.find([':', '/', '?', '#'])?;
-    url[end..]
-        .starts_with(':')
-        .then(|| url[..end].to_ascii_lowercase())
-}
-
-fn has_scheme(url: &str, schemes: &[&str]) -> bool {
-    scheme(url).is_some_and(|scheme| schemes.contains(&scheme.as_str()))
-}
-
-/// `value` with the character references decoded that a browser decodes in an
-/// attribute and a script URL can hide behind: numeric ones (`&#106;`,
-/// `&#x6A;`, with or without the `;`) and the five XML ones. Any other named
-/// reference (`&colon;`) stays literal, since the value is written back with
-/// its `&` escaped.
-fn decode_references(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    let mut rest = value;
-    while let Some(amp) = rest.find('&') {
-        out.push_str(&rest[..amp]);
-        rest = &rest[amp..];
-        let (decoded, len) = reference(rest).unwrap_or(('&', 1));
-        out.push(decoded);
-        rest = &rest[len..];
+        out.push_str(&rest[..lt]);
+        rest = &rest[lt + 1..];
+        let name = rest.strip_prefix('/').unwrap_or(rest);
+        let filtered = AS_TEXT.iter().any(|tag| {
+            name.get(..tag.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(tag))
+                && name[tag.len()..]
+                    .starts_with(|c: char| c.is_ascii_whitespace() || c == '/' || c == '>')
+        });
+        out.push_str(if filtered { "&lt;" } else { "<" });
     }
     out.push_str(rest);
     out
 }
 
-/// The character the reference at the start of `s` stands for, and the
-/// reference's length.
-fn reference(s: &str) -> Option<(char, usize)> {
-    const NAMED: [(&str, char); 5] = [
-        ("&amp;", '&'),
-        ("&lt;", '<'),
-        ("&gt;", '>'),
-        ("&quot;", '"'),
-        ("&apos;", '\''),
-    ];
-    if let Some(&(name, decoded)) = NAMED.iter().find(|(name, _)| s.starts_with(name)) {
-        return Some((decoded, name.len()));
-    }
-    let (start, radix) = if s.starts_with("&#x") || s.starts_with("&#X") {
-        (3, 16)
-    } else if s.starts_with("&#") {
-        (2, 10)
-    } else {
-        return None;
+/// A relative link is kept only as a fragment of this document. Any other
+/// path resolves only beside the Markdown file, so the link leaves its text.
+fn fragment_only(url: &str) -> Option<Cow<'_, str>> {
+    url.starts_with('#').then_some(Cow::Borrowed(url))
+}
+
+/// The attribute values worth keeping. URLs arrive decoded and with an allowed
+/// scheme, or relative; an image keeps only a web URL, since neither Outlook
+/// nor Gmail can show a local file or a `data:` URI. Sizes and alignment keep
+/// only the values HTML gave them.
+fn checked_value<'u>(element: &str, attribute: &str, value: &'u str) -> Option<Cow<'u, str>> {
+    let keep = match attribute {
+        "href" | "src" => return url(element, value),
+        "align" => {
+            return ["left", "center", "right", "justify"]
+                .into_iter()
+                .find(|align| align.eq_ignore_ascii_case(value))
+                .map(Cow::Borrowed);
+        }
+        "start" => is_number(value.strip_prefix('-').unwrap_or(value), 9),
+        "colspan" | "rowspan" => is_number(value, 4),
+        "width" | "height" => is_number(value.strip_suffix('%').unwrap_or(value), 5),
+        _ => true,
     };
-    let digits = s[start..]
-        .bytes()
-        .take_while(|&b| char::from(b).is_digit(radix))
-        .count();
-    if digits == 0 {
-        return None;
-    }
-    let end = start + digits;
-    let code = s[start..end].bytes().fold(0u32, |code, b| {
-        code.saturating_mul(radix)
-            .saturating_add(char::from(b).to_digit(radix).unwrap_or(0))
+    keep.then_some(Cow::Borrowed(value))
+}
+
+/// A URL as a browser reads it: no surrounding spaces or controls, and no tab
+/// or line break inside.
+fn url<'u>(element: &str, value: &'u str) -> Option<Cow<'u, str>> {
+    let trimmed = value.trim_matches(|c: char| c <= ' ');
+    let url = if trimmed.contains(['\t', '\n', '\r']) {
+        Cow::Owned(trimmed.replace(['\t', '\n', '\r'], ""))
+    } else {
+        Cow::Borrowed(trimmed)
+    };
+    let web = ["http:", "https:"].iter().any(|scheme| {
+        url.get(..scheme.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(scheme))
     });
-    let decoded = char::from_u32(code)
-        .filter(|&c| c != '\0')
-        .unwrap_or(char::REPLACEMENT_CHARACTER);
-    Some((decoded, end + usize::from(s[end..].starts_with(';'))))
+    (element != "img" || web).then_some(url)
 }
 
-fn alignment(value: &str) -> Option<&'static str> {
-    ["left", "center", "right", "justify"]
-        .into_iter()
-        .find(|align| value.eq_ignore_ascii_case(align))
+/// The changes ammonia doesn't make: a local image becomes its alt text,
+/// `<del>` and the unfamiliar containers get names mail knows, and a link left
+/// with no URL or target leaves only its text.
+///
+/// The input is html5ever's serialization of the cleaned tree. Text escapes
+/// `<`, and every attribute value is double-quoted with `"` escaped, so each
+/// `<` opens a tag that ends at the first `>` outside quotes.
+fn for_mail(html: &str, image_label: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    // Whether each open `<a>` was written, so its end tag matches.
+    let mut links = Vec::new();
+    let mut rest = html;
+    while let Some(lt) = rest.find('<') {
+        out.push_str(&rest[..lt]);
+        rest = &rest[lt..];
+        let Some(len) = tag_len(rest) else {
+            out.push_str(&escape_text(rest));
+            return out;
+        };
+        let tag = &rest[..len];
+        rest = &rest[len..];
+        let end = tag.starts_with("</");
+        let body = &tag[if end { 2 } else { 1 }..len - 1];
+        let name = body.split(' ').next().unwrap_or(body);
+        match name {
+            "a" if end => {
+                if links.pop().unwrap_or(true) {
+                    out.push_str(tag);
+                }
+            }
+            "a" => {
+                let keep = ["href", "id", "name"]
+                    .iter()
+                    .any(|attr| attr_value(body, attr).is_some());
+                links.push(keep);
+                if keep {
+                    out.push_str(tag);
+                }
+            }
+            "img" if attr_value(body, "src").is_none() => {
+                let label = escape_text(image_label);
+                match attr_value(body, "alt")
+                    .map(str::trim)
+                    .filter(|alt| !alt.is_empty())
+                {
+                    // Already escaped as an attribute value, which leaves `<`
+                    // and `>` alone.
+                    Some(alt) => {
+                        let alt = alt.replace('<', "&lt;").replace('>', "&gt;");
+                        out.push_str(&format!("<em>[{label}: {alt}]</em>"));
+                    }
+                    None => out.push_str(&format!("<em>[{label}]</em>")),
+                }
+            }
+            // `<s>` is plain strikethrough; `<del>` marks an edit, which a
+            // word processor's HTML import may take as a tracked change.
+            "del" => rename(&mut out, end, "s", &body[name.len()..]),
+            _ if AS_DIV.contains(&name) => rename(&mut out, end, "div", &body[name.len()..]),
+            _ => out.push_str(tag),
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
-/// One to `max` ASCII digits.
+/// Length of the tag at the start of `s`, up to the first `>` outside double
+/// quotes.
+fn tag_len(s: &str) -> Option<usize> {
+    let mut quoted = false;
+    s.bytes()
+        .position(|b| {
+            if b == b'"' {
+                quoted = !quoted;
+            }
+            b == b'>' && !quoted
+        })
+        .map(|end| end + 1)
+}
+
+/// The value of `attr` in a serialized tag's `name attr="value" …`, still
+/// escaped.
+fn attr_value<'a>(body: &'a str, attr: &str) -> Option<&'a str> {
+    let mut rest = body.split_once(' ')?.1;
+    while let Some((name, after)) = rest.split_once("=\"") {
+        let (value, after) = after.split_once('"')?;
+        if name == attr {
+            return Some(value);
+        }
+        rest = after.strip_prefix(' ').unwrap_or(after);
+    }
+    None
+}
+
+fn rename(out: &mut String, end: bool, name: &str, attrs: &str) {
+    out.push_str(if end { "</" } else { "<" });
+    out.push_str(name);
+    out.push_str(attrs);
+    out.push('>');
+}
+
+fn escape_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn is_number(value: &str, max: usize) -> bool {
     (1..=max).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit())
 }
@@ -530,6 +356,48 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    /// The elements the export may write.
+    const WRITTEN: &[&str] = &[
+        "a",
+        "b",
+        "blockquote",
+        "br",
+        "caption",
+        "code",
+        "dd",
+        "div",
+        "dl",
+        "dt",
+        "em",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "hr",
+        "i",
+        "img",
+        "li",
+        "mark",
+        "ol",
+        "p",
+        "pre",
+        "s",
+        "strong",
+        "sub",
+        "sup",
+        "table",
+        "tbody",
+        "td",
+        "tfoot",
+        "th",
+        "thead",
+        "tr",
+        "u",
+        "ul",
+    ];
+
     /// The document as mail HTML, held to the clipboard's safety rule.
     fn html(markdown: &str) -> String {
         let out = markdown_to_html(markdown, "Image");
@@ -537,27 +405,48 @@ mod tests {
         out
     }
 
-    /// The safety rule, read off the output alone: every `<` opens a tag
-    /// written `</name>` or `<name( attr="value")*( /)?>`, with no event
-    /// handler, no `<` or `>` inside a value, and every link or image URL on
-    /// the web, a mail address or a fragment of the document. A browser parses
-    /// markup of that shape one way only.
+    /// Length of the tag at the start of `s`: up to the first `>` outside
+    /// double quotes.
+    fn tag_len(s: &str) -> Option<usize> {
+        let mut quoted = false;
+        s.bytes()
+            .position(|b| {
+                if b == b'"' {
+                    quoted = !quoted;
+                }
+                b == b'>' && !quoted
+            })
+            .map(|end| end + 1)
+    }
+
+    /// Every tag in `html`, in order: each `<` outside a tag opens one.
+    fn tags(html: &str) -> Vec<&str> {
+        let mut tags = Vec::new();
+        let mut rest = html;
+        while let Some(lt) = rest.find('<') {
+            rest = &rest[lt..];
+            let len = tag_len(rest).unwrap_or_else(|| panic!("unclosed `<` in:\n{html}"));
+            tags.push(&rest[..len]);
+            rest = &rest[len..];
+        }
+        tags
+    }
+
+    /// The safety rule, read off the output alone: every `<` outside a tag
+    /// opens one written `</name>` or `<name( attr="value")*>` for an element
+    /// the export may write, with no event handler, every link on the web, to
+    /// a mail address or to a fragment of the document, and every image on the
+    /// web. A browser parses markup of that shape one way only.
     fn assert_safe(html: &str) {
-        for (at, _) in html.match_indices('<') {
-            let len = html[at..]
-                .find('>')
-                .unwrap_or_else(|| panic!("unclosed `<` at {at} in:\n{html}"));
-            let tag = &html[at..=at + len];
-            let inner = &tag[1..tag.len() - 1];
+        for tag in tags(html) {
+            let len = tag.len();
+            let inner = &tag[1..len - 1];
             let inner = inner.strip_prefix('/').unwrap_or(inner);
             let inner = inner.strip_suffix(" /").unwrap_or(inner);
             let (name, mut attrs) = inner.split_once(' ').unwrap_or((inner, ""));
             assert!(
-                !name.is_empty()
-                    && name
-                        .bytes()
-                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
-                "`<` that opens no tag the export writes: {tag} in:\n{html}"
+                WRITTEN.contains(&name),
+                "element {name:?} the export doesn't write: {tag} in:\n{html}"
             );
             while !attrs.is_empty() {
                 let (attr, rest) = attrs
@@ -569,18 +458,18 @@ mod tests {
                     "attribute {attr:?} in {tag}"
                 );
                 assert!(!attr.starts_with("on"), "event handler in {tag}");
-                assert!(!value.contains(['<', '>']), "markup inside {tag}");
-                if attr == "href" || attr == "src" {
+                let schemes: &[&str] = match attr {
+                    "href" => &["http://", "https://", "mailto:", "#"],
+                    "src" => &["http://", "https://"],
+                    _ => &[],
+                };
+                if !schemes.is_empty() {
                     let url = value
                         .replace("&quot;", "\"")
-                        .replace("&lt;", "<")
-                        .replace("&gt;", ">")
                         .replace("&amp;", "&")
                         .to_ascii_lowercase();
                     assert!(
-                        ["http://", "https://", "mailto:", "#"]
-                            .iter()
-                            .any(|scheme| url.starts_with(scheme)),
+                        schemes.iter().any(|scheme| url.starts_with(scheme)),
                         "URL {url:?} in {tag}"
                     );
                 }
@@ -596,12 +485,11 @@ mod tests {
 
     /// Every opening `<name …>` tag in `html`.
     fn open_tags<'a>(html: &'a str, name: &str) -> Vec<&'a str> {
-        html.match_indices('<')
-            .map(|(i, _)| &html[i..])
-            .filter(|s| {
-                s[1..].starts_with(name) && s[1 + name.len()..].starts_with([' ', '>', '/'])
+        tags(html)
+            .into_iter()
+            .filter(|t| {
+                t[1..].starts_with(name) && t[1 + name.len()..].starts_with([' ', '>', '/'])
             })
-            .map(|s| &s[..=s.find('>').unwrap()])
             .collect()
     }
 
@@ -621,11 +509,11 @@ mod tests {
             "<ul>\n<li>one</li>\n<li>two</li>\n</ul>",
             "<ol>\n<li>first</li>\n<li>second</li>\n</ol>",
             "<p>quoted</p>",
-            "<hr />",
             r#"<a href="https://auto.example.org">https://auto.example.org</a>"#,
         ] {
             assert!(out.contains(expected), "missing {expected:?} in:\n{out}");
         }
+        assert_eq!(open_tags(&out, "hr").len(), 1, "{out}");
         // Strikethrough as `<s>`, never `<del>`.
         assert!(out.contains("<s>gone</s>"), "{out}");
         assert!(!out.contains("<del"), "{out}");
@@ -661,11 +549,9 @@ mod tests {
         assert_eq!((pre.len(), code.len()), (1, 2), "{out}");
         assert!(pre[0].contains("font-family:Consolas"));
         assert!(
-            code[0].contains("font-family:Consolas"),
-            "inline code: {}",
-            code[0]
+            code.iter().all(|tag| tag.contains("font-family:Consolas")),
+            "{out}"
         );
-        assert_eq!(code[1], "<code>", "the block's own <pre> carries the style");
         assert!(!out.contains("class="), "{out}");
         assert!(out.contains(">cargo test</code>"));
         assert!(out.contains("fn main() { let a = 1 &lt; 2; }\n</code></pre>"));
@@ -687,32 +573,80 @@ mod tests {
              ![Logo](https://example.com/logo.png)\n\n![Inline](data:image/png;base64,iVBORw0KGgo=)\n\n\
              <img src=\"data:image/png;base64,iVBORw0KGgo=\" alt=\"Raw > html\">\n\n<img src='C:\\shots\\a.png'>\n",
         );
+        for expected in [
+            "<em>[Image: Architecture diagram]</em>",
+            "<em>[Image: Inline]</em>",
+            "<em>[Image: Raw &gt; html]</em>",
+        ] {
+            assert!(out.contains(expected), "missing {expected:?} in:\n{out}");
+        }
+        // No alt text: the stand-in says only that an image was there.
+        assert_eq!(out.matches("<em>[Image]</em>").count(), 2, "{out}");
+        assert!(!out.contains("data:"), "{out}");
+        let images = open_tags(&out, "img");
+        assert_eq!(images.len(), 1, "{out}");
         assert!(
-            out.contains("<em>[Image: Architecture diagram]</em>"),
+            images[0].contains(r#"src="https://example.com/logo.png""#),
             "{out}"
         );
-        assert!(out.contains("<em>[Image: flow.png]</em>"), "{out}");
-        assert!(out.contains("<em>[Image: Inline]</em>"), "{out}");
-        assert!(out.contains("<em>[Image: Raw &gt; html]</em>"), "{out}");
-        assert!(out.contains("<em>[Image: a.png]</em>"), "{out}");
-        assert!(!out.contains("data:"), "{out}");
-        assert_eq!(
-            open_tags(&out, "img"),
-            [r#"<img src="https://example.com/logo.png" alt="Logo" />"#],
+        assert!(images[0].contains(r#"alt="Logo""#), "{out}");
+    }
+
+    #[test]
+    fn raw_html_the_view_renders_survives_and_comments_go() {
+        let out = html(
+            "<strong>bold</strong>, <u>under</u> and H<sub>2</sub>O\n\nline one<br>line two\n\n\
+             <!-- private note -->\n",
+        );
+        for expected in [
+            "<strong>bold</strong>",
+            "<u>under</u>",
+            "H<sub>2</sub>O",
+            "line one<br",
+        ] {
+            assert!(out.contains(expected), "missing {expected:?} in:\n{out}");
+        }
+        assert!(!out.contains("private note"), "{out}");
+    }
+
+    #[test]
+    fn scripts_styles_and_frames_never_become_elements() {
+        // Their tags show as text, as on GitHub (see the module doc).
+        let out = html(
+            "Before.\n\n<script>alert(1)</script>\n\n<style>p { color: red }</style>\n\n\
+             <iframe src=\"https://evil.example/\">frame</iframe>\n\n\
+             Inline <SCRIPT >alert(2)</script> and <svg><style>x</style></svg>.\n\nAfter.\n",
+        );
+        for name in ["script", "SCRIPT", "style", "iframe", "svg"] {
+            assert!(open_tags(&out, name).is_empty(), "<{name}> in:\n{out}");
+        }
+        assert!(
+            out.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "{out}"
+        );
+        assert!(
+            out.contains("<p>Before.</p>") && out.contains("<p>After.</p>"),
             "{out}"
         );
     }
 
     #[test]
-    fn raw_html_passes_through_except_what_gfm_disallows() {
-        // GFM spec example 652 (the tag filter) plus HTML the rendered view shows.
+    fn a_tag_whose_content_is_text_takes_only_itself() {
+        // In the rendered view each piece of raw HTML parses alone, so one of
+        // these in prose can't hide the rest of the document.
         let out = html(
-            "<strong> <title> <style> <em>\n\nline one<br>line two\n\n<!-- private note -->\n\n<script>alert(1)</script>\n",
+            "Set the <title> and <textarea> tags.\n\n## Next\n\n\
+             Pick with <select>, <noscript> or <template>.\n\n## End\n",
         );
-        assert!(out.contains("<strong> &lt;title> &lt;style> <em>"), "{out}");
-        assert!(out.contains("line one<br />line two"), "{out}");
-        assert!(out.contains("&lt;script>"), "{out}");
-        assert!(!out.contains("private note"), "{out}");
+        for kept in ["<h2>Next</h2>", "<h2>End</h2>"] {
+            assert!(out.contains(kept), "missing {kept:?} in:\n{out}");
+        }
+        for tag in ["title", "textarea", "select", "noscript", "template"] {
+            assert!(
+                out.contains(&format!("&lt;{tag}&gt;")),
+                "<{tag}> isn't text in:\n{out}"
+            );
+        }
     }
 
     #[test]
@@ -724,6 +658,80 @@ mod tests {
         // Markup written as text stays text.
         assert!(out.contains("&lt;table&gt;</code> and 1 &lt; 2"), "{out}");
         assert!(!out.contains("<table"), "{out}");
+    }
+
+    #[test]
+    fn a_quoted_angle_bracket_stays_inside_its_attribute() {
+        // HTML allows `<` in a quoted attribute value, single or double quoted.
+        let out = html(
+            "<a href=\"https://example.com/a\" title=\"1 < 2\">Docs</a> and \
+             <a href='https://example.com/b' title='a < b'>More</a>.\n\n\
+             <img src=\"https://example.com/x.png\" alt=\"x < y\">\n",
+        );
+        assert!(!out.contains("&lt;a") && !out.contains("&lt;img"), "{out}");
+        let links = open_tags(&out, "a");
+        assert!(
+            links
+                .iter()
+                .any(|t| t.contains(r#"href="https://example.com/a""#) && t.contains("1 < 2")),
+            "{out}"
+        );
+        assert!(
+            links
+                .iter()
+                .any(|t| t.contains(r#"href="https://example.com/b""#) && t.contains("a < b")),
+            "{out}"
+        );
+        assert!(
+            out.contains(">Docs</a>") && out.contains(">More</a>"),
+            "{out}"
+        );
+        assert!(
+            open_tags(&out, "img").iter().any(|t| t.contains("x < y")),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn fragment_targets_keep_their_ids() {
+        // Elements the export restyles or renames, and a legacy named anchor.
+        let out = html(
+            "<div><a href=\"#sample\">Sample</a><pre id=\"sample\">x</pre></div>\n\n\
+             <table id=\"t\"><tr><td>c</td></tr></table>\n\n\
+             <blockquote id=\"q\">quoted</blockquote>\n\n\
+             <section id=\"s\">part</section>\n\n\
+             <a name=\"legacy\"></a>Legacy target, <a href=\"#legacy\">back</a>.\n",
+        );
+        for (name, target) in [
+            ("pre", r#"id="sample""#),
+            ("table", r#"id="t""#),
+            ("blockquote", r#"id="q""#),
+            ("div", r#"id="s""#),
+            ("a", r#"name="legacy""#),
+        ] {
+            assert!(
+                open_tags(&out, name).iter().any(|tag| tag.contains(target)),
+                "no <{name} {target}> in:\n{out}"
+            );
+        }
+        assert!(out.contains(r##"<a href="#sample">Sample</a>"##), "{out}");
+    }
+
+    #[test]
+    fn urls_decode_every_named_reference() {
+        // `&sol;` and `&colon;` are HTML character references like `&amp;`.
+        let out = html(
+            "<img src=\"https://example.com/a&sol;b.png\" alt=\"pic\">\n\n\
+             <a href=\"https&colon;//example.com/x\">colon</a> and \
+             <a href=\"https://example.com/?a=1&AMP;b=2\">amp</a>\n",
+        );
+        for expected in [
+            r#"src="https://example.com/a/b.png""#,
+            r#"href="https://example.com/x""#,
+            r#"href="https://example.com/?a=1&amp;b=2""#,
+        ] {
+            assert!(out.contains(expected), "missing {expected:?} in:\n{out}");
+        }
     }
 
     #[test]
@@ -751,14 +759,14 @@ mod tests {
             assert!(!lower.contains(gone), "{gone} survived in:\n{out}");
         }
         assert!(out.contains("<p>para</p>"), "{out}");
-        assert!(
-            out.contains(r#"<img src="https://example.com/x.png" alt="pic" />"#),
-            "{out}"
-        );
-        assert!(
-            out.contains(r#"<img src="https://example.com/y.png" />"#),
-            "{out}"
-        );
+        for src in ["https://example.com/x.png", "https://example.com/y.png"] {
+            assert!(
+                open_tags(&out, "img")
+                    .iter()
+                    .any(|t| t.contains(&format!(r#"src="{src}""#))),
+                "no image {src} in:\n{out}"
+            );
+        }
         assert!(out.contains("<div>block</div>"), "{out}");
     }
 
@@ -809,9 +817,12 @@ mod tests {
              and <someone@example.com>.\n",
         );
         for expected in [
-            r#"<a href="https://example.com/a?b=1&amp;c=2" title="The &quot;best&quot; docs">docs</a>"#,
-            r#"<img src="https://example.com/x.png" alt="A &quot;quoted&quot; alt" title="Single 'quoted' title" />"#,
-            r#"<a href="https://example.com/?q=a&amp;b" title="Say &quot;hi&quot;">raw</a>"#,
+            r#"href="https://example.com/a?b=1&amp;c=2""#,
+            r#"title="The &quot;best&quot; docs""#,
+            r#"alt="A &quot;quoted&quot; alt""#,
+            r#"title="Single 'quoted' title""#,
+            r#"href="https://example.com/?q=a&amp;b""#,
+            r#"title="Say &quot;hi&quot;""#,
             r#"<a href="mailto:someone@example.com">someone@example.com</a>"#,
         ] {
             assert!(out.contains(expected), "missing {expected:?} in:\n{out}");
@@ -857,16 +868,26 @@ mod tests {
     #[test]
     fn unfinished_tags_take_linear_time() {
         // Raw HTML whose tags never close: GFM keeps the whole run as one HTML
-        // block, and every `<` starts a tag with no `>` before the next `<`.
-        let markdown = format!("<div>\n{}", "<a ".repeat(100_000));
+        // block, and every `<` starts a tag that never ends, bare or inside a
+        // quote left open.
+        let inputs = [
+            format!("<div>\n{}", "<a ".repeat(100_000)),
+            format!("<div>\n<a title=\"{}", "<b ".repeat(100_000)),
+        ];
         let (done, finished) = mpsc::channel();
-        std::thread::spawn(move || done.send(markdown_to_html(&markdown, "Image")));
+        std::thread::spawn(move || {
+            for markdown in inputs {
+                let _ = done.send(markdown_to_html(&markdown, "Image"));
+            }
+        });
         // Linear work takes milliseconds, so 10 s leaves room for a loaded
-        // machine. Rescanning the rest of the document at each `<` is about
-        // 1.5e10 byte steps, which ran past the bound.
-        let out = finished
-            .recv_timeout(Duration::from_secs(10))
-            .expect("300 KB of unfinished tags took over 10 s");
-        assert_eq!(out.matches("&lt;a ").count(), 100_000);
+        // machine. The first rewriter rescanned the rest of the document at
+        // each `<`, about 1.5e10 byte steps here, and ran past the bound.
+        for _ in 0..2 {
+            let out = finished
+                .recv_timeout(Duration::from_secs(10))
+                .expect("300 KB of unfinished tags took over 10 s");
+            assert!(!out.contains("<a") && !out.contains("<b"), "{out}");
+        }
     }
 }

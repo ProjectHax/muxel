@@ -1276,8 +1276,9 @@ feature is added or changed, update the matching entry here in the same change**
   Outlook, Gmail or a word processor keeps headings, lists, bold, links, code and
   bordered tables; task items show ☐/☑, web images come along, and local images
   become an `[Image: alt]` placeholder to insert by hand. Links to files beside the
-  document become their text. Raw HTML keeps only the elements and attributes mail
-  understands, and only web and mail links.
+  document become their text; links within it keep their targets. Raw HTML keeps
+  only the elements and attributes mail understands and only web and mail links;
+  script and style tags paste as text, as GitHub shows them.
 - **Rendered-text copy parity** — Ctrl+C and Ctrl+Insert copy the exact selected
   text in rendered Markdown, images, and settings fields without intercepting Ctrl+C
   from a focused terminal.
