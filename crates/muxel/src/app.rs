@@ -16615,6 +16615,9 @@ impl MuxelApp {
         if cfg!(target_os = "linux") {
             html.insert_str(0, r#"<meta charset="utf-8">"#);
         }
+        // On the UI thread, like gpui's own clipboard write: on Windows both open
+        // the clipboard, empty it and set the formats synchronously. arboard
+        // retries the open for up to 25 ms while another process holds it.
         let clipboard = match self.rich_clipboard.take() {
             Some(clipboard) => Ok(clipboard),
             None => arboard::Clipboard::new(),
@@ -24254,6 +24257,10 @@ impl MuxelApp {
                                     } else {
                                         IconName::Copy
                                     })
+                                    // Also the accessible name, which gpui-component's
+                                    // Button takes only from its label. It stays put
+                                    // while the icon shows the check.
+                                    .label(t("Copy as rich text"))
                                     .tooltip(if copied {
                                         t("Copied")
                                     } else {
