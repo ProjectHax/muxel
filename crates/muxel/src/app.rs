@@ -6938,6 +6938,14 @@ impl Render for PopoutView {
                     v.read(cx).session().write_user_input(b"\x1b[Z");
                 }
             }))
+            .on_action(cx.listener(|_, a: &muxel_terminal::OpenLink, _w, cx| {
+                MuxelApp::open_popout_link(&a.url, a.pane, OpenFocus::Focus, cx);
+            }))
+            .on_action(
+                cx.listener(|_, a: &muxel_terminal::OpenLinkBackground, _w, cx| {
+                    MuxelApp::open_popout_link(&a.url, a.pane, OpenFocus::Background, cx);
+                }),
+            )
             .child(
                 // Intercept the title-bar X to confirm before closing (which
                 // terminates the terminal).
@@ -7446,6 +7454,18 @@ enum GitDiffTab {
     #[default]
     Files,
     Worktrees,
+}
+
+/// Whether opening a file, diff or page moves focus to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenFocus {
+    /// Focus it in the window that shows its project, raising that window, or
+    /// showing the project in the main window when no window does.
+    Focus,
+    /// A middle-click or "Open in new tab": focus stays where it is in every
+    /// window. The resource only comes to the front of its group, unless one
+    /// of that group's tabs has focus, which then stays in front.
+    Background,
 }
 
 fn link_source_project(workspace: &Workspace, source: Option<Uuid>) -> Option<Uuid> {
@@ -13847,7 +13867,7 @@ impl MuxelApp {
             }
             for (source, url) in new_windows {
                 if browser_popup_url_allowed(&url) {
-                    self.open_link_from(&url, Some(source), window, cx);
+                    self.open_link_from(&url, Some(source), OpenFocus::Focus, window, cx);
                 }
             }
             if changed {
@@ -15170,6 +15190,7 @@ impl MuxelApp {
                 url,
                 ResourceOrigin::Chrome { near: target },
                 Some(placement),
+                OpenFocus::Focus,
                 window,
                 cx,
             );
@@ -15590,25 +15611,45 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_link_from(&a.url, Some(a.pane), window, cx);
+        self.open_link_from(&a.url, Some(a.pane), OpenFocus::Focus, window, cx);
     }
 
-    /// A middle-clicked terminal link, routed from the terminal it was clicked
-    /// in. The click doesn't move focus, and the open gives it back to the pane
-    /// that had it, so terminal input continues where it was.
+    /// A middle-clicked terminal link, or the right-click menu's "Open in new
+    /// tab", routed from the terminal it was clicked in. Focus stays where it is
+    /// in every window, so terminal input continues where it was.
     fn on_open_link_background(
         &mut self,
         a: &muxel_terminal::OpenLinkBackground,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let previous = self.active_instance;
-        self.open_link_from(&a.url, Some(a.pane), window, cx);
-        if let Some(previous) = previous
-            && self.workspace.instance(previous).is_some()
-        {
-            self.focus_instance(previous, window, cx);
-        }
+        self.open_link_from(&a.url, Some(a.pane), OpenFocus::Background, window, cx);
+    }
+
+    /// A link clicked in a popped-out terminal. It opens in the window showing
+    /// the terminal's project, else the main window, and never in the popout's
+    /// own: an editor or page belongs to the window it's made in. A foreground
+    /// open raises that window.
+    fn open_popout_link(url: &str, pane: Uuid, focus: OpenFocus, cx: &mut App) {
+        let Some(app) = cx
+            .try_global::<MuxelHandle>()
+            .map(|handle| handle.0.clone())
+        else {
+            return;
+        };
+        let target = app.read_with(cx, |app, _| {
+            let pid = app.workspace.instance(pane)?.project_id;
+            app.window_showing(pid).or(app.main_window)
+        });
+        let Ok(Some(target)) = target else {
+            return;
+        };
+        Self::update_in_window(&app, target, cx, |app, window, cx| {
+            app.open_link_from(url, Some(pane), focus, window, cx);
+            if focus == OpenFocus::Focus {
+                window.activate_window();
+            }
+        });
     }
 
     /// Route a link relative to `source`, the pane it came from (a terminal, or
@@ -15621,6 +15662,7 @@ impl MuxelApp {
         &mut self,
         url: &str,
         source: Option<Uuid>,
+        focus: OpenFocus,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -15656,6 +15698,7 @@ impl MuxelApp {
                         canonical_url.clone(),
                         origin,
                         None,
+                        focus,
                         window,
                         cx,
                     )
@@ -15667,7 +15710,7 @@ impl MuxelApp {
             if target.path.is_file()
                 && let Some(pid) = source_project
                 && let Some(iid) =
-                    self.open_editor_at(pid, Some(target.path.clone()), origin, window, cx)
+                    self.open_editor_at(pid, Some(target.path.clone()), origin, focus, window, cx)
             {
                 if let Some(line) = target.line
                     && let Some(editor) = self.editors.get(&iid)
@@ -15699,7 +15742,8 @@ impl MuxelApp {
         #[cfg(not(target_os = "linux"))]
         {
             if source_project.is_none_or(|pid| {
-                self.open_browser_in_project(pid, url.to_string(), origin, None, window, cx)
+                let url = url.to_string();
+                self.open_browser_in_project(pid, url, origin, None, focus, window, cx)
                     .is_none()
             }) {
                 cx.open_url(url);
@@ -15708,17 +15752,20 @@ impl MuxelApp {
     }
 
     /// Open the embedded browser pane on `url` in `pid`, placed as `placement`
-    /// asks or else by where `origin` is (or seeding an empty project), or focus
-    /// and refresh the pane already showing it. Returns the instance id. (Linux
-    /// routes links to the separate browser window instead; restored
-    /// cross-platform browser panes go through spawn_project_terminals_now.)
+    /// asks or else by where `origin` is (or seeding an empty project), or
+    /// refresh the pane already showing it; either is then focused or brought
+    /// forward as `focus` says. Returns the instance id. (Linux routes links to
+    /// the separate browser window instead; restored cross-platform browser
+    /// panes go through spawn_project_terminals_now.)
     #[cfg(not(target_os = "linux"))]
+    #[allow(clippy::too_many_arguments)]
     fn open_browser_in_project(
         &mut self,
         pid: Uuid,
         url: String,
         origin: ResourceOrigin,
         placement: Option<PlacementMode>,
+        focus: OpenFocus,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Uuid> {
@@ -15752,7 +15799,7 @@ impl MuxelApp {
                     }
                 });
             }
-            self.focus_resource(iid, window, cx);
+            self.focus_resource(iid, focus, window, cx);
             self.persist();
             cx.notify();
             return Some(iid);
@@ -15764,7 +15811,7 @@ impl MuxelApp {
         }
         let view = cx.new(|cx| crate::browser::BrowserView::new(iid, pid, url, window, cx));
         self.browsers.insert(iid, view);
-        self.focus_resource(iid, window, cx);
+        self.focus_resource(iid, focus, window, cx);
         self.persist();
         cx.notify();
         Some(iid)
@@ -16047,13 +16094,16 @@ impl MuxelApp {
     }
 
     /// Open `path` (None = a new Untitled buffer) as an editor pane in `pid`,
-    /// placed by where `origin` is (or seeding if the project is empty). If the
-    /// file is already open, focuses that pane. Returns the instance id.
+    /// placed by where `origin` is (or seeding if the project is empty), or
+    /// reuse the pane that already has the file open, in whichever project.
+    /// Either is then focused or brought forward as `focus` says. Returns the
+    /// instance id.
     fn open_editor_at(
         &mut self,
         pid: Uuid,
         path: Option<PathBuf>,
         origin: ResourceOrigin,
+        focus: OpenFocus,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Uuid> {
@@ -16072,7 +16122,7 @@ impl MuxelApp {
             if let Some(editor) = self.editors.get(&iid).cloned() {
                 editor.update(cx, |editor, cx| editor.reload_if_clean(window, cx));
             }
-            self.focus_resource(iid, window, cx);
+            self.focus_resource(iid, focus, window, cx);
             return Some(iid);
         }
         let instance = Instance::editor(pid, path.clone());
@@ -16102,7 +16152,7 @@ impl MuxelApp {
             })
             .detach();
         }
-        self.focus_resource(iid, window, cx);
+        self.focus_resource(iid, focus, window, cx);
         self.persist();
         cx.notify();
         Some(iid)
@@ -16189,7 +16239,7 @@ impl MuxelApp {
             if let Some(ed) = self.editors.get(&iid).cloned() {
                 ed.update(cx, |e, cx| e.refresh_diff(window, cx));
             }
-            self.focus_resource(iid, window, cx);
+            self.focus_resource(iid, OpenFocus::Focus, window, cx);
             return;
         }
 
@@ -16201,19 +16251,33 @@ impl MuxelApp {
         let config = self.editor_config();
         let ed = cx.new(|cx| EditorView::diff(dir, config, window, cx));
         self.editors.insert(iid, ed);
-        self.focus_resource(iid, window, cx);
+        self.focus_resource(iid, OpenFocus::Focus, window, cx);
         self.persist();
         cx.notify();
     }
 
-    /// Focus a resource just opened, or found already open. A maximized pane
-    /// in its project that doesn't hold it would hide it, so the maximize ends
-    /// and the resource shows beside the pane that opened it.
-    fn focus_resource(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+    /// Focus a resource just opened, or found already open, or with
+    /// [`OpenFocus::Background`] only bring it forward. A maximized pane in its
+    /// project that doesn't hold it would hide it, so the maximize ends and the
+    /// resource shows beside the pane that opened it.
+    ///
+    /// Focus lands in the window that shows the resource's project, which can
+    /// be another window than this one (a reopened file lives in its own
+    /// project), raising it. When no window shows the project, the main window
+    /// switches to it.
+    fn focus_resource(
+        &mut self,
+        iid: Uuid,
+        focus: OpenFocus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pid) = self.workspace.instance(iid).map(|i| i.project_id) else {
+            return;
+        };
         let hidden = self.maximized.is_some_and(|max| {
             self.workspace
-                .instance(iid)
-                .and_then(|instance| self.workspace.project(instance.project_id))
+                .project(pid)
                 .and_then(|project| project.layout.as_ref())
                 .filter(|layout| layout.leaf_containing(iid).is_some())
                 .and_then(|layout| layout.tab_group(max))
@@ -16222,7 +16286,78 @@ impl MuxelApp {
         if hidden {
             self.maximized = None;
         }
-        self.focus_instance(iid, window, cx);
+        if focus == OpenFocus::Background {
+            self.bring_forward(iid, pid, window, cx);
+            return;
+        }
+        let shown = self.window_showing(pid);
+        match shown.or(self.main_window) {
+            Some(target) if target.window_id() != window.window_handle().window_id() => {
+                // Focusing there needs the app, which this update holds.
+                let app = cx.weak_entity();
+                cx.defer(move |cx| {
+                    Self::update_in_window(&app, target, cx, |app, window, cx| {
+                        app.focus_resource(iid, OpenFocus::Focus, window, cx);
+                        window.activate_window();
+                    });
+                });
+            }
+            _ => {
+                if shown.is_none() {
+                    self.select_project_with_attendance(pid, false, window, cx);
+                }
+                self.focus_instance(iid, window, cx);
+            }
+        }
+    }
+
+    /// Put `iid` at the front of its group without moving focus. A group with a
+    /// tab that has focus (the app's focused pane, or the pane focused in the
+    /// window showing the group) keeps that tab in front instead, even when
+    /// placing `iid` there brought it forward: otherwise the pane taking the
+    /// keys would be hidden.
+    fn bring_forward(&mut self, iid: Uuid, pid: Uuid, window: &Window, cx: &mut Context<Self>) {
+        let Some(group) = self
+            .workspace
+            .project(pid)
+            .and_then(|project| project.layout.as_ref())
+            .and_then(|layout| layout.tab_group(iid))
+            .map(<[Uuid]>::to_vec)
+        else {
+            return;
+        };
+        // A reused resource can live in another window than this one.
+        let elsewhere = self
+            .window_showing(pid)
+            .filter(|shown| shown.window_id() != window.window_handle().window_id());
+        let focused = group.into_iter().find(|&tab| {
+            self.active_instance == Some(tab)
+                || self
+                    .pane_focus_handle(tab, cx)
+                    .is_some_and(|handle| match elsewhere {
+                        None => handle.is_focused(window),
+                        Some(shown) => shown
+                            .update(cx, |_, shown, _| handle.is_focused(shown))
+                            .unwrap_or(false),
+                    })
+        });
+        if let Some(project) = self.workspace.project_mut(pid) {
+            set_active_tab(&mut project.layout, focused.unwrap_or(iid));
+            cx.notify();
+        }
+    }
+
+    /// The focus handle of pane `iid`'s docked view, if it has one.
+    fn pane_focus_handle(&self, iid: Uuid, cx: &App) -> Option<FocusHandle> {
+        if let Some(view) = self.terminals.get(&iid) {
+            return Some(view.read(cx).focus_handle(cx));
+        }
+        if let Some(editor) = self.editors.get(&iid) {
+            return Some(editor.read(cx).focus_handle(cx));
+        }
+        self.browsers
+            .get(&iid)
+            .map(|browser| browser.read(cx).focus_handle(cx))
     }
 
     /// Place a non-agent resource. Explicit New Tab/New Pane commands keep their
@@ -16645,7 +16780,8 @@ impl MuxelApp {
                     let origin = ResourceOrigin::Chrome {
                         near: self.active_instance,
                     };
-                    let _ = self.open_editor_at(pid, Some(path), origin, window, cx);
+                    let _ =
+                        self.open_editor_at(pid, Some(path), origin, OpenFocus::Focus, window, cx);
                 }
             }
             SearchItem::RunCommand(cmd) => self.run_palette_command(cmd, window, cx),
@@ -16733,7 +16869,8 @@ impl MuxelApp {
         let origin = ResourceOrigin::Chrome {
             near: self.active_instance,
         };
-        if let Some(iid) = self.open_editor_at(pid, Some(hit.path.clone()), origin, window, cx)
+        let path = Some(hit.path.clone());
+        if let Some(iid) = self.open_editor_at(pid, path, origin, OpenFocus::Focus, window, cx)
             && let Some(ed) = self.editors.get(&iid).cloned()
         {
             ed.update(cx, |e, cx| e.goto_line(hit.line, window, cx));
@@ -17954,7 +18091,7 @@ impl MuxelApp {
         {
             self.add_event(NotifKind::Error, t("Project memory"), format!("{e}"));
         }
-        self.open_editor_at(pid, Some(path), origin, window, cx);
+        self.open_editor_at(pid, Some(path), origin, OpenFocus::Focus, window, cx);
     }
 
     /// Ensure the project's `.muxel/MEMORY.md` + `.gitignore` entry exist, off the
@@ -23209,7 +23346,7 @@ impl MuxelApp {
             let origin = ResourceOrigin::Chrome {
                 near: self.active_instance,
             };
-            self.open_editor_at(pid, Some(path), origin, window, cx);
+            self.open_editor_at(pid, Some(path), origin, OpenFocus::Focus, window, cx);
         }
     }
 
@@ -24178,6 +24315,7 @@ impl MuxelApp {
                                                 url,
                                                 ResourceOrigin::Pane(iid),
                                                 None,
+                                                OpenFocus::Focus,
                                                 window,
                                                 cx,
                                             );
@@ -25928,7 +26066,8 @@ impl MuxelApp {
                                 let origin = ResourceOrigin::Chrome {
                                     near: this.active_instance,
                                 };
-                                this.open_editor_at(pid, Some(full), origin, window, cx);
+                                let focus = OpenFocus::Focus;
+                                this.open_editor_at(pid, Some(full), origin, focus, window, cx);
                             }
                         })),
                 )

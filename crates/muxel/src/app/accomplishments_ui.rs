@@ -543,7 +543,7 @@ impl MuxelApp {
         {
             self.add_event(NotifKind::Error, t("Accomplishment log"), format!("{e}"));
         }
-        self.open_editor_at(pid, Some(path), origin, window, cx);
+        self.open_editor_at(pid, Some(path), origin, OpenFocus::Focus, window, cx);
     }
 
     /// Step the retention window by `delta` days (Settings), pruning open logs.

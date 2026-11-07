@@ -1204,9 +1204,10 @@ feature is added or changed, update the matching entry here in the same change**
   underlines the link and shows a pointing-hand cursor (Ctrl/Cmd down re-hit-tests
   without requiring a mouse move).
 - **Links in new tabs** — middle-clicking a terminal link opens it without stealing
-  terminal focus; browser target=_blank, window.open, Ctrl+click, and middle-click
-  requests stay in the source project and open as Muxel tabs. Right-clicking a
-  terminal link opens link actions instead of copying or pasting through the PTY.
+  focus in any window; browser target=_blank, window.open, Ctrl+click, and
+  middle-click requests stay in the source project and open as Muxel tabs, a
+  popped-out terminal's in its project's window. Right-clicking a terminal link
+  opens link actions instead of copying or pasting through the PTY.
 - **Focus reporting** — forwards focus in/out to the PTY (DECSET 1004) so agents
   know when their pane is active.
 - **OSC-52 clipboard** — programs in the terminal (including over SSH/tmux) can
@@ -1293,15 +1294,21 @@ feature is added or changed, update the matching entry here in the same change**
   main, secondary, and popped-out editor windows.
 - **Resources open beside their pane** — a file, diff or web page opened from a
   pane (a terminal link, a pane's diff button, an HTML **Preview**, a page's
-  new-window link) opens as a tab in the pane next to it: the one on its right,
-  or on its left when it sits at the right edge. A link goes beside the pane it
-  was clicked in, even one that didn't have focus. A pane with no neighbour in
-  its row splits once, and its later opens join that new column. Files opened
-  from the file browser, palette, find panel, sidebar or git panel join the
-  nearest pane of the same type instead. An already-open file or page is focused
-  and refreshed wherever it is, and explicit New Tab and New Pane commands still
-  use the requested placement. Opening a resource as a tab preserves the
-  surrounding split geometry, including narrow resource columns.
+  new-window link) opens as a tab in the pane next to it, whatever that pane
+  holds: the one on its right, or on its left when it sits at the right edge. A
+  link goes beside the pane it was clicked in, even one that didn't have focus.
+  A pane with no neighbour in its row splits once, and its later opens join that
+  new column. Opens with no pane behind them (the file browser, palette, find
+  panel, sidebar or git panel) join the nearest pane of the same type instead,
+  and so do links from a popped-out terminal, which has left the layout; those
+  open in the window showing the terminal's project. A middle-click or **Open in
+  new tab** places the resource the same way and leaves focus where it is in
+  every window. A file already open anywhere, or a page already open in the same
+  project, is refreshed and focused where it is: the window showing its project
+  comes to the front, or the main window switches to that project. Explicit New
+  Tab and New Pane commands still use the requested placement. Opening a
+  resource as a tab preserves the surrounding split geometry, including narrow
+  resource columns.
 - **Resize preferences** — project, file/memory, and right-hand tool sidebars keep
   their preferred logical-pixel widths as the window changes size. The center
   splits redistribute proportionally at every level. Temporary minimum-size
