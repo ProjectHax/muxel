@@ -842,3 +842,77 @@ fn reopening_a_file_behind_the_dashboard_shows_it() {
         assert_eq!(focused(cx, secondary), secondary_focus);
     });
 }
+
+#[test]
+fn reopening_a_file_no_window_shows_from_a_second_window_focuses_it_only_in_the_main_window() {
+    with_app(|cx, main| {
+        let hidden = project(cx, main, "main window, not shown");
+        let shown = project(cx, main, "main window");
+        let other = project(cx, main, "second window");
+        let (notes, readme, todo) = main
+            .update(cx, |app, _, _| {
+                (
+                    text_file(app, hidden, "notes.txt"),
+                    text_file(app, shown, "readme.txt"),
+                    text_file(app, other, "todo.txt"),
+                )
+            })
+            .unwrap();
+        let near = ResourceOrigin::Chrome { near: None };
+        let open = open_file(cx, main, main, hidden, &notes, near);
+        let secondary = secondary_window(cx, main, other);
+        let caller = main.update(cx, |app, _, _| pane(app, other, None)).unwrap();
+        let held = open_file(
+            cx,
+            main,
+            secondary,
+            other,
+            &todo,
+            ResourceOrigin::Pane(caller),
+        );
+        let held_focus = editor_focus(cx, main, held);
+        let app = main.entity(cx).unwrap();
+
+        // Going to a line, and reloading a changed file, both focus the editor
+        // in the window they run in: here, the second window.
+        let line = format!("{}#L2", muxel_terminal::file_uri(&notes));
+        for (url, text) in [
+            (line, "notes\n"),
+            (muxel_terminal::file_uri(&notes), "changed\n"),
+        ] {
+            // The main window turns to another project's file, so no window
+            // shows the notes' project.
+            open_file(cx, main, main, shown, &readme, near);
+            std::fs::write(&notes, text).unwrap();
+            assert_eq!(focused(cx, secondary), Some(held_focus.clone()));
+
+            // A Ctrl+click on its path in the second window.
+            let link = muxel_terminal::OpenLink {
+                url: url.clone(),
+                pane: caller,
+            };
+            cx.update_window(secondary.into(), |_, window, cx| {
+                app.update(cx, |app, cx| app.on_open_link(&link, window, cx))
+            })
+            .unwrap();
+            cx.run_until_parked();
+
+            assert_eq!(
+                focused(cx, secondary),
+                Some(held_focus.clone()),
+                "{url}: the second window was handed the main window's file"
+            );
+            assert_eq!(
+                focused(cx, main),
+                Some(editor_focus(cx, main, open)),
+                "{url}: the main window didn't focus the file"
+            );
+            main.read_with(cx, |app, cx| {
+                assert_eq!(app.editors.len(), 3, "{url}: the file opened twice");
+                assert_eq!(app.editors[&open].read(cx).text(cx), text, "{url}");
+                assert_eq!(app.workspace.active_project, Some(hidden), "{url}");
+            })
+            .unwrap();
+        }
+    });
+}

@@ -11292,6 +11292,13 @@ impl MuxelApp {
         )
     }
 
+    /// The window that focuses project `pid`'s panes and opens its links. That's
+    /// the one showing it, else the main window, which switches to the project
+    /// to focus a pane.
+    fn project_window(&self, pid: Uuid) -> Option<AnyWindowHandle> {
+        self.window_showing(pid).or(self.main_window)
+    }
+
     /// The window showing project `pid` now, read without a window.
     fn shown_window(
         this: &WeakEntity<Self>,
@@ -15674,7 +15681,7 @@ impl MuxelApp {
         };
         let target = app.read_with(cx, |app, _| {
             let pid = app.workspace.instance(pane)?.project_id;
-            app.window_showing(pid).or(app.main_window)
+            app.project_window(pid)
         });
         let Ok(Some(target)) = target else {
             return;
@@ -15699,7 +15706,8 @@ impl MuxelApp {
     /// whichever window shows it. So every window's focus is noted first. A
     /// background open puts each one back afterwards. A foreground open puts
     /// back only this window's, and only when it was left holding a pane that
-    /// another window shows, which focuses the pane itself.
+    /// [`Self::project_window`] gives to another window. That window focuses
+    /// the pane itself.
     fn open_link_from(
         &mut self,
         url: &str,
@@ -15718,8 +15726,8 @@ impl MuxelApp {
                     .focused(cx)
                     .and_then(|focused| self.pane_holding(&focused, window, cx))
                     .and_then(|iid| self.workspace.instance(iid))
-                    .and_then(|instance| self.window_showing(instance.project_id))
-                    .is_some_and(|shown| shown.window_id() != here);
+                    .and_then(|instance| self.project_window(instance.project_id))
+                    .is_some_and(|target| target.window_id() != here);
                 if elsewhere {
                     self.give_back_focus(&kept[..1], window, cx);
                 }
@@ -16331,10 +16339,10 @@ impl MuxelApp {
     /// project that doesn't hold it would hide it, so the maximize ends and the
     /// resource shows beside the pane that opened it.
     ///
-    /// Focus lands in the window that shows the resource's project, which can
-    /// be another window than this one (a reopened file lives in its own
-    /// project), raising it. When no window shows the project, the main window
-    /// switches to it.
+    /// Focus lands in [`Self::project_window`], raising it. That's the window
+    /// that shows the resource's project, which can be another window than this
+    /// one (a reopened file lives in its own project). When no window shows the
+    /// project, it's the main window, which switches to it.
     fn focus_resource(
         &mut self,
         iid: Uuid,
@@ -16365,8 +16373,7 @@ impl MuxelApp {
             }
             return;
         }
-        let shown = self.window_showing(pid);
-        match shown.or(self.main_window) {
+        match self.project_window(pid) {
             Some(target) if target.window_id() != window.window_handle().window_id() => {
                 // Focusing there needs the app, which this update holds.
                 let app = cx.weak_entity();
@@ -16378,7 +16385,7 @@ impl MuxelApp {
                 });
             }
             _ => {
-                if shown.is_none() {
+                if self.window_showing(pid).is_none() {
                     self.select_project_with_attendance(pid, false, window, cx);
                 }
                 // A hotbar view filling the main window would hide it.
@@ -16392,11 +16399,6 @@ impl MuxelApp {
 
     /// Put each window's focus back as `kept` noted it, and bring the tab that
     /// holds it to the front of its group, where an open may have covered it.
-    ///
-    /// A window that had nothing focused gets that back by focusing a handle
-    /// that's dropped at once: GPUI blurs any window whose focused handle is
-    /// released, and `Window::blur` takes different arguments on the two GPUI
-    /// revisions muxel builds against.
     fn give_back_focus(
         &mut self,
         kept: &[(AnyWindowHandle, Option<FocusHandle>)],
@@ -16410,10 +16412,7 @@ impl MuxelApp {
                 if window.focused(cx) != *focus {
                     match focus {
                         Some(focus) => window.focus(focus, cx),
-                        None => {
-                            let nothing = cx.focus_handle();
-                            window.focus(&nothing, cx);
-                        }
+                        None => window.blur(),
                     }
                 }
                 focus

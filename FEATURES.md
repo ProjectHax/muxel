@@ -1306,7 +1306,8 @@ feature is added or changed, update the matching entry here in the same change**
   every window, even when the file jumps to a line or reloads. A file already
   open anywhere, or a page already open in the same project, is refreshed and
   focused where it is: the window showing its project comes to the front, or the
-  main window switches to that project. A resource focused in the main window is
+  main window switches to that project. When that's another window, the one the
+  link was clicked in keeps its own focus. A resource focused in the main window is
   shown even when the Dashboard or another hotbar view covered the panes. Explicit New
   Tab and New Pane commands still use the requested placement. Opening a
   resource as a tab preserves the surrounding split geometry, including narrow
