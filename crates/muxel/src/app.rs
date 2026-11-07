@@ -24566,22 +24566,35 @@ impl MuxelApp {
                                 let reading = self.readings.state(tab);
                                 (reading != ReadState::Idle).then(|| {
                                     let playing = reading == ReadState::Playing;
-                                    StripIconButton::new(
-                                        SharedString::from(format!("tabra-{}", tab.simple())),
-                                        Icon::empty().path(if playing {
-                                            "icons/volume-2.svg"
-                                        } else {
-                                            "icons/pause.svg"
-                                        }),
-                                        if playing {
-                                            t("Reading aloud — click to pause")
-                                        } else {
-                                            t("Reading paused — click to resume")
-                                        },
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, _e, _w, cx| this.toggle_pane_reading(tab, cx),
-                                    ))
+                                    // A full `Button`, not `StripIconButton`: its tooltip
+                                    // flips with the click, and only the managed tooltip
+                                    // cancels a pending show on press. stop_propagation
+                                    // so pausing isn't a focus/drag.
+                                    div()
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        })
+                                        .child(
+                                            Button::new(SharedString::from(format!(
+                                                "tabra-{}",
+                                                tab.simple()
+                                            )))
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(Icon::empty().path(if playing {
+                                                "icons/volume-2.svg"
+                                            } else {
+                                                "icons/pause.svg"
+                                            }))
+                                            .tooltip(if playing {
+                                                t("Reading aloud — click to pause")
+                                            } else {
+                                                t("Reading paused — click to resume")
+                                            })
+                                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                                this.toggle_pane_reading(tab, cx)
+                                            })),
+                                        )
                                 })
                             })
                             .child(

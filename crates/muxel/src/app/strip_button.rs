@@ -1,11 +1,16 @@
 //! The pane strip's icon buttons: split, diff, maximize, pop out and close per
-//! pane, close and read-aloud per tab, and `+` for a new tab.
+//! pane, close per tab, and `+` for a new tab.
 //!
 //! The strips draw every frame, one of these per tab plus up to seven per pane.
 //! gpui-component's `Button` builds a nested label element and a managed tooltip
-//! around each icon, which made the buttons most of the strips' frame cost. This
-//! draws the same xsmall ghost icon button as a single element. It keeps the
-//! colours, size, focus ring, tab stop and mouse-down handling.
+//! around each icon, a large share of the strips' frame cost. This draws the
+//! same xsmall ghost icon button as a single element. It keeps the colours,
+//! size, focus ring, tab stop and mouse-down handling.
+//!
+//! The tooltip is GPUI's own, which unlike the managed one doesn't cancel a
+//! pending show when the button is pressed: a quick click can still bring up
+//! the tooltip built at hover time. Give it fixed text only; a button whose
+//! tooltip changes with its click (like the read-aloud toggle) stays a `Button`.
 
 use super::*;
 use gpui::accesskit::Role;
