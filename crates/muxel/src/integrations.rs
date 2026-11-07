@@ -1112,15 +1112,44 @@ enum FileHead {
 }
 
 /// Environment variables that choose the repository or change how git looks
-/// for it. Git children inherit muxel's environment, and the file read can't
+/// for it. Git children inherit muxel's environment, and the file read doesn't
 /// follow these, so any of them set leaves the answer to git.
-const GIT_DISCOVERY_ENV: [&str; 5] = [
+/// `GIT_CEILING_DIRECTORIES` is followed instead (see [`ceiling_dirs`]): it is
+/// commonly set for good, and bailing on it would turn the read off entirely.
+const GIT_DISCOVERY_ENV: [&str; 4] = [
     "GIT_DIR",
     "GIT_COMMON_DIR",
     "GIT_OBJECT_DIRECTORY",
-    "GIT_CEILING_DIRECTORIES",
     "GIT_DISCOVERY_ACROSS_FILESYSTEM",
 ];
+
+/// `GIT_CEILING_DIRECTORIES` as git reads it: absolute folders, separated by
+/// `;` on Windows and `:` elsewhere, each resolved to its real path. git drops
+/// a relative entry and one that can't be resolved. `None` for what this
+/// doesn't model, which the caller leaves to git: an entry after an empty one
+/// (git then compares it unresolved), a path git counts as absolute and Rust
+/// doesn't (`\dir`, `D:dir`), or a value that isn't Unicode.
+fn ceiling_dirs(value: &OsStr) -> Option<Vec<PathBuf>> {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    let mut dirs = Vec::new();
+    let mut after_empty = false;
+    for entry in value.to_str()?.split(separator) {
+        if entry.is_empty() {
+            after_empty = true;
+            continue;
+        }
+        let bytes = entry.as_bytes();
+        let git_absolute = bytes[0] == b'/'
+            || (cfg!(windows) && (bytes[0] == b'\\' || (bytes.len() > 1 && bytes[1] == b':')));
+        if git_absolute != Path::new(entry).is_absolute() || (git_absolute && after_empty) {
+            return None;
+        }
+        if git_absolute && let Ok(real) = real_dir(Path::new(entry)) {
+            dirs.push(real);
+        }
+    }
+    Some(dirs)
+}
 
 /// The branch `dir`'s HEAD names, when the files settle what git would print:
 /// the repository git would use (see [`find_git_dir`]), a HEAD of exactly
@@ -1132,15 +1161,22 @@ const GIT_DISCOVERY_ENV: [&str; 5] = [
 /// `safe.directory`) still gets its branch read, which is display-only.
 ///
 /// [`FileHead::AskGit`] for anything else: a variable from
-/// [`GIT_DISCOVERY_ENV`] set in `env`, a detached HEAD, a HEAD naming another
-/// kind of ref or a name git rejects (reftable's placeholder `.invalid` among
-/// them), a bare repository, a `.git` git can't use, or a file that can't be
-/// read.
+/// [`GIT_DISCOVERY_ENV`] set in `env`, a ceiling [`ceiling_dirs`] can't read, a
+/// detached HEAD, a HEAD naming another kind of ref or a name git rejects
+/// (reftable's placeholder `.invalid` among them), a bare repository, a `.git`
+/// git can't use, or a file that can't be read.
 fn head_from_files(dir: &Path, env: impl Fn(&str) -> Option<OsString>) -> FileHead {
     if GIT_DISCOVERY_ENV.iter().any(|key| env(key).is_some()) {
         return FileHead::AskGit;
     }
-    let git_dir = match find_git_dir(dir) {
+    let ceilings = match env("GIT_CEILING_DIRECTORIES") {
+        None => Vec::new(),
+        Some(value) => match ceiling_dirs(&value) {
+            Some(dirs) => dirs,
+            None => return FileHead::AskGit,
+        },
+    };
+    let git_dir = match find_git_dir(dir, &ceilings) {
         Ok(None) => return FileHead::NoRepo,
         Ok(Some(GitDir::Dot(git_dir))) => git_dir,
         Ok(Some(GitDir::Bare(_) | GitDir::Broken(_))) | Err(_) => return FileHead::AskGit,
@@ -1265,7 +1301,9 @@ pub struct GitRefStamp {
 }
 
 pub fn git_ref_stamp(dir: &Path) -> GitRefStamp {
-    let Ok(Some(found)) = find_git_dir(dir) else {
+    // No ceilings: a ceiling only stops git short of a repo the walk would
+    // find, and watching that repo costs a re-check that still finds none.
+    let Ok(Some(found)) = find_git_dir(dir, &[]) else {
         return GitRefStamp::default();
     };
     let (GitDir::Dot(git_dir) | GitDir::Bare(git_dir) | GitDir::Broken(git_dir)) = found;
@@ -1321,17 +1359,22 @@ enum GitDir {
 
 /// The git dir for `dir`, found as git finds it. git starts from the folder's
 /// real path, since its `chdir` resolves symlinks and junctions, and walks up to
-/// the nearest folder with a `.git` or that is a repository itself. On Linux
-/// and macOS it also stops at a filesystem boundary. `Ok(None)` when there is
-/// none, or when `dir` is missing or not a folder, where git can't start.
-/// `Err` when `dir` can't be resolved.
-fn find_git_dir(dir: &Path) -> std::io::Result<Option<GitDir>> {
+/// the nearest folder with a `.git` or that is a repository itself. It never
+/// walks up into the nearest of `ceilings` (real paths, see [`ceiling_dirs`])
+/// strictly above the start, and on Linux and macOS it also stops at a
+/// filesystem boundary. `Ok(None)` when there is none, or when `dir` is missing
+/// or not a folder, where git can't start. `Err` when `dir` can't be resolved.
+fn find_git_dir(dir: &Path, ceilings: &[PathBuf]) -> std::io::Result<Option<GitDir>> {
     let real = match real_dir(dir) {
         Ok(real) if real.is_dir() => real,
         Ok(_) => return Ok(None),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
+    let ceiling = ceilings
+        .iter()
+        .filter(|c| real.starts_with(c) && real != **c)
+        .max_by_key(|c| c.as_os_str().len());
     #[cfg(unix)]
     let elsewhere = {
         use std::os::unix::fs::MetadataExt as _;
@@ -1339,6 +1382,11 @@ fn find_git_dir(dir: &Path) -> std::io::Result<Option<GitDir>> {
         move |d: &Path| std::fs::metadata(d).map(|m| m.dev()).ok() != Some(device)
     };
     for d in real.ancestors() {
+        // Both are ancestors of `real`, so `d` is below the ceiling exactly
+        // when it is longer.
+        if d != real && ceiling.is_some_and(|c| d.as_os_str().len() <= c.as_os_str().len()) {
+            return Ok(None);
+        }
         #[cfg(unix)]
         if d != real && elsewhere(d) {
             return Ok(None);
@@ -7818,6 +7866,22 @@ mod tests {
         }
         repo.git(&["symbolic-ref", "HEAD", "refs/heads/feature/x"]);
 
+        // A ceiling that doesn't fall between the folder and its repo (here one
+        // above the repo, and one elsewhere) leaves the read on.
+        let above = repo.path().parent().unwrap().to_path_buf();
+        let elsewhere = lib_temp_dir();
+        let separator = if cfg!(windows) { ";" } else { ":" };
+        let mut both = above.clone().into_os_string();
+        both.push(separator);
+        both.push(&elsewhere);
+        let ceiling = |key: &str| (key == "GIT_CEILING_DIRECTORIES").then(|| both.clone());
+        assert_eq!(
+            head_from_files(&deeper, ceiling),
+            FileHead::Branch("feature/x".into()),
+            "ceilings above the repo and elsewhere"
+        );
+        lib_cleanup(&elsewhere);
+
         // git can't read this repo any more, yet the branch still comes back:
         // it was read without starting git.
         std::fs::write(repo.path().join(".git").join("config"), "[core\n").unwrap();
@@ -7951,6 +8015,21 @@ mod tests {
             elsewhere.path(),
             &[("GIT_DIR", &outer_git)],
             "GIT_DIR naming another repository",
+        );
+
+        // git checks the folder itself, then won't walk up into the ceiling.
+        let sub = outer.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let outer_dir = outer.path().to_path_buf();
+        check(
+            &sub,
+            &[("GIT_CEILING_DIRECTORIES", &outer_dir)],
+            "a ceiling at the repo root, above the folder",
+        );
+        check(
+            outer.path(),
+            &[("GIT_CEILING_DIRECTORIES", &outer_dir)],
+            "a ceiling at the folder itself",
         );
 
         let broken = outer.path().join("broken");
