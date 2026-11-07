@@ -507,23 +507,29 @@ fn open_in_new_tab_from_a_terminals_menu_keeps_focus_where_the_menu_leaves_it() 
                 })
             })
             .unwrap();
+        // A right-click lands on a drawn terminal. Wait until the window's last
+        // frame holds B's terminal under the window's root, so the menu's
+        // action has B's node to start from; on a missing node it's a no-op.
+        let (root, b_focus) = main
+            .read_with(cx, |app, cx| {
+                let own = app.secondary_windows.iter().find(|s| s.pid == pid);
+                let root = own.unwrap().view.read(cx).focus_handle.clone();
+                (root, b_view.read(cx).focus_handle(cx))
+            })
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            // The real shells and GPUI's virtual paint timers both advance
-            // before the panes draw their terminals.
+            // The real shell and GPUI's virtual paint timers both advance
+            // before the pane draws its terminal and the window redraws.
             cx.executor().advance_clock(Duration::from_millis(300));
             cx.run_until_parked();
-            let drawn = main
-                .read_with(cx, |app, cx| {
-                    [a, b]
-                        .iter()
-                        .all(|iid| app.terminals[iid].read(cx).has_visible_content())
-                })
+            let drawn = cx
+                .update_window(secondary, |_, window, _| root.contains(&b_focus, window))
                 .unwrap();
             if drawn {
                 break;
             }
-            assert!(Instant::now() < deadline, "the terminals never drew");
+            assert!(Instant::now() < deadline, "B's terminal never drew");
             std::thread::sleep(Duration::from_millis(20));
         }
         let a_focus = main
@@ -549,7 +555,15 @@ fn open_in_new_tab_from_a_terminals_menu_keeps_focus_where_the_menu_leaves_it() 
         assert_eq!(focused(cx, secondary), Some(a_focus));
         main.read_with(cx, |app, _| {
             assert_eq!(app.editors.len(), 1, "the file opened twice");
-            assert_eq!(front_tab(app, pid, b), f, "the file didn't come forward");
+            let front = front_tab(app, pid, b);
+            let name = [(a, "A"), (b, "B"), (f, "F")]
+                .into_iter()
+                .find(|(iid, _)| *iid == front)
+                .map(|(_, name)| name);
+            assert_eq!(
+                front, f,
+                "the file didn't come forward: {name:?} is in front"
+            );
             assert_eq!(app.active_instance, Some(a));
         })
         .unwrap();
