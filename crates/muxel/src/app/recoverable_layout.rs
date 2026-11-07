@@ -2,6 +2,56 @@ use muxel_core::{LeafData, PaneNode, SplitDirection, remove};
 use std::collections::HashSet;
 use uuid::Uuid;
 
+/// What one close group's hide did to one project's live layout: the layout
+/// just before it took its panes out, and just after.
+pub(super) struct LiveHide {
+    pub before: Option<PaneNode>,
+    pub after: Option<PaneNode>,
+}
+
+/// Undo one close group in one project. While the live layout is still what
+/// the hide left, the layout from just before it goes back exactly, less any of
+/// its panes whose close went final. Otherwise the layout changed since, and
+/// [`restore_layout`] replays the closes over the durable snapshot.
+pub(super) fn restore_hidden(
+    current: &mut Option<PaneNode>,
+    hide: Option<&LiveHide>,
+    original: &Option<PaneNode>,
+    restoring: &HashSet<Uuid>,
+    closed: &[Uuid],
+) {
+    let present: HashSet<_> = current
+        .as_ref()
+        .map(PaneNode::collect_instances)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    if !restoring.iter().any(|id| !present.contains(id)) {
+        return;
+    }
+    if let Some(hide) = hide
+        && same(current, &hide.after)
+    {
+        let mut restored = hide.before.clone();
+        remove_in_close_order(
+            &mut restored,
+            |id| !present.contains(id) && !restoring.contains(id),
+            closed,
+        );
+        *current = restored;
+        return;
+    }
+    restore_layout(current, original, restoring, closed);
+}
+
+/// The same layout, up to float rounding in the sizes.
+fn same(a: &Option<PaneNode>, b: &Option<PaneNode>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.same_layout(b),
+        (a, b) => a.is_none() && b.is_none(),
+    }
+}
+
 /// Restore held instances without replaying layout edits made during the hold.
 /// Capture `original` from the durable layout (including earlier held groups),
 /// so independent groups retain the topology needed for either restoration order.
@@ -32,11 +82,7 @@ pub(super) fn restore_layout(
     remove_in_close_order(&mut expected, |id| !present.contains(id), closed);
     // Sizes added in another order can still round differently. Compare up to
     // that rounding.
-    let unchanged = match (current.as_ref(), expected.as_ref()) {
-        (Some(current), Some(expected)) => current.same_layout(expected),
-        (current, expected) => current.is_none() && expected.is_none(),
-    };
-    if unchanged {
+    if same(current, &expected) {
         let mut restored = original.clone();
         remove_in_close_order(
             &mut restored,

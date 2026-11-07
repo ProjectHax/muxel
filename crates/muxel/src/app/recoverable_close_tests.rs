@@ -1962,6 +1962,116 @@ fn undo_during_a_worktree_question_keeps_the_pane_out_of_its_answer() {
     });
 }
 
+/// Four equal 400 px columns A, Y, X, B in a project of their own, with live
+/// terminals. Y was split off B; the others have no recorded origin, so X gives
+/// its width to Y beside it.
+struct Row {
+    pid: Uuid,
+    a: Uuid,
+    y: Uuid,
+    x: Uuid,
+    b: Uuid,
+    _children: Vec<OwnedChild>,
+}
+
+impl Row {
+    fn new(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -> Self {
+        let pid = project(cx, window);
+        let mut ids = [Uuid::nil(); 4];
+        let mut children = Vec::new();
+        for id in &mut ids {
+            let (iid, _, child) = terminal(cx, window, pid);
+            *id = iid;
+            children.push(child);
+        }
+        let [a, y, x, b] = ids;
+        window
+            .update(cx, |app, _, _| {
+                let panes = ids.map(|iid| (iid, Uuid::new_v4()));
+                let from_b = panes[3].1;
+                app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::Split {
+                    direction: SplitDirection::Horizontal,
+                    sizes: vec![400.0; 4],
+                    children: panes
+                        .iter()
+                        .map(|&(iid, pane_id)| {
+                            PaneNode::Leaf(LeafData {
+                                pane_id,
+                                tabs: vec![iid],
+                                active: 0,
+                                split_from: (iid == y).then_some(from_b),
+                            })
+                        })
+                        .collect(),
+                });
+            })
+            .unwrap();
+        Self {
+            pid,
+            a,
+            y,
+            x,
+            b,
+            _children: children,
+        }
+    }
+
+    fn name(&self, iid: Uuid) -> char {
+        [(self.a, 'A'), (self.y, 'Y'), (self.x, 'X'), (self.b, 'B')]
+            .into_iter()
+            .find(|(id, _)| *id == iid)
+            .expect("a pane of the row")
+            .1
+    }
+
+    /// The row's columns by name, in whole pixels.
+    fn columns(&self, layout: &Option<PaneNode>) -> Vec<(char, i32)> {
+        let Some(PaneNode::Split {
+            sizes, children, ..
+        }) = layout
+        else {
+            panic!("expected a row: {layout:?}");
+        };
+        children
+            .iter()
+            .zip(sizes)
+            .map(|(child, size)| {
+                (
+                    self.name(child.first_instance().unwrap()),
+                    size.round() as i32,
+                )
+            })
+            .collect()
+    }
+
+    fn live(&self, app: &MuxelApp) -> Vec<(char, i32)> {
+        self.columns(&app.workspace.project(self.pid).unwrap().layout)
+    }
+
+    /// The row as the saved and shared document holds it.
+    fn durable(&self, app: &MuxelApp) -> Vec<(char, i32)> {
+        let durable = app.workspace_with_closes_restored();
+        self.columns(&durable.project(self.pid).unwrap().layout)
+    }
+
+    /// Every pane in the live layout by name, sorted, and the row's total
+    /// width: what any undo must keep, however it puts panes back.
+    fn panes_and_width(&self, app: &MuxelApp) -> (Vec<char>, i32) {
+        let layout = app.workspace.project(self.pid).unwrap().layout.as_ref();
+        let Some(PaneNode::Split { sizes, .. }) = layout else {
+            panic!("expected a row: {layout:?}");
+        };
+        let mut panes: Vec<_> = layout
+            .unwrap()
+            .collect_instances()
+            .into_iter()
+            .map(|iid| self.name(iid))
+            .collect();
+        panes.sort_unstable();
+        (panes, sizes.iter().sum::<f32>().round() as i32)
+    }
+}
+
 /// How the second of two closed panes goes for good while the first is held.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SecondLeaves {
@@ -1982,50 +2092,10 @@ fn undo_replays_a_close_that_went_final_in_the_order_it_happened() {
             SecondLeaves::FinalFromALaterClose,
             SecondLeaves::ClosedAtOnce,
         ] {
-            let pid = project(cx, window);
-            let (a, _, _a) = terminal(cx, window, pid);
-            let (y, _, _y) = terminal(cx, window, pid);
-            let (x, _, _x) = terminal(cx, window, pid);
-            let (b, _, _b) = terminal(cx, window, pid);
-            let names = [(a, 'A'), (y, 'Y'), (x, 'X'), (b, 'B')];
-            let columns = |layout: &Option<PaneNode>| -> Vec<(char, i32)> {
-                let Some(PaneNode::Split {
-                    sizes, children, ..
-                }) = layout
-                else {
-                    panic!("expected a row: {layout:?}");
-                };
-                children
-                    .iter()
-                    .zip(sizes)
-                    .map(|(child, size)| {
-                        let iid = child.first_instance().unwrap();
-                        let name = names.iter().find(|(id, _)| *id == iid).unwrap().1;
-                        (name, size.round() as i32)
-                    })
-                    .collect()
-            };
+            let row = Row::new(cx, window);
+            let (x, y) = (row.x, row.y);
             window
                 .update(cx, |app, window, cx| {
-                    // Four equal columns. Y was split off B; the others have no
-                    // recorded origin, so X gives its width to Y beside it.
-                    let panes = [a, y, x, b].map(|iid| (iid, Uuid::new_v4()));
-                    let from_b = panes[3].1;
-                    app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::Split {
-                        direction: SplitDirection::Horizontal,
-                        sizes: vec![400.0; 4],
-                        children: panes
-                            .iter()
-                            .map(|&(iid, pane_id)| {
-                                PaneNode::Leaf(LeafData {
-                                    pane_id,
-                                    tabs: vec![iid],
-                                    active: 0,
-                                    split_from: (iid == y).then_some(from_b),
-                                })
-                            })
-                            .collect(),
-                    });
                     let held = match way {
                         SecondLeaves::FinalFromTheSameClose => {
                             let group = app
@@ -2048,12 +2118,10 @@ fn undo_replays_a_close_that_went_final_in_the_order_it_happened() {
                             group
                         }
                     };
-                    let live = columns(&app.workspace.project(pid).unwrap().layout);
-                    let saved = app.workspace_with_closes_restored();
-                    let saved = columns(&saved.project(pid).unwrap().layout);
+                    let live = row.live(app);
+                    let saved = row.durable(app);
                     app.undo_close(held, window, cx);
-                    let undone = columns(&app.workspace.project(pid).unwrap().layout);
-                    got.push((way, live, saved, undone));
+                    got.push((way, live, saved, row.live(app)));
                 })
                 .unwrap();
         }
@@ -2071,5 +2139,132 @@ fn undo_replays_a_close_that_went_final_in_the_order_it_happened() {
             })
             .collect();
         assert_eq!(got, want);
+    });
+}
+
+#[test]
+fn undoing_the_newest_close_puts_back_the_row_it_hid() {
+    with_app(|cx, window| {
+        let row = Row::new(cx, window);
+        let (a, y, x, b) = (row.a, row.y, row.x, row.b);
+        window
+            .update(cx, |app, window, cx| {
+                let mut got = Vec::new();
+                let older = app.hold_closes(vec![(x, false)], None, cx).unwrap();
+                let later = app.hold_closes(vec![(y, false)], None, cx).unwrap();
+                app.finalize_close_group(later, cx);
+                got.push(("Y final, X held", row.live(app)));
+                let newest = app.hold_closes(vec![(a, false)], None, cx).unwrap();
+                assert_eq!(app.workspace.project(row.pid).unwrap().instances(), [b]);
+                got.push(("saved, X and A held", row.durable(app)));
+                app.undo_close(newest, window, cx);
+                got.push(("A undone", row.live(app)));
+                got.push(("saved, X held", row.durable(app)));
+                app.undo_close(older, window, cx);
+                got.push(("X undone", row.live(app)));
+                // Undoing A puts back the row from just before A closed. Y's
+                // 400 went back to B, the pane it was split from.
+                assert_eq!(
+                    got,
+                    [
+                        ("Y final, X held", vec![('A', 400), ('B', 1200)]),
+                        (
+                            "saved, X and A held",
+                            vec![('A', 400), ('X', 400), ('B', 800)]
+                        ),
+                        ("A undone", vec![('A', 400), ('B', 1200)]),
+                        ("saved, X held", vec![('A', 400), ('X', 400), ('B', 800)]),
+                        ("X undone", vec![('A', 400), ('X', 400), ('B', 800)]),
+                    ]
+                );
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn two_held_closes_undone_straight_away_restore_exactly_in_either_order() {
+    with_app(|cx, window| {
+        for newest_first in [true, false] {
+            let row = Row::new(cx, window);
+            let (y, x) = (row.y, row.x);
+            window
+                .update(cx, |app, window, cx| {
+                    let mut got = Vec::new();
+                    let older = app.hold_closes(vec![(x, false)], None, cx).unwrap();
+                    let newer = app.hold_closes(vec![(y, false)], None, cx).unwrap();
+                    got.push(row.durable(app));
+                    let (first, second) = if newest_first {
+                        (newer, older)
+                    } else {
+                        (older, newer)
+                    };
+                    app.undo_close(first, window, cx);
+                    got.push(row.live(app));
+                    app.undo_close(second, window, cx);
+                    got.push(row.live(app));
+                    let all = vec![('A', 400), ('Y', 400), ('X', 400), ('B', 400)];
+                    let between = if newest_first {
+                        // X's 400 went to Y beside it.
+                        vec![('A', 400), ('Y', 800), ('B', 400)]
+                    } else {
+                        // Y's 400 went back to B, the pane it was split from.
+                        vec![('A', 400), ('X', 400), ('B', 800)]
+                    };
+                    assert_eq!(
+                        got,
+                        [all.clone(), between, all],
+                        "newest first: {newest_first}"
+                    );
+                })
+                .unwrap();
+        }
+    });
+}
+
+#[test]
+fn undo_after_the_row_changed_keeps_every_pane_once_and_the_width() {
+    with_app(|cx, window| {
+        for newest_first in [true, false] {
+            let row = Row::new(cx, window);
+            let (a, y, x, pid) = (row.a, row.y, row.x, row.pid);
+            window
+                .update(cx, |app, window, cx| {
+                    let mut got = Vec::new();
+                    let older = app.hold_closes(vec![(x, false)], None, cx).unwrap();
+                    let later = app.hold_closes(vec![(y, false)], None, cx).unwrap();
+                    app.finalize_close_group(later, cx);
+                    // A divider drag: [A400, B1200] becomes [A700, B900].
+                    let Some(PaneNode::Split { sizes, .. }) =
+                        &mut app.workspace.project_mut(pid).unwrap().layout
+                    else {
+                        panic!("expected a row");
+                    };
+                    *sizes = vec![700.0, 900.0];
+                    let newest = app.hold_closes(vec![(a, false)], None, cx).unwrap();
+                    let (first, second) = if newest_first {
+                        (newest, older)
+                    } else {
+                        (older, newest)
+                    };
+                    app.undo_close(first, window, cx);
+                    got.push(row.panes_and_width(app));
+                    app.undo_close(second, window, cx);
+                    got.push(row.panes_and_width(app));
+                    // Sizes after an edit are approximate. No pane may be lost
+                    // or doubled, and the row keeps its width.
+                    let between = if newest_first {
+                        vec!['A', 'B']
+                    } else {
+                        vec!['B', 'X']
+                    };
+                    assert_eq!(
+                        got,
+                        [(between, 1600), (vec!['A', 'B', 'X'], 1600)],
+                        "newest first: {newest_first}"
+                    );
+                })
+                .unwrap();
+        }
     });
 }
