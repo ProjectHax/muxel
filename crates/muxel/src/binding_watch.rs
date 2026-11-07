@@ -254,6 +254,9 @@ pub(crate) mod test_backend {
             })
         }
 
+        /// The backend reports `event` while alive. Only the app's watcher
+        /// tests play one, and they run on Windows alone.
+        #[cfg(windows)]
         pub fn send(&self, event: notify::Result<notify::Event>) {
             self.handler
                 .lock()
