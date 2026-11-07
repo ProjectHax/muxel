@@ -35,7 +35,7 @@ const BLOCKQUOTE_STYLE: &str =
 const MARK_STYLE: &str = "background-color:#fff8c5";
 
 /// Elements written back as themselves (`del` and the containers below are
-/// renamed on the way out).
+/// renamed on the way out, and `<span>` is written only to carry an `id`).
 const ELEMENTS: &[&str] = &[
     "a",
     "b",
@@ -64,6 +64,7 @@ const ELEMENTS: &[&str] = &[
     "p",
     "pre",
     "s",
+    "span",
     "strong",
     "sub",
     "sup",
@@ -76,6 +77,12 @@ const ELEMENTS: &[&str] = &[
     "tr",
     "u",
     "ul",
+];
+/// HTML's other text-level elements that hold text (all but ruby's parts), and
+/// `<ins>`. Mail may not know them, so each leaves its text, inside a `<span>`
+/// when it carries an `id`.
+const AS_SPAN: &[&str] = &[
+    "abbr", "bdi", "bdo", "cite", "data", "dfn", "ins", "kbd", "q", "samp", "small", "time", "var",
 ];
 /// Block containers a mail client may not know, written as `<div>` so their
 /// content still starts on its own line and an `id` still marks a target.
@@ -124,7 +131,14 @@ static SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|| {
     }
     let mut builder = Builder::empty();
     builder
-        .tags(ELEMENTS.iter().chain(AS_DIV).copied().collect())
+        .tags(
+            ELEMENTS
+                .iter()
+                .chain(AS_SPAN)
+                .chain(AS_DIV)
+                .copied()
+                .collect(),
+        )
         // An `id` is a fragment link's target, `<a name>` the older spelling.
         .generic_attributes(HashSet::from(["id"]))
         .tag_attributes(attributes)
@@ -233,16 +247,19 @@ fn url<'u>(element: &str, value: &'u str) -> Option<Cow<'u, str>> {
 }
 
 /// The changes ammonia doesn't make: a local image becomes its alt text,
-/// `<del>` and the unfamiliar containers get names mail knows, and a link left
-/// with no URL or target leaves only its text.
+/// `<del>` and the unfamiliar elements get names mail knows, and a link with
+/// no URL or target, or a span with no target, leaves only its text. A target
+/// (`id`) stays wherever the text does.
 ///
 /// The input is html5ever's serialization of the cleaned tree. Text escapes
 /// `<`, and every attribute value is double-quoted with `"` escaped, so each
-/// `<` opens a tag that ends at the first `>` outside quotes.
+/// `<` opens a tag that ends at the first `>` outside quotes. Elements nest
+/// properly, so an end tag closes the latest element still open.
 fn for_mail(html: &str, image_label: &str) -> String {
     let mut out = String::with_capacity(html.len());
-    // Whether each open `<a>` was written, so its end tag matches.
-    let mut links = Vec::new();
+    // What each open `<a>`, `<span>` or AS_SPAN element was written as, if
+    // anything, so its end tag matches.
+    let mut inline: Vec<Option<&str>> = Vec::new();
     let mut rest = html;
     while let Some(lt) = rest.find('<') {
         out.push_str(&rest[..lt]);
@@ -256,40 +273,53 @@ fn for_mail(html: &str, image_label: &str) -> String {
         let end = tag.starts_with("</");
         let body = &tag[if end { 2 } else { 1 }..len - 1];
         let name = body.split(' ').next().unwrap_or(body);
+        let attrs = &body[name.len()..];
+        let inline_name = name == "a" || name == "span" || AS_SPAN.contains(&name);
         match name {
-            "a" if end => {
-                if links.pop().unwrap_or(true) {
-                    out.push_str(tag);
+            _ if end && inline_name => {
+                if let Some(written) = inline.pop().flatten() {
+                    rename(&mut out, true, written, "");
                 }
             }
             "a" => {
                 let keep = ["href", "id", "name"]
                     .iter()
                     .any(|attr| attr_value(body, attr).is_some());
-                links.push(keep);
+                inline.push(keep.then_some("a"));
                 if keep {
                     out.push_str(tag);
                 }
             }
+            // ammonia leaves these no attribute but `id`.
+            _ if inline_name => {
+                let keep = attr_value(body, "id").is_some();
+                inline.push(keep.then_some("span"));
+                if keep {
+                    rename(&mut out, false, "span", attrs);
+                }
+            }
             "img" if attr_value(body, "src").is_none() => {
                 let label = escape_text(image_label);
+                // Already escaped as an attribute value, as is the alt text,
+                // which leaves `<` and `>` alone.
+                let id = attr_value(body, "id")
+                    .map(|id| format!(r#" id="{id}""#))
+                    .unwrap_or_default();
                 match attr_value(body, "alt")
                     .map(str::trim)
                     .filter(|alt| !alt.is_empty())
                 {
-                    // Already escaped as an attribute value, which leaves `<`
-                    // and `>` alone.
                     Some(alt) => {
                         let alt = alt.replace('<', "&lt;").replace('>', "&gt;");
-                        out.push_str(&format!("<em>[{label}: {alt}]</em>"));
+                        out.push_str(&format!("<em{id}>[{label}: {alt}]</em>"));
                     }
-                    None => out.push_str(&format!("<em>[{label}]</em>")),
+                    None => out.push_str(&format!("<em{id}>[{label}]</em>")),
                 }
             }
             // `<s>` is plain strikethrough; `<del>` marks an edit, which a
             // word processor's HTML import may take as a tracked change.
-            "del" => rename(&mut out, end, "s", &body[name.len()..]),
-            _ if AS_DIV.contains(&name) => rename(&mut out, end, "div", &body[name.len()..]),
+            "del" => rename(&mut out, end, "s", attrs),
+            _ if AS_DIV.contains(&name) => rename(&mut out, end, "div", attrs),
             _ => out.push_str(tag),
         }
     }
@@ -384,6 +414,7 @@ mod tests {
         "p",
         "pre",
         "s",
+        "span",
         "strong",
         "sub",
         "sup",
@@ -694,13 +725,19 @@ mod tests {
 
     #[test]
     fn fragment_targets_keep_their_ids() {
-        // Elements the export restyles or renames, and a legacy named anchor.
+        // Elements the export restyles or renames, a legacy named anchor, and
+        // elements that would otherwise leave only their text: spans, unfamiliar
+        // inline tags and local images.
         let out = html(
             "<div><a href=\"#sample\">Sample</a><pre id=\"sample\">x</pre></div>\n\n\
              <table id=\"t\"><tr><td>c</td></tr></table>\n\n\
              <blockquote id=\"q\">quoted</blockquote>\n\n\
              <section id=\"s\">part</section>\n\n\
-             <a name=\"legacy\"></a>Legacy target, <a href=\"#legacy\">back</a>.\n",
+             <a name=\"legacy\"></a>Legacy target, <a href=\"#legacy\">back</a>.\n\n\
+             <a href=\"#here\">Here</a> is <span id=\"here\" class=\"x\">there</span>\
+             <span id=\"anchor\"></span>, <span class=\"outer\"><span id=\"inner\">in</span> out</span>, \
+             <kbd id=\"key\">Ctrl</kbd> and <a href=\"#plot\">Plot</a>\
+             <img id=\"plot\" src=\"./plot.png\" alt=\"Plot\">\n",
         );
         for (name, target) in [
             ("pre", r#"id="sample""#),
@@ -714,7 +751,14 @@ mod tests {
                 "no <{name} {target}> in:\n{out}"
             );
         }
-        assert!(out.contains(r##"<a href="#sample">Sample</a>"##), "{out}");
+        for expected in [
+            r##"<a href="#sample">Sample</a>"##,
+            r##"<a href="#here">Here</a> is <span id="here">there</span><span id="anchor"></span>, "##,
+            r#"<span id="inner">in</span> out, <span id="key">Ctrl</span> and "#,
+            r##"<a href="#plot">Plot</a><em id="plot">[Image: Plot]</em>"##,
+        ] {
+            assert!(out.contains(expected), "missing {expected:?} in:\n{out}");
+        }
     }
 
     #[test]

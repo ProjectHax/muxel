@@ -315,12 +315,17 @@ impl EditorView {
     }
 
     /// Start a rich-text copy: the document to convert, or `None` while an
-    /// earlier copy is still converting, so a repeated click is ignored.
-    pub fn begin_rich_copy(&mut self, cx: &App) -> Option<String> {
+    /// earlier copy is still converting, so a repeated click is ignored. An
+    /// earlier copy's check goes, so it can't sit beside this one's error.
+    pub fn begin_rich_copy(&mut self, cx: &mut Context<Self>) -> Option<String> {
         if self.rich_copy_converting {
             return None;
         }
         self.rich_copy_converting = true;
+        if self.rich_copied {
+            self.rich_copied = false;
+            cx.notify();
+        }
         Some(self.text(cx))
     }
 

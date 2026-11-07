@@ -16642,22 +16642,23 @@ impl MuxelApp {
             }
             (html, markdown)
         });
-        // Only weak handles wait on the conversion, so closing the pane (or the
-        // app) meanwhile frees it, and the copy is dropped.
+        // Only weak handles wait on the conversion, so it keeps neither the app
+        // nor the editor alive.
         let editor = editor.downgrade();
         cx.spawn(async move |this: WeakEntity<Self>, cx| {
             let (html, markdown) = conversion.await;
             let _ = this.update(cx, |this, cx| {
-                this.write_rich_copy(&editor, html, markdown, cx)
+                this.write_rich_copy(iid, &editor, html, markdown, cx)
             });
         })
         .detach();
     }
 
-    /// Put a finished conversion on the clipboard, then show the check or the
-    /// error. Nothing happens if its pane has closed.
+    /// Put pane `iid`'s finished conversion on the clipboard, then show the
+    /// check or the error. Nothing is written if the pane has closed.
     fn write_rich_copy(
         &mut self,
+        iid: Uuid,
         editor: &WeakEntity<EditorView>,
         html: String,
         markdown: String,
@@ -16667,6 +16668,11 @@ impl MuxelApp {
             return;
         };
         editor.update(cx, |editor, _| editor.end_rich_copy());
+        // A closed pane's editor can outlive it while another task holds it,
+        // such as a remote file's load, so the pane must still show it.
+        if self.editors.get(&iid) != Some(&editor) {
+            return;
+        }
         // On the UI thread, like gpui's own clipboard write: on Windows both open
         // the clipboard, empty it and set the formats synchronously. arboard
         // retries the open for up to 25 ms while another process holds it.

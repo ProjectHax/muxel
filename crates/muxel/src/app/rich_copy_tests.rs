@@ -127,7 +127,7 @@ fn copy_converts_in_the_background_and_writes_afterwards() {
     let mut cx = test_cx();
     let window = cx.add_window(MuxelApp::new);
     let writes = Recorder::default();
-    let notes = window
+    let (notes, held) = window
         .update(&mut cx, |app, window, cx| {
             app.rich_clipboard = Some(Box::new(writes.clone()));
             app.rich_copy_convert = counted;
@@ -151,20 +151,30 @@ fn copy_converts_in_the_background_and_writes_afterwards() {
             });
             app.copy_rich_text(notes, cx);
 
-            // A pane that closes while it converts drops its copy.
+            // A pane that closes while it converts drops its copy, even while
+            // something else holds its editor, as a remote file's load does.
             let closing = open(app, pid, &project.join("closing.md"), window, cx);
             app.copy_rich_text(closing, cx);
+            let held = app.editors[&closing].clone();
             app.close_instance_inner(closing, "rich copy test", cx);
-            notes
+            (notes, held)
         })
         .unwrap();
     assert!(writes.0.borrow().is_empty(), "written before converting");
 
-    // Run every task that can run, without advancing the clock, so the check's
-    // 1.5 s timer is still pending.
+    // Background tasks alone: both panes convert (the ignored click doesn't),
+    // and nothing is written until the UI thread runs. A conversion on the UI
+    // thread would wait here too.
+    while cx.dispatcher.tick(true) {}
+    assert_eq!(
+        CONVERSIONS.load(Ordering::SeqCst),
+        2,
+        "converted on the UI thread"
+    );
+    assert!(writes.0.borrow().is_empty(), "written off the UI thread");
+    // Then every task that can run, without advancing the clock, so the
+    // check's 1.5 s timer is still pending.
     while cx.executor().tick() {}
-    // Both panes converted; the ignored click didn't.
-    assert_eq!(CONVERSIONS.load(Ordering::SeqCst), 2);
     let written = writes.0.borrow().clone();
     assert_eq!(written.len(), 1, "{written:?}");
     let (html, text) = &written[0];
@@ -184,6 +194,62 @@ fn copy_converts_in_the_background_and_writes_afterwards() {
     let written = writes.0.borrow().clone();
     assert_eq!(written.len(), 2, "{written:?}");
     assert_eq!(written[1].1, "# Changed\n");
+    drop(held);
+    drop(cx);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Fails every write, as when another process keeps the clipboard open.
+struct Busy;
+
+impl RichClipboard for Busy {
+    fn write_html(&mut self, _html: String, _text: String) -> Result<(), String> {
+        Err("clipboard busy".into())
+    }
+}
+
+#[test]
+fn a_failed_copy_does_not_show_the_last_ones_check() {
+    let (root, project) = project_with(&[("notes.md", b"# Draft\n")]);
+    let _storage = muxel_store::test_support::set_root(root.clone());
+    let mut cx = test_cx();
+    let window = cx.add_window(MuxelApp::new);
+    let notes = window
+        .update(&mut cx, |app, window, cx| {
+            app.rich_clipboard = Some(Box::new(Recorder::default()));
+            let pid = app
+                .workspace
+                .add_project(Project::new("rich-copy", project.clone()));
+            let notes = open(app, pid, &project.join("notes.md"), window, cx);
+            app.copy_rich_text(notes, cx);
+            notes
+        })
+        .unwrap();
+    // The clock stays put, so the check's 1.5 s never runs out.
+    while cx.executor().tick() {}
+    window
+        .update(&mut cx, |app, _, cx| {
+            assert!(app.editors[&notes].read(cx).rich_text_copied());
+            app.rich_clipboard = Some(Box::new(Busy));
+            app.copy_rich_text(notes, cx);
+            assert!(
+                !app.editors[&notes].read(cx).rich_text_copied(),
+                "the last copy's check shows during this one"
+            );
+        })
+        .unwrap();
+    while cx.executor().tick() {}
+    window
+        .update(&mut cx, |app, _, cx| {
+            assert!(!app.editors[&notes].read(cx).rich_text_copied());
+            assert!(
+                app.notifications
+                    .iter()
+                    .any(|n| n.subtitle == "clipboard busy"),
+                "no error shown"
+            );
+        })
+        .unwrap();
     drop(cx);
     let _ = std::fs::remove_dir_all(&root);
 }
