@@ -19,7 +19,9 @@
 //! dates and 256 MiB per family (`MUXEL_PROFILE_KEEP_DAYS` / `MUXEL_PROFILE_MAX_BYTES`).
 //! Steady discovery misses aggregate in per-minute summaries; hits, changes,
 //! calls of at least 5 ms, and every launch lookup retain individual records.
-//! Every local `git` run gets a `ui-prof[git v1]` record (see `git.rs`).
+//! Local `git` runs through the integrations helpers get a `ui-prof[git v1]`
+//! record (see `git.rs`); team-library jobs don't, and a record the full queue
+//! drops is only counted in `deferred_dropped`.
 //!
 //! When disabled: single OnceLock check, no flusher, no probe work.
 //!

@@ -1749,8 +1749,9 @@ feature is added or changed, update the matching entry here in the same change**
 - **Opt-in session diagnostics** — `MUXEL_PROFILE=1` records background
   session lookup hits, outcome changes and slow calls, with per-minute counts
   and maximum durations for all discovery polls. Launch-time resume lookups
-  always log. Every local `git` run gets a record (which poll ran it, the
-  subcommand, its time, and whether it printed the same as last time).
+  always log. Local `git` runs get a record (which poll ran it, the
+  subcommand, its time, and whether it printed the same as last time), except
+  team-library jobs, and records a saturated queue drops are only counted.
   Both profiler logs keep stable live paths and dated history
   (14 local dates and 256 MiB per family by default, tunable with
   `MUXEL_PROFILE_KEEP_DAYS` and `MUXEL_PROFILE_MAX_BYTES`). Quiet terminal
