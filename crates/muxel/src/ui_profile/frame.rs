@@ -10,7 +10,7 @@
 //! reports how much region request-layout ran there. A frame of at least
 //! 50 ms emits one `ui-frame[v1 slow]` record. Every frame feeds a ten-second
 //! `ui-frame[v1 sum]` summary, which also reports the UI thread's CPU time and
-//! estimates its split inside and outside frames.
+//! the frames' share of its cycles.
 //!
 //! Intervals, in GPUI's order. Each starts where the previous one ends, so a
 //! frame's intervals add up to its `wall`:
@@ -38,18 +38,17 @@
 //! `cycles` counts the UI thread's own cycles (Windows
 //! `QueryThreadCycleTime`) over `cpu_span`, the frame from its build to arena
 //! clear. `pre` is outside that span: GPUI gives no hook at draw start to
-//! read the counters. Microsoft doesn't promise a fixed cycle rate, so a slow
-//! record's `cpu_est` (cycles over the rate calibrated at start, in
-//! `ui-frame[v1 start]`) is an estimate, and `cpu_span - cpu_est` the
-//! estimated time the thread didn't run: blocked on the GPU, a lock or a
-//! hard page fault, or runnable but not scheduled. The summary's `ui_cpu` is
-//! the thread's CPU time from `GetThreadTimes`: 100 ns units, but charged per
-//! scheduler tick, so too coarse for one frame and usable over ten seconds.
-//! `frame_cpu_est` apportions it by the frames' share of the thread's cycles,
-//! which needs no cycle rate, and `outside_cpu_est` is the rest, frames' `pre`
-//! included; `frame_cpu_span` sums the frames' `cpu_span`. `faults` is the
-//! process-wide page-fault count, soft faults included. Off Windows, or when a
-//! read fails, these say `unavailable`.
+//! read the counters. Cycles are a count, not a duration. Microsoft warns
+//! against converting them to elapsed time, and the rate can differ between
+//! frames and the thread's other work, so nothing here converts them. The
+//! summary's `ui_cpu` is the thread's measured CPU time from `GetThreadTimes`
+//! (100 ns units, but charged per scheduler tick, so too coarse for one frame
+//! and usable over ten seconds). `frame_cycle_share` is the frames' share of
+//! the thread's cycles over the same interval, frames' `pre` outside it; it is
+//! a share of cycles, not of `ui_cpu`. It says `unavailable` unless every
+//! frame's cycles read, and `inconsistent` if the frames' cycles exceed the
+//! interval's. `faults` is the process-wide page-fault count, soft faults
+//! included. Off Windows, or when a read fails, these say `unavailable`.
 //!
 //! Records carry fixed labels, counts and durations only.
 
@@ -259,9 +258,8 @@ pub(super) struct Summary {
     queue_max_us: u64,
     queue_n: u32,
     invalidations: u64,
-    /// Cycles and `cpu_span` over the `cycles_n` frames whose counters read.
+    /// Cycles over the `cycles_n` frames whose counters read.
     frame_cycles: u64,
-    cpu_span_sum_us: u64,
     cycles_n: u32,
     faults: u64,
     faults_n: u32,
@@ -292,7 +290,6 @@ impl Summary {
             queue_n: 0,
             invalidations: 0,
             frame_cycles: 0,
-            cpu_span_sum_us: 0,
             cycles_n: 0,
             faults: 0,
             faults_n: 0,
@@ -338,7 +335,6 @@ impl Summary {
         self.invalidations += frame.invalidations;
         if let Some(cycles) = frame.cycles {
             self.frame_cycles += cycles;
-            self.cpu_span_sum_us += frame.cpu_span_us;
             self.cycles_n += 1;
         }
         if let Some(faults) = frame.faults {
@@ -376,6 +372,27 @@ impl Interval {
             cycles: thread_cycles(),
             summary: Box::new(Summary::new()),
         }
+    }
+
+    /// Close this interval now: its summary, with the thread's counters over
+    /// the interval, and a fresh interval in its place.
+    fn roll(&mut self) -> Box<Summary> {
+        let next = Interval::start();
+        let mut summary = std::mem::replace(&mut self.summary, Box::new(Summary::new()));
+        summary.span_us = next
+            .started
+            .saturating_duration_since(self.started)
+            .as_micros() as u64;
+        summary.ui_cpu_us = self
+            .cpu_100ns
+            .zip(next.cpu_100ns)
+            .map(|(start, end)| end.saturating_sub(start) / 10);
+        summary.ui_cycles = self
+            .cycles
+            .zip(next.cycles)
+            .map(|(start, end)| end.saturating_sub(start));
+        *self = next;
+        summary
     }
 }
 
@@ -435,6 +452,11 @@ fn take_draw_timings() -> Vec<DrawTiming> {
 /// profiling is enabled.
 pub(super) fn begin(view: RenderView, token: u64) {
     start_gpui_trace();
+    // The summary's counters start before the first frame's, so every frame
+    // a summary counts falls inside the span its thread totals cover.
+    INTERVAL.with(|interval| {
+        interval.borrow_mut().get_or_insert_with(Interval::start);
+    });
     let acc = FrameAcc {
         data: Box::new(FrameData::new(view, token)),
         cycles_start: thread_cycles(),
@@ -592,26 +614,14 @@ pub(super) fn end(token: u64) {
 
     let slow = data.wall_us >= super::SLOW_RENDER_US;
     INTERVAL.with(|interval| {
+        // `begin` opened the interval before this frame's counters.
         let mut interval = interval.borrow_mut();
-        let current = interval.get_or_insert_with(Interval::start);
+        let Some(current) = interval.as_mut() else {
+            return;
+        };
         current.summary.add(&data, slow);
         if current.started.elapsed() >= SUMMARY_EVERY {
-            let next = Interval::start();
-            let mut summary = std::mem::replace(&mut current.summary, Box::new(Summary::new()));
-            summary.span_us = next
-                .started
-                .saturating_duration_since(current.started)
-                .as_micros() as u64;
-            summary.ui_cpu_us = current
-                .cpu_100ns
-                .zip(next.cpu_100ns)
-                .map(|(start, end)| end.saturating_sub(start) / 10);
-            summary.ui_cycles = current
-                .cycles
-                .zip(next.cycles)
-                .map(|(start, end)| end.saturating_sub(start));
-            *current = next;
-            super::defer_frame_summary(summary);
+            super::defer_frame_summary(current.roll());
         }
     });
     if slow {
@@ -845,33 +855,7 @@ fn process_faults() -> Option<u32> {
     None
 }
 
-/// Thread cycles per microsecond of a spinning thread (the invariant TSC
-/// rate on current x86 hardware). The best of three 10 ms spins, so a
-/// preempted spin cannot lower it. Runs once on the record worker.
-pub(super) fn calibrate_cycles_per_us() -> Option<f64> {
-    let mut best: Option<f64> = None;
-    for _ in 0..3 {
-        let start_cycles = thread_cycles()?;
-        let started = Instant::now();
-        while started.elapsed() < Duration::from_millis(10) {
-            std::hint::spin_loop();
-        }
-        let cycles = thread_cycles()?.saturating_sub(start_cycles);
-        let us = started.elapsed().as_secs_f64() * 1e6;
-        if us > 0.0 {
-            let rate = cycles as f64 / us;
-            best = Some(best.map_or(rate, |best| best.max(rate)));
-        }
-    }
-    best
-}
-
 // --- Record formatting (record worker) ---------------------------------------
-
-fn cycles_us(cycles: u64, rate: Option<f64>) -> Option<u64> {
-    rate.filter(|rate| *rate > 0.0)
-        .map(|rate| (cycles as f64 / rate) as u64)
-}
 
 fn interval_fields(out: &mut String, intervals_us: &[u64; INTERVALS], traced: bool) {
     use std::fmt::Write as _;
@@ -945,7 +929,7 @@ fn phase_totals(intervals_us: &[u64; INTERVALS]) -> [u64; PHASES] {
     ]
 }
 
-pub(super) fn frame_line(frame: &FrameData, rate: Option<f64>) -> String {
+pub(super) fn frame_line(frame: &FrameData) -> String {
     use std::fmt::Write as _;
     let mut out = format!(
         "ui-frame[v1 slow] view={} token={} wall={}µs cpu_span={}µs",
@@ -957,9 +941,6 @@ pub(super) fn frame_line(frame: &FrameData, rate: Option<f64>) -> String {
     match frame.cycles {
         Some(cycles) => {
             let _ = write!(out, " cycles={cycles}");
-            if let Some(cpu) = cycles_us(cycles, rate) {
-                let _ = write!(out, " cpu_est={cpu}µs");
-            }
         }
         None => out.push_str(" cycles=unavailable"),
     }
@@ -1041,28 +1022,21 @@ pub(super) fn summary_line(summary: &Summary) -> String {
         }
         None => out.push_str(" ui_cpu=unavailable"),
     }
-    // Every frame's cycles must have read for the share to be the frames'. A
-    // frame open across the interval boundary can push it past the whole.
-    let ui_cycles = summary
+    // Every frame's cycles must have read for the share to be the frames'.
+    match summary
         .ui_cycles
-        .filter(|&cycles| cycles > 0 && summary.cycles_n == summary.frames);
-    match summary.ui_cpu_us.zip(ui_cycles) {
-        Some((ui, ui_cycles)) => {
-            let frame_cycles = summary.frame_cycles.min(ui_cycles);
-            let share = |of: u64| {
-                (u128::from(of) * u128::from(frame_cycles) / u128::from(ui_cycles)) as u64
-            };
-            let frames = share(ui);
-            let _ = write!(
-                out,
-                " frame_cpu_est={}ms outside_cpu_est={}ms frame_cycle_share={}% frame_cpu_span={}ms",
-                frames / 1000,
-                (ui - frames) / 1000,
-                share(100),
-                summary.cpu_span_sum_us / 1000,
-            );
+        .filter(|&cycles| cycles > 0 && summary.cycles_n == summary.frames)
+    {
+        // Frames' cycles beyond the interval's mean the two didn't cover the
+        // same span; say so rather than print a share over 100%.
+        Some(ui_cycles) if summary.frame_cycles > ui_cycles => {
+            out.push_str(" frame_cycle_share=inconsistent");
         }
-        None => out.push_str(" frame_cpu_est=unavailable"),
+        Some(ui_cycles) => {
+            let share = u128::from(summary.frame_cycles) * 100 / u128::from(ui_cycles);
+            let _ = write!(out, " frame_cycle_share={share}%");
+        }
+        None => out.push_str(" frame_cycle_share=unavailable"),
     }
     match summary.faults_n {
         0 => out.push_str(" faults=unavailable"),
@@ -1159,7 +1133,7 @@ mod tests {
             frames.remove(index).data
         });
         data.intervals_us[IV_PREPAINT] = prepaint_us;
-        let line = frame_line(&data, None);
+        let line = frame_line(&data);
         let other = line.rsplit(" other=").next().unwrap();
         let other_prepaint: u64 = other.split('/').nth(2).unwrap().parse().unwrap();
         assert!(
@@ -1222,7 +1196,7 @@ mod tests {
         frame.group_tabs[0] = 5;
         frame.group_tabs[1] = 12;
         assert_eq!(
-            frame_line(&frame, None),
+            frame_line(&frame),
             "ui-frame[v1 slow] view=main token=7 wall=80000µs cpu_span=0µs cycles=unavailable \
              faults=unavailable \
              build=30000µs layout=10000µs compute=0µs prepaint=5000µs paint=4000µs post=0µs \
@@ -1232,11 +1206,10 @@ mod tests {
     }
 
     #[test]
-    fn summary_line_reports_duty_and_cpu_outside_frames() {
+    fn summary_line_reports_duty_and_the_frames_cycle_share() {
         let mut summary = Summary::new();
         let mut frame = FrameData::new(RenderView::Main, 1);
         frame.wall_us = 60_000;
-        frame.cpu_span_us = 55_000;
         frame.cycles = Some(30_000 * 3000);
         summary.add(&frame, true);
         summary.add(&frame, true);
@@ -1247,12 +1220,51 @@ mod tests {
         assert!(line.contains(" frames=2 main=2 popout=0 other_views=0 slow=2 duty=12% "));
         assert!(line.contains(" hist_ms(<8/<16/<33/<50/<100/<250/<1000/more)=0/0/0/0/2/0/0/0"));
         assert!(
-            line.contains(
-                " ui_cpu=100ms frame_cpu_est=60ms outside_cpu_est=40ms frame_cycle_share=60% \
-                 frame_cpu_span=110ms"
-            ),
+            line.contains(" ui_cpu=100ms frame_cycle_share=60% "),
             "{line}"
         );
+
+        // Frames' cycles beyond the interval's are a coverage error, not 100%.
+        summary.ui_cycles = Some(50_000 * 3000);
+        let line = summary_line(&summary);
+        assert!(line.contains(" frame_cycle_share=inconsistent "), "{line}");
+    }
+
+    /// The first summary's thread counters start before its first frame's.
+    /// A costly first frame, then as much work outside frames, is about half
+    /// the interval's cycles, not all of them.
+    #[cfg(windows)]
+    #[test]
+    fn the_first_summary_counts_its_first_frame_inside_its_counters() {
+        use super::{INTERVAL, begin, end, thread_cycles};
+        // A fresh thread, so this thread's interval doesn't exist yet.
+        std::thread::spawn(|| {
+            // Run on the CPU until this thread has used `cycles` more cycles.
+            let spin = |cycles: u64| {
+                let start = thread_cycles().unwrap();
+                while thread_cycles().unwrap() - start < cycles {
+                    std::hint::spin_loop();
+                }
+            };
+            let token = 9_002;
+            begin(RenderView::Main, token);
+            spin(30_000_000);
+            end(token);
+            spin(30_000_000);
+            let summary = INTERVAL.with(|interval| interval.borrow_mut().as_mut().unwrap().roll());
+            let line = summary_line(&summary);
+            let share = line
+                .split(" frame_cycle_share=")
+                .nth(1)
+                .and_then(|rest| rest.split('%').next())
+                .and_then(|share| share.parse::<u64>().ok());
+            assert!(
+                share.is_some_and(|share| (40..=60).contains(&share)),
+                "{line}"
+            );
+        })
+        .join()
+        .unwrap();
     }
 
     /// Intervals telescope from draw start to arena clear, so a slow record
@@ -1351,7 +1363,7 @@ mod tests {
         summary.add(&frame, false);
         let line = summary_line(&summary);
         assert!(line.contains(" faults=unavailable"), "{line}");
-        assert!(line.contains(" frame_cpu_est=unavailable"), "{line}");
+        assert!(line.contains(" frame_cycle_share=unavailable"), "{line}");
 
         let mut traced = FrameData::new(RenderView::Main, 2);
         traced.traced = true;

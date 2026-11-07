@@ -222,19 +222,19 @@ region's request-layout can run in the prepaint interval; `layout_late` is
 that time, and `other` doesn't count it twice. `cycles` is the UI thread's
 cycle count (Windows `QueryThreadCycleTime`) over `cpu_span`, which is the
 frame without `pre`. GPUI has no hook at draw start to read it sooner.
-Windows doesn't promise a fixed cycle rate, so `cpu_est` (cycles over the rate
-calibrated at start, recorded in `ui-frame[v1 start]`) is an estimate, and
-`cpu_span` minus `cpu_est` estimates the time the thread did not run.
-`faults` is the process page-fault count. The summary adds `duty` (frame wall
-time over the interval), `ui_cpu` (the thread's CPU time from
-`GetThreadTimes`, charged per scheduler tick, so usable over ten seconds
-though not per frame),
-`frame_cpu_est` and `outside_cpu_est` (`ui_cpu` split by the frames' share of
-the thread's cycles, with `pre` counted outside), `queue` (first invalidation
-to draw start) and a frame-time histogram. A counter that didn't read says
-`unavailable`. Its interval averages take `pre`, `tail` and `present` over
-traced frames (`traced=T/F`) and `post` over the rest. Records hold fixed
-labels, counts and durations only.
+Cycles are a count, not a duration. Windows warns against converting them to
+elapsed time, and the rate can differ between frames and other work, so the
+records don't convert them. `faults` is the process page-fault count. The
+summary adds `duty` (frame wall time over the interval), `ui_cpu` (the
+thread's CPU time from `GetThreadTimes`, charged per scheduler tick, so usable
+over ten seconds though not per frame), `frame_cycle_share` (the frames' share
+of the thread's cycles over the interval, `pre` outside it; a share of cycles,
+not of `ui_cpu`), `queue` (first invalidation to draw start) and a frame-time
+histogram. A counter that didn't read says `unavailable`, and a cycle share
+whose frames exceed the interval's cycles says `inconsistent`. Its interval
+averages take `pre`, `tail` and `present` over traced frames (`traced=T/F`)
+and `post` over the rest. Records hold fixed labels, counts and durations
+only.
 
 When GPUI reports that nothing in the newly rendered dispatch tree owns focus,
 `ui-prof[focus path v2]` records fixed owner classes and pane UUIDs for the
