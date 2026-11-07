@@ -1303,9 +1303,11 @@ feature is added or changed, update the matching entry here in the same change**
   and so do links from a popped-out terminal, which has left the layout; those
   open in the window showing the terminal's project. A middle-click or **Open in
   new tab** places the resource the same way and leaves focus where it is in
-  every window. A file already open anywhere, or a page already open in the same
-  project, is refreshed and focused where it is: the window showing its project
-  comes to the front, or the main window switches to that project. Explicit New
+  every window, even when the file jumps to a line or reloads. A file already
+  open anywhere, or a page already open in the same project, is refreshed and
+  focused where it is: the window showing its project comes to the front, or the
+  main window switches to that project. A resource focused in the main window is
+  shown even when the Dashboard or another hotbar view covered the panes. Explicit New
   Tab and New Pane commands still use the requested placement. Opening a
   resource as a tab preserves the surrounding split geometry, including narrow
   resource columns.

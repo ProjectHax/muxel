@@ -3086,6 +3086,47 @@ fn split_resize_terminal_ids(
         .collect()
 }
 
+/// A terminal context menu's Open link (`background` false) or Open in new tab,
+/// raised from `terminal`. The menu runs its item while it holds the terminal
+/// and the window's focus, so the link opens once the menu has let go of both:
+/// the open can then read the terminal, and it sees the focus the menu gave
+/// back on closing.
+fn open_link_from_menu(
+    terminal: &mut TerminalView,
+    url: String,
+    background: bool,
+    window: &mut Window,
+    cx: &mut Context<TerminalView>,
+) {
+    let pane = terminal.instance_id();
+    let focus = terminal.focus_handle(cx);
+    window.defer(cx, move |window, cx| {
+        if background {
+            let open = muxel_terminal::OpenLinkBackground { url, pane };
+            focus.dispatch_action(&open, window, cx);
+        } else {
+            let open = muxel_terminal::OpenLink { url, pane };
+            focus.dispatch_action(&open, window, cx);
+        }
+    });
+}
+
+/// Every window's focused handle, this window's first. The handle is the
+/// focused element itself, so an editor's text input or a browser's address
+/// bar counts, not only a pane's own handle.
+fn window_focus(window: &Window, cx: &mut App) -> Vec<(AnyWindowHandle, Option<FocusHandle>)> {
+    let here = window.window_handle();
+    let mut kept = vec![(here, window.focused(cx))];
+    for other in cx.windows() {
+        if other.window_id() != here.window_id()
+            && let Ok(focus) = other.update(cx, |_, window, cx| window.focused(cx))
+        {
+            kept.push((other, focus));
+        }
+    }
+    kept
+}
+
 /// Render a terminal pane. In `RightClickMenu` mouse mode it wraps the view in a
 /// right-click Copy/Paste context menu (the menu component lives in this crate, not
 /// in muxel-terminal); the other modes handle the mouse inside the terminal element
@@ -3112,22 +3153,14 @@ fn terminal_pane_element(view: &Entity<TerminalView>, cache_paint: bool, cx: &Ap
                     PopupMenuItem::new(t("Open link")).on_click(window.listener_for(
                         &view,
                         move |this, _e, window, cx| {
-                            let open = muxel_terminal::OpenLink {
-                                url: foreground_url.clone(),
-                                pane: this.instance_id(),
-                            };
-                            this.focus_handle(cx).dispatch_action(&open, window, cx);
+                            open_link_from_menu(this, foreground_url.clone(), false, window, cx);
                         },
                     )),
                 );
                 let background_url = url.clone();
                 menu = menu.item(PopupMenuItem::new(t("Open in new tab")).on_click(
                     window.listener_for(&view, move |this, _e, window, cx| {
-                        let open = muxel_terminal::OpenLinkBackground {
-                            url: background_url.clone(),
-                            pane: this.instance_id(),
-                        };
-                        this.focus_handle(cx).dispatch_action(&open, window, cx);
+                        open_link_from_menu(this, background_url.clone(), true, window, cx);
                     }),
                 ));
                 return menu.item(
@@ -7460,11 +7493,13 @@ enum GitDiffTab {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OpenFocus {
     /// Focus it in the window that shows its project, raising that window, or
-    /// showing the project in the main window when no window does.
+    /// showing the project in the main window when no window does. The main
+    /// window shows its panes again if a hotbar view replaced them.
     Focus,
-    /// A middle-click or "Open in new tab": focus stays where it is in every
-    /// window. The resource only comes to the front of its group, unless one
-    /// of that group's tabs has focus, which then stays in front.
+    /// A middle-click or "Open in new tab": every window ends with the focus
+    /// it had, put back after the open if anything moved it. The resource
+    /// only comes to the front of its group, unless one of that group's tabs
+    /// holds a window's focus, which then stays in front.
     Background,
 }
 
@@ -15658,7 +15693,42 @@ impl MuxelApp {
     /// other `file://` / disabled-browser cases go to the OS handler; otherwise
     /// macOS/Windows open an embedded browser pane and Linux spawns the separate
     /// muxel browser window.
+    ///
+    /// Opening can move focus on its own: going to a link's line, or reloading
+    /// a reused file that changed on disk, focuses the editor in this window,
+    /// whichever window shows it. So every window's focus is noted first. A
+    /// background open puts each one back afterwards. A foreground open puts
+    /// back only this window's, and only when it was left holding a pane that
+    /// another window shows, which focuses the pane itself.
     fn open_link_from(
+        &mut self,
+        url: &str,
+        source: Option<Uuid>,
+        focus: OpenFocus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let kept = window_focus(window, cx);
+        self.route_link(url, source, focus, window, cx);
+        match focus {
+            OpenFocus::Background => self.give_back_focus(&kept, window, cx),
+            OpenFocus::Focus => {
+                let here = window.window_handle().window_id();
+                let elsewhere = window
+                    .focused(cx)
+                    .and_then(|focused| self.pane_holding(&focused, window, cx))
+                    .and_then(|iid| self.workspace.instance(iid))
+                    .and_then(|instance| self.window_showing(instance.project_id))
+                    .is_some_and(|shown| shown.window_id() != here);
+                if elsewhere {
+                    self.give_back_focus(&kept[..1], window, cx);
+                }
+            }
+        }
+    }
+
+    /// [`Self::open_link_from`]'s routing, leaving focus as the open left it.
+    fn route_link(
         &mut self,
         url: &str,
         source: Option<Uuid>,
@@ -16287,7 +16357,12 @@ impl MuxelApp {
             self.maximized = None;
         }
         if focus == OpenFocus::Background {
-            self.bring_forward(iid, pid, window, cx);
+            // The link's open then gives every window its focus back and keeps
+            // the tab holding it in front.
+            if let Some(project) = self.workspace.project_mut(pid) {
+                set_active_tab(&mut project.layout, iid);
+                cx.notify();
+            }
             return;
         }
         let shown = self.window_showing(pid);
@@ -16306,58 +16381,84 @@ impl MuxelApp {
                 if shown.is_none() {
                     self.select_project_with_attendance(pid, false, window, cx);
                 }
+                // A hotbar view filling the main window would hide it.
+                if self.is_main_window(window) {
+                    self.main_view = hotbar::MainView::Panes;
+                }
                 self.focus_instance(iid, window, cx);
             }
         }
     }
 
-    /// Put `iid` at the front of its group without moving focus. A group with a
-    /// tab that has focus (the app's focused pane, or the pane focused in the
-    /// window showing the group) keeps that tab in front instead, even when
-    /// placing `iid` there brought it forward: otherwise the pane taking the
-    /// keys would be hidden.
-    fn bring_forward(&mut self, iid: Uuid, pid: Uuid, window: &Window, cx: &mut Context<Self>) {
-        let Some(group) = self
-            .workspace
-            .project(pid)
-            .and_then(|project| project.layout.as_ref())
-            .and_then(|layout| layout.tab_group(iid))
-            .map(<[Uuid]>::to_vec)
-        else {
-            return;
-        };
-        // A reused resource can live in another window than this one.
-        let elsewhere = self
-            .window_showing(pid)
-            .filter(|shown| shown.window_id() != window.window_handle().window_id());
-        let focused = group.into_iter().find(|&tab| {
-            self.active_instance == Some(tab)
-                || self
-                    .pane_focus_handle(tab, cx)
-                    .is_some_and(|handle| match elsewhere {
-                        None => handle.is_focused(window),
-                        Some(shown) => shown
-                            .update(cx, |_, shown, _| handle.is_focused(shown))
-                            .unwrap_or(false),
-                    })
-        });
-        if let Some(project) = self.workspace.project_mut(pid) {
-            set_active_tab(&mut project.layout, focused.unwrap_or(iid));
-            cx.notify();
+    /// Put each window's focus back as `kept` noted it, and bring the tab that
+    /// holds it to the front of its group, where an open may have covered it.
+    ///
+    /// A window that had nothing focused gets that back by focusing a handle
+    /// that's dropped at once: GPUI blurs any window whose focused handle is
+    /// released, and `Window::blur` takes different arguments on the two GPUI
+    /// revisions muxel builds against.
+    fn give_back_focus(
+        &mut self,
+        kept: &[(AnyWindowHandle, Option<FocusHandle>)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let here = window.window_handle().window_id();
+        let mut holders = Vec::new();
+        for (handle, focus) in kept {
+            let restore = |window: &mut Window, cx: &mut App| {
+                if window.focused(cx) != *focus {
+                    match focus {
+                        Some(focus) => window.focus(focus, cx),
+                        None => {
+                            let nothing = cx.focus_handle();
+                            window.focus(&nothing, cx);
+                        }
+                    }
+                }
+                focus
+                    .as_ref()
+                    .and_then(|focus| self.pane_holding(focus, window, cx))
+            };
+            let holder = if handle.window_id() == here {
+                restore(window, cx)
+            } else {
+                handle
+                    .update(cx, |_, window, cx| restore(window, cx))
+                    .ok()
+                    .flatten()
+            };
+            holders.extend(holder);
         }
+        for iid in holders {
+            if let Some(pid) = self.workspace.instance(iid).map(|i| i.project_id)
+                && let Some(project) = self.workspace.project_mut(pid)
+            {
+                set_active_tab(&mut project.layout, iid);
+            }
+        }
+        cx.notify();
     }
 
-    /// The focus handle of pane `iid`'s docked view, if it has one.
-    fn pane_focus_handle(&self, iid: Uuid, cx: &App) -> Option<FocusHandle> {
-        if let Some(view) = self.terminals.get(&iid) {
-            return Some(view.read(cx).focus_handle(cx));
-        }
-        if let Some(editor) = self.editors.get(&iid) {
-            return Some(editor.read(cx).focus_handle(cx));
-        }
-        self.browsers
-            .get(&iid)
-            .map(|browser| browser.read(cx).focus_handle(cx))
+    /// The docked pane whose view holds `focus` in `window`: the view's own
+    /// handle, or an element inside it, such as a browser's address bar.
+    fn pane_holding(&self, focus: &FocusHandle, window: &Window, cx: &App) -> Option<Uuid> {
+        let terminals = self
+            .terminals
+            .iter()
+            .map(|(iid, v)| (*iid, v.read(cx).focus_handle(cx)));
+        let editors = self
+            .editors
+            .iter()
+            .map(|(iid, v)| (*iid, v.read(cx).focus_handle(cx)));
+        let browsers = self
+            .browsers
+            .iter()
+            .map(|(iid, v)| (*iid, v.read(cx).focus_handle(cx)));
+        terminals
+            .chain(editors)
+            .chain(browsers)
+            .find_map(|(iid, handle)| handle.contains(focus, window).then_some(iid))
     }
 
     /// Place a non-agent resource. Explicit New Tab/New Pane commands keep their
