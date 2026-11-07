@@ -5,7 +5,8 @@ use uuid::Uuid;
 /// Restore held instances without replaying layout edits made during the hold.
 /// Capture `original` from the durable layout (including earlier held groups),
 /// so independent groups retain the topology needed for either restoration order.
-/// `closed` lists every held pane, across groups, in the order it was closed.
+/// `closed` lists the panes closed since the snapshots were taken, held or
+/// final, in the order they closed.
 pub(super) fn restore_layout(
     current: &mut Option<PaneNode>,
     original: &Option<PaneNode>,
@@ -62,20 +63,21 @@ pub(super) fn restore_layout(
     }
 }
 
-/// Remove the panes `leaving` picks from `layout`: those that left without a
-/// held close first, in reading order, then held ones in the order they closed.
+/// Remove the panes `leaving` picks from `layout`: those that left without
+/// closing (a popout, say) first, in reading order, then closed ones in the
+/// order they closed.
 fn remove_in_close_order(
     layout: &mut Option<PaneNode>,
     leaving: impl Fn(&Uuid) -> bool,
     closed: &[Uuid],
 ) {
-    let held: HashSet<_> = closed.iter().copied().collect();
+    let recorded: HashSet<_> = closed.iter().copied().collect();
     let others: Vec<_> = layout
         .as_ref()
         .map(PaneNode::collect_instances)
         .unwrap_or_default()
         .into_iter()
-        .filter(|id| !held.contains(id))
+        .filter(|id| !recorded.contains(id))
         .collect();
     for id in others.iter().chain(closed) {
         if leaving(id) {

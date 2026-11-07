@@ -450,6 +450,9 @@ impl MuxelApp {
         let gid = group.id;
         let members = group.members.clone();
         self.close_groups.push(group);
+        // They leave their layouts now, in this order.
+        self.close_history.retain(|iid| !members.contains(iid));
+        self.close_history.extend(&members);
         for iid in members {
             self.close_requests.remove(&iid);
             self.terminal_restarts.cancel(iid);
@@ -515,7 +518,6 @@ impl MuxelApp {
     /// Put every held pane of project `pid` back into `layout`, where the
     /// durable document keeps it until its close is final.
     fn restore_held_layout(&self, pid: Uuid, layout: &mut Option<PaneNode>) {
-        let closed = self.closed_in_order();
         for group in self.close_groups.iter().rev() {
             let Some(original) = group.layouts.get(&pid) else {
                 continue;
@@ -528,16 +530,21 @@ impl MuxelApp {
                 })
                 .copied()
                 .collect();
-            recoverable_layout::restore_layout(layout, original, &ids, &closed);
+            recoverable_layout::restore_layout(layout, original, &ids, &self.close_history);
         }
     }
 
-    /// Every held pane, oldest close first: the order they left their layouts.
-    fn closed_in_order(&self) -> Vec<Uuid> {
-        self.close_groups
+    /// Forget the closes no held snapshot holds any more. Their order can't
+    /// change a restore.
+    fn prune_close_history(&mut self) {
+        let held: HashSet<_> = self
+            .close_groups
             .iter()
-            .flat_map(|group| group.members.iter().copied())
-            .collect()
+            .flat_map(|group| group.layouts.values())
+            .flatten()
+            .flat_map(PaneNode::collect_instances)
+            .collect();
+        self.close_history.retain(|iid| held.contains(iid));
     }
 
     /// The project as the saved and shared documents hold it: a held pane is
@@ -605,6 +612,7 @@ impl MuxelApp {
                 *original = durable.clone();
             }
         }
+        self.prune_close_history();
         for iid in gone {
             muxel_store::append_event_log(&format!("close: a peer closed held pane [{iid}]"));
             self.forget_close(iid);
@@ -715,7 +723,6 @@ impl MuxelApp {
         index: usize,
         cx: &mut Context<Self>,
     ) -> (Option<Uuid>, Vec<(Uuid, HeldClose)>) {
-        let closed = self.closed_in_order();
         let group = self.close_groups.remove(index);
         let ids: HashSet<_> = group
             .members
@@ -729,9 +736,17 @@ impl MuxelApp {
             .or_else(|| group.members.iter().copied().find(|iid| ids.contains(iid)));
         for (&pid, original) in &group.layouts {
             if let Some(project) = self.workspace.project_mut(pid) {
-                recoverable_layout::restore_layout(&mut project.layout, original, &ids, &closed);
+                recoverable_layout::restore_layout(
+                    &mut project.layout,
+                    original,
+                    &ids,
+                    &self.close_history,
+                );
             }
         }
+        // Back in their layouts, so no longer closed.
+        self.close_history.retain(|iid| !ids.contains(iid));
+        self.prune_close_history();
         let mut restored = Vec::new();
         for iid in group.members {
             if let Some(held) = self.closing.remove(&iid) {
@@ -1086,6 +1101,12 @@ impl MuxelApp {
             group.members.retain(|&member| member != iid);
         }
         self.close_groups.retain(|group| !group.members.is_empty());
+        // Going final keeps the place it took when held. A pane closed at once
+        // leaves now, after every close held so far.
+        if !self.close_history.contains(&iid) {
+            self.close_history.push(iid);
+        }
+        self.prune_close_history();
         if self.close_groups.is_empty() {
             self.show_close_list = false;
         }

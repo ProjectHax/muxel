@@ -7,7 +7,7 @@ use super::{
 };
 use gpui::{AppContext, Entity, Focusable, TestAppContext, VisualTestContext, WindowHandle};
 use muxel_core::control::ErrorCode;
-use muxel_core::{PaneNode, Worktree, add_tab};
+use muxel_core::{LeafData, PaneNode, SplitDirection, Worktree, add_tab};
 use muxel_terminal::{
     AgentStatus, CommandSpec, TerminalLaunch, TerminalSession, TerminalStatusReason, TerminalView,
 };
@@ -1959,5 +1959,117 @@ fn undo_during_a_worktree_question_keeps_the_pane_out_of_its_answer() {
                 app.cancel_confirm(cx);
             })
             .unwrap();
+    });
+}
+
+/// How the second of two closed panes goes for good while the first is held.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SecondLeaves {
+    /// Both closed together, and its countdown finishes before the other's.
+    FinalFromTheSameClose,
+    /// Closed afterwards in a close of its own, which goes final.
+    FinalFromALaterClose,
+    /// Closed at once with no hold, as a dead pane is.
+    ClosedAtOnce,
+}
+
+#[test]
+fn undo_replays_a_close_that_went_final_in_the_order_it_happened() {
+    with_app(|cx, window| {
+        let mut got = Vec::new();
+        for way in [
+            SecondLeaves::FinalFromTheSameClose,
+            SecondLeaves::FinalFromALaterClose,
+            SecondLeaves::ClosedAtOnce,
+        ] {
+            let pid = project(cx, window);
+            let (a, _, _a) = terminal(cx, window, pid);
+            let (y, _, _y) = terminal(cx, window, pid);
+            let (x, _, _x) = terminal(cx, window, pid);
+            let (b, _, _b) = terminal(cx, window, pid);
+            let names = [(a, 'A'), (y, 'Y'), (x, 'X'), (b, 'B')];
+            let columns = |layout: &Option<PaneNode>| -> Vec<(char, i32)> {
+                let Some(PaneNode::Split {
+                    sizes, children, ..
+                }) = layout
+                else {
+                    panic!("expected a row: {layout:?}");
+                };
+                children
+                    .iter()
+                    .zip(sizes)
+                    .map(|(child, size)| {
+                        let iid = child.first_instance().unwrap();
+                        let name = names.iter().find(|(id, _)| *id == iid).unwrap().1;
+                        (name, size.round() as i32)
+                    })
+                    .collect()
+            };
+            window
+                .update(cx, |app, window, cx| {
+                    // Four equal columns. Y was split off B; the others have no
+                    // recorded origin, so X gives its width to Y beside it.
+                    let panes = [a, y, x, b].map(|iid| (iid, Uuid::new_v4()));
+                    let from_b = panes[3].1;
+                    app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::Split {
+                        direction: SplitDirection::Horizontal,
+                        sizes: vec![400.0; 4],
+                        children: panes
+                            .iter()
+                            .map(|&(iid, pane_id)| {
+                                PaneNode::Leaf(LeafData {
+                                    pane_id,
+                                    tabs: vec![iid],
+                                    active: 0,
+                                    split_from: (iid == y).then_some(from_b),
+                                })
+                            })
+                            .collect(),
+                    });
+                    let held = match way {
+                        SecondLeaves::FinalFromTheSameClose => {
+                            let group = app
+                                .hold_closes(vec![(x, false), (y, false)], None, cx)
+                                .unwrap();
+                            // As `finish_close_expiry` does for a member ready
+                            // before the rest of its close.
+                            app.close_instance_inner(y, "close (countdown)", cx);
+                            group
+                        }
+                        SecondLeaves::FinalFromALaterClose => {
+                            let group = app.hold_closes(vec![(x, false)], None, cx).unwrap();
+                            let later = app.hold_closes(vec![(y, false)], None, cx).unwrap();
+                            app.finalize_close_group(later, cx);
+                            group
+                        }
+                        SecondLeaves::ClosedAtOnce => {
+                            let group = app.hold_closes(vec![(x, false)], None, cx).unwrap();
+                            app.close_instance_inner(y, "close", cx);
+                            group
+                        }
+                    };
+                    let live = columns(&app.workspace.project(pid).unwrap().layout);
+                    let saved = app.workspace_with_closes_restored();
+                    let saved = columns(&saved.project(pid).unwrap().layout);
+                    app.undo_close(held, window, cx);
+                    let undone = columns(&app.workspace.project(pid).unwrap().layout);
+                    got.push((way, live, saved, undone));
+                })
+                .unwrap();
+        }
+        // Y's 400 went back to B, the pane it was split from. X has its own 400.
+        let back = vec![('A', 400), ('X', 400), ('B', 800)];
+        let want: Vec<_> = got
+            .iter()
+            .map(|&(way, ..)| {
+                (
+                    way,
+                    vec![('A', 400), ('B', 1200)],
+                    back.clone(),
+                    back.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(got, want);
     });
 }
