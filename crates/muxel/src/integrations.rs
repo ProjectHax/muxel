@@ -1113,8 +1113,9 @@ enum FileHead {
 
 /// Environment variables that choose the repository or change how git looks
 /// for it. Git children inherit muxel's environment, and neither the file read
-/// nor [`git_ref_stamp`] follows these, so with any of them set git answers on
-/// every poll. `GIT_CEILING_DIRECTORIES` is followed instead (see
+/// nor [`git_ref_stamp`] follows these, so with any of them set the read asks
+/// git and the stamp is unsettled (see [`GitRefStamp`]).
+/// `GIT_CEILING_DIRECTORIES` is followed instead (see
 /// [`ceiling_dirs`]): it is commonly set for good, and bailing on it would turn
 /// the read off entirely.
 const GIT_DISCOVERY_ENV: [&str; 4] = [
@@ -1228,9 +1229,9 @@ fn is_valid_ref_name(name: &str) -> bool {
 /// answer can: HEAD is a file, not a symlink, and the ref it names, if any,
 /// holds an object id itself (see [`ref_is_direct`]). `None` where git would
 /// follow HEAD on through a file the stamp doesn't read. That folder's stamp
-/// then stops gating git, and [`head_from_files`], which reads HEAD through
-/// this too, leaves the answer to git, so the two never disagree about which
-/// ref they look at.
+/// is then unsettled (see [`GitRefStamp`]), and [`head_from_files`], which
+/// reads HEAD through this too, leaves the answer to git, so the two never
+/// disagree about which ref they look at.
 fn settled_head(git_dir: &Path, common: &Path) -> Option<Vec<u8>> {
     let path = git_dir.join("HEAD");
     if std::fs::symlink_metadata(&path).ok()?.is_symlink() {
@@ -1345,14 +1346,14 @@ fn common_git_dir(git_dir: &Path) -> PathBuf {
 /// and no `git` subprocess, so the status poll re-runs git only when this
 /// moves. Not a repo is a stamp too, so a `git init` there is noticed.
 ///
-/// Where those files can't vouch for what git reads, the stamp is one of a
-/// kind: it never matches the one before, so git answers on every poll, as it
-/// did before stamps. That is with a variable from [`GIT_DISCOVERY_ENV`] set, a
-/// folder that can't be resolved, or a HEAD [`settled_head`] turns down.
+/// Where those files can't vouch for what git reads, the stamp is unsettled:
+/// that is with a variable from [`GIT_DISCOVERY_ENV`] set, a folder that can't
+/// be resolved, or a HEAD [`settled_head`] turns down. Unsettled is a state,
+/// not a change: such stamps all compare equal, so only a move into or out of
+/// it, or the shorter backstop [`GitRefStamp::backstop`] gives it, asks git.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GitRefStamp {
-    /// A serial number, set only on an unsettled stamp.
-    unsettled: Option<u64>,
+    unsettled: bool,
     git_dir: Option<PathBuf>,
     head: Option<Vec<u8>>,
     branches: Vec<PathBuf>,
@@ -1361,15 +1362,27 @@ pub struct GitRefStamp {
     worktree_reftable: Option<(std::time::SystemTime, u64)>,
 }
 
+impl GitRefStamp {
+    /// How long the branch poll lets this stamp stand before asking git
+    /// anyway. A settled stamp waits five minutes, for what it can't see (git
+    /// config, `safe.directory`, git installed later); the current branch is
+    /// read from the HEAD file, so that only re-lists the branches. An
+    /// unsettled one can't see the repository or ref git reads, so it gets the
+    /// one minute the poll waited before this read: a label there is at most
+    /// that stale, at no more launches than then.
+    pub fn backstop(&self) -> Duration {
+        Duration::from_secs(if self.unsettled { 60 } else { 300 })
+    }
+}
+
 pub fn git_ref_stamp(dir: &Path) -> GitRefStamp {
     git_ref_stamp_with(dir, |key| std::env::var_os(key))
 }
 
 /// [`git_ref_stamp`], reading git's environment from `env`.
 fn git_ref_stamp_with(dir: &Path, env: impl Fn(&str) -> Option<OsString>) -> GitRefStamp {
-    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let unsettled = || GitRefStamp {
-        unsettled: Some(SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+        unsettled: true,
         ..GitRefStamp::default()
     };
     if GIT_DISCOVERY_ENV.iter().any(|key| env(key).is_some()) {
@@ -1419,7 +1432,7 @@ fn git_ref_stamp_with(dir: &Path, env: impl Fn(&str) -> Option<OsString>) -> Git
         .then(|| file_stamp(git_dir.join("reftable").join("tables.list")))
         .flatten();
     GitRefStamp {
-        unsettled: None,
+        unsettled: false,
         head,
         branches,
         packed_refs: file_stamp(common.join("packed-refs")),
@@ -8313,27 +8326,41 @@ mod tests {
         set
     }
 
+    /// Seconds after the first poll at which the gate checks below ask whether
+    /// git may run: the next tick, then either side of the unsettled backstop
+    /// and of the settled one.
+    const TICKS: [u64; 5] = [1, 59, 60, 299, 300];
+    /// Shut until the settled backstop: nothing git reads moved.
+    const SHUT: [bool; 5] = [false, false, false, false, true];
+    /// Open from the next tick: the stamp moved.
+    const OPEN: [bool; 5] = [true; 5];
+    /// Shut until the unsettled backstop, master's one minute.
+    const MINUTE: [bool; 5] = [false, false, true, true, true];
+
     /// Whether the branch poll's gate, kept as the app keeps it, lets git run
-    /// on the tick after `change`, with git's environment read from `env`.
-    fn gate_reopens(dir: &Path, env: &[(&str, &Path)], change: impl FnOnce()) -> bool {
+    /// at each of [`TICKS`] after `change`, with git's environment read from
+    /// `env`. Each tick takes a fresh stamp, as the poll does.
+    fn gate_opens(dir: &Path, env: &[(&str, &Path)], change: impl FnOnce()) -> [bool; 5] {
         let lookup = |key: &str| {
             env.iter()
                 .find(|(k, _)| *k == key)
                 .map(|(_, v)| v.as_os_str().to_owned())
         };
-        let mut gate = muxel_core::refresh_gate::RefreshGate::new(Duration::from_secs(300));
+        let mut gate = muxel_core::refresh_gate::RefreshGate::per_stamp(GitRefStamp::backstop);
         let start = Instant::now();
         let first = git_ref_stamp_with(dir, lookup);
         assert!(gate.due(&(), &first, start), "the first poll runs git");
         gate.record((), first, start);
         change();
-        let next = git_ref_stamp_with(dir, lookup);
-        gate.due(&(), &next, start + Duration::from_secs(1))
+        TICKS.map(|secs| {
+            let stamp = git_ref_stamp_with(dir, lookup);
+            gate.due(&(), &stamp, start + Duration::from_secs(secs))
+        })
     }
 
-    /// The gate must let git run on the next tick whenever git's answer can
-    /// have moved, including where the stamp can't watch what git reads, and
-    /// stay shut while nothing moved.
+    /// The gate must let git run on the next tick when the stamp sees git's
+    /// answer move, wait for master's one-minute backstop where the stamp
+    /// can't see what git reads, and otherwise wait for the five-minute one.
     #[test]
     fn the_branch_gate_reopens_whenever_gits_answer_can_move() {
         let repo = TestRepo::init();
@@ -8343,17 +8370,18 @@ mod tests {
             repo.git(&["switch", "-q", branch]);
         };
         let mut wrong = Vec::new();
-        let mut expect = |case: &str, want: bool, reopened: bool| {
-            if reopened != want {
-                let gate = if reopened { "reopened" } else { "stayed shut" };
-                wrong.push(format!("{case}: the gate {gate}"));
+        let mut expect = |case: &str, want: [bool; 5], got: [bool; 5]| {
+            if got != want {
+                wrong.push(format!(
+                    "{case}: due at {TICKS:?} s was {got:?}, want {want:?}"
+                ));
             }
         };
-        expect("untouched", false, gate_reopens(repo.path(), &[], || {}));
+        expect("untouched", SHUT, gate_opens(repo.path(), &[], || {}));
         expect(
             "a switch",
-            true,
-            gate_reopens(repo.path(), &[], || switch("other")),
+            OPEN,
+            gate_opens(repo.path(), &[], || switch("other")),
         );
 
         // The stamp watches the folder shown; git reads the repo named.
@@ -8361,24 +8389,32 @@ mod tests {
         shown.commit(&[("b.txt", "two\n")], "init");
         let chosen = repo.path().join(".git");
         for key in ["GIT_DIR", "GIT_COMMON_DIR"] {
-            let reopened = gate_reopens(shown.path(), &[(key, &chosen)], || switch("main"));
-            expect(&format!("{key}: a switch there"), true, reopened);
+            let got = gate_opens(shown.path(), &[(key, &chosen)], || switch("main"));
+            expect(&format!("{key}: a switch there"), MINUTE, got);
             switch("other");
         }
 
         // The stamp holds branch names, not what a symbolic one names.
         repo.git(&["symbolic-ref", "refs/heads/alias", "refs/heads/main"]);
-        repo.git(&["symbolic-ref", "HEAD", "refs/heads/alias"]);
+        let onto_alias = || {
+            repo.git(&["symbolic-ref", "HEAD", "refs/heads/alias"]);
+        };
+        let got = gate_opens(repo.path(), &[], onto_alias);
+        expect("HEAD moved onto a symbolic branch", OPEN, got);
         let retarget = || {
             repo.git(&["symbolic-ref", "refs/heads/alias", "refs/heads/other"]);
         };
-        let reopened = gate_reopens(repo.path(), &[], retarget);
-        expect("a symbolic branch retargeted", true, reopened);
+        let got = gate_opens(repo.path(), &[], retarget);
+        expect("that branch retargeted", MINUTE, got);
         if !discovery_env_set() {
             let loc = RepoLoc::Local(repo.path().to_path_buf());
             assert_eq!(repo_current_branch(&loc).as_deref(), Some("other"));
         }
-        repo.git(&["symbolic-ref", "HEAD", "refs/heads/other"]);
+        let off_alias = || {
+            repo.git(&["symbolic-ref", "HEAD", "refs/heads/other"]);
+        };
+        let got = gate_opens(repo.path(), &[], off_alias);
+        expect("HEAD back on a plain branch", OPEN, got);
         repo.git(&["update-ref", "-d", "--no-deref", "refs/heads/alias"]);
 
         // Folders git walks on past must not take the repo's place.
@@ -8387,17 +8423,14 @@ mod tests {
             std::fs::create_dir_all(fixture.join(part)).unwrap();
         }
         std::fs::write(fixture.join("HEAD"), "fixture\n").unwrap();
-        let reopened = gate_reopens(&fixture, &[], || switch("main"));
-        expect("objects, refs and a HEAD git rejects", true, reopened);
+        let got = gate_opens(&fixture, &[], || switch("main"));
+        expect("objects, refs and a HEAD git rejects", OPEN, got);
         let hollow = repo.path().join("hollow");
         std::fs::create_dir_all(hollow.join(".git")).unwrap();
-        let reopened = gate_reopens(&hollow, &[], || switch("other"));
-        expect("an empty .git folder", true, reopened);
-        expect(
-            "below them, untouched",
-            false,
-            gate_reopens(&fixture, &[], || {}),
-        );
+        let got = gate_opens(&hollow, &[], || switch("other"));
+        expect("an empty .git folder", OPEN, got);
+        let got = gate_opens(&fixture, &[], || {});
+        expect("below them, untouched", SHUT, got);
 
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
