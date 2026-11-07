@@ -139,9 +139,11 @@ impl SessionDiscoveries {
         }
     }
 
-    /// Whether a lookup finished since the last call had been woken while it
-    /// ran. Its pane is due now, but nothing else asks for a lookup before the
-    /// next tick, so the caller should.
+    /// Whether a lookup finished since the last call left its pane due at
+    /// once: a wake arrived while it ran, or the pane's key changed under it
+    /// (its result then doesn't apply, but the new key's lookup is waiting).
+    /// Nothing else asks for a lookup before the next tick, so the caller
+    /// should.
     pub fn take_redispatch(&mut self) -> bool {
         std::mem::take(&mut self.redispatch)
     }
@@ -236,9 +238,9 @@ impl SessionDiscoveries {
         let Some(state) = self.panes.get_mut(&request.key.pane) else {
             return false;
         };
-        let woken = state.woken;
+        let releases = state.in_flight.as_ref() == Some(request);
         let valid = state.finish_with_quiet(request, current, now, found, quiet);
-        self.redispatch |= valid && woken;
+        self.redispatch |= releases && state.due(now);
         valid
     }
 
@@ -284,11 +286,13 @@ impl SessionDiscoveries {
         let Some(state) = self.panes.get_mut(&request.key.pane) else {
             return false;
         };
-        let woken = state.woken;
+        // Releasing the request can leave work due whether or not its result
+        // applies: a wake that waited on it, or a key that changed under it.
+        let releases = state.in_flight.as_ref() == Some(request);
         if !state.finish_with_quiet(request, current, now, found, quiet) {
+            self.redispatch |= releases && state.due(now);
             return false;
         }
-        self.redispatch |= woken;
         state.codex_miss = evidence.miss;
         if !found && request.key.provider == SessionProvider::Codex {
             state.codex_owner = owner;
@@ -301,6 +305,7 @@ impl SessionDiscoveries {
             state.misses = 0;
             state.retry_at = None;
         }
+        self.redispatch |= state.due(now);
         true
     }
 }
@@ -375,6 +380,11 @@ impl SessionDiscovery {
         } else {
             self.retry_at = None;
         }
+    }
+
+    /// Whether [`Self::begin`] would start a lookup at `now`.
+    fn due(&self, now: Instant) -> bool {
+        self.in_flight.is_none() && self.retry_at.is_none_or(|at| at <= now)
     }
 
     pub fn begin(
@@ -878,6 +888,33 @@ mod tests {
             discoveries.begin(key, now + 2 * SECOND).is_none(),
             "the wake is spent"
         );
+    }
+
+    #[test]
+    fn a_lookup_whose_key_changed_while_it_ran_asks_for_a_dispatch() {
+        let key = claude_key();
+        let mut discoveries = SessionDiscoveries::default();
+        discoveries.set_watched(SessionProvider::Claude, true);
+        let now = Instant::now();
+        let request = discoveries.begin(key.clone(), now).unwrap();
+        // The pane's directory changes and a hook wake arrives; both find the
+        // old lookup still running.
+        let moved = SessionDiscoveryKey {
+            cwd: PathBuf::from("elsewhere"),
+            ..key.clone()
+        };
+        assert!(discoveries.begin(moved.clone(), now).is_none());
+        discoveries.wake(SessionProvider::Claude, key.pane);
+        // It lands stale, but the new key's lookup is waiting on it.
+        assert!(!discoveries.finish_with_evidence(
+            &request,
+            Some(&moved),
+            now,
+            false,
+            LookupEvidence::default()
+        ));
+        assert!(discoveries.take_redispatch());
+        assert!(discoveries.begin(moved, now).is_some());
     }
 
     #[test]

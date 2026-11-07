@@ -2410,6 +2410,7 @@ mod claude_watch_regressions {
     use super::super::{MuxelApp, claude_test_home, popout_lifecycle_tests::with_app};
     use super::{DiscoveryBatch, DiscoveryCandidate};
     use crate::binding_watch::ClaudeBindingWatch;
+    use crate::binding_watch::test_backend::TestBackend;
     use crate::session_binding;
     use gpui::{AppContext as _, TestAppContext, WindowHandle};
     use muxel_core::session_discovery::SessionProvider;
@@ -2538,35 +2539,77 @@ mod claude_watch_regressions {
         });
     }
 
-    /// A backend that stops without reporting an error closes the signal's
-    /// sender. Claude panes go back to polling at once, so a record written
-    /// meanwhile is picked up with no tick and no event.
+    /// Follow a watch on `backend`, a stand-in for notify's.
+    fn follow_test_backend(
+        cx: &mut TestAppContext,
+        window: WindowHandle<MuxelApp>,
+        data: &Path,
+        backend: &TestBackend,
+    ) {
+        let (watch, signal) =
+            ClaudeBindingWatch::start_with(&session_binding::claude_binding_dir(data), |handler| {
+                backend.build(handler)
+            })
+            .unwrap();
+        window
+            .update(cx, |app, _, cx| {
+                app.follow_claude_binding_watch(watch, signal, cx)
+            })
+            .unwrap();
+    }
+
+    fn claude_watched(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -> bool {
+        window
+            .update(cx, |app, _, _| {
+                app.session_discoveries.watched(SessionProvider::Claude)
+            })
+            .unwrap()
+    }
+
+    /// The backend's worker dies without reporting an error, as inotify's
+    /// does when its poll fails: the handler it owned goes, closing the
+    /// signal, and its watcher's destructor would talk to the dead worker.
+    /// Claude panes go back to polling at once without running it, so a
+    /// record written meanwhile is picked up with no tick and no event.
     #[test]
-    fn a_closed_watcher_signal_puts_claude_panes_back_on_polling() {
+    fn a_watcher_backend_that_dies_puts_claude_panes_back_on_polling() {
         with_app(|cx, window| {
             let data = muxel_store::data_dir().unwrap();
             let _home = claude_test_home(Some(data.join("home")));
             let (pane, session, project) = claude_pane(cx, window, &data, false);
-            let (watch, _) =
-                ClaudeBindingWatch::start(&session_binding::claude_binding_dir(&data)).unwrap();
-            let (sender, signal) = async_channel::bounded(1);
-            window
-                .update(cx, |app, _, cx| {
-                    app.follow_claude_binding_watch(watch, signal, cx)
-                })
-                .unwrap();
+            let backend = TestBackend::default();
+            follow_test_backend(cx, window, &data, &backend);
             first_lookup(cx, window);
             let next = clear_hook(&data, &project, pane);
-            drop(sender);
+            backend.kill();
             let bound = bound_within(cx, window, pane, &next, Duration::from_secs(10), false);
-            let watched = window
-                .update(cx, |app, _, _| {
-                    app.session_discoveries.watched(SessionProvider::Claude)
-                })
-                .unwrap();
+            let watched = claude_watched(cx, window);
             session.kill();
             assert_eq!(bound.as_deref(), Some(next.as_str()));
             assert!(!watched);
+            assert!(!backend.dropped());
+        });
+    }
+
+    /// The watcher reports an error while its backend lives on. Claude panes
+    /// go back to polling at once, and the backend is stopped as usual.
+    #[test]
+    fn a_watcher_error_puts_claude_panes_back_on_polling() {
+        with_app(|cx, window| {
+            let data = muxel_store::data_dir().unwrap();
+            let _home = claude_test_home(Some(data.join("home")));
+            let (pane, session, project) = claude_pane(cx, window, &data, false);
+            let backend = TestBackend::default();
+            follow_test_backend(cx, window, &data, &backend);
+            first_lookup(cx, window);
+            let next = clear_hook(&data, &project, pane);
+            backend.send(Err(notify::Error::generic("watch lost")));
+            let bound = bound_within(cx, window, pane, &next, Duration::from_secs(10), false);
+            let watched = claude_watched(cx, window);
+            session.kill();
+            assert_eq!(bound.as_deref(), Some(next.as_str()));
+            assert!(!watched);
+            assert!(backend.dropped());
         });
     }
 
@@ -2587,6 +2630,39 @@ mod claude_watch_regressions {
                     let request = app.session_discoveries.begin(key, Instant::now()).unwrap();
                     let next = clear_hook(&data, &project, pane);
                     app.session_discoveries.wake(SessionProvider::Claude, pane);
+                    let batch = DiscoveryBatch {
+                        results: vec![(request, DiscoveryCandidate::Unresolved, None, None)],
+                        grok_read: None,
+                    };
+                    app.apply_discovery_batch(batch, Some(&data), cx);
+                    next
+                })
+                .unwrap();
+            let bound = bound_within(cx, window, pane, &next, Duration::from_secs(10), false);
+            session.kill();
+            assert_eq!(bound.as_deref(), Some(next.as_str()));
+        });
+    }
+
+    /// As above, but the pane's key changes while that lookup runs, so its
+    /// result lands stale. The new key's lookup still runs as soon as it does.
+    #[test]
+    fn a_wake_behind_a_lookup_whose_key_changed_runs_the_next_one_when_it_lands() {
+        with_app(|cx, window| {
+            let data = muxel_store::data_dir().unwrap();
+            let _home = claude_test_home(Some(data.join("home")));
+            let (pane, session, project) = claude_pane(cx, window, &data, true);
+            first_lookup(cx, window);
+            let next = window
+                .update(cx, |app, _, cx| {
+                    app.session_discoveries.wake(SessionProvider::Claude, pane);
+                    let key = app.session_discovery_key(pane, cx).unwrap();
+                    let request = app.session_discoveries.begin(key, Instant::now()).unwrap();
+                    app.bump_session_binding_generation(pane);
+                    let next = clear_hook(&data, &project, pane);
+                    app.session_discoveries.wake(SessionProvider::Claude, pane);
+                    // The event's own dispatch finds the old lookup running.
+                    app.sync_provider_session_ids(cx);
                     let batch = DiscoveryBatch {
                         results: vec![(request, DiscoveryCandidate::Unresolved, None, None)],
                         grok_read: None,
