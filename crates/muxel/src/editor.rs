@@ -384,7 +384,7 @@ impl EditorView {
     /// Unmarking IME text can commit it without emitting InputEvent::Change.
     /// Compare only when deciding whether a disk reload may discard the buffer.
     fn check_unreported_edits(&mut self, cx: &mut Context<Self>) {
-        if !self.dirty && self.input.read(cx).text() != &self.clean_text {
+        if !self.dirty && self.is_dirty(cx) {
             self.dirty = true;
             cx.notify();
         }
@@ -472,8 +472,12 @@ impl EditorView {
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
+    pub fn is_dirty(&self, cx: &App) -> bool {
+        self.dirty || (self.diff_dir.is_none() && self.input.read(cx).text() != &self.clean_text)
+    }
+    #[cfg(all(test, windows))]
+    pub(crate) fn input_for_test(&self) -> Entity<InputState> {
+        self.input.clone()
     }
     pub(crate) fn external_change(&self) -> Option<ExternalChange> {
         self.external_change.clone()
@@ -890,7 +894,8 @@ mod ime_tests {
             reload.compose("あ");
             assert_eq!(reload.text(), "あone\n");
             assert_eq!(reload.marked_range(), Some(0..1));
-            assert!(!reload.update(|editor, _, _| editor.is_dirty()));
+            // Preedit still emits no Change event; the dirty query also checks text.
+            assert!(!reload.update(|editor, _, _| editor.dirty));
             std::fs::write(&reload.path, "remote replacement\n").unwrap();
             if reopen {
                 reload.update(|editor, window, cx| editor.reload_if_clean(window, cx));
@@ -934,7 +939,7 @@ mod ime_tests {
             reload.poll();
             assert_eq!(reload.marked_range(), None);
             assert_eq!(reload.text(), "あone\n");
-            assert!(reload.update(|editor, _, _| editor.is_dirty()));
+            assert!(reload.update(|editor, _, cx| editor.is_dirty(cx)));
             assert!(reload.update(|editor, _, _| matches!(
                 editor.external_change(),
                 Some(ExternalChange::Modified(content)) if content == "remote replacement\n"
@@ -975,7 +980,7 @@ mod ime_tests {
             reload.update(|editor, window, cx| editor.reload_external_change(window, cx));
             assert_eq!(reload.text(), disk_text);
             assert_eq!(reload.marked_range(), None);
-            assert!(!reload.update(|editor, _, _| editor.is_dirty()));
+            assert!(!reload.update(|editor, _, cx| editor.is_dirty(cx)));
             assert!(reload.update(|editor, _, _| editor.external_change().is_none()));
 
             std::fs::write(&reload.path, "next disk version\n").unwrap();

@@ -1314,8 +1314,9 @@ feature is added or changed, update the matching entry here in the same change**
   position. Automatic refresh waits for IME composition to finish. Cancelling
   composition allows refresh; committed text stays local. Dirty buffers show
   **Reload / Keep mine** instead of being overwritten. Explicit **Reload** discards
-  local edits, including any active composition. Deleted or unreadable files remain
-  open with a warning. The same behavior works in
+  local edits, including any active composition. Closing asks to save composing text,
+  and popping out preserves it as unsaved. Deleted or unreadable files remain open
+  with a warning. The same behavior works in
   main, secondary, and popped-out editor windows.
 - **Resource tab grouping** — files, diffs, and browser pages opened by default join
   the nearest pane of the same type; explicit New Tab and New Pane commands still
