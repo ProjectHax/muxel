@@ -6,7 +6,7 @@
 use crate::i18n::{t, tf};
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputEvent, InputState, Position, TabSize};
+use gpui_component::input::{Input, InputEvent, InputState, Position, Rope, TabSize};
 use gpui_component::text::markdown;
 use gpui_component::{ActiveTheme, Sizable};
 use std::path::{Path, PathBuf};
@@ -46,6 +46,8 @@ pub struct EditorView {
     input: Entity<InputState>,
     path: Option<PathBuf>,
     dirty: bool,
+    /// Last clean buffer, for detecting edits accepted without InputEvent::Change.
+    clean_text: Rope,
     config: EditorConfig,
     /// Set for read-only diff panes: the directory whose `git diff` is shown.
     diff_dir: Option<PathBuf>,
@@ -212,10 +214,12 @@ impl EditorView {
         let stamp = path.as_deref().and_then(disk_stamp);
         let is_markdown = path.as_deref().is_some_and(is_markdown_path);
         let is_image = path.as_deref().is_some_and(is_image_path);
+        let clean_text = input.read(cx).text().clone();
         Self {
             input,
             path,
             dirty,
+            clean_text,
             config,
             diff_dir: None,
             is_image,
@@ -248,6 +252,8 @@ impl EditorView {
             input,
             path: None,
             dirty: false,
+            // Read-only diffs never reload from a file or need a clean snapshot.
+            clean_text: Rope::new(),
             config,
             diff_dir: Some(dir),
             is_image: false,
@@ -369,14 +375,34 @@ impl EditorView {
         });
     }
 
-    /// Reload an unchanged local buffer from disk. Dirty source always wins.
+    fn is_composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.input.update(cx, |input, cx| {
+            input.marked_text_range(window, cx).is_some()
+        })
+    }
+
+    /// Unmarking IME text can commit it without emitting InputEvent::Change.
+    /// Compare only when deciding whether a disk reload may discard the buffer.
+    fn check_unreported_edits(&mut self, cx: &mut Context<Self>) {
+        if !self.dirty && self.input.read(cx).text() != &self.clean_text {
+            self.dirty = true;
+            cx.notify();
+        }
+    }
+
+    /// Reload an unchanged local buffer from disk. Dirty source always wins,
+    /// and in-progress IME text stays in place until composition ends.
     pub fn reload_if_clean(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dirty {
+        if self.dirty || self.is_composing(window, cx) {
             return;
         }
         let Some(path) = self.path.clone() else {
             return;
         };
+        self.check_unreported_edits(cx);
+        if self.dirty {
+            return;
+        }
         let Some(content) = read_text_file(&path) else {
             return;
         };
@@ -395,6 +421,12 @@ impl EditorView {
     ) {
         match change {
             DiskChange::Content { stamp, content } => {
+                if self.is_composing(window, cx) {
+                    // Leave the old stamp so the next poll retries after the
+                    // composition commits or cancels, using current disk text.
+                    return;
+                }
+                self.check_unreported_edits(cx);
                 self.disk_stamp = Some(stamp);
                 if self.dirty {
                     self.external_change = Some(ExternalChange::Modified(content));
@@ -422,6 +454,7 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         if &*self.input.read(cx).value() == content.as_str() {
+            self.clean_text = self.input.read(cx).text().clone();
             return;
         }
         self.input.update(cx, |s, cx| {
@@ -431,6 +464,7 @@ impl EditorView {
             s.set_scroll_offset(offset, cx);
             s.set_cursor_position(cursor, window, cx);
         });
+        self.clean_text = self.input.read(cx).text().clone();
         self.dirty = false;
         cx.notify();
     }
@@ -489,6 +523,7 @@ impl EditorView {
     pub fn mark_saved(&mut self, cx: &mut Context<Self>) {
         let was_dirty = self.dirty;
         let changed = self.external_change.take().is_some();
+        self.clean_text = self.input.read(cx).text().clone();
         self.disk_stamp = self.path.as_deref().and_then(disk_stamp);
         if self.dirty {
             self.dirty = false;
@@ -502,6 +537,7 @@ impl EditorView {
     /// path/language, and clear the dirty flag.
     pub fn set_content(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         self.input.update(cx, |s, cx| s.set_value(text, window, cx));
+        self.clean_text = self.input.read(cx).text().clone();
         self.dirty = false;
         self.external_change = None;
         self.disk_stamp = self.path.as_deref().and_then(disk_stamp);
@@ -514,10 +550,24 @@ impl EditorView {
         let lang = language_for_path(&path).to_string();
         let stamp = disk_stamp(&path);
         self.input.update(cx, |s, cx| s.set_highlighter(lang, cx));
+        self.clean_text = self.input.read(cx).text().clone();
         self.path = Some(path);
         self.dirty = false;
         self.external_change = None;
         self.disk_stamp = stamp;
+        cx.notify();
+    }
+
+    /// Explicit Reload discards all local text, including an active composition.
+    fn reload_external_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ExternalChange::Modified(content)) = self.external_change.take() else {
+            return;
+        };
+        // End composition even if the chosen disk text already equals the input.
+        self.input
+            .update(cx, |input, cx| input.unmark_text(window, cx));
+        self.replace_disk_content(content, window, cx);
+        self.dirty = false;
         cx.notify();
     }
 
@@ -538,13 +588,7 @@ impl EditorView {
                     .xsmall()
                     .label(t("Reload"))
                     .on_click(cx.listener(|this, _event, window, cx| {
-                        let Some(ExternalChange::Modified(content)) = this.external_change.take()
-                        else {
-                            return;
-                        };
-                        this.replace_disk_content(content, window, cx);
-                        this.dirty = false;
-                        cx.notify();
+                        this.reload_external_change(window, cx);
                     })),
             );
         }
@@ -763,5 +807,180 @@ mod tests {
             Some(DiskChange::Unavailable { .. })
         ));
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod ime_tests {
+    use super::{EditorConfig, EditorView, ExternalChange, read_disk_change};
+    use gpui::{Context, EntityInputHandler, TestAppContext, Window, WindowHandle};
+    use std::ops::Range;
+    use std::path::PathBuf;
+
+    struct ImeReload {
+        window: WindowHandle<EditorView>,
+        path: PathBuf,
+        cx: TestAppContext,
+    }
+
+    impl ImeReload {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "muxel-editor-ime-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("notes.txt");
+            std::fs::write(&path, "one\n").unwrap();
+            let mut cx = TestAppContext::single();
+            cx.skip_drawing();
+            cx.update(gpui_component::init);
+            let window = cx.add_window(|window, cx| {
+                EditorView::open(Some(path.clone()), EditorConfig::default(), window, cx)
+            });
+            Self { window, path, cx }
+        }
+
+        fn update<R>(
+            &mut self,
+            run: impl FnOnce(&mut EditorView, &mut Window, &mut Context<EditorView>) -> R,
+        ) -> R {
+            self.window.update(&mut self.cx, run).unwrap()
+        }
+
+        fn compose(&mut self, text: &str) {
+            self.update(|editor, window, cx| {
+                editor.input.update(cx, |input, cx| {
+                    input.replace_and_mark_text_in_range(None, text, None, window, cx)
+                })
+            });
+        }
+
+        fn text(&mut self) -> String {
+            self.update(|editor, _, cx| editor.text(cx))
+        }
+
+        fn marked_range(&mut self) -> Option<Range<usize>> {
+            self.update(|editor, window, cx| {
+                editor
+                    .input
+                    .update(cx, |input, cx| input.marked_text_range(window, cx))
+            })
+        }
+
+        fn poll(&mut self) {
+            let stamp = self.update(|editor, _, _| editor.disk_stamp());
+            if let Some(change) = read_disk_change(&self.path, stamp) {
+                self.update(|editor, window, cx| editor.apply_disk_change(change, window, cx));
+            }
+        }
+    }
+
+    impl Drop for ImeReload {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.path.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn automatic_reload_preserves_ime_text_until_composition_is_cancelled() {
+        for reopen in [false, true] {
+            let mut reload = ImeReload::new(if reopen { "reopen" } else { "poll" });
+            reload.compose("あ");
+            assert_eq!(reload.text(), "あone\n");
+            assert_eq!(reload.marked_range(), Some(0..1));
+            assert!(!reload.update(|editor, _, _| editor.is_dirty()));
+            std::fs::write(&reload.path, "remote replacement\n").unwrap();
+            if reopen {
+                reload.update(|editor, window, cx| editor.reload_if_clean(window, cx));
+            } else {
+                reload.poll();
+                reload.poll();
+            }
+            assert_eq!(
+                reload.text(),
+                "あone\n",
+                "automatic reload discarded preedit"
+            );
+            assert_eq!(reload.marked_range(), Some(0..1));
+
+            // Cancellation restores the clean buffer; the next ordinary poll
+            // must still see the disk change, without another write to the file.
+            reload.compose("");
+            assert_eq!(reload.marked_range(), None);
+            reload.poll();
+            assert_eq!(reload.text(), "remote replacement\n");
+        }
+    }
+
+    #[test]
+    fn committed_ime_text_keeps_local_edits_and_offers_the_disk_version() {
+        for unmark in [false, true] {
+            let mut reload = ImeReload::new(if unmark { "unmark" } else { "commit" });
+            reload.compose("あ");
+            std::fs::write(&reload.path, "remote replacement\n").unwrap();
+            reload.poll();
+            assert_eq!(reload.text(), "あone\n", "disk poll discarded preedit");
+            reload.update(|editor, window, cx| {
+                editor.input.update(cx, |input, cx| {
+                    if unmark {
+                        input.unmark_text(window, cx);
+                    } else {
+                        input.replace_text_in_range(None, "あ", window, cx);
+                    }
+                })
+            });
+            reload.poll();
+            assert_eq!(reload.marked_range(), None);
+            assert_eq!(reload.text(), "あone\n");
+            assert!(reload.update(|editor, _, _| editor.is_dirty()));
+            assert!(reload.update(|editor, _, _| matches!(
+                editor.external_change(),
+                Some(ExternalChange::Modified(content)) if content == "remote replacement\n"
+            )));
+
+            // Saving accepts the composed text as the new clean version.
+            let saved_text = reload.text();
+            std::fs::write(&reload.path, saved_text).unwrap();
+            reload.update(|editor, _, cx| editor.mark_saved(cx));
+            std::fs::write(&reload.path, "later disk version\n").unwrap();
+            reload.poll();
+            assert_eq!(reload.text(), "later disk version\n");
+        }
+    }
+
+    #[test]
+    fn explicit_reload_discards_ime_composition_with_other_local_edits() {
+        for same_text in [false, true] {
+            let mut reload = ImeReload::new(if same_text {
+                "explicit-equal"
+            } else {
+                "explicit"
+            });
+            reload.update(|editor, window, cx| {
+                editor.input.update(cx, |input, cx| {
+                    input.replace_text_in_range(None, "local ", window, cx)
+                })
+            });
+            let disk_text = if same_text {
+                "local あone\n"
+            } else {
+                "remote replacement\n"
+            };
+            std::fs::write(&reload.path, disk_text).unwrap();
+            reload.poll();
+            reload.compose("あ");
+            assert!(reload.marked_range().is_some());
+            reload.update(|editor, window, cx| editor.reload_external_change(window, cx));
+            assert_eq!(reload.text(), disk_text);
+            assert_eq!(reload.marked_range(), None);
+            assert!(!reload.update(|editor, _, _| editor.is_dirty()));
+            assert!(reload.update(|editor, _, _| editor.external_change().is_none()));
+
+            std::fs::write(&reload.path, "next disk version\n").unwrap();
+            reload.poll();
+            assert_eq!(reload.text(), "next disk version\n");
+        }
     }
 }

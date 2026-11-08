@@ -1311,8 +1311,11 @@ feature is added or changed, update the matching entry here in the same change**
   the browser preview while HTML source panes offer a **Preview** action.
 - **External file freshness** — open local text files, including rendered Markdown,
   update within 500 ms when another tool writes them. Refresh keeps cursor and scroll
-  position. Dirty buffers show **Reload / Keep mine** instead of being overwritten;
-  deleted or unreadable files remain open with a warning. The same behavior works in
+  position. Automatic refresh waits for IME composition to finish. Cancelling
+  composition allows refresh; committed text stays local. Dirty buffers show
+  **Reload / Keep mine** instead of being overwritten. Explicit **Reload** discards
+  local edits, including any active composition. Deleted or unreadable files remain
+  open with a warning. The same behavior works in
   main, secondary, and popped-out editor windows.
 - **Resource tab grouping** — files, diffs, and browser pages opened by default join
   the nearest pane of the same type; explicit New Tab and New Pane commands still
