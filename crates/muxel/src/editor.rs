@@ -196,12 +196,16 @@ impl EditorView {
                 })
                 .default_value(content)
         });
-        // Mark dirty on edit; refresh the pane title's dirty dot once.
+        // IME cancellation can emit Change after restoring the clean text.
+        // Mark actual edits dirty; refresh the pane title's dirty dot once.
         cx.subscribe_in(
             &input,
             window,
-            |this: &mut Self, _input, ev: &InputEvent, _window, cx| {
-                if matches!(ev, InputEvent::Change) && !this.dirty {
+            |this: &mut Self, input, ev: &InputEvent, _window, cx| {
+                if matches!(ev, InputEvent::Change)
+                    && !this.dirty
+                    && input.read(cx).text() != &this.clean_text
+                {
                     this.dirty = true;
                     cx.notify();
                 }
@@ -861,6 +865,19 @@ mod ime_tests {
             });
         }
 
+        fn cancel_by_replacing_marked_text(&mut self, explicit_range: bool) {
+            self.update(|editor, window, cx| {
+                editor.input.update(cx, |input, cx| {
+                    let range = if explicit_range {
+                        input.marked_text_range(window, cx)
+                    } else {
+                        None
+                    };
+                    input.replace_text_in_range(range, "", window, cx);
+                })
+            });
+        }
+
         fn text(&mut self) -> String {
             self.update(|editor, _, cx| editor.text(cx))
         }
@@ -986,6 +1003,77 @@ mod ime_tests {
             std::fs::write(&reload.path, "next disk version\n").unwrap();
             reload.poll();
             assert_eq!(reload.text(), "next disk version\n");
+        }
+    }
+
+    fn assert_cancel_retries_pending_reload(explicit_range: bool) {
+        let mut reload = ImeReload::new(if explicit_range {
+            "cancel-explicit-range"
+        } else {
+            "cancel-implicit-range"
+        });
+        reload.compose("あ");
+        std::fs::write(&reload.path, "remote replacement\n").unwrap();
+        reload.poll();
+        assert_eq!(reload.text(), "あone\n");
+        reload.cancel_by_replacing_marked_text(explicit_range);
+        assert_eq!(reload.text(), "one\n");
+        assert_eq!(reload.marked_range(), None);
+        reload.poll();
+        assert_eq!(
+            reload.text(),
+            "remote replacement\n",
+            "cancelling unchanged text blocked the pending disk reload"
+        );
+        assert!(!reload.update(|editor, _, cx| editor.is_dirty(cx)));
+        assert!(reload.update(|editor, _, _| editor.external_change().is_none()));
+    }
+
+    #[test]
+    fn cancellation_with_implicit_range_retries_pending_reload() {
+        // Windows' empty-composition callback replaces the implicit marked range.
+        assert_cancel_retries_pending_reload(false);
+    }
+
+    #[test]
+    fn cancellation_with_explicit_range_retries_pending_reload() {
+        // Wayland's delete-preedit callback supplies the marked range explicitly.
+        assert_cancel_retries_pending_reload(true);
+    }
+
+    #[test]
+    fn cancellation_callbacks_preserve_existing_dirty_state() {
+        for explicit_range in [false, true] {
+            let mut reload = ImeReload::new(if explicit_range {
+                "dirty-cancel-explicit"
+            } else {
+                "dirty-cancel-implicit"
+            });
+            // An already-dirty editor stays dirty even if earlier edits were
+            // returned to their original text, matching ordinary edit behavior.
+            reload.update(|editor, window, cx| {
+                editor.input.update(cx, |input, cx| {
+                    input.replace_text_in_range(None, "local ", window, cx)
+                })
+            });
+            reload.update(|editor, window, cx| {
+                editor.input.update(cx, |input, cx| {
+                    input.replace_text_in_range(Some(0..6), "", window, cx)
+                })
+            });
+            assert_eq!(reload.text(), "one\n");
+            assert!(reload.update(|editor, _, cx| editor.is_dirty(cx)));
+            reload.compose("あ");
+            std::fs::write(&reload.path, "remote replacement\n").unwrap();
+            reload.poll();
+            reload.cancel_by_replacing_marked_text(explicit_range);
+            reload.poll();
+            assert_eq!(reload.text(), "one\n");
+            assert!(reload.update(|editor, _, cx| editor.is_dirty(cx)));
+            assert!(reload.update(|editor, _, _| matches!(
+                editor.external_change(),
+                Some(ExternalChange::Modified(content)) if content == "remote replacement\n"
+            )));
         }
     }
 }
