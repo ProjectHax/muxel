@@ -113,6 +113,11 @@ feature is added or changed, update the matching entry here in the same change**
   a popped-out terminal returns to the main window. Busy or uncertain terminals
   ask first; confirmed busy closes still get Undo. Quiet closes recheck launch,
   binding, input and completion before expiry; changed work gets Close / Keep.
+  On Linux and macOS, a shell prompt counts as idle only when the shell owns
+  the foreground group, still runs its launched executable and has no child
+  process. Background jobs and `exec` into a different executable ask before
+  closing, even with OSC 133 marks; incomplete process information asks too.
+  Persistent prompt helpers keep asking while they remain children.
   An OSC 7501 report counts as quiet only while idle or finished; an `error`
   report asks, and any turn a report finishes during the countdown is changed
   work. Batch closes offer Close all, Close only the idle ones, or Cancel; a

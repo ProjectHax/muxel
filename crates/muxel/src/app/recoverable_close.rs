@@ -2,10 +2,12 @@
 
 use super::*;
 use muxel_core::control::AgentState;
+#[cfg(not(unix))]
+use muxel_core::recoverable_close::shell_close_evidence;
 use muxel_core::recoverable_close::{
     CloseDecision, CloseEvidence, CloseFacts, CloseStage, ExpiredCloseSync, HeldLaunch, HeldView,
     LayoutWait, UndoLaunch, decide, departure_finalizes, exit_proves_closed, expired_close_sync,
-    held_launch, may_finalize, rehide_held, session_may_outlive, shell_close_evidence, undo_launch,
+    held_launch, may_finalize, rehide_held, session_may_outlive, undo_launch,
 };
 use muxel_terminal::TerminalStatusReason;
 use std::borrow::Cow;
@@ -198,18 +200,27 @@ impl MuxelApp {
         });
         let evidence = if let Some(view) = view {
             if !muxel_core::is_known_agent_program(inst.and_then(|inst| inst.program.as_deref())) {
-                shell_close_evidence(
-                    inst.and_then(|inst| inst.program.as_deref()),
-                    inst.is_some_and(|inst| {
-                        inst.tmux_session.is_some()
-                            || self
-                                .workspace
-                                .project(inst.project_id)
-                                .is_some_and(Project::is_remote)
-                    }),
-                    cfg!(unix) && view.session().is_idle_foreground(),
-                    view.session().shell_at_prompt(),
-                )
+                let program = inst.and_then(|inst| inst.program.as_deref());
+                let via_client = inst.is_some_and(|inst| {
+                    inst.tmux_session.is_some()
+                        || self
+                            .workspace
+                            .project(inst.project_id)
+                            .is_some_and(Project::is_remote)
+                });
+                #[cfg(unix)]
+                {
+                    view.session().shell_close_evidence(program, via_client)
+                }
+                #[cfg(not(unix))]
+                {
+                    shell_close_evidence(
+                        program,
+                        via_client,
+                        false,
+                        view.session().shell_at_prompt(),
+                    )
+                }
             } else if !attributable {
                 CloseEvidence::Settling
             } else {

@@ -15,6 +15,8 @@ mod keymap;
 mod links;
 mod listener;
 mod present_flag;
+#[cfg(unix)]
+mod process_tree_unix;
 mod profile;
 mod profile_idle;
 pub mod profile_log;
