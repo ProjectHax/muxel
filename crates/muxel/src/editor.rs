@@ -434,9 +434,10 @@ impl EditorView {
             let offset = s.scroll_offset();
             let cursor = s.cursor_position();
             s.set_value(content, window, cx);
-            s.set_scroll_offset(offset, cx);
             let at = s.text().position_to_offset(&cursor);
             s.set_selected_range(at..at, cx);
+            // Restoring the cursor scrolls it into view once layout exists.
+            s.set_scroll_offset(offset, cx);
         });
         self.dirty = false;
         cx.notify();
@@ -938,5 +939,65 @@ mod tests {
         // The cursor's own line shrinks past it, leaving it at the line's end.
         reload.poll("one more\nsec\n");
         assert_eq!(reload.cursor(), Position::new(1, 3));
+    }
+
+    // On macOS, gpui-component's Root installs native accessibility hooks;
+    // GPUI test windows have no native window handle for that constructor.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_drawn_editor_keeps_its_scroll_and_cursor_after_disk_reload() {
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_component::init);
+        let original = (0..200).map(|i| format!("line {i}\n")).collect::<String>();
+        let mut editor = None;
+        let window = cx.add_window(|window, cx| {
+            let view = cx.new(|cx| {
+                EditorView::build(
+                    None,
+                    original.clone(),
+                    "text".into(),
+                    Some(Position::new(2, 3)),
+                    false,
+                    EditorConfig::default(),
+                    window,
+                    cx,
+                )
+            });
+            editor = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let editor = editor.unwrap();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), &cx);
+        visual.run_until_parked();
+        // Scroll away from the cursor, as when reading further down the file.
+        visual.update(|_, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.input.update(cx, |input, cx| {
+                    input.set_scroll_offset(gpui::point(gpui::px(0.), gpui::px(-500.)), cx)
+                })
+            })
+        });
+        visual.run_until_parked();
+        let before = visual.update(|_, cx| {
+            let editor = editor.read(cx);
+            (editor.input.read(cx).scroll_offset(), editor.cursor(cx))
+        });
+        assert!(
+            before.0.y < gpui::px(0.),
+            "the drawn editor must be scrolled"
+        );
+        assert_eq!(before.1, Position::new(2, 3));
+
+        visual.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.replace_disk_content(format!("{original}extra\n"), window, cx)
+            })
+        });
+        visual.run_until_parked();
+        let after = visual.update(|_, cx| {
+            let editor = editor.read(cx);
+            (editor.input.read(cx).scroll_offset(), editor.cursor(cx))
+        });
+        assert_eq!(after, before, "disk reload moved the viewport or cursor");
     }
 }
