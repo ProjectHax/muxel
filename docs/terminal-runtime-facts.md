@@ -6,6 +6,81 @@ return the stored snapshot; they never parse terminal rows or advance status.
 Attribution also checks the session's current binding revision, so a switch
 invalidates cached facts before its queued reconciliation runs.
 
+## Recoverable close and outside control
+
+A held terminal keeps its process and runtime snapshot. It leaves ctl listings,
+but `status`, `show`, `screen` and `wait` can still address it by id or name.
+Input, including forced sends and delayed keys, refuses with `closing`.
+`undo_until` is present only during an active countdown. Otherwise `reason`
+is `counting_down`, `checking`, `awaiting_decision` or `restoring`, with no
+deadline. `counting_down` covers a hold whose monotonic grace period continues
+after its wall-clock deadline elapsed, such as across suspend. Keep or
+Undo in the app restores input. A pane removed while `wait` polls or collects
+its result returns an `exited` error explaining that it closed or left the
+workspace.
+
+For shared layouts, expiry waits for a read begun after the deadline was
+noticed. Explicit Close starts a fresh read barrier after the click, including
+when an earlier expiry read succeeded before suspend. Malformed or failed
+reads and reads overtaken by a local push do not release that barrier. A
+confirmed missing local layout does. Unreadable layouts offer an explicit
+Close without reading or Keep. Quit and workspace departure restore shared
+closes instead of committing removal without a fresh comparison.
+
+Local tmux removal saves a pending kill and a fresh close token in the project's
+ledger before I/O, then saves any resolved legacy server owner before killing.
+Only the original in-memory attempt can stamp that token on the session. A
+retry never stamps; the tmux server compares the saved token and observed
+session id before killing that exact id. A replacement, including a new server
+reusing an id, does not inherit the stamp. A mismatch preserves the session
+and files; an unknown or failed query retains the ledger. The ten-second bound
+starts at the final close, after any Undo hold. The first stamp identifies the
+session present when that attempt runs, not at the original click, and a forced
+close doesn't recheck the pane during its hold, so a peer's replacement in that
+window isn't detected. An attempt that fails before stamping leaves nothing to
+prove, so the next activation cancels it and keeps the session.
+
+Worktree answers run only through their hold's final close. Quit and workspace
+departure void them: files stay, and a worktree left without a pane is detached
+so the sidebar still lists it. Loading a workspace applies the same rule to local
+worktrees saved attached with no pane.
+
+Activation reconciles shared layout before replay, and cancels any close whose
+instance reappeared or whose target a current pane shows. Closes without a
+verifiable token are cancelled without killing. The event log retains the target's
+name and any known server. Import keeps its existing discovery scope; an arbitrary
+recorded server outside that scope needs an explicit reattach. Import excludes
+pending closes from every project on the same host. Automatic worktree cleanup
+runs only after confirmed local session death; unconfirmed remote teardown
+keeps the worktree and logs why.
+
+Worktree choices still pass through busy confirmation and the Undo countdown.
+A file answer runs only if the close it was given for is accepted and takes every
+captured pane. Close only the idle ones leaving one open, a replaced prompt, a
+newer close, a cancelled client check, or any captured pane leaving before
+acceptance (exiting, or closed by a peer through the shared layout), even with
+others still open, each drop the answer, and the worktree asks again when its
+last pane goes.
+
+The selected file action waits until the captured panes have closed and the kills
+for that worktree's panes are confirmed. Each ledger entry records the worktree its
+pane ran in, so another pane's kill holds nothing back; an entry saved before that
+was recorded counts as any worktree. A worktree with its own kill still running
+waits without a notice. A local one whose kill fails, can't be saved to the ledger
+or can't be confirmed is kept and detached, so the sidebar still lists it; an
+activation retry settles it as the first attempt would have. A remote one is never removed on close.
+It stays on the host and attached, since a peer's panes may use it. Undo, Cancel, a new worktree member, or a
+failed or unsaved kill or preserved session for that worktree cancels the pending file action, so a retry that
+confirms the kill later leaves the files alone. Dirty,
+unmerged or shared legacy worktrees are kept rather than force-removed.
+
+Project removal never waits on the ledger, which goes with the project. Kills
+already running finish in the background, older unconfirmed entries get one last
+try, and nothing retries after that. A session that survives keeps running on its
+host, the removal says so, and Import lists it. A held pane's file answer is dropped
+and its files stay. A worktree whose kill finishes after removal also stays on disk,
+as no project is left to act from.
+
 ## Reconciliation edges
 
 The view reconciles after drained PTY output, process exit, a settled resize,

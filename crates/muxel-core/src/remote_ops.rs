@@ -206,7 +206,8 @@ pub fn test_file(os: RemoteOs, path: &str) -> String {
 }
 
 /// Create `<root>/<dir>`, seed `<root>/<dir>/<file>` with `header` when absent,
-/// and make sure `<ignore_line>` is in `.gitignore`. Idempotent.
+/// and make sure git ignores `<ignore_line>`, adding it to `.gitignore` when no
+/// ignore source covers it yet. Idempotent.
 pub fn ensure_seeded_file(
     os: RemoteOs,
     root: &str,
@@ -219,12 +220,12 @@ pub fn ensure_seeded_file(
     match os {
         RemoteOs::Unix => format!(
             "cd {root} && mkdir -p {dir} && {{ test -f {file} || printf '%s' {hdr} > {file}; }} \
-             && {{ grep -qxF {ign} .gitignore 2>/dev/null || printf '%s\\n' {ign} >> .gitignore; }}",
+             && {{ {ignore}; }}",
             root = sh_quote(root),
             dir = sh_quote(dir),
             file = sh_quote(rel_file),
             hdr = sh_quote(header),
-            ign = sh_quote(ignore_line),
+            ignore = append_gitignore_sh(ignore_line),
         ),
         RemoteOs::Windows => ps(&format!(
             "Set-Location -LiteralPath {root}; \
@@ -256,12 +257,12 @@ pub fn push_prep(
     match os {
         RemoteOs::Unix => format!(
             "cd {root} && mkdir -p {dir} && {{ test -f {rel} && cp -f {rel} {bak} || true; }} \
-             && {{ grep -qxF {ign} .gitignore 2>/dev/null || printf '%s\\n' {ign} >> .gitignore; }}",
+             && {{ {ignore}; }}",
             root = sh_quote(root),
             dir = sh_quote(dir),
             rel = sh_quote(rel_file),
             bak = sh_quote(rel_bak),
-            ign = sh_quote(ignore_line),
+            ignore = append_gitignore_sh(ignore_line),
         ),
         RemoteOs::Windows => ps(&format!(
             "Set-Location -LiteralPath {root}; \
@@ -278,8 +279,22 @@ pub fn push_prep(
     }
 }
 
-/// The PowerShell half of "add this line to .gitignore unless it is already
-/// there", shared by the two callers above.
+/// The POSIX shell half of "add this line to .gitignore unless git already
+/// ignores it", shared by the two callers above.
+///
+/// `git check-ignore` covers the ignore sources other than `.gitignore`, such
+/// as `.git/info/exclude` and `core.excludesFile`. A missing git or a root
+/// outside a repository makes it fail, so the line is appended as before.
+fn append_gitignore_sh(ignore_line: &str) -> String {
+    let ign = sh_quote(ignore_line);
+    format!(
+        "grep -qxF {ign} .gitignore 2>/dev/null \
+         || git check-ignore -q -- {ign} 2>/dev/null \
+         || printf '%s\\n' {ign} >> .gitignore"
+    )
+}
+
+/// The PowerShell twin of [`append_gitignore_sh`].
 ///
 /// Matched against the whole trimmed line, mirroring `grep -qxF`, so a
 /// `.muxel/` entry is not considered present because some other line happens to
@@ -291,6 +306,9 @@ fn append_gitignore_ps(ignore_line: &str) -> String {
          $have = (Test-Path -LiteralPath $gi -PathType Leaf) -and \
          ((Get-Content -LiteralPath $gi -ErrorAction SilentlyContinue | \
          ForEach-Object {{ $_.Trim() }}) -contains {ign}); \
+         if (-not $have -and (Get-Command git -ErrorAction SilentlyContinue)) {{ \
+         try {{ & git check-ignore -q -- {ign} 2>$null; $have = $LASTEXITCODE -eq 0 }} \
+         catch {{ $have = $false }} }}; \
          if (-not $have) {{ Add-Content -LiteralPath $gi -Value {ign} }}"
     )
 }
@@ -640,6 +658,48 @@ mod tests {
         ));
         assert!(s.contains("-contains '.muxel/'"), "{s}");
         assert!(s.contains("$_.Trim()"), "{s}");
+    }
+
+    /// Both hosts ask git before appending, so a `.muxel/` that
+    /// `.git/info/exclude` already ignores leaves `.gitignore` alone.
+    #[test]
+    fn gitignore_append_defers_to_git_check_ignore() {
+        for cmd in [
+            ensure_seeded_file(UNIX, "/p", ".muxel", ".muxel/M.md", "h", ".muxel/"),
+            push_prep(
+                UNIX,
+                "/p",
+                ".muxel",
+                ".muxel/w.json",
+                ".muxel/b.json",
+                ".muxel/",
+            ),
+        ] {
+            assert!(
+                cmd.contains(
+                    "grep -qxF .muxel/ .gitignore 2>/dev/null \
+                     || git check-ignore -q -- .muxel/ 2>/dev/null \
+                     || printf '%s\\n' .muxel/ >> .gitignore"
+                ),
+                "{cmd}"
+            );
+        }
+        let s = script_of(&ensure_seeded_file(
+            WIN,
+            "C:/p",
+            ".muxel",
+            ".muxel/M.md",
+            "h",
+            ".muxel/",
+        ));
+        assert!(
+            s.contains(
+                "try { & git check-ignore -q -- '.muxel/' 2>$null; $have = $LASTEXITCODE -eq 0 } \
+                 catch { $have = $false }"
+            ),
+            "{s}"
+        );
+        assert!(s.contains("Get-Command git"), "{s}");
     }
 
     #[test]
