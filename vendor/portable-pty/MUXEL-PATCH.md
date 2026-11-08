@@ -13,7 +13,18 @@ cursor queries still go through Muxel's terminal emulator.
 Microsoft documents this shutdown dependency in
 [Creating a Pseudoconsole session](https://learn.microsoft.com/en-us/windows/console/creating-a-pseudoconsole-session#ending-the-pseudoconsole-session).
 
+## Job objects
+
+`CommandBuilder::set_job_object` (Windows) names a job object for the child.
+`src/win/psuedocon.rs` adds it to the process's attribute list with
+`PROC_THREAD_ATTRIBUTE_JOB_LIST` (`src/win/procthreadattr.rs`), so the child is
+in the job from its first instruction and nothing it starts at once escapes.
+Assigning the job after `CreateProcessW` returns would leave that window open.
+If Windows refuses the job, the spawn logs it and retries once without it, so a
+job never keeps a program from starting; callers check `IsProcessInJob`. Muxel
+uses this for its per-pane memory limit.
+
 The workspace patch is local and pinned to the checked-in package. Remove it
-when portable-pty exposes creation flags and Muxel can select no cursor
-inheritance without changing the dependency. Keep source changes bounded to
-the creation flag and associated tests.
+when portable-pty exposes creation flags and a job-list attribute, so Muxel can
+select no cursor inheritance and a creation-time job without changing the
+dependency. Keep source changes bounded to these two hooks and their tests.

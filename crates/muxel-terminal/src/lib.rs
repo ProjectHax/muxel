@@ -14,6 +14,7 @@ mod element;
 mod keymap;
 mod links;
 mod listener;
+mod pane_job;
 mod present_flag;
 mod profile;
 mod profile_idle;
@@ -30,6 +31,7 @@ pub use control_input::{
     ControlInput, ControlWrite, ControlWriteError, TmuxInputRoute, TmuxRunner,
 };
 pub use links::{FileLinkTarget, file_target_from_uri, file_uri, path_from_file_uri};
+pub use pane_job::{HitStatus, MemoryLimitHit};
 pub use present_flag::{mark_present_needed, take_present_needed};
 pub use profile::startup_event;
 pub use program_status::ProgramStatusKind;

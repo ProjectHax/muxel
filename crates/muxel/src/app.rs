@@ -9152,7 +9152,7 @@ impl MuxelApp {
             )
         }) {
             create_missing_cwd(&spec)?;
-            return Ok(spec);
+            return Ok(spec.with_memory_limit(self.settings.pane_memory_limit_bytes()));
         }
         // Resume-capable agents (e.g. Claude): give the pane a stable session id and
         // resolve the --session-id / --resume flag *before* anything borrows the
@@ -9478,7 +9478,10 @@ impl MuxelApp {
                 .with_startup_delay(startup_delay)
                 .with_markers(working, blocked)
                 .with_binding(binding)
-                .with_launch_resumed(resuming),
+                .with_launch_resumed(resuming)
+                // Covers the pane's local process tree only: for an ssh or
+                // tmux client, that's the client, not the remote or server side.
+                .with_memory_limit(self.settings.pane_memory_limit_bytes()),
         ))
     }
 
@@ -14131,6 +14134,7 @@ impl MuxelApp {
             restoring: bool,
             runtime: muxel_terminal::TerminalRuntimeSnapshot,
             binding_rev: u64,
+            memory_hits: Vec<muxel_terminal::MemoryLimitHit>,
         }
         let snapshot: Vec<Snap> = self
             .terminals
@@ -14150,6 +14154,7 @@ impl MuxelApp {
                 let exit_code = v.exit_code();
                 let exit_signal = v.exit_signal().map(str::to_string);
                 let read_error = v.exit_read_error().map(str::to_string);
+                let memory_hits = v.session().take_memory_limit_hits();
                 let inst = self.workspace.instance(*iid);
                 // Some providers hang after reporting a missing conversation.
                 // The Codex message names the exact saved ID; a generic failure
@@ -14187,6 +14192,7 @@ impl MuxelApp {
                     restoring,
                     runtime,
                     binding_rev,
+                    memory_hits,
                 }
             })
             .collect();
@@ -14230,8 +14236,13 @@ impl MuxelApp {
             restoring,
             runtime,
             binding_rev,
+            memory_hits,
         } in snapshot
         {
+            for hit in &memory_hits {
+                self.report_memory_limit_hit(hit, &title, &project);
+                dirty = true;
+            }
             // A completion that happens in the pane the user is actively watching
             // is already attended. Record that at the same transition timestamp so
             // it cannot reappear as unseen after restart.
@@ -15099,6 +15110,64 @@ impl MuxelApp {
             title: title.to_string(),
             subtitle: format!("{} · {}", kind.label(), project),
         });
+    }
+
+    /// Tell the user a process in pane `title` reached the pane's memory limit:
+    /// the feed (and developer console) now, the durable event log for later.
+    fn report_memory_limit_hit(
+        &mut self,
+        hit: &muxel_terminal::MemoryLimitHit,
+        title: &str,
+        project: &str,
+    ) {
+        let gb = hit.limit_bytes as f64 / f64::from(1u32 << 30);
+        let limit = if gb.fract() == 0.0 {
+            format!("{gb:.0}")
+        } else {
+            format!("{gb:.1}")
+        };
+        let program = hit
+            .program
+            .clone()
+            .unwrap_or_else(|| t("A process").to_string());
+        let pid = hit.pid.to_string();
+        let args = [
+            ("program", program.as_str()),
+            ("pid", pid.as_str()),
+            ("limit", limit.as_str()),
+        ];
+        let (body, status) = match hit.status {
+            muxel_terminal::HitStatus::Stopped => (
+                tf(
+                    "{program} (PID {pid}) reached this pane's {limit} GB memory limit and stopped. Settings → Behavior sets the limit.",
+                    &args,
+                ),
+                "stopped",
+            ),
+            muxel_terminal::HitStatus::Running => (
+                tf(
+                    "{program} (PID {pid}) reached this pane's {limit} GB memory limit. Windows refused the memory it asked for; it is still running. Settings → Behavior sets the limit.",
+                    &args,
+                ),
+                "running",
+            ),
+            muxel_terminal::HitStatus::Unknown => (
+                tf(
+                    "{program} (PID {pid}) reached this pane's {limit} GB memory limit. Windows refused the memory it asked for; muxel couldn't check whether it stopped. Settings → Behavior sets the limit.",
+                    &args,
+                ),
+                "unknown",
+            ),
+        };
+        muxel_store::append_event_log(&format!(
+            "memory-limit: \"{title}\" [{project}] pid={pid} program=\"{program}\" limit_bytes={} status={status}",
+            hit.limit_bytes
+        ));
+        self.add_event(
+            NotifKind::Error,
+            tf("{title}: memory limit reached", &[("title", title)]),
+            body,
+        );
     }
 
     /// Add a generic event notification to the sidebar feed (replaces pop-up
@@ -29695,6 +29764,43 @@ impl MuxelApp {
         cx.notify();
     }
 
+    /// Settings → Behavior: the per-process memory limit for local panes.
+    fn render_pane_memory_limit(&self, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.settings.pane_memory_limit_gb;
+        let mut choices = vec![0, 8, 16, 32, 64];
+        // A hand-edited value still shows as the selected choice.
+        if !choices.contains(&current) {
+            choices.push(current);
+            choices.sort_unstable();
+        }
+        let mut row = div().flex().flex_wrap().gap_1();
+        for gb in choices {
+            let label = if gb == 0 {
+                t("Off")
+            } else {
+                tf("{gb} GB", &[("gb", &gb.to_string())]).into()
+            };
+            row = row.child(self.option_btn(
+                SharedString::from(format!("b-mem-{gb}")),
+                label,
+                current == gb,
+                cx,
+                move |s| s.pane_memory_limit_gb = gb,
+            ));
+        }
+        v_flex()
+            .gap_1()
+            .child(self.settings_label(&t("Memory limit for each process in a pane"), cx))
+            .child(row)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(t("Limits how much memory each process a local pane starts can commit. A process that asks for more is refused, which usually stops it, so one runaway doesn't take the computer down in the common case; it can't help when less memory is free than the limit. The 16 GB default fits typical developer tools; large Java heaps, optimized links and local model runners can need more. Applies to panes started after a change. Windows reports a process that reaches the limit on a best-effort basis. Programs launched with their own breakaway flag, and processes a tmux server or remote host runs, aren't covered.")),
+            )
+            .into_any_element()
+    }
+
     fn set_close_on_exit(&mut self, on: bool, cx: &mut Context<Self>) {
         self.settings.close_on_exit = on;
         self.persist_settings();
@@ -33176,6 +33282,8 @@ impl MuxelApp {
                     &t("Ask before closing a busy terminal"),
                 ),
             )
+            // Job objects are Windows-only; elsewhere the setting does nothing.
+            .children(cfg!(windows).then(|| self.render_pane_memory_limit(cx)))
             .child(
                 self.check_row(
                     Checkbox::new("b-dev-console")
