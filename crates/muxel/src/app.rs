@@ -31,6 +31,7 @@ use muxel_core::library::resolve::{SnippetStep, snippet_send_action};
 use muxel_core::library::{LibKind, MENU_WINDOW_MARGIN};
 use muxel_core::memory::{self, MemoryEntry};
 use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
+use muxel_core::placement::ResourceOrigin;
 use muxel_core::refresh_gate::RefreshGate;
 use muxel_core::sound_alert::{AlertGate, AlertSound};
 use muxel_core::tmux::{SessionTarget, Socket};
@@ -72,6 +73,8 @@ mod control_api;
 mod hidden_paint_tests;
 mod hotbar;
 mod libraries_ui;
+#[cfg(all(test, windows))]
+mod placement_tests;
 mod popout_lifecycle;
 #[cfg(all(test, windows))]
 mod popout_lifecycle_tests;
@@ -3244,6 +3247,47 @@ fn split_resize_terminal_ids(
         .collect()
 }
 
+/// A terminal context menu's Open link (`background` false) or Open in new tab,
+/// raised from `terminal`. The menu runs its item while it holds the terminal
+/// and the window's focus, so the link opens once the menu has let go of both:
+/// the open can then read the terminal, and it sees the focus the menu gave
+/// back on closing.
+fn open_link_from_menu(
+    terminal: &mut TerminalView,
+    url: String,
+    background: bool,
+    window: &mut Window,
+    cx: &mut Context<TerminalView>,
+) {
+    let pane = terminal.instance_id();
+    let focus = terminal.focus_handle(cx);
+    window.defer(cx, move |window, cx| {
+        if background {
+            let open = muxel_terminal::OpenLinkBackground { url, pane };
+            focus.dispatch_action(&open, window, cx);
+        } else {
+            let open = muxel_terminal::OpenLink { url, pane };
+            focus.dispatch_action(&open, window, cx);
+        }
+    });
+}
+
+/// Every window's focused handle, this window's first. The handle is the
+/// focused element itself, so an editor's text input or a browser's address
+/// bar counts, not only a pane's own handle.
+fn window_focus(window: &Window, cx: &mut App) -> Vec<(AnyWindowHandle, Option<FocusHandle>)> {
+    let here = window.window_handle();
+    let mut kept = vec![(here, window.focused(cx))];
+    for other in cx.windows() {
+        if other.window_id() != here.window_id()
+            && let Ok(focus) = other.update(cx, |_, window, cx| window.focused(cx))
+        {
+            kept.push((other, focus));
+        }
+    }
+    kept
+}
+
 /// Render a terminal pane. In `RightClickMenu` mouse mode it wraps the view in a
 /// right-click Copy/Paste context menu (the menu component lives in this crate, not
 /// in muxel-terminal); the other modes handle the mouse inside the terminal element
@@ -3278,22 +3322,14 @@ fn terminal_pane_element(
                     PopupMenuItem::new(t("Open link")).on_click(window.listener_for(
                         &view,
                         move |this, _e, window, cx| {
-                            this.focus_handle(cx).dispatch_action(
-                                &muxel_terminal::OpenLink(foreground_url.clone()),
-                                window,
-                                cx,
-                            );
+                            open_link_from_menu(this, foreground_url.clone(), false, window, cx);
                         },
                     )),
                 );
                 let background_url = url.clone();
                 menu = menu.item(PopupMenuItem::new(t("Open in new tab")).on_click(
                     window.listener_for(&view, move |this, _e, window, cx| {
-                        this.focus_handle(cx).dispatch_action(
-                            &muxel_terminal::OpenLinkBackground(background_url.clone()),
-                            window,
-                            cx,
-                        );
+                        open_link_from_menu(this, background_url.clone(), true, window, cx);
                     }),
                 ));
                 return menu.item(
@@ -3604,8 +3640,8 @@ struct JumpToTab(usize);
 #[action(namespace = muxel, no_json)]
 struct JumpToProject(usize);
 
-/// Open a new pane running the Nth agent preset (1-based, in the preset list
-/// order). Bound to Ctrl+Alt+1..9.
+/// Open the Nth agent preset (1-based, in the preset list order) as a new tab
+/// in the focused pane. Bound to Ctrl+Alt+1..9.
 #[derive(Action, Clone, PartialEq)]
 #[action(namespace = muxel, no_json)]
 struct NewAgent(usize);
@@ -5086,51 +5122,6 @@ enum PlacementMode {
     Split(SplitDirection),
     /// Add the agent as a new tab in the target pane.
     Tab,
-}
-fn nearest_kind_instance(
-    instances: &[(Uuid, InstanceKind)],
-    kind: InstanceKind,
-    requested_anchor: Option<Uuid>,
-) -> Option<Uuid> {
-    let requested_index = requested_anchor.and_then(|anchor| {
-        instances
-            .iter()
-            .position(|(candidate, _)| *candidate == anchor)
-    });
-    instances
-        .iter()
-        .enumerate()
-        .filter(|(_, (_, candidate_kind))| *candidate_kind == kind)
-        .min_by_key(|(index, _)| requested_index.map_or(*index, |anchor| index.abs_diff(anchor)))
-        .map(|(_, (candidate, _))| *candidate)
-}
-
-#[cfg(test)]
-mod resource_lane_tests {
-    use super::{InstanceKind, Uuid, nearest_kind_instance};
-
-    #[test]
-    fn chooses_same_kind_lane_nearest_the_requested_anchor() {
-        let left_browser = Uuid::new_v4();
-        let left_terminal = Uuid::new_v4();
-        let right_terminal = Uuid::new_v4();
-        let right_browser = Uuid::new_v4();
-        let instances = [
-            (left_browser, InstanceKind::Browser),
-            (left_terminal, InstanceKind::Terminal),
-            (right_terminal, InstanceKind::Terminal),
-            (right_browser, InstanceKind::Browser),
-        ];
-
-        assert_eq!(
-            nearest_kind_instance(&instances, InstanceKind::Browser, Some(right_terminal)),
-            Some(right_browser)
-        );
-        assert_eq!(
-            nearest_kind_instance(&instances, InstanceKind::Browser, Some(left_terminal)),
-            Some(left_browser)
-        );
-    }
 }
 
 fn selected_copy_text(text: String) -> Option<String> {
@@ -7194,6 +7185,14 @@ impl Render for PopoutView {
                     v.read(cx).session().write_user_input(b"\x1b[Z");
                 }
             }))
+            .on_action(cx.listener(|_, a: &muxel_terminal::OpenLink, _w, cx| {
+                MuxelApp::open_popout_link(&a.url, a.pane, OpenFocus::Focus, cx);
+            }))
+            .on_action(
+                cx.listener(|_, a: &muxel_terminal::OpenLinkBackground, _w, cx| {
+                    MuxelApp::open_popout_link(&a.url, a.pane, OpenFocus::Background, cx);
+                }),
+            )
             .child(
                 // Intercept the title-bar X to confirm before closing (which
                 // terminates the terminal).
@@ -7702,6 +7701,20 @@ enum GitDiffTab {
     #[default]
     Files,
     Worktrees,
+}
+
+/// Whether opening a file, diff or page moves focus to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenFocus {
+    /// Focus it in the window that shows its project, raising that window, or
+    /// showing the project in the main window when no window does. The main
+    /// window shows its panes again if a hotbar view replaced them.
+    Focus,
+    /// A middle-click or "Open in new tab": every window ends with the focus
+    /// it had, put back after the open if anything moved it. The resource
+    /// only comes to the front of its group, unless one of that group's tabs
+    /// holds a window's focus, which then stays in front.
+    Background,
 }
 
 fn link_source_project(workspace: &Workspace, source: Option<Uuid>) -> Option<Uuid> {
@@ -11538,6 +11551,13 @@ impl MuxelApp {
         )
     }
 
+    /// The window that focuses project `pid`'s panes and opens its links. That's
+    /// the one showing it, else the main window, which switches to the project
+    /// to focus a pane.
+    fn project_window(&self, pid: Uuid) -> Option<AnyWindowHandle> {
+        self.window_showing(pid).or(self.main_window)
+    }
+
     /// The window showing project `pid` now, read without a window.
     fn shown_window(
         this: &WeakEntity<Self>,
@@ -14147,7 +14167,7 @@ impl MuxelApp {
             }
             for (source, url) in new_windows {
                 if browser_popup_url_allowed(&url) {
-                    self.open_link_from(&url, Some(source), window, cx);
+                    self.open_link_from(&url, Some(source), OpenFocus::Focus, window, cx);
                 }
             }
             if changed {
@@ -15430,60 +15450,37 @@ impl MuxelApp {
         }
     }
 
-    /// Create a new agent from the current preset: split the active pane, or
-    /// seed an empty project's first pane.
+    /// Create a new agent from the current preset in a new pane: split the
+    /// active pane (Split Right / Split Down), or seed an empty project's first
+    /// pane.
     fn add_agent(
         &mut self,
         direction: SplitDirection,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.add_agent_at(
+        self.place_with_preset(
             self.active_instance,
-            direction,
+            PlacementMode::Split(direction),
             self.current_preset,
             window,
             cx,
         );
     }
 
-    /// Create a new agent from `preset_idx`, splitting `target` (or seeding the
-    /// layout if empty).
-    fn add_agent_at(
-        &mut self,
-        target: Option<Uuid>,
-        direction: SplitDirection,
-        preset_idx: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.place_with_preset(
-            target,
-            PlacementMode::Split(direction),
-            preset_idx,
-            window,
-            cx,
-        );
-    }
-
-    /// Open a new pane running preset number `n` (1-based, in the preset list
-    /// order) beside the active pane — the keyboard counterpart to the toolbar's
-    /// preset picker (bound to Ctrl+Alt+1..9). Out-of-range `n` is ignored.
+    /// Open preset number `n` (1-based, in the preset list order) as a new tab
+    /// in the active pane, like the toolbar's agent button (bound to
+    /// Ctrl+Alt+1..9). Out-of-range `n` is ignored.
     fn new_agent_preset(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(idx) = n.checked_sub(1).filter(|i| *i < self.presets.len()) else {
             return;
         };
-        self.add_agent_at(
-            self.active_instance,
-            SplitDirection::Horizontal,
-            idx,
-            window,
-            cx,
-        );
+        self.place_with_preset(self.active_instance, PlacementMode::Tab, idx, window, cx);
     }
 
-    /// Spawn an agent from `preset_idx` and place it (split or tab) at `target`.
-    /// The shared body behind every split / new-tab path.
+    /// Spawn an agent from `preset_idx` and place it (split or tab) at `target`,
+    /// in the project `window` shows. The shared body behind every split /
+    /// new-tab path.
     fn place_with_preset(
         &mut self,
         target: Option<Uuid>,
@@ -15492,9 +15489,25 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(pid) = self.workspace.active_project else {
+        // A toolbar click or shortcut acts on the window it came from. The
+        // focused pane may be in another window; then the new pane goes to
+        // this window's project, at its last-focused pane.
+        let Some(project) = self
+            .secondary_pid_for(window)
+            .or(self.workspace.active_project)
+            .and_then(|pid| self.workspace.project(pid))
+        else {
             return;
         };
+        let pid = project.id;
+        let target = target
+            .filter(|iid| {
+                project
+                    .layout
+                    .as_ref()
+                    .is_some_and(|layout| layout.leaf_containing(*iid).is_some())
+            })
+            .or_else(|| project.preferred_instance());
         let preset = self
             .presets
             .get(preset_idx)
@@ -15502,18 +15515,20 @@ impl MuxelApp {
             .unwrap_or_else(AgentPreset::shell);
         // A Browser-kind preset opens a browser pane, not a terminal.
         if preset.kind == muxel_core::PresetKind::Browser {
-            self.place_browser_url(&preset.url, target, placement, window, cx);
+            self.place_browser_url(pid, &preset.url, target, placement, window, cx);
             return;
         }
         let instance = Instance::from_preset(pid, &preset);
         self.place_and_spawn(pid, instance, placement, target, None, window, cx);
     }
 
-    /// Open a browser pane at `url` (a Browser-kind preset's homepage). macOS/
-    /// Windows get an embedded pane in the layout; Linux (which can't host a web
-    /// view in a pane) opens `url` in a separate browser window, like Ctrl+click.
+    /// Open a browser pane at `url` (a Browser-kind preset's homepage) in `pid`.
+    /// macOS/Windows get an embedded pane in the layout; Linux (which can't host
+    /// a web view in a pane) opens `url` in a separate browser window, like
+    /// Ctrl+click.
     fn place_browser_url(
         &mut self,
+        pid: Uuid,
         url: &str,
         target: Option<Uuid>,
         placement: PlacementMode,
@@ -15522,7 +15537,7 @@ impl MuxelApp {
     ) {
         #[cfg(target_os = "linux")]
         {
-            let _ = (target, placement, window);
+            let _ = (pid, target, placement, window);
             self.dispatch_linux_browser(crate::browser::LinuxBrowserRequest::Preset(url), cx);
         }
         #[cfg(not(target_os = "linux"))]
@@ -15536,7 +15551,15 @@ impl MuxelApp {
             // Browser presets are resource opens, not requests for another agent
             // process. Route them through the canonical opener so the same full
             // URL focuses and refreshes its existing tab before placement runs.
-            self.open_browser_at_with_placement(url, target, Some(placement), window, cx);
+            self.open_browser_in_project(
+                pid,
+                url,
+                ResourceOrigin::Chrome { near: target },
+                Some(placement),
+                OpenFocus::Focus,
+                window,
+                cx,
+            );
         }
     }
 
@@ -15571,7 +15594,8 @@ impl MuxelApp {
     }
 
     /// Create a new agent as a tab in the pane holding `target` (the pane's `+`
-    /// button); `None` falls back to seeding the layout for an empty project.
+    /// button); `None` falls back to the project's last-focused pane, or seeds
+    /// an empty project's layout.
     fn new_tab_in(&mut self, target: Option<Uuid>, window: &mut Window, cx: &mut Context<Self>) {
         self.place_with_preset(target, PlacementMode::Tab, self.current_preset, window, cx);
     }
@@ -15946,24 +15970,106 @@ impl MuxelApp {
         }
     }
 
-    /// Route a ctrl+clicked terminal link: local `file://` paths open in a muxel
-    /// editor pane; other `file://` / disabled-browser cases go to the OS handler;
-    /// otherwise macOS/Windows open an embedded browser pane and Linux spawns the
-    /// separate muxel browser window.
-    fn open_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_link_from(url, self.active_instance, window, cx);
+    /// A ctrl+clicked terminal link, routed from the terminal it was clicked in.
+    fn on_open_link(
+        &mut self,
+        a: &muxel_terminal::OpenLink,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_link_from(&a.url, Some(a.pane), OpenFocus::Focus, window, cx);
     }
 
-    /// Route relative to the pane that emitted the link. Native browser popup
-    /// events arrive on a later tick, when the globally active pane may differ.
+    /// A middle-clicked terminal link, or the right-click menu's "Open in new
+    /// tab", routed from the terminal it was clicked in. Focus stays where it is
+    /// in every window, so terminal input continues where it was.
+    fn on_open_link_background(
+        &mut self,
+        a: &muxel_terminal::OpenLinkBackground,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_link_from(&a.url, Some(a.pane), OpenFocus::Background, window, cx);
+    }
+
+    /// A link clicked in a popped-out terminal. It opens in the window showing
+    /// the terminal's project, else the main window, and never in the popout's
+    /// own: an editor or page belongs to the window it's made in. A foreground
+    /// open raises that window.
+    fn open_popout_link(url: &str, pane: Uuid, focus: OpenFocus, cx: &mut App) {
+        let Some(app) = cx
+            .try_global::<MuxelHandle>()
+            .map(|handle| handle.0.clone())
+        else {
+            return;
+        };
+        let target = app.read_with(cx, |app, _| {
+            let pid = app.workspace.instance(pane)?.project_id;
+            app.project_window(pid)
+        });
+        let Ok(Some(target)) = target else {
+            return;
+        };
+        Self::update_in_window(&app, target, cx, |app, window, cx| {
+            app.open_link_from(url, Some(pane), focus, window, cx);
+            if focus == OpenFocus::Focus {
+                window.activate_window();
+            }
+        });
+    }
+
+    /// Route a link relative to `source`, the pane it came from (a terminal, or
+    /// a browser page whose new-window event arrives a tick later, when another
+    /// pane may be active): local `file://` paths open in a muxel editor pane;
+    /// other `file://` / disabled-browser cases go to the OS handler; otherwise
+    /// macOS/Windows open an embedded browser pane and Linux spawns the separate
+    /// muxel browser window.
+    ///
+    /// Opening can move focus on its own: going to a link's line, or reloading
+    /// a reused file that changed on disk, focuses the editor in this window,
+    /// whichever window shows it. So every window's focus is noted first. A
+    /// background open puts each one back afterwards. A foreground open puts
+    /// back only this window's, and only when it was left holding a pane that
+    /// [`Self::project_window`] gives to another window. That window focuses
+    /// the pane itself.
     fn open_link_from(
         &mut self,
         url: &str,
         source: Option<Uuid>,
+        focus: OpenFocus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let kept = window_focus(window, cx);
+        self.route_link(url, source, focus, window, cx);
+        match focus {
+            OpenFocus::Background => self.give_back_focus(&kept, window, cx),
+            OpenFocus::Focus => {
+                let here = window.window_handle().window_id();
+                let elsewhere = window
+                    .focused(cx)
+                    .and_then(|focused| self.pane_holding(&focused, window, cx))
+                    .and_then(|iid| self.workspace.instance(iid))
+                    .and_then(|instance| self.project_window(instance.project_id))
+                    .is_some_and(|target| target.window_id() != here);
+                if elsewhere {
+                    self.give_back_focus(&kept[..1], window, cx);
+                }
+            }
+        }
+    }
+
+    /// [`Self::open_link_from`]'s routing, leaving focus as the open left it.
+    fn route_link(
+        &mut self,
+        url: &str,
+        source: Option<Uuid>,
+        focus: OpenFocus,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let source_project = link_source_project(&self.workspace, source);
+        let origin = source.map_or(ResourceOrigin::Chrome { near: None }, ResourceOrigin::Pane);
         if let Some(mut target) = muxel_terminal::file_target_from_uri(url) {
             let mut canonical_url = muxel_terminal::file_uri(&target.path);
             if let Some((_, fragment)) = url.split_once('#')
@@ -15992,8 +16098,9 @@ impl MuxelApp {
                     self.open_browser_in_project(
                         pid,
                         canonical_url.clone(),
-                        source,
+                        origin,
                         None,
+                        focus,
                         window,
                         cx,
                     )
@@ -16005,7 +16112,7 @@ impl MuxelApp {
             if target.path.is_file()
                 && let Some(pid) = source_project
                 && let Some(iid) =
-                    self.open_editor_at(pid, Some(target.path.clone()), source, window, cx)
+                    self.open_editor_at(pid, Some(target.path.clone()), origin, focus, window, cx)
             {
                 if let Some(line) = target.line
                     && let Some(editor) = self.editors.get(&iid)
@@ -16037,7 +16144,8 @@ impl MuxelApp {
         #[cfg(not(target_os = "linux"))]
         {
             if source_project.is_none_or(|pid| {
-                self.open_browser_in_project(pid, url.to_string(), source, None, window, cx)
+                let url = url.to_string();
+                self.open_browser_in_project(pid, url, origin, None, focus, window, cx)
                     .is_none()
             }) {
                 cx.open_url(url);
@@ -16045,53 +16153,21 @@ impl MuxelApp {
         }
     }
 
-    /// Route a link normally, then restore the pane that initiated it. Used by
-    /// middle-click so opening a reference does not interrupt terminal input.
-    fn open_link_background(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let previous = self.active_instance;
-        self.open_link_from(url, previous, window, cx);
-        if let Some(previous) = previous
-            && self.workspace.instance(previous).is_some()
-        {
-            self.focus_instance(previous, window, cx);
-        }
-    }
-
-    /// Open the embedded browser pane on `url` in the active project, splitting
-    /// beside `target` (or seeding an empty project). Returns the instance id.
-    /// (Linux routes links to the separate browser window instead; restored
-    /// cross-platform browser panes go through spawn_project_terminals_now.)
+    /// Open the embedded browser pane on `url` in `pid`, placed as `placement`
+    /// asks or else by where `origin` is (or seeding an empty project), or
+    /// refresh the pane already showing it; either is then focused or brought
+    /// forward as `focus` says. Returns the instance id. (Linux routes links to
+    /// the separate browser window instead; restored cross-platform browser
+    /// panes go through spawn_project_terminals_now.)
     #[cfg(not(target_os = "linux"))]
-    fn open_browser_at(
-        &mut self,
-        url: String,
-        target: Option<Uuid>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<Uuid> {
-        self.open_browser_at_with_placement(url, target, None, window, cx)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn open_browser_at_with_placement(
-        &mut self,
-        url: String,
-        target: Option<Uuid>,
-        placement: Option<PlacementMode>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<Uuid> {
-        let pid = self.workspace.active_project?;
-        self.open_browser_in_project(pid, url, target, placement, window, cx)
-    }
-
-    #[cfg(not(target_os = "linux"))]
+    #[allow(clippy::too_many_arguments)]
     fn open_browser_in_project(
         &mut self,
         pid: Uuid,
         url: String,
-        target: Option<Uuid>,
+        origin: ResourceOrigin,
         placement: Option<PlacementMode>,
+        focus: OpenFocus,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Uuid> {
@@ -16125,19 +16201,19 @@ impl MuxelApp {
                     }
                 });
             }
-            self.focus_instance(iid, window, cx);
+            self.focus_resource(iid, focus, window, cx);
             self.persist();
             cx.notify();
             return Some(iid);
         }
         let instance = Instance::browser(pid, url.clone());
         let iid = instance.id;
-        if !self.place_resource_instance(pid, instance, target, placement) {
+        if !self.place_resource_instance(pid, instance, origin, placement) {
             return None;
         }
         let view = cx.new(|cx| crate::browser::BrowserView::new(iid, pid, url, window, cx));
         self.browsers.insert(iid, view);
-        self.focus_instance(iid, window, cx);
+        self.focus_resource(iid, focus, window, cx);
         self.persist();
         cx.notify();
         Some(iid)
@@ -16420,13 +16496,16 @@ impl MuxelApp {
     }
 
     /// Open `path` (None = a new Untitled buffer) as an editor pane in `pid`,
-    /// splitting beside `target` (or seeding if the project is empty). If the
-    /// file is already open, focuses that pane. Returns the instance id.
+    /// placed by where `origin` is (or seeding if the project is empty), or
+    /// reuse the pane that already has the file open, in whichever project.
+    /// Either is then focused or brought forward as `focus` says. Returns the
+    /// instance id.
     fn open_editor_at(
         &mut self,
         pid: Uuid,
         path: Option<PathBuf>,
-        target: Option<Uuid>,
+        origin: ResourceOrigin,
+        focus: OpenFocus,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Uuid> {
@@ -16445,12 +16524,12 @@ impl MuxelApp {
             if let Some(editor) = self.editors.get(&iid).cloned() {
                 editor.update(cx, |editor, cx| editor.reload_if_clean(window, cx));
             }
-            self.focus_instance(iid, window, cx);
+            self.focus_resource(iid, focus, window, cx);
             return Some(iid);
         }
         let instance = Instance::editor(pid, path.clone());
         let iid = instance.id;
-        if !self.place_resource_instance(pid, instance, target, None) {
+        if !self.place_resource_instance(pid, instance, origin, None) {
             return None;
         }
         let config = self.editor_config();
@@ -16475,15 +16554,15 @@ impl MuxelApp {
             })
             .detach();
         }
-        self.focus_instance(iid, window, cx);
+        self.focus_resource(iid, focus, window, cx);
         self.persist();
         cx.notify();
         Some(iid)
     }
 
-    /// Open a read-only git-diff pane to the right of `source_iid`, diffing that
-    /// agent's worktree (if any) or the project root. Reuses + refreshes an
-    /// existing diff pane for the same directory.
+    /// Open a read-only git-diff pane beside `source_iid`, diffing that agent's
+    /// worktree (if any) or the project root. Reuses + refreshes an existing
+    /// diff pane for the same directory.
     fn open_diff_for(&mut self, source_iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         let Some(src) = self.workspace.instance(source_iid) else {
             return;
@@ -16494,7 +16573,7 @@ impl MuxelApp {
             .map(std::path::Path::to_path_buf)
             .or_else(|| self.workspace.project(pid).map(|p| p.root_path.clone()))
             .unwrap_or_default();
-        self.open_diff_for_dir(pid, dir, Some(source_iid), window, cx);
+        self.open_diff_for_dir(pid, dir, ResourceOrigin::Pane(source_iid), window, cx);
     }
 
     /// Open a read-only git-diff pane for the worktree `wid`, anchored beside one
@@ -16511,7 +16590,13 @@ impl MuxelApp {
             .next()
             .or(self.active_instance)
             .or_else(|| self.workspace.project(pid).and_then(|p| p.first_instance()));
-        self.open_diff_for_dir(pid, dir, anchor, window, cx);
+        self.open_diff_for_dir(
+            pid,
+            dir,
+            ResourceOrigin::Chrome { near: anchor },
+            window,
+            cx,
+        );
     }
 
     /// Open a read-only git-diff pane for `pid`'s repo root, split beside one of
@@ -16526,16 +16611,22 @@ impl MuxelApp {
             .project(pid)
             .and_then(|p| p.first_instance())
             .or(self.active_instance);
-        self.open_diff_for_dir(pid, dir, anchor, window, cx);
+        self.open_diff_for_dir(
+            pid,
+            dir,
+            ResourceOrigin::Chrome { near: anchor },
+            window,
+            cx,
+        );
     }
 
-    /// Open (or refresh + focus) a read-only git-diff pane for `dir`, as a new tab
-    /// in `anchor`'s pane (or seeding the layout if the project is empty).
+    /// Open (or refresh + focus) a read-only git-diff pane for `dir`, placed by
+    /// where `origin` is (or seeding the layout if the project is empty).
     fn open_diff_for_dir(
         &mut self,
         pid: Uuid,
         dir: PathBuf,
-        anchor: Option<Uuid>,
+        origin: ResourceOrigin,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -16550,69 +16641,187 @@ impl MuxelApp {
             if let Some(ed) = self.editors.get(&iid).cloned() {
                 ed.update(cx, |e, cx| e.refresh_diff(window, cx));
             }
-            self.focus_instance(iid, window, cx);
+            self.focus_resource(iid, OpenFocus::Focus, window, cx);
             return;
         }
 
         let instance = Instance::diff(pid, dir.clone());
         let iid = instance.id;
-        if !self.place_resource_instance(pid, instance, anchor, None) {
+        if !self.place_resource_instance(pid, instance, origin, None) {
             return;
         }
         let config = self.editor_config();
         let ed = cx.new(|cx| EditorView::diff(dir, config, window, cx));
         self.editors.insert(iid, ed);
-        self.focus_instance(iid, window, cx);
+        self.focus_resource(iid, OpenFocus::Focus, window, cx);
         self.persist();
         cx.notify();
     }
 
+    /// Focus a resource just opened, or found already open, or with
+    /// [`OpenFocus::Background`] only bring it forward. A maximized pane in its
+    /// project that doesn't hold it would hide it, so the maximize ends and the
+    /// resource shows beside the pane that opened it.
+    ///
+    /// Focus lands in [`Self::project_window`], raising it. That's the window
+    /// that shows the resource's project, which can be another window than this
+    /// one (a reopened file lives in its own project). When no window shows the
+    /// project, it's the main window, which switches to it.
+    fn focus_resource(
+        &mut self,
+        iid: Uuid,
+        focus: OpenFocus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pid) = self.workspace.instance(iid).map(|i| i.project_id) else {
+            return;
+        };
+        let hidden = self.maximized.is_some_and(|max| {
+            self.workspace
+                .project(pid)
+                .and_then(|project| project.layout.as_ref())
+                .filter(|layout| layout.leaf_containing(iid).is_some())
+                .and_then(|layout| layout.tab_group(max))
+                .is_some_and(|group| !group.contains(&iid))
+        });
+        if hidden {
+            self.maximized = None;
+        }
+        if focus == OpenFocus::Background {
+            // The link's open then gives every window its focus back and keeps
+            // the tab holding it in front.
+            if let Some(project) = self.workspace.project_mut(pid) {
+                set_active_tab(&mut project.layout, iid);
+                cx.notify();
+            }
+            return;
+        }
+        match self.project_window(pid) {
+            Some(target) if target.window_id() != window.window_handle().window_id() => {
+                // Focusing there needs the app, which this update holds.
+                let app = cx.weak_entity();
+                cx.defer(move |cx| {
+                    Self::update_in_window(&app, target, cx, |app, window, cx| {
+                        app.focus_resource(iid, OpenFocus::Focus, window, cx);
+                        window.activate_window();
+                    });
+                });
+            }
+            _ => {
+                if self.window_showing(pid).is_none() {
+                    self.select_project_with_attendance(pid, false, window, cx);
+                }
+                // A hotbar view filling the main window would hide it.
+                if self.is_main_window(window) {
+                    self.main_view = hotbar::MainView::Panes;
+                }
+                self.focus_instance(iid, window, cx);
+            }
+        }
+    }
+
+    /// Put each window's focus back as `kept` noted it, and bring the tab that
+    /// holds it to the front of its group, where an open may have covered it.
+    fn give_back_focus(
+        &mut self,
+        kept: &[(AnyWindowHandle, Option<FocusHandle>)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let here = window.window_handle().window_id();
+        let mut holders = Vec::new();
+        for (handle, focus) in kept {
+            let restore = |window: &mut Window, cx: &mut App| {
+                if window.focused(cx) != *focus {
+                    match focus {
+                        Some(focus) => window.focus(focus, cx),
+                        None => window.blur(),
+                    }
+                }
+                focus
+                    .as_ref()
+                    .and_then(|focus| self.pane_holding(focus, window, cx))
+            };
+            let holder = if handle.window_id() == here {
+                restore(window, cx)
+            } else {
+                handle
+                    .update(cx, |_, window, cx| restore(window, cx))
+                    .ok()
+                    .flatten()
+            };
+            holders.extend(holder);
+        }
+        for iid in holders {
+            if let Some(pid) = self.workspace.instance(iid).map(|i| i.project_id)
+                && let Some(project) = self.workspace.project_mut(pid)
+            {
+                set_active_tab(&mut project.layout, iid);
+            }
+        }
+        cx.notify();
+    }
+
+    /// The docked pane whose view holds `focus` in `window`: the view's own
+    /// handle, or an element inside it, such as a browser's address bar.
+    fn pane_holding(&self, focus: &FocusHandle, window: &Window, cx: &App) -> Option<Uuid> {
+        let terminals = self
+            .terminals
+            .iter()
+            .map(|(iid, v)| (*iid, v.read(cx).focus_handle(cx)));
+        let editors = self
+            .editors
+            .iter()
+            .map(|(iid, v)| (*iid, v.read(cx).focus_handle(cx)));
+        let browsers = self
+            .browsers
+            .iter()
+            .map(|(iid, v)| (*iid, v.read(cx).focus_handle(cx)));
+        terminals
+            .chain(editors)
+            .chain(browsers)
+            .find_map(|(iid, handle)| handle.contains(focus, window).then_some(iid))
+    }
+
     /// Place a non-agent resource. Explicit New Tab/New Pane commands keep their
-    /// requested placement. Default opens join the nearest same-kind lane, or
-    /// create one beside the requested anchor when no such lane exists.
+    /// requested placement; every other open follows
+    /// [`muxel_core::placement::place_resource`].
     fn place_resource_instance(
         &mut self,
         pid: Uuid,
         instance: Instance,
-        requested_anchor: Option<Uuid>,
+        origin: ResourceOrigin,
         placement: Option<PlacementMode>,
     ) -> bool {
         let iid = instance.id;
         let kind = instance.kind;
-        let Some(project) = self.workspace.project(pid) else {
-            return false;
-        };
-        if project.is_empty() {
-            self.workspace.add_instance(instance);
-            if let Some(project) = self.workspace.project_mut(pid) {
-                project.layout = Some(PaneNode::leaf(iid));
-            }
-            return true;
-        }
-        let instances: Vec<_> = project
-            .instances()
-            .into_iter()
-            .filter_map(|candidate| {
-                self.workspace
-                    .instance(candidate)
-                    .map(|existing| (candidate, existing.kind))
-            })
+        let kinds: HashMap<Uuid, InstanceKind> = self
+            .workspace
+            .instances
+            .iter()
+            .filter(|existing| existing.project_id == pid)
+            .map(|existing| (existing.id, existing.kind))
             .collect();
-        let same_kind = nearest_kind_instance(&instances, kind, requested_anchor);
         let placed = self.workspace.project_mut(pid).is_some_and(|project| {
-            let fallback = || requested_anchor.or_else(|| project.first_instance());
+            if project.is_empty() {
+                project.layout = Some(PaneNode::leaf(iid));
+                return true;
+            }
+            let anchor = || origin.anchor().or_else(|| project.first_instance());
             match placement {
                 Some(PlacementMode::Tab) => {
-                    fallback().is_some_and(|anchor| add_tab(&mut project.layout, anchor, iid))
+                    anchor().is_some_and(|anchor| add_tab(&mut project.layout, anchor, iid))
                 }
-                Some(PlacementMode::Split(direction)) => fallback()
+                Some(PlacementMode::Split(direction)) => anchor()
                     .is_some_and(|anchor| split(&mut project.layout, anchor, direction, iid)),
-                None if same_kind.is_some() => {
-                    add_tab(&mut project.layout, same_kind.unwrap(), iid)
-                }
-                None => fallback().is_some_and(|anchor| {
-                    split(&mut project.layout, anchor, SplitDirection::Horizontal, iid)
-                }),
+                None => muxel_core::placement::place_resource(
+                    &mut project.layout,
+                    iid,
+                    kind,
+                    origin,
+                    |existing| kinds.get(&existing).copied(),
+                ),
             }
         });
         if placed {
@@ -17087,8 +17296,11 @@ impl MuxelApp {
             }
             SearchItem::OpenFile(path) | SearchItem::CreateFile(path) => {
                 if let Some(pid) = self.workspace.active_project {
-                    let target = self.active_instance;
-                    let _ = self.open_editor_at(pid, Some(path), target, window, cx);
+                    let origin = ResourceOrigin::Chrome {
+                        near: self.active_instance,
+                    };
+                    let _ =
+                        self.open_editor_at(pid, Some(path), origin, OpenFocus::Focus, window, cx);
                 }
             }
             SearchItem::RunCommand(cmd) => self.run_palette_command(cmd, window, cx),
@@ -17173,8 +17385,11 @@ impl MuxelApp {
         let Some(pid) = self.workspace.active_project else {
             return;
         };
-        let target = self.active_instance;
-        if let Some(iid) = self.open_editor_at(pid, Some(hit.path.clone()), target, window, cx)
+        let origin = ResourceOrigin::Chrome {
+            near: self.active_instance,
+        };
+        let path = Some(hit.path.clone());
+        if let Some(iid) = self.open_editor_at(pid, path, origin, OpenFocus::Focus, window, cx)
             && let Some(ed) = self.editors.get(&iid).cloned()
         {
             ed.update(cx, |e, cx| e.goto_line(hit.line, window, cx));
@@ -18957,7 +19172,9 @@ impl MuxelApp {
             None => p.root_path.display().to_string(),
         };
         let path = PathBuf::from(format!("{root}/{MEMORY_DIR}/{MEMORY_FILE}"));
-        let target = self.active_instance;
+        let origin = ResourceOrigin::Chrome {
+            near: self.active_instance,
+        };
         // Seed the file if it doesn't exist yet (e.g. memory injection never on).
         if is_remote {
             self.ensure_project_memory(pid, cx);
@@ -18966,7 +19183,7 @@ impl MuxelApp {
         {
             self.add_event(NotifKind::Error, t("Project memory"), format!("{e}"));
         }
-        self.open_editor_at(pid, Some(path), target, window, cx);
+        self.open_editor_at(pid, Some(path), origin, OpenFocus::Focus, window, cx);
     }
 
     /// Ensure the project's `.muxel/MEMORY.md` + `.gitignore` entry exist, off the
@@ -20995,14 +21212,9 @@ impl MuxelApp {
                     this.toggle_dev_console(cx);
                 }
             }))
-            // A ctrl+clicked terminal link: URLs go to the built-in browser when
-            // enabled (embedded pane / Linux browser window), files to the OS.
-            .on_action(
-                cx.listener(|this, a: &muxel_terminal::OpenLink, window, cx| {
-                    let url = a.0.clone();
-                    this.open_link(&url, window, cx);
-                }),
-            )
+            // A ctrl+clicked terminal link opens beside the pane it was clicked
+            // in: URLs in the built-in browser when enabled, files in an editor.
+            .on_action(cx.listener(Self::on_open_link))
             .on_action(cx.listener(|_this, _: &CopySelection, window, cx| {
                 use gpui_component::WindowExt as _;
                 if let Some(text) = selected_copy_text(window.selected_text(cx)) {
@@ -21011,12 +21223,7 @@ impl MuxelApp {
                     window.dispatch_action(Box::new(gpui_component::input::Copy), cx);
                 }
             }))
-            .on_action(
-                cx.listener(|this, a: &muxel_terminal::OpenLinkBackground, window, cx| {
-                    let url = a.0.clone();
-                    this.open_link_background(&url, window, cx);
-                }),
-            )
+            .on_action(cx.listener(Self::on_open_link_background))
     }
 
     /// The full workspace UI for a secondary window: title bar, toolbar, the
@@ -21056,7 +21263,7 @@ impl MuxelApp {
                     .items_center()
                     .justify_center()
                     .text_color(cx.theme().muted_foreground)
-                    .child(t("No terminals — pick a preset and Split."))
+                    .child(t("No terminals — the toolbar's agent button opens one."))
                     .into_any_element(),
             }
         };
@@ -24252,8 +24459,10 @@ impl MuxelApp {
     /// Open the file the browser row points at (reuses/splits an editor pane).
     fn open_browser_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(pid) = self.file_browser_pid {
-            let target = self.active_instance;
-            self.open_editor_at(pid, Some(path), target, window, cx);
+            let origin = ResourceOrigin::Chrome {
+                near: self.active_instance,
+            };
+            self.open_editor_at(pid, Some(path), origin, OpenFocus::Focus, window, cx);
         }
     }
 
@@ -25239,14 +25448,27 @@ impl MuxelApp {
                                     .label(t("Preview"))
                                     .tooltip(t("Preview HTML in the browser"))
                                     .on_click(cx.listener(move |this, _e, window, cx| {
+                                        // The preview belongs to the editor's own
+                                        // project, which a secondary window may show
+                                        // while another project is active.
                                         #[cfg(not(target_os = "linux"))]
                                         if let Some(path) = this
                                             .editors
                                             .get(&iid)
                                             .and_then(|editor| editor.read(cx).path().map(PathBuf::from))
+                                            && let Some(pid) =
+                                                this.workspace.instance(iid).map(|i| i.project_id)
                                         {
                                             let url = muxel_terminal::file_uri(&path);
-                                            let _ = this.open_browser_at(url, Some(iid), window, cx);
+                                            let _ = this.open_browser_in_project(
+                                                pid,
+                                                url,
+                                                ResourceOrigin::Pane(iid),
+                                                None,
+                                                OpenFocus::Focus,
+                                                window,
+                                                cx,
+                                            );
                                         }
                                         #[cfg(target_os = "linux")]
                                         let _ = (this, window, cx);
@@ -26966,8 +27188,11 @@ impl MuxelApp {
                                     .map(|w| (w.project_id, w.path.join(&open_p))),
                             };
                             if let Some((pid, full)) = target {
-                                let active = this.active_instance;
-                                this.open_editor_at(pid, Some(full), active, window, cx);
+                                let origin = ResourceOrigin::Chrome {
+                                    near: this.active_instance,
+                                };
+                                let focus = OpenFocus::Focus;
+                                this.open_editor_at(pid, Some(full), origin, focus, window, cx);
                             }
                         })),
                 )
@@ -28085,8 +28310,8 @@ impl MuxelApp {
                 cx.listener(|this, _e: &MouseDownEvent, window, cx| this.deselect_pane(window, cx)),
             );
 
-        // Preset split-button: the body opens a new pane with the current
-        // preset; the caret picks the active preset / sets the default.
+        // Preset split-button: the body opens the current preset as a tab in
+        // the focused pane; the caret picks the active preset / sets the default.
         let current = self.current_agent_preset();
         let current_name = current.name.clone();
         let current_icon = preset_icon_obj(&current);
@@ -28113,10 +28338,8 @@ impl MuxelApp {
                         .small()
                         .icon(current_icon)
                         .label(current_name.clone())
-                        .tooltip(t("New pane with the current preset"))
-                        .on_click(cx.listener(|this, _ev, window, cx| {
-                            this.add_agent(SplitDirection::Horizontal, window, cx)
-                        })),
+                        .tooltip(t("New tab with the current preset"))
+                        .on_click(cx.listener(|this, _ev, window, cx| this.new_tab(window, cx))),
                 )
                 .dropdown_menu(move |mut menu, _window, _cx| {
                     for (id, name, is_default, icon_path) in preset_items.iter() {
@@ -35380,7 +35603,7 @@ impl Render for MuxelApp {
                     .items_center()
                     .justify_center()
                     .text_color(cx.theme().muted_foreground)
-                    .child(t("No terminals — pick a preset and Split."))
+                    .child(t("No terminals — the toolbar's agent button opens one."))
                     .into_any_element(),
             }
         };

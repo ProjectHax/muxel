@@ -533,7 +533,9 @@ impl MuxelApp {
             None => p.root_path.display().to_string(),
         };
         let path = PathBuf::from(format!("{root}/{MEMORY_DIR}/{ACCOMPLISHMENTS_FILE}"));
-        let target = self.active_instance;
+        let origin = ResourceOrigin::Chrome {
+            near: self.active_instance,
+        };
         if is_remote {
             self.ensure_project_accomplishments(pid, cx);
         } else if let Some(loc) = self.repo_loc(pid)
@@ -541,7 +543,7 @@ impl MuxelApp {
         {
             self.add_event(NotifKind::Error, t("Accomplishment log"), format!("{e}"));
         }
-        self.open_editor_at(pid, Some(path), target, window, cx);
+        self.open_editor_at(pid, Some(path), origin, OpenFocus::Focus, window, cx);
     }
 
     /// Step the retention window by `delta` days (Settings), pruning open logs.

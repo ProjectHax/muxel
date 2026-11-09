@@ -157,6 +157,46 @@ pub fn focus_in_direction(root: &PaneNode, from: Uuid, dir: FocusDir) -> Option<
     best_overlap.or(best_any).map(|(inst, _)| inst)
 }
 
+/// Rect edges closer than this count as shared.
+const EDGE_EPSILON: f32 = 1e-4;
+
+/// The pane bordering `from`'s pane on its right, or on its left when nothing
+/// borders the right: where a resource `from` opened belongs. Of several panes
+/// along that edge, the one sharing most of it wins, then the first in reading
+/// order. Returns that pane's active instance; `None` when nothing borders
+/// either side (`from` is alone in its row) or `from` isn't in the tree.
+pub(crate) fn side_neighbor(root: &PaneNode, from: Uuid) -> Option<Uuid> {
+    let mut leaves: Vec<(Rect, Uuid, bool)> = Vec::new();
+    collect_leaf_rects(
+        root,
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+        },
+        from,
+        &mut leaves,
+    );
+    let src = leaves.iter().find(|(_, _, is_src)| *is_src)?.0;
+    let bordering = |right: bool| {
+        let edge = if right { src.x + src.w } else { src.x };
+        let mut best: Option<(Uuid, f32)> = None;
+        for (rect, inst, is_src) in &leaves {
+            let facing_edge = if right { rect.x } else { rect.x + rect.w };
+            let shared = (src.y + src.h).min(rect.y + rect.h) - src.y.max(rect.y);
+            if *is_src || (facing_edge - edge).abs() > EDGE_EPSILON || shared <= EDGE_EPSILON {
+                continue;
+            }
+            if best.is_none_or(|(_, most)| shared > most + EDGE_EPSILON) {
+                best = Some((*inst, shared));
+            }
+        }
+        best.map(|(inst, _)| inst)
+    };
+    bordering(true).or_else(|| bordering(false))
+}
+
 /// A tabbed pane: a non-empty, ordered list of instance `tabs` plus the index of
 /// the currently active (visible/focused) one. Invariants, upheld by every
 /// mutating function here: `tabs` is never empty and `active < tabs.len()`.
