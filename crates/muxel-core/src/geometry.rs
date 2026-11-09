@@ -27,6 +27,52 @@ pub fn proportional_sizes(extent: f32, preferred: &[f32], minimums: &[f32]) -> V
     sizes
 }
 
+/// Move the divider after child `index` by `delta` pixels (positive moves it
+/// right or down) and return the new sizes. The child on the side the divider
+/// moves away from grows. The children on the side it moves toward shrink nearest
+/// first, each down to its minimum before the next gives anything, so the drag
+/// pushes through a neighbour held at its minimum. It stops when the growing child
+/// reaches its maximum or every child on the far side is at its minimum. Limits
+/// that don't give one value per child leave the sizes as they are.
+pub fn drag_divider(
+    sizes: &[f32],
+    minimums: &[f32],
+    maximums: &[f32],
+    index: usize,
+    delta: f32,
+) -> Vec<f32> {
+    let mut out = sizes.to_vec();
+    if index + 1 >= sizes.len()
+        || minimums.len() != sizes.len()
+        || maximums.len() != sizes.len()
+        || !delta.is_finite()
+        || delta == 0.0
+    {
+        return out;
+    }
+    let (grow, shrink): (usize, Vec<usize>) = if delta > 0.0 {
+        (index, (index + 1..sizes.len()).collect())
+    } else {
+        (index + 1, (0..=index).rev().collect())
+    };
+    let room = (maximums[grow] - sizes[grow]).max(0.0);
+    let give: f32 = shrink
+        .iter()
+        .map(|&i| (sizes[i] - minimums[i]).max(0.0))
+        .sum();
+    let mut left = delta.abs().min(room).min(give);
+    out[grow] += left;
+    for i in shrink {
+        let take = (out[i] - minimums[i]).max(0.0).min(left);
+        out[i] -= take;
+        left -= take;
+        if left <= 0.0 {
+            break;
+        }
+    }
+    out
+}
+
 /// A sidebar holds logical pixels until its container cannot accommodate both
 /// its preference and the other panel's minimum. This does not save the clamp.
 pub fn fixed_panel_size(extent: f32, preferred: f32, min: f32, max: f32, other_min: f32) -> f32 {
@@ -38,7 +84,7 @@ pub fn fixed_panel_size(extent: f32, preferred: f32, min: f32, max: f32, other_m
 
 #[cfg(test)]
 mod tests {
-    use super::{fixed_panel_size, proportional_sizes};
+    use super::{drag_divider, fixed_panel_size, proportional_sizes};
 
     #[test]
     fn window_resize_preserves_sidebar_pixels_and_center_ratios() {
@@ -93,6 +139,49 @@ mod tests {
         let project = fixed_panel_size(1600.0, 232.0, 160.0, 900.0, 100.0);
         let files = fixed_panel_size(1600.0 - project, preferred, 180.0, 800.0, 100.0);
         assert_eq!(files, preferred);
+    }
+
+    #[test]
+    fn a_divider_stops_at_the_growing_maximum_and_takes_nothing_below_a_minimum() {
+        // A 232px sidebar with a 900px maximum, dragged 800px wider.
+        assert_eq!(
+            drag_divider(
+                &[232.0, 968.0],
+                &[160.0, 100.0],
+                &[900.0, f32::MAX],
+                0,
+                800.0
+            ),
+            [900.0, 300.0]
+        );
+        // The same panel on the right, dragged wider from its left edge.
+        assert_eq!(
+            drag_divider(
+                &[968.0, 232.0],
+                &[100.0, 160.0],
+                &[f32::MAX, 900.0],
+                0,
+                -800.0
+            ),
+            [300.0, 900.0]
+        );
+        // Panes already squeezed under their minimum by a small window give nothing.
+        assert_eq!(
+            drag_divider(&[300.0; 3], &[340.0; 3], &[f32::MAX; 3], 0, 100.0),
+            [300.0; 3]
+        );
+    }
+
+    #[test]
+    fn limits_that_dont_match_the_panels_leave_the_sizes_alone() {
+        assert_eq!(
+            drag_divider(&[500.0; 3], &[340.0; 2], &[f32::MAX; 3], 1, 100.0),
+            [500.0; 3]
+        );
+        assert_eq!(
+            drag_divider(&[500.0; 3], &[340.0; 3], &[f32::MAX; 1], 0, -100.0),
+            [500.0; 3]
+        );
     }
 
     #[test]

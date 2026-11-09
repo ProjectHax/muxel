@@ -184,11 +184,9 @@ fn emit_line(line: &str) {
             ProfileLogLimits::from_env(),
         ))
     });
-    if let Ok(mut g) = slot.lock()
-        && let Err(error) = g.append(line)
-        && log_stderr()
-    {
-        eprintln!("term-prof: could not append log: {error}");
+    if let Ok(mut g) = slot.lock() {
+        // The log names its first failure on stderr itself.
+        let _ = g.append(line);
     }
 }
 
