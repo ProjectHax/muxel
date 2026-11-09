@@ -147,18 +147,47 @@ fn status_paint_defer(held: Option<Instant>, now: Instant) -> Duration {
 /// jamming against it.
 const TERM_INSET: Pixels = px(6.0);
 
+/// The grid, `(cols, rows)`, a terminal view gets when it fills a pane of
+/// `size`, drawn in `font_family` at `font_size` as [`TerminalView::set_config`]
+/// takes them: whole cells inside the [`TERM_INSET`] margin. Lets a launch open
+/// its PTY at the size the terminal will paint at, before any view exists.
+pub fn pane_grid(
+    window: &Window,
+    font_family: &SharedString,
+    font_size: f32,
+    pane: Size<Pixels>,
+) -> (u16, u16) {
+    let font = crate::element::terminal_font(font_family);
+    let (cell_width, line_height) = crate::element::cell_size(window, &font, px(font_size));
+    let margin = TERM_INSET * 2.0;
+    crate::element::grid_in(
+        size(pane.width - margin, pane.height - margin),
+        cell_width,
+        line_height,
+    )
+}
+
 /// Open a link the user ctrl+clicked in a terminal — an `http(s)://` URL or a
 /// `file://` URI for an existing local file. Dispatched by the terminal element
 /// and handled by the app, which routes URLs to the built-in browser (when
 /// enabled) or the OS.
 #[derive(Action, Clone, PartialEq)]
 #[action(namespace = terminal, no_json)]
-pub struct OpenLink(pub String);
+pub struct OpenLink {
+    pub url: String,
+    /// The terminal's instance id. The click that raises the link hasn't
+    /// moved focus to its pane yet, so the focused pane can't stand in for it.
+    pub pane: Uuid,
+}
 
 /// Open a terminal link without moving focus away from the terminal.
 #[derive(Action, Clone, PartialEq)]
 #[action(namespace = terminal, no_json)]
-pub struct OpenLinkBackground(pub String);
+pub struct OpenLinkBackground {
+    pub url: String,
+    /// The terminal's instance id, as in [`OpenLink`].
+    pub pane: Uuid,
+}
 
 /// Lifecycle state of a terminal/agent, shown as a badge. Inferred from the
 /// agent's TUI (per-agent markers), the bell, output activity, and process exit.
@@ -4201,6 +4230,11 @@ impl TerminalView {
     /// The active mouse copy/paste mode.
     pub fn mouse_mode(&self) -> TerminalMouseMode {
         self.mouse_mode
+    }
+
+    /// The pane (instance) this terminal belongs to.
+    pub fn instance_id(&self) -> Uuid {
+        self.instance_id
     }
 
     /// Link under the last pointer position, if the terminal grid can resolve one.

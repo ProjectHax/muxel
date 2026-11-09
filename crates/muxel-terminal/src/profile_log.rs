@@ -51,6 +51,8 @@ pub struct ProfileLog {
     live_day: Option<NaiveDate>,
     bytes: u64,
     pruned_on: Option<NaiveDate>,
+    /// Whether this log has named a failure on stderr yet.
+    reported: bool,
 }
 
 impl ProfileLog {
@@ -72,11 +74,29 @@ impl ProfileLog {
             limits,
             file: None,
             pruned_on: None,
+            reported: false,
         }
     }
 
+    /// Append one record. The log's first append or prune failure is named
+    /// on stderr; later ones aren't, so a lasting fault shows once rather
+    /// than on every record.
     pub fn append(&mut self, line: &str) -> io::Result<()> {
-        self.append_dated(Local::now().date_naive(), line)
+        let result = self.append_dated(Local::now().date_naive(), line);
+        if let Err(error) = &result {
+            self.report("append", error);
+        }
+        result
+    }
+
+    fn report(&mut self, what: &str, error: &io::Error) {
+        if !self.reported {
+            self.reported = true;
+            eprintln!(
+                "profile log {}: {what} failed: {error} (later failures are not reported)",
+                self.path.display()
+            );
+        }
     }
 
     fn append_dated(&mut self, today: NaiveDate, line: &str) -> io::Result<()> {
@@ -143,7 +163,13 @@ impl ProfileLog {
             self.pruned_on = None;
         }
         if self.pruned_on != Some(today) {
-            self.prune(today)?;
+            // An archive that can't be removed (read-only, or held open
+            // without delete sharing) doesn't stop the log while the family
+            // still fits its budget; pruning tries it again at the next roll
+            // or date. Over budget, skip the write rather than grow.
+            if let Some(error) = self.prune(today)? {
+                self.report("prune", &error);
+            }
             self.pruned_on = Some(today);
         }
         self.live_day = Some(day);
@@ -200,9 +226,25 @@ impl ProfileLog {
         Ok(self.parent().join(format!("{prefix}{sequence:06}")))
     }
 
-    fn prune(&self, today: NaiveDate) -> io::Result<()> {
+    /// Remove expired archives, then the oldest until the family fits its
+    /// budget. A file that can't be removed is skipped and the rest are still
+    /// pruned. `Ok(Some(error))` names the first such failure when the family
+    /// fits anyway; `Err` means it doesn't (or the directory can't be read),
+    /// and the caller must not write.
+    fn prune(&self, today: NaiveDate) -> io::Result<Option<io::Error>> {
         let prefix = self.family();
+        let mut first_error = None;
+        let mut remove = |path: &Path| match fs::remove_file(path) {
+            Ok(()) => true,
+            Err(error) => {
+                first_error.get_or_insert(error);
+                false
+            }
+        };
         let mut archives = Vec::new();
+        // Expired archives that couldn't be removed are still on disk, so
+        // they count against the budget too.
+        let mut stuck = 0_u64;
         for entry in fs::read_dir(self.parent())? {
             let entry = entry?;
             if !entry.file_type()?.is_file() {
@@ -227,16 +269,19 @@ impl ProfileLog {
                 ),
                 None => continue,
             };
+            let bytes = entry.metadata()?.len();
             if u64::try_from(today.signed_duration_since(day).num_days())
                 .is_ok_and(|age| age >= self.limits.keep_days)
             {
-                fs::remove_file(entry.path())?;
+                if !remove(&entry.path()) {
+                    stuck = stuck.saturating_add(bytes);
+                }
             } else {
-                archives.push((day, sequence, entry.path(), entry.metadata()?.len()));
+                archives.push((day, sequence, entry.path(), bytes));
             }
         }
         archives.sort_unstable_by(|a, b| (&a.0, &a.1, &a.2).cmp(&(&b.0, &b.1, &b.2)));
-        let mut total = archives.iter().map(|entry| entry.3).sum::<u64>();
+        let mut total = stuck.saturating_add(archives.iter().map(|entry| entry.3).sum::<u64>());
         // Reserve a full live file, avoiding a directory walk for every line.
         let budget = self
             .limits
@@ -246,10 +291,15 @@ impl ProfileLog {
             if total <= budget {
                 break;
             }
-            fs::remove_file(path)?;
-            total = total.saturating_sub(bytes);
+            if remove(&path) {
+                total = total.saturating_sub(bytes);
+            }
         }
-        Ok(())
+        if total > budget {
+            return Err(first_error
+                .unwrap_or_else(|| io::Error::other("profile history over its byte budget")));
+        }
+        Ok(first_error)
     }
 }
 
@@ -486,6 +536,93 @@ mod tests {
         assert!(log.file.is_none());
         assert!(log.path.is_dir());
         assert!(fs::read_dir(&log.path).unwrap().next().is_none());
+    }
+
+    /// A reader holding an expired archive open without delete sharing (the
+    /// usual tailer on Windows) must not stop the log: the record is written,
+    /// the other expired archive is still pruned, and the held one goes on a
+    /// later prune once it's released. Unix can't make one file undeletable
+    /// without locking the whole directory, so this runs on Windows.
+    #[cfg(windows)]
+    #[test]
+    fn held_archive_does_not_block_appends_or_other_pruning() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let fixture = Fixture::new();
+        let held = fixture.0.join("term.log.2026-11-01.000001");
+        let expired = fixture.0.join("term.log.2026-11-01.000002");
+        fs::write(&held, "old").unwrap();
+        fs::write(&expired, "old").unwrap();
+        // FILE_SHARE_READ | FILE_SHARE_WRITE, without FILE_SHARE_DELETE.
+        let reader = File::options()
+            .read(true)
+            .share_mode(1 | 2)
+            .open(&held)
+            .unwrap();
+        let mut log = fixture.log(limits());
+        log.append_on(day(15), day(15), "new", |from, to| fs::rename(from, to))
+            .expect("an undeletable archive refused the record");
+        assert_eq!(fs::read_to_string(&log.path).unwrap(), "new\n");
+        assert!(!expired.exists(), "the other expired archive was kept");
+        assert!(held.exists());
+        drop(reader);
+        append(&mut log, day(16), "next");
+        assert!(!held.exists(), "the released archive was not pruned later");
+    }
+
+    /// The other side of the same rule: when the archive that can't be
+    /// removed keeps the family over its byte budget, the record is refused
+    /// rather than growing the history past its bound.
+    #[cfg(windows)]
+    #[test]
+    fn held_archive_over_budget_still_refuses_the_record() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let fixture = Fixture::new();
+        let held = fixture.0.join("term.log.2026-11-15.000001");
+        fs::write(&held, "x".repeat(20)).unwrap();
+        // FILE_SHARE_READ | FILE_SHARE_WRITE, without FILE_SHARE_DELETE.
+        let _reader = File::options()
+            .read(true)
+            .share_mode(1 | 2)
+            .open(&held)
+            .unwrap();
+        // Budget: 24 total less an 8-byte live file leaves 16 for archives.
+        let mut log = fixture.log(ProfileLogLimits {
+            total_bytes: 24,
+            ..limits()
+        });
+        assert!(
+            log.append_on(day(15), day(15), "new", |from, to| fs::rename(from, to))
+                .is_err()
+        );
+        assert!(!log.path.exists());
+    }
+
+    /// The same bound when the held archive is past its keep days: a
+    /// failed delete leaves its bytes on disk, so they still count.
+    #[cfg(windows)]
+    #[test]
+    fn held_expired_archive_over_budget_still_refuses_the_record() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let fixture = Fixture::new();
+        let held = fixture.0.join("term.log.2026-11-01.000001");
+        fs::write(&held, "x".repeat(25)).unwrap();
+        // FILE_SHARE_READ | FILE_SHARE_WRITE, without FILE_SHARE_DELETE.
+        let _reader = File::options()
+            .read(true)
+            .share_mode(1 | 2)
+            .open(&held)
+            .unwrap();
+        // Budget: 24 total less an 8-byte live file leaves 16 for archives.
+        let mut log = fixture.log(ProfileLogLimits {
+            total_bytes: 24,
+            ..limits()
+        });
+        assert!(
+            log.append_on(day(15), day(15), "new", |from, to| fs::rename(from, to))
+                .is_err(),
+            "a 25-byte archive that can't be deleted leaves no room under a 24-byte family"
+        );
+        assert!(!log.path.exists());
     }
 
     #[test]

@@ -184,11 +184,9 @@ fn emit_line(line: &str) {
             ProfileLogLimits::from_env(),
         ))
     });
-    if let Ok(mut g) = slot.lock()
-        && let Err(error) = g.append(line)
-        && log_stderr()
-    {
-        eprintln!("term-prof: could not append log: {error}");
+    if let Ok(mut g) = slot.lock() {
+        // The log names its first failure on stderr itself.
+        let _ = g.append(line);
     }
 }
 
@@ -205,6 +203,9 @@ pub fn startup_event(
     if !enabled() {
         return;
     }
+    // A launch can report a phase before any terminal exists to start the
+    // profiler (waiting for its pane's layout, say).
+    start();
     defer(DeferredRecord::Startup(StartupRecord {
         instance_id,
         phase: startup_phase_label(phase),
@@ -243,6 +244,7 @@ fn startup_phase_label(phase: &str) -> &'static str {
         "automation-write-failed" => "automation-write-failed",
         "first-output" => "first-output",
         "first-screen" => "first-screen",
+        "pane-layout" => "pane-layout",
         "openpty" => "openpty",
         "program-resolution" => "program-resolution",
         "child-spawn" => "child-spawn",

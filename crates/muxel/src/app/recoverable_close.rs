@@ -43,6 +43,9 @@ pub(super) struct CloseGroup {
     /// The decision is whether to close without reading the shared layout.
     pub layout_unread: bool,
     pub layouts: HashMap<Uuid, Option<PaneNode>>,
+    /// Each project's live layout just before and just after this close hid
+    /// its panes. Undo puts the first back while the second is still live.
+    pub hides: HashMap<Uuid, recoverable_layout::LiveHide>,
     pub focus: Option<Uuid>,
     pub caller: Option<String>,
 }
@@ -211,16 +214,18 @@ impl MuxelApp {
         });
         let evidence = if let Some(view) = view {
             if !muxel_core::is_known_agent_program(inst.and_then(|inst| inst.program.as_deref())) {
+                let program = inst.and_then(|inst| inst.program.as_deref());
+                let via_client = inst.is_some_and(|inst| {
+                    inst.tmux_session.is_some()
+                        || self
+                            .workspace
+                            .project(inst.project_id)
+                            .is_some_and(Project::is_remote)
+                });
                 shell_close_evidence(
-                    inst.and_then(|inst| inst.program.as_deref()),
-                    inst.is_some_and(|inst| {
-                        inst.tmux_session.is_some()
-                            || self
-                                .workspace
-                                .project(inst.project_id)
-                                .is_some_and(Project::is_remote)
-                    }),
-                    cfg!(unix) && view.session().is_idle_foreground(),
+                    program,
+                    via_client,
+                    view.session().foreground_idle(),
                     view.session().shell_at_prompt(),
                 )
             } else if !attributable {
@@ -334,7 +339,7 @@ impl MuxelApp {
     fn plan_close_request(&mut self, ids: Vec<Uuid>, cx: &mut Context<Self>) {
         if let Some(&iid) = ids.iter().find(|&&iid| {
             self.close_editor(iid)
-                .is_some_and(|editor| editor.read(cx).is_dirty())
+                .is_some_and(|editor| editor.read(cx).is_dirty(cx))
         }) {
             self.request_confirm(
                 t("Save changes before closing?"),
@@ -447,7 +452,7 @@ impl MuxelApp {
             let step = if inst.kind != InstanceKind::Terminal {
                 if self
                     .close_editor(iid)
-                    .is_some_and(|editor| editor.read(cx).is_dirty())
+                    .is_some_and(|editor| editor.read(cx).is_dirty(cx))
                 {
                     AcceptedClose::Stays
                 } else {
@@ -549,6 +554,7 @@ impl MuxelApp {
             sync_marks: None,
             layout_unread: false,
             layouts: HashMap::new(),
+            hides: HashMap::new(),
             focus: self.active_instance,
             caller,
         };
@@ -574,7 +580,19 @@ impl MuxelApp {
                     .project(pid)
                     .and_then(|project| project.layout.clone())
             });
+            let hide = group.hides.entry(pid).or_insert_with(|| {
+                let live = self
+                    .workspace
+                    .project(pid)
+                    .and_then(|project| project.layout.clone());
+                recoverable_layout::LiveHide {
+                    before: live,
+                    after: None,
+                }
+            });
             if let Some(popout) = self.popouts.get(&iid) {
+                // Undo docks it where it would redock.
+                Self::restore_popout_layout(&mut hide.before, iid, popout.redock);
                 Self::restore_popout_layout(
                     group.layouts.get_mut(&pid).unwrap(),
                     iid,
@@ -601,6 +619,9 @@ impl MuxelApp {
         let gid = group.id;
         let members = group.members.clone();
         self.close_groups.push(group);
+        // They leave their layouts now, in this order.
+        self.close_history.retain(|iid| !members.contains(iid));
+        self.close_history.extend(&members);
         for iid in members {
             self.close_requests.remove(&iid);
             self.terminal_restarts.cancel(iid);
@@ -630,6 +651,14 @@ impl MuxelApp {
             }
             if self.active_instance == Some(iid) {
                 self.active_instance = self.workspace.active().and_then(Project::first_instance);
+            }
+        }
+        if let Some(group) = self.close_groups.iter_mut().find(|group| group.id == gid) {
+            for (pid, hide) in &mut group.hides {
+                hide.after = self
+                    .workspace
+                    .project(*pid)
+                    .and_then(|project| project.layout.clone());
             }
         }
         self.persist();
@@ -664,7 +693,8 @@ impl MuxelApp {
     }
 
     /// Put every held pane of project `pid` back into `layout`, where the
-    /// durable document keeps it until its close is final.
+    /// durable document keeps it until its close is final. Newest close first,
+    /// so each undoes onto the layout its own hide left.
     fn restore_held_layout(&self, pid: Uuid, layout: &mut Option<PaneNode>) {
         for group in self.close_groups.iter().rev() {
             let Some(original) = group.layouts.get(&pid) else {
@@ -678,8 +708,27 @@ impl MuxelApp {
                 })
                 .copied()
                 .collect();
-            recoverable_layout::restore_layout(layout, original, &ids);
+            recoverable_layout::restore_hidden(
+                layout,
+                group.hides.get(&pid),
+                original,
+                &ids,
+                &self.close_history,
+            );
         }
+    }
+
+    /// Forget the closes no held snapshot holds any more. Their order can't
+    /// change a restore.
+    fn prune_close_history(&mut self) {
+        let held: HashSet<_> = self
+            .close_groups
+            .iter()
+            .flat_map(|group| group.layouts.values())
+            .flatten()
+            .flat_map(PaneNode::collect_instances)
+            .collect();
+        self.close_history.retain(|iid| held.contains(iid));
     }
 
     /// The project as the saved and shared documents hold it: a held pane is
@@ -741,12 +790,27 @@ impl MuxelApp {
             return;
         };
         let durable = project.layout.clone();
-        let gone = rehide_held(&mut project.layout, &held);
+        let mut gone = Vec::new();
+        // Hide them close by close, oldest first, so each close's before and
+        // after are the adopted layout's.
         for group in &mut self.close_groups {
             if let Some(original) = group.layouts.get_mut(&pid) {
                 *original = durable.clone();
             }
+            let members: Vec<_> = group
+                .members
+                .iter()
+                .copied()
+                .filter(|iid| held.contains(iid))
+                .collect();
+            let before = project.layout.clone();
+            gone.extend(rehide_held(&mut project.layout, &members));
+            if let Some(hide) = group.hides.get_mut(&pid) {
+                hide.before = before;
+                hide.after = project.layout.clone();
+            }
         }
+        self.prune_close_history();
         for iid in gone {
             muxel_store::append_event_log(&format!("close: a peer closed held pane [{iid}]"));
             self.forget_close(iid);
@@ -870,9 +934,18 @@ impl MuxelApp {
             .or_else(|| group.members.iter().copied().find(|iid| ids.contains(iid)));
         for (&pid, original) in &group.layouts {
             if let Some(project) = self.workspace.project_mut(pid) {
-                recoverable_layout::restore_layout(&mut project.layout, original, &ids);
+                recoverable_layout::restore_hidden(
+                    &mut project.layout,
+                    group.hides.get(&pid),
+                    original,
+                    &ids,
+                    &self.close_history,
+                );
             }
         }
+        // Back in their layouts, so no longer closed.
+        self.close_history.retain(|iid| !ids.contains(iid));
+        self.prune_close_history();
         let mut restored = Vec::new();
         for iid in group.members {
             if let Some(held) = self.closing.remove(&iid) {
@@ -1285,6 +1358,12 @@ impl MuxelApp {
             group.members.retain(|&member| member != iid);
         }
         self.close_groups.retain(|group| !group.members.is_empty());
+        // Going final keeps the place it took when held. A pane closed at once
+        // leaves now, after every close held so far.
+        if !self.close_history.contains(&iid) {
+            self.close_history.push(iid);
+        }
+        self.prune_close_history();
         if self.close_groups.is_empty() {
             self.show_close_list = false;
         }
@@ -1633,6 +1712,7 @@ mod tests {
             sync_marks: None,
             layout_unread: false,
             layouts: HashMap::new(),
+            hides: HashMap::new(),
             focus: None,
             caller: None,
         };

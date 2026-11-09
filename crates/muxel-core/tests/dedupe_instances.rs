@@ -16,6 +16,7 @@ fn project_with(instances: &[Uuid]) -> Project {
         pane_id: Uuid::new_v4(),
         tabs: instances.to_vec(),
         active: 0,
+        split_from: None,
     }));
     p
 }
@@ -39,6 +40,7 @@ fn a_second_instance_on_the_same_session_is_dropped_from_both_the_list_and_the_l
         pane_id: Uuid::new_v4(),
         tabs: vec![first.id, dup.id, other.id],
         active: 1, // the duplicate is focused — removing it must not leave a hole
+        split_from: None,
     }));
     let (first_id, dup_id, other_id) = (first.id, dup.id, other.id);
     ws.projects.push(proj);

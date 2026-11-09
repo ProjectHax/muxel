@@ -7,7 +7,7 @@ use super::{
 };
 use gpui::{AppContext, Entity, Focusable, TestAppContext, VisualTestContext, WindowHandle};
 use muxel_core::control::ErrorCode;
-use muxel_core::{PaneNode, Worktree, add_tab};
+use muxel_core::{LeafData, PaneNode, SplitDirection, Worktree, add_tab};
 use muxel_terminal::{
     AgentStatus, CommandSpec, TerminalLaunch, TerminalSession, TerminalStatusReason, TerminalView,
 };
@@ -997,6 +997,120 @@ fn review_close_dirty_worktree_keep_preserves_the_busy_agent_and_undo() {
 }
 
 #[test]
+fn ime_text_requires_confirmation_before_editor_close() {
+    use gpui::EntityInputHandler;
+
+    for unmark in [false, true] {
+        with_app(|cx, window| {
+            let pid = project(cx, window);
+            window
+                .update(cx, |app, window, cx| {
+                    let path = app.workspace.project(pid).unwrap().root_path.join("ime.txt");
+                    std::fs::write(&path, "one\n").unwrap();
+                    let instance = Instance::editor(pid, Some(path.clone()));
+                    let iid = instance.id;
+                    let config = app.editor_config();
+                    let editor = cx.new(|cx| {
+                        crate::editor::EditorView::open(Some(path), config, window, cx)
+                    });
+                    app.workspace.add_instance(instance);
+                    app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::leaf(iid));
+                    app.editors.insert(iid, editor.clone());
+                    let input = editor.read(cx).input_for_test();
+                    input.update(cx, |input, cx| {
+                        input.replace_and_mark_text_in_range(None, "あ", None, window, cx);
+                        if unmark {
+                            input.unmark_text(window, cx);
+                        }
+                    });
+                    app.request_close_instance(iid, cx);
+                    assert!(
+                        matches!(app.confirm.as_ref().map(|p| &p.action),
+                            Some(ConfirmAction::SaveEditorBeforeClose { iid: pending, .. }) if *pending == iid),
+                        "closing discarded IME text without an unsaved-changes choice"
+                    );
+                    assert_eq!(editor.read(cx).text(cx), "あone\n");
+                    assert!(app.workspace.instance(iid).is_some());
+                    app.cancel_confirm(cx);
+
+                    // Pop-out rebuilds from this snapshot without a marked range.
+                    let snapshot = EditorSnapshot::capture(&editor, cx);
+                    assert!(snapshot.dirty, "pop-out captured composing text as clean");
+                    assert_eq!(snapshot.text, "あone\n");
+
+                    if !unmark {
+                        input.update(cx, |input, cx| {
+                            input.replace_and_mark_text_in_range(None, "", None, window, cx);
+                        });
+                        app.request_close_instance(iid, cx);
+                        assert!(app.confirm.is_none(), "cancelled composition is clean");
+                        assert!(app.workspace.instance(iid).is_none());
+                    }
+                })
+                .unwrap();
+        });
+    }
+}
+
+#[test]
+fn cancellation_callbacks_allow_clean_editor_close() {
+    use gpui::EntityInputHandler;
+
+    for explicit_range in [false, true] {
+        with_app(|cx, window| {
+            let pid = project(cx, window);
+            let (iid, editor) = window
+                .update(cx, |app, window, cx| {
+                    let path = app
+                        .workspace
+                        .project(pid)
+                        .unwrap()
+                        .root_path
+                        .join("cancel.txt");
+                    std::fs::write(&path, "one\n").unwrap();
+                    let instance = Instance::editor(pid, Some(path.clone()));
+                    let iid = instance.id;
+                    let config = app.editor_config();
+                    let editor = cx
+                        .new(|cx| crate::editor::EditorView::open(Some(path), config, window, cx));
+                    app.workspace.add_instance(instance);
+                    app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::leaf(iid));
+                    app.editors.insert(iid, editor.clone());
+                    editor.read(cx).input_for_test().update(cx, |input, cx| {
+                        input.replace_and_mark_text_in_range(None, "あ", None, window, cx);
+                        let range = if explicit_range {
+                            input.marked_text_range(window, cx)
+                        } else {
+                            None
+                        };
+                        input.replace_text_in_range(range, "", window, cx);
+                    });
+                    (iid, editor)
+                })
+                .unwrap();
+            // Deliver Change before closing, as separate input and close events do.
+            cx.run_until_parked();
+            let (asked, exists, text) = window
+                .update(cx, |app, _, cx| {
+                    app.request_close_instance(iid, cx);
+                    (
+                        app.confirm.is_some(),
+                        app.workspace.instance(iid).is_some(),
+                        editor.read(cx).text(cx),
+                    )
+                })
+                .unwrap();
+            assert_eq!(text, "one\n");
+            assert!(
+                !asked,
+                "cancelled unchanged text caused a false save prompt"
+            );
+            assert!(!exists, "the clean editor did not close");
+        });
+    }
+}
+
+#[test]
 fn dirty_editor_cancel_and_save_failure_preserve_the_draft_until_discarded() {
     with_app(|cx, window| {
         let pid = project(cx, window);
@@ -1015,7 +1129,7 @@ fn dirty_editor_cancel_and_save_failure_preserve_the_draft_until_discarded() {
             assert!(matches!(app.confirm.as_ref().map(|p| &p.action), Some(ConfirmAction::SaveEditorBeforeClose { iid: pending, .. }) if *pending == iid));
             app.cancel_confirm(cx);
             assert!(app.workspace.instance(iid).is_some());
-            assert!(editor.read(cx).is_dirty());
+            assert!(editor.read(cx).is_dirty(cx));
             assert_eq!(editor.read(cx).text(cx), "unsaved draft");
             app.request_close_instance(iid, cx);
             app.run_confirm(window, cx);
@@ -1045,7 +1159,7 @@ fn dirty_editor_cancel_and_save_failure_preserve_the_draft_until_discarded() {
             .update(cx, |app, _, cx| {
                 assert!(app.workspace.instance(iid).is_some());
                 assert_eq!(app.editors.get(&iid), Some(&editor));
-                assert!(editor.read(cx).is_dirty());
+                assert!(editor.read(cx).is_dirty(cx));
                 assert_eq!(editor.read(cx).text(cx), "unsaved draft");
                 assert!(!app.is_closing(iid));
                 app.request_close_instance(iid, cx);
@@ -3276,5 +3390,402 @@ fn removing_a_project_leaves_the_files_of_an_answered_close() {
                 assert!(app.workspace.worktree(wid).is_some());
             })
             .unwrap();
+    });
+}
+
+/// Four equal 400 px columns A, Y, X, B in a project of their own, with live
+/// terminals. Y was split off B; the others have no recorded origin, so X gives
+/// its width to Y beside it.
+struct Row {
+    pid: Uuid,
+    a: Uuid,
+    y: Uuid,
+    x: Uuid,
+    b: Uuid,
+    /// Each pane's name in assertions, including any a test adds.
+    names: Vec<(Uuid, char)>,
+    _children: Vec<OwnedChild>,
+}
+
+impl Row {
+    fn new(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -> Self {
+        let pid = project(cx, window);
+        let mut ids = [Uuid::nil(); 4];
+        let mut children = Vec::new();
+        for id in &mut ids {
+            let (iid, _, child) = terminal(cx, window, pid);
+            *id = iid;
+            children.push(child);
+        }
+        let [a, y, x, b] = ids;
+        window
+            .update(cx, |app, _, _| {
+                let panes = ids.map(|iid| (iid, Uuid::new_v4()));
+                let from_b = panes[3].1;
+                app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::Split {
+                    direction: SplitDirection::Horizontal,
+                    sizes: vec![400.0; 4],
+                    children: panes
+                        .iter()
+                        .map(|&(iid, pane_id)| {
+                            PaneNode::Leaf(LeafData {
+                                pane_id,
+                                tabs: vec![iid],
+                                active: 0,
+                                split_from: (iid == y).then_some(from_b),
+                            })
+                        })
+                        .collect(),
+                });
+            })
+            .unwrap();
+        Self {
+            pid,
+            a,
+            y,
+            x,
+            b,
+            names: vec![(a, 'A'), (y, 'Y'), (x, 'X'), (b, 'B')],
+            _children: children,
+        }
+    }
+
+    fn name(&self, iid: Uuid) -> char {
+        self.names
+            .iter()
+            .find(|(id, _)| *id == iid)
+            .expect("a pane of the row")
+            .1
+    }
+
+    /// The row's columns by name, in whole pixels.
+    fn columns(&self, layout: &Option<PaneNode>) -> Vec<(char, i32)> {
+        let Some(PaneNode::Split {
+            sizes, children, ..
+        }) = layout
+        else {
+            panic!("expected a row: {layout:?}");
+        };
+        children
+            .iter()
+            .zip(sizes)
+            .map(|(child, size)| {
+                (
+                    self.name(child.first_instance().unwrap()),
+                    size.round() as i32,
+                )
+            })
+            .collect()
+    }
+
+    fn live(&self, app: &MuxelApp) -> Vec<(char, i32)> {
+        self.columns(&app.workspace.project(self.pid).unwrap().layout)
+    }
+
+    /// The row as the saved and shared document holds it.
+    fn durable(&self, app: &MuxelApp) -> Vec<(char, i32)> {
+        let durable = app.workspace_with_closes_restored();
+        self.columns(&durable.project(self.pid).unwrap().layout)
+    }
+
+    /// Every pane in `layout` by name, sorted, and the row's total width to
+    /// three places: what any undo must keep, however it puts panes back.
+    fn panes_and_width(&self, layout: &Option<PaneNode>) -> (Vec<char>, String) {
+        let Some(root @ PaneNode::Split { sizes, .. }) = layout else {
+            panic!("expected a row: {layout:?}");
+        };
+        let mut panes: Vec<_> = root
+            .collect_instances()
+            .into_iter()
+            .map(|iid| self.name(iid))
+            .collect();
+        panes.sort_unstable();
+        (panes, format!("{:.3}", sizes.iter().sum::<f32>()))
+    }
+
+    /// Each column's share of the row, in thousandths.
+    fn shares(&self, layout: &Option<PaneNode>) -> Vec<(char, i32)> {
+        let Some(PaneNode::Split { sizes, .. }) = layout else {
+            panic!("expected a row: {layout:?}");
+        };
+        let width: f32 = sizes.iter().sum();
+        self.columns(layout)
+            .into_iter()
+            .zip(sizes)
+            .map(|((name, _), size)| (name, (size / width * 1000.0).round() as i32))
+            .collect()
+    }
+}
+
+/// How the second of two closed panes goes for good while the first is held.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SecondLeaves {
+    /// Both closed together, and its countdown finishes before the other's.
+    FinalFromTheSameClose,
+    /// Closed afterwards in a close of its own, which goes final.
+    FinalFromALaterClose,
+    /// Closed at once with no hold, as a dead pane is.
+    ClosedAtOnce,
+}
+
+#[test]
+fn undo_replays_a_close_that_went_final_in_the_order_it_happened() {
+    with_app(|cx, window| {
+        let mut got = Vec::new();
+        for way in [
+            SecondLeaves::FinalFromTheSameClose,
+            SecondLeaves::FinalFromALaterClose,
+            SecondLeaves::ClosedAtOnce,
+        ] {
+            let row = Row::new(cx, window);
+            let (x, y) = (row.x, row.y);
+            window
+                .update(cx, |app, window, cx| {
+                    let held = match way {
+                        SecondLeaves::FinalFromTheSameClose => {
+                            let group = app
+                                .hold_closes(vec![(x, false), (y, false)], None, cx)
+                                .unwrap();
+                            // As `finish_close_expiry` does for a member ready
+                            // before the rest of its close.
+                            app.close_instance_inner(y, "close (countdown)", cx);
+                            group
+                        }
+                        SecondLeaves::FinalFromALaterClose => {
+                            let group = app.hold_closes(vec![(x, false)], None, cx).unwrap();
+                            let later = app.hold_closes(vec![(y, false)], None, cx).unwrap();
+                            app.finalize_close_group(later, cx);
+                            group
+                        }
+                        SecondLeaves::ClosedAtOnce => {
+                            let group = app.hold_closes(vec![(x, false)], None, cx).unwrap();
+                            app.close_instance_inner(y, "close", cx);
+                            group
+                        }
+                    };
+                    let live = row.live(app);
+                    let saved = row.durable(app);
+                    app.undo_close(held, window, cx);
+                    got.push((way, live, saved, row.live(app)));
+                })
+                .unwrap();
+        }
+        // Y's 400 went back to B, the pane it was split from. X has its own 400.
+        let back = vec![('A', 400), ('X', 400), ('B', 800)];
+        let want: Vec<_> = got
+            .iter()
+            .map(|&(way, ..)| {
+                (
+                    way,
+                    vec![('A', 400), ('B', 1200)],
+                    back.clone(),
+                    back.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(got, want);
+    });
+}
+
+#[test]
+fn undoing_the_newest_close_puts_back_the_row_it_hid() {
+    with_app(|cx, window| {
+        let row = Row::new(cx, window);
+        let (a, y, x, b) = (row.a, row.y, row.x, row.b);
+        window
+            .update(cx, |app, window, cx| {
+                let mut got = Vec::new();
+                let older = app.hold_closes(vec![(x, false)], None, cx).unwrap();
+                let later = app.hold_closes(vec![(y, false)], None, cx).unwrap();
+                app.finalize_close_group(later, cx);
+                got.push(("Y final, X held", row.live(app)));
+                let newest = app.hold_closes(vec![(a, false)], None, cx).unwrap();
+                assert_eq!(app.workspace.project(row.pid).unwrap().instances(), [b]);
+                got.push(("saved, X and A held", row.durable(app)));
+                app.undo_close(newest, window, cx);
+                got.push(("A undone", row.live(app)));
+                got.push(("saved, X held", row.durable(app)));
+                app.undo_close(older, window, cx);
+                got.push(("X undone", row.live(app)));
+                // Undoing A puts back the row from just before A closed. Y's
+                // 400 went back to B, the pane it was split from.
+                assert_eq!(
+                    got,
+                    [
+                        ("Y final, X held", vec![('A', 400), ('B', 1200)]),
+                        (
+                            "saved, X and A held",
+                            vec![('A', 400), ('X', 400), ('B', 800)]
+                        ),
+                        ("A undone", vec![('A', 400), ('B', 1200)]),
+                        ("saved, X held", vec![('A', 400), ('X', 400), ('B', 800)]),
+                        ("X undone", vec![('A', 400), ('X', 400), ('B', 800)]),
+                    ]
+                );
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn two_held_closes_undone_straight_away_restore_exactly_in_either_order() {
+    with_app(|cx, window| {
+        for newest_first in [true, false] {
+            let row = Row::new(cx, window);
+            let (y, x) = (row.y, row.x);
+            window
+                .update(cx, |app, window, cx| {
+                    let mut got = Vec::new();
+                    let older = app.hold_closes(vec![(x, false)], None, cx).unwrap();
+                    let newer = app.hold_closes(vec![(y, false)], None, cx).unwrap();
+                    got.push(row.durable(app));
+                    let (first, second) = if newest_first {
+                        (newer, older)
+                    } else {
+                        (older, newer)
+                    };
+                    app.undo_close(first, window, cx);
+                    got.push(row.live(app));
+                    app.undo_close(second, window, cx);
+                    got.push(row.live(app));
+                    let all = vec![('A', 400), ('Y', 400), ('X', 400), ('B', 400)];
+                    let between = if newest_first {
+                        // X's 400 went to Y beside it.
+                        vec![('A', 400), ('Y', 800), ('B', 400)]
+                    } else {
+                        // Y's 400 went back to B, the pane it was split from.
+                        vec![('A', 400), ('X', 400), ('B', 800)]
+                    };
+                    assert_eq!(
+                        got,
+                        [all.clone(), between, all],
+                        "newest first: {newest_first}"
+                    );
+                })
+                .unwrap();
+        }
+    });
+}
+
+/// How the row changes while closes are held, so undo can't put back the
+/// layout a close hid and rebuilds it from the saved one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Edit {
+    /// Drag the divider between the two columns left once Y goes final.
+    DragADivider,
+    /// Split B, the one column left, into B and a new pane C.
+    SplitTheSurvivor,
+}
+
+#[test]
+fn undo_after_the_row_changed_keeps_every_pane_once_and_the_width() {
+    with_app(|cx, window| {
+        let mut got = Vec::new();
+        let mut shares = Vec::new();
+        for edit in [Edit::DragADivider, Edit::SplitTheSurvivor] {
+            for newest_first in [true, false] {
+                let mut row = Row::new(cx, window);
+                // `terminal` opens C as a tab beside the row's first pane.
+                let added = (edit == Edit::SplitTheSurvivor).then(|| terminal(cx, window, row.pid));
+                let c = added.as_ref().map(|(c, ..)| *c);
+                row.names.extend(c.map(|c| (c, 'C')));
+                let (a, y, x, b, pid) = (row.a, row.y, row.x, row.b, row.pid);
+                window
+                    .update(cx, |app, window, cx| {
+                        if let Some(c) = c {
+                            let layout = &mut app.workspace.project_mut(pid).unwrap().layout;
+                            assert!(muxel_core::remove(layout, c));
+                        }
+                        let older = app.hold_closes(vec![(x, false)], None, cx).unwrap();
+                        let later = app.hold_closes(vec![(y, false)], None, cx).unwrap();
+                        app.finalize_close_group(later, cx);
+                        if edit == Edit::DragADivider {
+                            // [A400, B1200] becomes [A700, B900].
+                            let Some(PaneNode::Split { sizes, .. }) =
+                                &mut app.workspace.project_mut(pid).unwrap().layout
+                            else {
+                                panic!("expected a row");
+                            };
+                            *sizes = vec![700.0, 900.0];
+                        }
+                        let newest = app.hold_closes(vec![(a, false)], None, cx).unwrap();
+                        if let Some(c) = c {
+                            // B is all that's left, so splitting it gives [B1, C1].
+                            let layout = &mut app.workspace.project_mut(pid).unwrap().layout;
+                            assert!(muxel_core::split(layout, b, SplitDirection::Horizontal, c));
+                        }
+                        let saved = app.workspace_with_closes_restored();
+                        let saved = row.panes_and_width(&saved.project(pid).unwrap().layout);
+                        let (first, second) = if newest_first {
+                            (newest, older)
+                        } else {
+                            (older, newest)
+                        };
+                        app.undo_close(first, window, cx);
+                        let live = &app.workspace.project(pid).unwrap().layout;
+                        let between = row.panes_and_width(live);
+                        if c.is_some() {
+                            shares.push((newest_first, row.shares(live)));
+                        }
+                        app.undo_close(second, window, cx);
+                        let live = &app.workspace.project(pid).unwrap().layout;
+                        got.push((
+                            edit,
+                            newest_first,
+                            saved,
+                            between,
+                            row.panes_and_width(live),
+                        ));
+                    })
+                    .unwrap();
+            }
+        }
+        // Sizes after an edit are approximate. No pane may be lost or doubled,
+        // and the row keeps its width: 1600 after the drag, and 2 once B's
+        // split made a new row of its own.
+        let row = |panes: &[char], width: &str| (panes.to_vec(), width.to_string());
+        assert_eq!(
+            got,
+            [
+                (
+                    Edit::DragADivider,
+                    true,
+                    row(&['A', 'B', 'X'], "1600.000"),
+                    row(&['A', 'B'], "1600.000"),
+                    row(&['A', 'B', 'X'], "1600.000"),
+                ),
+                (
+                    Edit::DragADivider,
+                    false,
+                    row(&['A', 'B', 'X'], "1600.000"),
+                    row(&['B', 'X'], "1600.000"),
+                    row(&['A', 'B', 'X'], "1600.000"),
+                ),
+                (
+                    Edit::SplitTheSurvivor,
+                    true,
+                    row(&['A', 'B', 'C', 'X'], "2.000"),
+                    row(&['A', 'B', 'C'], "2.000"),
+                    row(&['A', 'B', 'C', 'X'], "2.000"),
+                ),
+                (
+                    Edit::SplitTheSurvivor,
+                    false,
+                    row(&['A', 'B', 'C', 'X'], "2.000"),
+                    row(&['B', 'C', 'X'], "2.000"),
+                    row(&['A', 'B', 'C', 'X'], "2.000"),
+                ),
+            ]
+        );
+        // The first pane back takes its saved share of the place B now fills,
+        // and B and C keep their 1:1. A, with X still held, had 400 against B's
+        // 800, so a third. X had 400 against B's 400, so half.
+        assert_eq!(
+            shares,
+            [
+                (true, vec![('A', 333), ('B', 333), ('C', 333)]),
+                (false, vec![('X', 500), ('B', 250), ('C', 250)]),
+            ]
+        );
     });
 }
