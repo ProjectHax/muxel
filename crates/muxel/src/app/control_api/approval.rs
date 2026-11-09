@@ -285,6 +285,8 @@ impl MuxelApp {
         if !parameters.is_empty() {
             details.insert(3, (t("Parameters"), ctl::card_value(&parameters)));
         }
+        // `control_new` honours the requesting pane by this same rule, so a
+        // request lands beside a declared pane only when the card names it.
         if let Some(pane) = request
             .options
             .requesting_pane
