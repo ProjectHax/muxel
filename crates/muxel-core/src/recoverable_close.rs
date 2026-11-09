@@ -21,15 +21,25 @@ pub enum CloseEvidence {
 
 /// Non-agent prompt evidence, separate from the platform foreground query so
 /// its policy can be exercised on every test host.
+///
+/// `foreground_idle` is None where the platform can't inspect the shell's
+/// foreground group and children (Windows); an OSC 133 prompt alone is the
+/// evidence there. Where it can, a prompt also needs the shell idle: a shell
+/// draws its prompt while a background job runs.
 pub fn shell_close_evidence(
     program: Option<&str>,
     via_client: bool,
-    foreground_idle: bool,
+    foreground_idle: Option<bool>,
     osc133_prompt: bool,
 ) -> CloseEvidence {
-    // Foreground ownership proves a prompt only for the direct default shell.
-    // A client or explicit program can own that group while remote work runs.
-    if osc133_prompt || program.is_none() && !via_client && foreground_idle {
+    let at_prompt = match foreground_idle {
+        None => osc133_prompt,
+        // Foreground ownership proves a prompt only for the direct default
+        // shell. A client or explicit program can own that group while remote
+        // work runs.
+        Some(idle) => idle && (osc133_prompt || program.is_none() && !via_client),
+    };
+    if at_prompt {
         CloseEvidence::ShellPrompt
     } else {
         CloseEvidence::Quiet
@@ -327,7 +337,7 @@ mod recoverable_close_policy_tests {
     #[test]
     fn non_agent_foreground_ownership_does_not_prove_a_shell_prompt() {
         for program in ["ssh", "python", "node", "wrapper.sh", "bash"] {
-            let evidence = shell_close_evidence(Some(program), false, true, false);
+            let evidence = shell_close_evidence(Some(program), false, Some(true), false);
             assert_eq!(evidence, CloseEvidence::Quiet, "explicit program {program}");
             assert_eq!(
                 decide(
@@ -345,16 +355,18 @@ mod recoverable_close_policy_tests {
     #[test]
     fn default_shell_foreground_proof_excludes_tmux_and_remote_clients() {
         assert_eq!(
-            shell_close_evidence(None, false, true, false),
+            shell_close_evidence(None, false, Some(true), false),
             CloseEvidence::ShellPrompt
         );
-        assert_eq!(
-            shell_close_evidence(None, false, false, false),
-            CloseEvidence::Quiet
-        );
+        for unknown in [Some(false), None] {
+            assert_eq!(
+                shell_close_evidence(None, false, unknown, false),
+                CloseEvidence::Quiet
+            );
+        }
         // Both tmux and an SSH connection can own the child foreground group
         // while a command is running beyond that client.
-        let evidence = shell_close_evidence(None, true, true, false);
+        let evidence = shell_close_evidence(None, true, Some(true), false);
         assert_eq!(evidence, CloseEvidence::Quiet);
         assert_eq!(
             decide(
@@ -369,11 +381,27 @@ mod recoverable_close_policy_tests {
     }
 
     #[test]
-    fn explicit_osc133_prompt_remains_protocol_evidence() {
+    fn an_osc133_prompt_needs_an_idle_shell_where_one_can_be_checked() {
         for program in [None, Some("custom-shell"), Some("wrapper.sh")] {
             for via_client in [false, true] {
-                let evidence = shell_close_evidence(program, via_client, false, true);
-                assert_eq!(evidence, CloseEvidence::ShellPrompt);
+                // Unix with the shell idle, and Windows, which can't check.
+                for foreground_idle in [Some(true), None] {
+                    let evidence = shell_close_evidence(program, via_client, foreground_idle, true);
+                    assert_eq!(evidence, CloseEvidence::ShellPrompt);
+                    assert_eq!(
+                        decide(
+                            CloseFacts {
+                                evidence,
+                                ..quiet()
+                            },
+                            true
+                        ),
+                        CloseDecision::Hold { forced: false }
+                    );
+                }
+                // Unix with a job behind the prompt, or an unreadable tree.
+                let evidence = shell_close_evidence(program, via_client, Some(false), true);
+                assert_eq!(evidence, CloseEvidence::Quiet);
                 assert_eq!(
                     decide(
                         CloseFacts {
@@ -382,7 +410,7 @@ mod recoverable_close_policy_tests {
                         },
                         true
                     ),
-                    CloseDecision::Hold { forced: false }
+                    CloseDecision::Ask
                 );
             }
         }
