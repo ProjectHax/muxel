@@ -997,6 +997,120 @@ fn review_close_dirty_worktree_keep_preserves_the_busy_agent_and_undo() {
 }
 
 #[test]
+fn ime_text_requires_confirmation_before_editor_close() {
+    use gpui::EntityInputHandler;
+
+    for unmark in [false, true] {
+        with_app(|cx, window| {
+            let pid = project(cx, window);
+            window
+                .update(cx, |app, window, cx| {
+                    let path = app.workspace.project(pid).unwrap().root_path.join("ime.txt");
+                    std::fs::write(&path, "one\n").unwrap();
+                    let instance = Instance::editor(pid, Some(path.clone()));
+                    let iid = instance.id;
+                    let config = app.editor_config();
+                    let editor = cx.new(|cx| {
+                        crate::editor::EditorView::open(Some(path), config, window, cx)
+                    });
+                    app.workspace.add_instance(instance);
+                    app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::leaf(iid));
+                    app.editors.insert(iid, editor.clone());
+                    let input = editor.read(cx).input_for_test();
+                    input.update(cx, |input, cx| {
+                        input.replace_and_mark_text_in_range(None, "あ", None, window, cx);
+                        if unmark {
+                            input.unmark_text(window, cx);
+                        }
+                    });
+                    app.request_close_instance(iid, cx);
+                    assert!(
+                        matches!(app.confirm.as_ref().map(|p| &p.action),
+                            Some(ConfirmAction::SaveEditorBeforeClose { iid: pending, .. }) if *pending == iid),
+                        "closing discarded IME text without an unsaved-changes choice"
+                    );
+                    assert_eq!(editor.read(cx).text(cx), "あone\n");
+                    assert!(app.workspace.instance(iid).is_some());
+                    app.cancel_confirm(cx);
+
+                    // Pop-out rebuilds from this snapshot without a marked range.
+                    let snapshot = EditorSnapshot::capture(&editor, cx);
+                    assert!(snapshot.dirty, "pop-out captured composing text as clean");
+                    assert_eq!(snapshot.text, "あone\n");
+
+                    if !unmark {
+                        input.update(cx, |input, cx| {
+                            input.replace_and_mark_text_in_range(None, "", None, window, cx);
+                        });
+                        app.request_close_instance(iid, cx);
+                        assert!(app.confirm.is_none(), "cancelled composition is clean");
+                        assert!(app.workspace.instance(iid).is_none());
+                    }
+                })
+                .unwrap();
+        });
+    }
+}
+
+#[test]
+fn cancellation_callbacks_allow_clean_editor_close() {
+    use gpui::EntityInputHandler;
+
+    for explicit_range in [false, true] {
+        with_app(|cx, window| {
+            let pid = project(cx, window);
+            let (iid, editor) = window
+                .update(cx, |app, window, cx| {
+                    let path = app
+                        .workspace
+                        .project(pid)
+                        .unwrap()
+                        .root_path
+                        .join("cancel.txt");
+                    std::fs::write(&path, "one\n").unwrap();
+                    let instance = Instance::editor(pid, Some(path.clone()));
+                    let iid = instance.id;
+                    let config = app.editor_config();
+                    let editor = cx
+                        .new(|cx| crate::editor::EditorView::open(Some(path), config, window, cx));
+                    app.workspace.add_instance(instance);
+                    app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::leaf(iid));
+                    app.editors.insert(iid, editor.clone());
+                    editor.read(cx).input_for_test().update(cx, |input, cx| {
+                        input.replace_and_mark_text_in_range(None, "あ", None, window, cx);
+                        let range = if explicit_range {
+                            input.marked_text_range(window, cx)
+                        } else {
+                            None
+                        };
+                        input.replace_text_in_range(range, "", window, cx);
+                    });
+                    (iid, editor)
+                })
+                .unwrap();
+            // Deliver Change before closing, as separate input and close events do.
+            cx.run_until_parked();
+            let (asked, exists, text) = window
+                .update(cx, |app, _, cx| {
+                    app.request_close_instance(iid, cx);
+                    (
+                        app.confirm.is_some(),
+                        app.workspace.instance(iid).is_some(),
+                        editor.read(cx).text(cx),
+                    )
+                })
+                .unwrap();
+            assert_eq!(text, "one\n");
+            assert!(
+                !asked,
+                "cancelled unchanged text caused a false save prompt"
+            );
+            assert!(!exists, "the clean editor did not close");
+        });
+    }
+}
+
+#[test]
 fn dirty_editor_cancel_and_save_failure_preserve_the_draft_until_discarded() {
     with_app(|cx, window| {
         let pid = project(cx, window);
@@ -1015,7 +1129,7 @@ fn dirty_editor_cancel_and_save_failure_preserve_the_draft_until_discarded() {
             assert!(matches!(app.confirm.as_ref().map(|p| &p.action), Some(ConfirmAction::SaveEditorBeforeClose { iid: pending, .. }) if *pending == iid));
             app.cancel_confirm(cx);
             assert!(app.workspace.instance(iid).is_some());
-            assert!(editor.read(cx).is_dirty());
+            assert!(editor.read(cx).is_dirty(cx));
             assert_eq!(editor.read(cx).text(cx), "unsaved draft");
             app.request_close_instance(iid, cx);
             app.run_confirm(window, cx);
@@ -1045,7 +1159,7 @@ fn dirty_editor_cancel_and_save_failure_preserve_the_draft_until_discarded() {
             .update(cx, |app, _, cx| {
                 assert!(app.workspace.instance(iid).is_some());
                 assert_eq!(app.editors.get(&iid), Some(&editor));
-                assert!(editor.read(cx).is_dirty());
+                assert!(editor.read(cx).is_dirty(cx));
                 assert_eq!(editor.read(cx).text(cx), "unsaved draft");
                 assert!(!app.is_closing(iid));
                 app.request_close_instance(iid, cx);

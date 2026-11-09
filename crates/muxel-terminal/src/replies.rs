@@ -20,6 +20,7 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 /// Primary device attributes, as alacritty answers them: a VT102.
@@ -29,6 +30,37 @@ const PRIMARY_DA: &str = "\x1b[?6c";
 const SECONDARY_DA: &str = "\x1b[>0;2501;1c";
 /// `CSI 5 n` operating status: OK.
 const STATUS_OK: &str = "\x1b[0n";
+
+/// The size, `(cols, rows)`, the PTY and the emulator grid have been resized
+/// to; the two always change together. It lets the reader answer the
+/// text-area size query (`CSI 18 t`) without the grid. tmux's client sends that
+/// query on every resize when the PTY reports no pixel size, right before its
+/// device-attributes queries on attach. Owed to the UI's drain, it held those
+/// replies past tmux's 5s window whenever the UI was busy (every remote pane
+/// reconnecting after a sleep), and tmux then typed them into the pane as
+/// `6c0;2501;1c`.
+#[derive(Debug)]
+pub(crate) struct GridSize(AtomicU32);
+
+impl GridSize {
+    pub(crate) fn new(cols: u16, rows: u16) -> Self {
+        Self(AtomicU32::new(Self::pack(cols, rows)))
+    }
+
+    /// Call before resizing the PTY, so a query the resize prompts sees it.
+    pub(crate) fn set(&self, cols: u16, rows: u16) {
+        self.0.store(Self::pack(cols, rows), Ordering::Release);
+    }
+
+    fn get(&self) -> (u16, u16) {
+        let packed = self.0.load(Ordering::Acquire);
+        ((packed >> 16) as u16, packed as u16)
+    }
+
+    fn pack(cols: u16, rows: u16) -> u32 {
+        (u32::from(cols) << 16) | u32::from(rows)
+    }
+}
 
 /// The PTY's reply path, shared by the reader thread and alacritty's listener,
 /// which keeps replies in the order their queries were sent.
@@ -112,9 +144,10 @@ impl Replies {
 
 /// Whether an alacritty reply is one the reader thread sends itself: device
 /// attributes (`…c`) and the operating status report (`…n`) are the only
-/// alacritty replies ending in those bytes.
+/// alacritty replies ending in those bytes, and `CSI 8 ; rows ; cols t` is its
+/// text-area size report.
 fn answered_by_reader(reply: &str) -> bool {
-    reply.ends_with('c') || reply.ends_with('n')
+    reply.ends_with('c') || reply.ends_with('n') || reply.starts_with("\x1b[8;")
 }
 
 /// Parses PTY output on the reader thread, as it's read, answering every query
@@ -131,6 +164,7 @@ impl ImmediateReplies {
     pub(crate) fn new(
         replies: Arc<Replies>,
         palette: Arc<Mutex<TerminalPalette>>,
+        grid_size: Arc<GridSize>,
         config: &TermConfig,
     ) -> Self {
         Self {
@@ -139,6 +173,7 @@ impl ImmediateReplies {
             handler: ReplyHandler {
                 replies,
                 palette,
+                grid_size,
                 kitty_keyboard: config.kitty_keyboard,
                 clipboard_reads: matches!(config.osc52, Osc52::OnlyPaste | Osc52::CopyPaste),
             },
@@ -193,6 +228,7 @@ impl Timeout for Unsynchronized {
 struct ReplyHandler {
     replies: Arc<Replies>,
     palette: Arc<Mutex<TerminalPalette>>,
+    grid_size: Arc<GridSize>,
     kitty_keyboard: bool,
     clipboard_reads: bool,
 }
@@ -223,8 +259,10 @@ impl Handler for ReplyHandler {
         self.replies.await_grid_reply();
     }
 
+    /// Formatted as alacritty formats it.
     fn text_area_size_chars(&mut self) {
-        self.replies.await_grid_reply();
+        let (cols, rows) = self.grid_size.get();
+        self.replies.send(format!("\x1b[8;{rows};{cols}t"));
     }
 
     fn report_keyboard_mode(&mut self) {
@@ -265,7 +303,7 @@ impl Handler for ReplyHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImmediateReplies, Replies, SECONDARY_DA};
+    use super::{GridSize, ImmediateReplies, Replies, SECONDARY_DA};
     use crate::colors::{TerminalPalette, index_to_rgb};
     use crate::listener::MuxelListener;
     use crate::program_status::CAPABILITY_REPLY;
@@ -328,8 +366,12 @@ mod tests {
                 bell: Default::default(),
                 clipboard_store: Default::default(),
             };
-            let reader =
-                ImmediateReplies::new(replies, Arc::new(Mutex::new(palette())), &term_config());
+            let reader = ImmediateReplies::new(
+                replies,
+                Arc::new(Mutex::new(palette())),
+                Arc::new(GridSize::new(80, 24)),
+                &term_config(),
+            );
             let term = Term::new(term_config(), &TermSize::new(80, 24), listener);
             Self {
                 reader,
@@ -428,6 +470,37 @@ mod tests {
         assert_eq!(pipeline.drain(probe), "\x1b[1;1R\x1b[?6c");
         // With nothing owed any more, the next query is answered at once again.
         assert_eq!(pipeline.read(b"\x1b[c"), "\x1b[?6c");
+    }
+
+    /// tmux's client asks for the text-area size on a resize, then for device
+    /// attributes on attach. Neither may wait for the UI: a reply that misses
+    /// tmux's window is typed into the pane.
+    #[test]
+    fn tmux_size_query_does_not_hold_device_attributes() {
+        let mut pipeline = Pipeline::new();
+        let attach = b"\x1b[18t\x1b[14t\x1b[c\x1b[>c\x1b[>q\x1b[?2026$p";
+        assert_eq!(
+            pipeline.read(attach),
+            format!("\x1b[8;24;80t\x1b[?6c{SECONDARY_DA}")
+        );
+        // Only the mode report, which needs the grid, is left to the drain.
+        assert_eq!(pipeline.drain(attach), "\x1b[?2026;2$y");
+    }
+
+    #[test]
+    fn size_report_follows_resizes() {
+        let sent = Sent::default();
+        let replies = Arc::new(Replies::new(Arc::new(Mutex::new(Box::new(sent.clone())))));
+        let size = Arc::new(GridSize::new(80, 24));
+        let mut reader = ImmediateReplies::new(
+            replies,
+            Arc::new(Mutex::new(palette())),
+            size.clone(),
+            &term_config(),
+        );
+        size.set(198, 51);
+        reader.advance(b"\x1b[18t");
+        assert_eq!(sent.take(), "\x1b[8;51;198t");
     }
 
     #[test]

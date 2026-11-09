@@ -70,9 +70,12 @@ mod codex_capture_tests;
 mod conpty_test_support;
 mod control_api;
 #[cfg(all(test, windows))]
+mod first_prompt_size_tests;
+#[cfg(all(test, windows))]
 mod hidden_paint_tests;
 mod hotbar;
 mod libraries_ui;
+mod pane_grid;
 #[cfg(all(test, windows))]
 mod paste_submission_tests;
 #[cfg(all(test, windows))]
@@ -5776,6 +5779,9 @@ pub struct MuxelApp {
     /// slow or unreachable host would otherwise stack one more batch of ssh
     /// round trips every few seconds.
     remote_branch_poll_inflight: bool,
+    /// Each host whose git failed to list branches, with what it said: said
+    /// once, until a poll where every read on that host succeeds.
+    branch_read_failures: HashSet<(Uuid, String)>,
     remote_layout_poll_inflight: bool,
     /// Per project, the layout polls begun and applied: a close whose
     /// countdown ran out waits for one begun after it did.
@@ -6055,6 +6061,9 @@ pub struct MuxelApp {
     /// projects (or detaching one to its own window) doesn't drag another one's
     /// scroll position along; a project is only ever in one window at a time.
     panes_scroll: HashMap<Uuid, ScrollHandle>,
+    /// The grid each pane gives its terminal, measured as panes are laid out,
+    /// so a launch opens its PTY at that size (see `pane_grid`).
+    pane_grids: pane_grid::SharedPaneGrids,
     /// Live state captured on open so the settings Cancel button can revert.
     settings_snapshot: Option<SettingsSnapshot>,
     /// The active workspace (None until one is chosen in the selector).
@@ -6351,7 +6360,7 @@ impl EditorSnapshot {
             path: e.path().map(|p| p.to_path_buf()),
             language: e.language(),
             cursor: Some(e.cursor(cx)),
-            dirty: e.is_dirty(),
+            dirty: e.is_dirty(cx),
             external_change: e.external_change(),
             disk_stamp: e.disk_stamp(),
             show_rendered: e.show_rendered(),
@@ -8290,6 +8299,7 @@ impl MuxelApp {
             remote_connect_failed: HashMap::new(),
             remote_poll_count: 0,
             remote_branch_poll_inflight: false,
+            branch_read_failures: HashSet::new(),
             remote_layout_poll_inflight: false,
             layout_reads: HashMap::new(),
             close_layout_poll: false,
@@ -8350,6 +8360,7 @@ impl MuxelApp {
             collapsed: HashSet::new(),
             settings_scroll: ScrollHandle::new(),
             panes_scroll: HashMap::new(),
+            pane_grids: Default::default(),
             settings_snapshot: None,
             current_workspace: None,
             workspaces,
@@ -9678,18 +9689,7 @@ impl MuxelApp {
         // launch can be reported with the path it tried.
         let prog = spec.program.clone();
         let cwd = spec.cwd.clone().unwrap_or_default();
-        // Open the PTY at the size this pane will actually be laid out at, so its
-        // program never has to be resized after its first paint. A `tmux attach`
-        // otherwise draws the session's long-since-painted UI at 80×24, and rights
-        // itself only when the user types. Falls back to a sibling tab's size (same
-        // pane, same bounds), then to 80×24 for a genuinely new pane — which lays out
-        // before its program has drawn anything, so a resize there costs nothing.
-        let size = self
-            .workspace
-            .instance(instance_id)
-            .and_then(|i| i.grid)
-            .or_else(|| self.sibling_grid(instance_id, cx))
-            .unwrap_or((80, 24));
+        let size = self.launch_grid(instance_id, cx);
         let meta = TerminalSpawnMeta {
             instance_id,
             token: 0,
@@ -10085,12 +10085,7 @@ impl MuxelApp {
             was_resume,
             started,
         };
-        let size = self
-            .workspace
-            .instance(instance_id)
-            .and_then(|i| i.grid)
-            .or_else(|| self.sibling_grid(instance_id, cx))
-            .unwrap_or((80, 24));
+        let size = self.launch_grid(instance_id, cx);
         Some((meta, spec, size))
     }
 
@@ -10152,6 +10147,18 @@ impl MuxelApp {
                 .timer(Duration::from_millis(1))
                 .await;
             Self::await_codex_restore_lookup(&this, instance_id, cx).await;
+            // A new tab or split hasn't been laid out yet: open at its size.
+            let pid = this
+                .read_with(cx, |this, _| {
+                    this.workspace.instance(instance_id).map(|i| i.project_id)
+                })
+                .ok()
+                .flatten();
+            if let Some(pid) = pid
+                && let Some(waited) = Self::await_pane_layout(&this, pid, cx).await
+            {
+                muxel_terminal::startup_event(instance_id, "", "pane-layout", waited, 0);
+            }
             let Some(prepared) = this
                 .update(cx, |this, cx| {
                     this.prepare_reserved_terminal_spawn(instance_id, token, reason, cx)
@@ -10788,6 +10795,60 @@ impl MuxelApp {
         }
     }
 
+    /// The grid to open `iid`'s PTY at. Its program draws its first screen
+    /// before muxel paints the terminal (the pane shows "Starting terminal…"
+    /// until then), so this must be the size the pane is laid out at: anything
+    /// else is reflowed by the first resize, and a shell prompt longer than the
+    /// starting width ends up with the first command drawn over it.
+    ///
+    /// The pane's own measurement comes first (`pane_grid`; a launch waits up to
+    /// a frame for it), then a sibling tab's (same pane, same bounds), which is
+    /// what a tab opened into a project no window shows gets: its pane's size
+    /// when last laid out. Without either, a sibling's live size, then the grid
+    /// the pane last had, then 80×24.
+    fn launch_grid(&self, iid: Uuid, cx: &App) -> (u16, u16) {
+        let grids = self.pane_grids.borrow();
+        grids
+            .grid(iid)
+            .or_else(|| {
+                let project = self
+                    .workspace
+                    .instance(iid)
+                    .and_then(|i| self.workspace.project(i.project_id))?;
+                let tabs = project.layout.as_ref()?.tab_group(iid)?;
+                tabs.iter().find_map(|tab| grids.grid(*tab))
+            })
+            .or_else(|| self.sibling_grid(iid, cx))
+            .or_else(|| self.workspace.instance(iid).and_then(|i| i.grid))
+            .unwrap_or((80, 24))
+    }
+
+    /// Wait, at most [`pane_grid::PANE_LAYOUT_WAIT`], for the window showing
+    /// `pid` to lay out its panes, so a launch that follows opens at its pane's
+    /// size. Returns how long that took; `None` when no window shows `pid`.
+    async fn await_pane_layout(
+        this: &WeakEntity<Self>,
+        pid: Uuid,
+        cx: &mut AsyncApp,
+    ) -> Option<Duration> {
+        let next = this
+            .update(cx, |this, cx| {
+                this.window_showing(pid)?;
+                let next = this.pane_grids.borrow_mut().next_layout(pid);
+                // The new pane may be the only change; make sure a frame comes.
+                cx.notify();
+                Some(next)
+            })
+            .ok()
+            .flatten()?;
+        let started = Instant::now();
+        let _ = next
+            .recv()
+            .with_timeout(pane_grid::PANE_LAYOUT_WAIT, cx.background_executor())
+            .await;
+        Some(started.elapsed())
+    }
+
     /// The grid of a live terminal sharing this instance's pane (a sibling tab).
     /// Tabs share a pane, so they share its bounds: this is exactly the size the new
     /// pane will render at, known before it has ever been laid out.
@@ -11397,6 +11458,31 @@ impl MuxelApp {
                 cx.background_executor()
                     .timer(restore_wave_delay(wave_start, cfg!(target_os = "windows")))
                     .await;
+                // Open the wave at the sizes its panes are laid out at, not the
+                // grids they had in last session's window. Every shown pane is
+                // measured each frame, so after the first wave a wave whose
+                // panes all have a measurement needn't wait for another; that
+                // wait costs the full bound when the window draws nothing
+                // (minimized or occluded). Waiting before the decision keeps
+                // its move/size check last before any ConPTY work starts.
+                let measured = wave_start > 0
+                    && this
+                        .read_with(cx, |this, _| {
+                            let grids = this.pane_grids.borrow();
+                            instances[wave_start..]
+                                .iter()
+                                .all(|iid| grids.grid(*iid).is_some())
+                        })
+                        .unwrap_or(false);
+                if !measured && let Some(waited) = Self::await_pane_layout(&this, pid, cx).await {
+                    muxel_terminal::startup_event(
+                        instances[wave_start],
+                        "",
+                        "pane-layout",
+                        waited,
+                        0,
+                    );
+                }
                 let wave_end = loop {
                     let decision = this
                         .read_with(cx, |this, cx| {
@@ -13556,7 +13642,7 @@ impl MuxelApp {
         if self.remote_branch_poll_inflight {
             return;
         }
-        let jobs: Vec<(Uuid, integrations::RepoLoc)> = self
+        let jobs: Vec<(Uuid, Uuid, String, integrations::RepoLoc)> = self
             .workspace
             .projects
             .iter()
@@ -13569,6 +13655,8 @@ impl MuxelApp {
                     .effective(&self.identities);
                 Some((
                     p.id,
+                    host.id,
+                    host.name.clone(),
                     integrations::RepoLoc::remote(
                         host,
                         r.remote_root.clone(),
@@ -13587,19 +13675,23 @@ impl MuxelApp {
                 .background_executor()
                 .spawn(async move {
                     jobs.into_iter()
-                        .map(|(pid, loc)| {
-                            let branch = integrations::repo_current_branch(&loc);
-                            let branches = integrations::list_branches(&loc);
-                            (pid, branch, branches)
+                        // One ssh for both: the branch and the list.
+                        .map(|(pid, host, name, loc)| {
+                            (pid, host, name, integrations::read_branches(&loc))
                         })
                         .collect::<Vec<_>>()
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.remote_branch_poll_inflight = false;
-                for (pid, branch, branches) in results {
-                    this.project_branches.insert(pid, branch);
-                    this.project_branch_lists.insert(pid, branches);
+                let notices = land_branch_reads(
+                    &mut this.project_branches,
+                    &mut this.project_branch_lists,
+                    &mut this.branch_read_failures,
+                    results,
+                );
+                for (title, detail) in notices {
+                    this.add_event(NotifKind::Error, title, detail);
                 }
                 cx.notify();
             });
@@ -14098,6 +14190,8 @@ impl MuxelApp {
         if resized {
             self.persist();
         }
+        let live: HashSet<Uuid> = self.workspace.instances.iter().map(|i| i.id).collect();
+        self.pane_grids.borrow_mut().prune(&live);
         self.claim_remote_window_sizes(cx);
 
         // Keep the program-supplied name for restart/resume UI. A manual name is
@@ -21298,7 +21392,8 @@ impl MuxelApp {
             .child(ui_profile::region(ui_profile::Region::Toolbar, || {
                 self.render_toolbar(cx)
             }))
-            .child(div().flex_1().min_h_0().child(main_content));
+            .child(div().flex_1().min_h_0().child(main_content))
+            .child(pane_grid::layout_done(self.pane_grids.clone(), pid));
         let body: AnyElement = if sidebar_hidden {
             main_column.into_any_element()
         } else {
@@ -25076,6 +25171,27 @@ impl MuxelApp {
             })
     }
 
+    /// Measures a pane body for its tabs' launches (`pane_grid::measure_pane`),
+    /// moving along any of its terminals that hasn't drawn anything yet.
+    fn measure_pane(&self, tabs: &[Uuid], cx: &App) -> AnyElement {
+        let starting = tabs
+            .iter()
+            .filter_map(|tab| self.terminals.get(tab))
+            .filter_map(|view| {
+                let view = view.read(cx);
+                (!view.exited() && !view.has_visible_content()).then(|| view.session().clone())
+            })
+            .collect();
+        pane_grid::measure_pane(
+            self.pane_grids.clone(),
+            tabs.to_vec(),
+            starting,
+            self.settings.font_family.clone().into(),
+            self.settings.font_size * self.settings.zoom,
+        )
+        .into_any_element()
+    }
+
     /// `shown` belongs to the window being rendered; see [`terminal_pane_element`].
     fn render_pane(
         &self,
@@ -26146,6 +26262,7 @@ impl MuxelApp {
                                 },
                             ))
                             .child(content)
+                            .child(self.measure_pane(&tabs, cx))
                             .children(drop_overlay_zone.map(|z| drop_zone_overlay(z, accent))),
                     );
                 if is_active {
@@ -35687,7 +35804,12 @@ impl Render for MuxelApp {
             .child(ui_profile::region(ui_profile::Region::Toolbar, || {
                 self.render_toolbar(cx)
             }))
-            .child(div().flex_1().min_h_0().child(main_content));
+            .child(div().flex_1().min_h_0().child(main_content))
+            .children(
+                self.workspace
+                    .active_project
+                    .map(|pid| pane_grid::layout_done(self.pane_grids.clone(), pid)),
+            );
         // The file browser (second sidebar) nests its own resizable so its width
         // persists independently of the project sidebar.
         // A hotbar view fills everything right of the sidebar: the docked panels
@@ -37390,6 +37512,120 @@ mod agent_notification_tests {
             assert_eq!(notifications.len(), 1);
             assert_eq!(notifications[0].id, card_id);
         }
+    }
+}
+
+/// One remote branch poll's reads, landed: each `(project, host, host's
+/// name, read)`. A read replaces its project's branch and list; a project
+/// whose read failed, or got nothing back, keeps the last ones read, with no
+/// expiry, until a read succeeds. git
+/// failing is said once per host and message, and said again only after a
+/// poll where every read on that host succeeded (a host can hold a folder
+/// with no repository, which reads fine, beside one git fails in). Returns
+/// the notices to raise, each a title and its detail.
+fn land_branch_reads(
+    branches: &mut HashMap<Uuid, Option<String>>,
+    lists: &mut HashMap<Uuid, Vec<String>>,
+    failures: &mut HashSet<(Uuid, String)>,
+    reads: Vec<(Uuid, Uuid, String, integrations::BranchRead)>,
+) -> Vec<(String, String)> {
+    // The hosts with a read that worked, and those with one that didn't:
+    // git's failure, or nothing back at all.
+    let (mut read_on, mut unread_on) = (HashSet::new(), HashSet::new());
+    let mut notices = Vec::new();
+    for (project, host, name, read) in reads {
+        match read {
+            integrations::BranchRead::Read(branch, list) => {
+                read_on.insert(host);
+                branches.insert(project, branch);
+                lists.insert(project, list);
+            }
+            integrations::BranchRead::Unknown => {
+                unread_on.insert(host);
+            }
+            integrations::BranchRead::Failed(said) => {
+                unread_on.insert(host);
+                if failures.insert((host, said.clone())) {
+                    let hint = t("muxel needs git 1.9 or newer there.");
+                    notices.push((
+                        tf("Can't read branches on {host}", &[("host", &name)]),
+                        if said.is_empty() {
+                            hint.to_string()
+                        } else {
+                            format!("{said}\n{hint}")
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    failures.retain(|(host, _)| unread_on.contains(host) || !read_on.contains(host));
+    notices
+}
+
+#[cfg(test)]
+mod branch_read_tests {
+    use super::{integrations, land_branch_reads};
+    use std::collections::{HashMap, HashSet};
+    use uuid::Uuid;
+
+    #[test]
+    fn a_hosts_git_failure_is_said_once_until_its_reads_succeed() {
+        use integrations::BranchRead::{Failed, Read, Unknown};
+        let (host, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let (repo, plain, elsewhere) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        #[derive(Default)]
+        struct Polls {
+            branches: HashMap<Uuid, Option<String>>,
+            lists: HashMap<Uuid, Vec<String>>,
+            failures: HashSet<(Uuid, String)>,
+        }
+        impl Polls {
+            /// The notices one poll's reads raise.
+            fn round(&mut self, reads: Vec<(Uuid, Uuid, integrations::BranchRead)>) -> usize {
+                let reads = reads
+                    .into_iter()
+                    .map(|(project, host, read)| (project, host, "box".to_string(), read))
+                    .collect();
+                land_branch_reads(
+                    &mut self.branches,
+                    &mut self.lists,
+                    &mut self.failures,
+                    reads,
+                )
+                .len()
+            }
+        }
+        let mut polls = Polls::default();
+        let old = || Failed("fatal: unknown field name: HEAD".to_string());
+        let main = || Read(Some("main".to_string()), vec!["main".to_string()]);
+        assert_eq!(polls.round(vec![(repo, host, main())]), 0);
+        // git there fails; the project keeps what it last read.
+        assert_eq!(polls.round(vec![(repo, host, old())]), 1);
+        assert_eq!(polls.branches.get(&repo), Some(&Some("main".to_string())));
+        assert_eq!(polls.lists.get(&repo), Some(&vec!["main".to_string()]));
+        // Every 5 s after, with another project on the host reading fine (a
+        // folder with no repository) and another host's read: still once.
+        for _ in 0..3 {
+            let reads = vec![
+                (plain, host, Read(None, Vec::new())),
+                (repo, host, old()),
+                (elsewhere, other, main()),
+            ];
+            assert_eq!(polls.round(reads), 0);
+        }
+        // Unreachable for a while: nothing said, nothing forgotten.
+        assert_eq!(polls.round(vec![(repo, host, Unknown)]), 0);
+        assert_eq!(polls.branches.get(&repo), Some(&Some("main".to_string())));
+        assert_eq!(polls.round(vec![(repo, host, old())]), 0);
+        // ssh failing for it while the folder with no repository on the same
+        // host reads: not every read there succeeded, so still once.
+        let reads = vec![(plain, host, Read(None, Vec::new())), (repo, host, Unknown)];
+        assert_eq!(polls.round(reads), 0);
+        assert_eq!(polls.round(vec![(repo, host, old())]), 0);
+        // git upgraded there: the next failure is news again.
+        assert_eq!(polls.round(vec![(repo, host, main())]), 0);
+        assert_eq!(polls.round(vec![(repo, host, old())]), 1);
     }
 }
 

@@ -201,16 +201,18 @@ impl MuxelApp {
         });
         let evidence = if let Some(view) = view {
             if !muxel_core::is_known_agent_program(inst.and_then(|inst| inst.program.as_deref())) {
+                let program = inst.and_then(|inst| inst.program.as_deref());
+                let via_client = inst.is_some_and(|inst| {
+                    inst.tmux_session.is_some()
+                        || self
+                            .workspace
+                            .project(inst.project_id)
+                            .is_some_and(Project::is_remote)
+                });
                 shell_close_evidence(
-                    inst.and_then(|inst| inst.program.as_deref()),
-                    inst.is_some_and(|inst| {
-                        inst.tmux_session.is_some()
-                            || self
-                                .workspace
-                                .project(inst.project_id)
-                                .is_some_and(Project::is_remote)
-                    }),
-                    cfg!(unix) && view.session().is_idle_foreground(),
+                    program,
+                    via_client,
+                    view.session().foreground_idle(),
                     view.session().shell_at_prompt(),
                 )
             } else if !attributable {
@@ -323,7 +325,7 @@ impl MuxelApp {
     fn plan_close_request(&mut self, ids: Vec<Uuid>, cx: &mut Context<Self>) {
         if let Some(&iid) = ids.iter().find(|&&iid| {
             self.close_editor(iid)
-                .is_some_and(|editor| editor.read(cx).is_dirty())
+                .is_some_and(|editor| editor.read(cx).is_dirty(cx))
         }) {
             self.request_confirm(
                 t("Save changes before closing?"),
@@ -424,7 +426,7 @@ impl MuxelApp {
             let step = if inst.kind != InstanceKind::Terminal {
                 if self
                     .close_editor(iid)
-                    .is_some_and(|editor| editor.read(cx).is_dirty())
+                    .is_some_and(|editor| editor.read(cx).is_dirty(cx))
                 {
                     AcceptedClose::Stays
                 } else {
