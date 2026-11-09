@@ -146,6 +146,26 @@ fn status_paint_defer(held: Option<Instant>, now: Instant) -> Duration {
 /// jamming against it.
 const TERM_INSET: Pixels = px(6.0);
 
+/// The grid, `(cols, rows)`, a terminal view gets when it fills a pane of
+/// `size`, drawn in `font_family` at `font_size` as [`TerminalView::set_config`]
+/// takes them: whole cells inside the [`TERM_INSET`] margin. Lets a launch open
+/// its PTY at the size the terminal will paint at, before any view exists.
+pub fn pane_grid(
+    window: &Window,
+    font_family: &SharedString,
+    font_size: f32,
+    pane: Size<Pixels>,
+) -> (u16, u16) {
+    let font = crate::element::terminal_font(font_family);
+    let (cell_width, line_height) = crate::element::cell_size(window, &font, px(font_size));
+    let margin = TERM_INSET * 2.0;
+    crate::element::grid_in(
+        size(pane.width - margin, pane.height - margin),
+        cell_width,
+        line_height,
+    )
+}
+
 /// Open a link the user ctrl+clicked in a terminal — an `http(s)://` URL or a
 /// `file://` URI for an existing local file. Dispatched by the terminal element
 /// and handled by the app, which routes URLs to the built-in browser (when

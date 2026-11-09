@@ -23,6 +23,19 @@ feature is added or changed, update the matching entry here in the same change**
 - **Resizable splits** — drag the divider between panes; sizes persist per project.
   Cached terminals receive the final size after the drag, so responsive TUIs redraw
   without requiring a keypress or scroll.
+- **Terminals start at their pane's size** — a new tab, split, restored pane,
+  `muxel ctl new` pane or runner opens its terminal at the size its pane is laid
+  out at, including a tab hidden behind another in the same pane, rather than at
+  80×24 or at the size it had in a differently sized window last time. A shell
+  can draw its first prompt before muxel paints its terminal (a hidden tab always
+  does), so a prompt wider than the starting size no longer wraps and then
+  reflows when the pane resizes; that reflow made PowerShell draw the first
+  command over the prompt. A pane resized while its program starts follows the
+  new size. A launch waits for its pane's next layout, bounded at 250 ms. A tab
+  opened into a project that isn't on screen starts at the size its pane last
+  had. A loop's new pane, a new split in a project that isn't on screen, and a
+  pane behind a maximized one can start at their best earlier guess and resize
+  once they're drawn.
 - **Minimum pane width** — panes can't shrink so narrow that an agent TUI becomes
   unusable (keeps a sane terminal width).
 - **Scrollable pane area** — because panes have that minimum width, a layout with

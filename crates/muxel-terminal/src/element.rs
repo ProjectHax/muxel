@@ -82,6 +82,62 @@ pub struct TermLayout {
     font_bold_italic: Font,
 }
 
+/// The regular face a terminal grid is measured and drawn in: `family`, or the
+/// platform's monospace default when it's empty.
+pub(crate) fn terminal_font(family: &SharedString) -> Font {
+    // Use a concrete, installed monospace face. The generic "monospace"
+    // family does not resolve in gpui's font database and silently falls
+    // back to a proportional font, which breaks fixed-width cell layout
+    // (glyphs get force-spread to a wrong advance width).
+    #[cfg(target_os = "macos")]
+    let default_family = "Menlo";
+    #[cfg(target_os = "windows")]
+    let default_family = "Consolas";
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let default_family = "DejaVu Sans Mono";
+    let family: SharedString = if family.is_empty() {
+        default_family.into()
+    } else {
+        family.clone()
+    };
+    Font {
+        family,
+        features: FontFeatures::disable_ligatures(),
+        fallbacks: Some(FontFallbacks::from_fonts(vec![
+            "DejaVu Sans Mono".into(),
+            "Liberation Mono".into(),
+            "Noto Sans Mono".into(),
+            "Source Code Pro".into(),
+            "Menlo".into(),
+            "Consolas".into(),
+        ])),
+        weight: FontWeight::NORMAL,
+        style: FontStyle::Normal,
+    }
+}
+
+/// One grid cell of `font` at `font_size`: the advance of `m` across, 1.3 ×
+/// the font size down.
+pub(crate) fn cell_size(window: &Window, font: &Font, font_size: Pixels) -> (Pixels, Pixels) {
+    let text_system = window.text_system();
+    let font_id = text_system.resolve_font(font);
+    let cell_width = text_system
+        .advance(font_id, font_size, 'm')
+        .map(|s| s.width)
+        .unwrap_or(font_size * 0.6);
+    (cell_width, font_size * 1.3)
+}
+
+/// The whole cells, `(cols, rows)`, that fit in `size`; at least one each way.
+pub(crate) fn grid_in(size: Size<Pixels>, cell_width: Pixels, line_height: Pixels) -> (u16, u16) {
+    let fit = |extent: Pixels, cell: Pixels| {
+        ((f32::from(extent) - 0.5) / f32::from(cell))
+            .floor()
+            .max(1.0) as u16
+    };
+    (fit(size.width, cell_width), fit(size.height, line_height))
+}
+
 impl Element for TerminalElement {
     type RequestLayoutState = TermLayout;
     type PrepaintState = Hitbox;
@@ -102,35 +158,7 @@ impl Element for TerminalElement {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let font_size = self.font_size;
-        // Use a concrete, installed monospace face. The generic "monospace"
-        // family does not resolve in gpui's font database and silently falls
-        // back to a proportional font, which breaks fixed-width cell layout
-        // (glyphs get force-spread to a wrong advance width).
-        #[cfg(target_os = "macos")]
-        let default_family = "Menlo";
-        #[cfg(target_os = "windows")]
-        let default_family = "Consolas";
-        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-        let default_family = "DejaVu Sans Mono";
-        let family: SharedString = if self.font_family.is_empty() {
-            default_family.into()
-        } else {
-            self.font_family.clone()
-        };
-        let font = Font {
-            family,
-            features: FontFeatures::disable_ligatures(),
-            fallbacks: Some(FontFallbacks::from_fonts(vec![
-                "DejaVu Sans Mono".into(),
-                "Liberation Mono".into(),
-                "Noto Sans Mono".into(),
-                "Source Code Pro".into(),
-                "Menlo".into(),
-                "Consolas".into(),
-            ])),
-            weight: FontWeight::NORMAL,
-            style: FontStyle::Normal,
-        };
+        let font = terminal_font(&self.font_family);
         let font_bold = Font {
             weight: FontWeight::BOLD,
             ..font.clone()
@@ -145,13 +173,7 @@ impl Element for TerminalElement {
             ..font.clone()
         };
 
-        let text_system = window.text_system();
-        let font_id = text_system.resolve_font(&font);
-        let cell_width = text_system
-            .advance(font_id, font_size, 'm')
-            .map(|s| s.width)
-            .unwrap_or(font_size * 0.6);
-        let line_height = font_size * 1.3;
+        let (cell_width, line_height) = cell_size(window, &font, font_size);
 
         let style = Style {
             size: Size {
@@ -216,12 +238,7 @@ impl Element for TerminalElement {
         let line_h = f32::from(line_height);
 
         // Size the PTY/grid to the available area.
-        let cols = (((f32::from(bounds.size.width) - 0.5) / cell_w)
-            .floor()
-            .max(1.0)) as u16;
-        let rows = (((f32::from(bounds.size.height) - 0.5) / line_h)
-            .floor()
-            .max(1.0)) as u16;
+        let (cols, rows) = grid_in(bounds.size, cell_width, line_height);
         // Resize the PTY/grid to fit — but NOT while a pane/tab is being dragged.
         // A drag churns the layout through many intermediate sizes; resizing on
         // each one floods the agent with SIGWINCHes, making it redraw (and often
