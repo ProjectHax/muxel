@@ -2803,9 +2803,12 @@ impl TerminalLaunch {
                 // `{e:#}` includes the full anyhow context chain (e.g. the real
                 // OS error: "No such file or directory"), not just the top context.
                 let detail = launch_error.replace(['\'', '"', '\n', '\r'], " ");
-                let mut shell = fallback.with_startup_input(format!(
-                    "printf '%s\\n' 'muxel: could not launch {prog}: {detail}'"
-                ));
+                let mut shell = fallback
+                    .with_startup_input(format!(
+                        "printf '%s\\n' 'muxel: could not launch {prog}: {detail}'"
+                    ))
+                    // The fallback runs locally in the same pane, under its limit.
+                    .with_memory_limit(spec.memory_limit);
                 if let Some(instance_id) = instance_id {
                     // The fallback is a local program even when the failed command
                     // was ssh or tmux. Give it only its own id, not transport env.

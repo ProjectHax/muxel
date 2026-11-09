@@ -207,6 +207,12 @@ pub struct CommandBuilder {
     #[cfg(unix)]
     pub(crate) umask: Option<libc::mode_t>,
     controlling_tty: bool,
+    /// Raw job object handle the child is created inside (see
+    /// [`CommandBuilder::set_job_object`]). Stored as an integer so the builder
+    /// stays `Send`, `Sync` and comparable; it is never closed here.
+    #[cfg(windows)]
+    #[cfg_attr(feature = "serde_support", serde(skip))]
+    job_object: Option<usize>,
 }
 
 impl CommandBuilder {
@@ -220,6 +226,8 @@ impl CommandBuilder {
             #[cfg(unix)]
             umask: None,
             controlling_tty: true,
+            #[cfg(windows)]
+            job_object: None,
         }
     }
 
@@ -232,6 +240,8 @@ impl CommandBuilder {
             #[cfg(unix)]
             umask: None,
             controlling_tty: true,
+            #[cfg(windows)]
+            job_object: None,
         }
     }
 
@@ -259,6 +269,8 @@ impl CommandBuilder {
             #[cfg(unix)]
             umask: None,
             controlling_tty: true,
+            #[cfg(windows)]
+            job_object: None,
         }
     }
 
@@ -578,6 +590,23 @@ impl CommandBuilder {
 
 #[cfg(windows)]
 impl CommandBuilder {
+    /// Create the child inside this job object, from its first instruction
+    /// (`PROC_THREAD_ATTRIBUTE_JOB_LIST`), so a process it starts at once
+    /// cannot escape the job. The caller owns the handle and keeps it open
+    /// until `spawn_command` returns. If Windows refuses the job, the spawn
+    /// retries once without it; check membership with `IsProcessInJob`.
+    pub fn set_job_object(&mut self, job: std::os::windows::io::RawHandle) {
+        self.job_object = Some(job as usize);
+    }
+
+    pub fn clear_job_object(&mut self) {
+        self.job_object = None;
+    }
+
+    pub(crate) fn job_object(&self) -> Option<std::os::windows::io::RawHandle> {
+        self.job_object.map(|job| job as std::os::windows::io::RawHandle)
+    }
+
     fn search_path(&self, exe: &OsStr) -> OsString {
         if let Some(path) = self.get_env("PATH") {
             let extensions = self.get_env("PATHEXT").unwrap_or(OsStr::new(".EXE"));
