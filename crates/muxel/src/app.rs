@@ -6348,7 +6348,7 @@ impl EditorSnapshot {
             path: e.path().map(|p| p.to_path_buf()),
             language: e.language(),
             cursor: Some(e.cursor(cx)),
-            dirty: e.is_dirty(),
+            dirty: e.is_dirty(cx),
             external_change: e.external_change(),
             disk_stamp: e.disk_stamp(),
             show_rendered: e.show_rendered(),

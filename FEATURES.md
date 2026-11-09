@@ -1363,8 +1363,13 @@ feature is added or changed, update the matching entry here in the same change**
 - **External file freshness** — open local text files, including rendered Markdown,
   update within 500 ms when another tool writes them. Refresh keeps cursor and scroll
   position and leaves keyboard focus where it was, so an agent rewriting an open file
-  doesn't pull your typing into it. Dirty buffers show **Reload / Keep mine** instead of being overwritten;
-  deleted or unreadable files remain open with a warning. The same behavior works in
+  doesn't pull your typing into it. Automatic refresh waits for IME composition to
+  finish. Cancellation that restores the clean text allows refresh; committed text
+  stays local. Dirty buffers show
+  **Reload / Keep mine** instead of being overwritten. Explicit **Reload** discards
+  local edits, including any active composition. Closing asks to save composing text,
+  and popping out preserves it as unsaved. Deleted or unreadable files remain open
+  with a warning. The same behavior works in
   main, secondary, and popped-out editor windows.
 - **Resources open beside their pane** — a file, diff or web page opened from a
   pane (a terminal link, a pane's diff button, an HTML **Preview**, a page's

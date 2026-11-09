@@ -323,7 +323,7 @@ impl MuxelApp {
     fn plan_close_request(&mut self, ids: Vec<Uuid>, cx: &mut Context<Self>) {
         if let Some(&iid) = ids.iter().find(|&&iid| {
             self.close_editor(iid)
-                .is_some_and(|editor| editor.read(cx).is_dirty())
+                .is_some_and(|editor| editor.read(cx).is_dirty(cx))
         }) {
             self.request_confirm(
                 t("Save changes before closing?"),
@@ -424,7 +424,7 @@ impl MuxelApp {
             let step = if inst.kind != InstanceKind::Terminal {
                 if self
                     .close_editor(iid)
-                    .is_some_and(|editor| editor.read(cx).is_dirty())
+                    .is_some_and(|editor| editor.read(cx).is_dirty(cx))
                 {
                     AcceptedClose::Stays
                 } else {
