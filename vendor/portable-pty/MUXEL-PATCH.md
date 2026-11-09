@@ -3,7 +3,11 @@
 This is the crates.io portable-pty 0.9.0 source package, with its original MIT
 license. The Windows change in `src/win/psuedocon.rs` removes
 `PSEUDOCONSOLE_INHERIT_CURSOR` from creation flags and its unused constant.
-The resize quirk and Win32 input mode flags remain intact. Unix is unchanged.
+The resize quirk and Win32 input mode flags remain intact. On Unix,
+`CommandBuilder::as_command` (`src/cmdbuilder.rs`) is `pub` instead of
+`pub(crate)`, so Muxel can resolve the executable a launch will run, with the
+PTY's own PATH and cwd resolution, before it spawns. Nothing else changes on
+Unix.
 
 Muxel creates a fresh terminal with its cursor at the origin. Inheriting a
 parent cursor adds a startup query whose missing reply can deadlock console
@@ -25,6 +29,7 @@ job never keeps a program from starting; callers check `IsProcessInJob`. Muxel
 uses this for its per-pane memory limit.
 
 The workspace patch is local and pinned to the checked-in package. Remove it
-when portable-pty exposes creation flags and a job-list attribute, so Muxel can
-select no cursor inheritance and a creation-time job without changing the
-dependency. Keep source changes bounded to these two hooks and their tests.
+when portable-pty exposes creation flags, a job-list attribute and its Unix
+command resolution, so Muxel can select no cursor inheritance and a
+creation-time job, and know the launched executable, without changing the
+dependency. Keep source changes bounded to these three hooks and their tests.

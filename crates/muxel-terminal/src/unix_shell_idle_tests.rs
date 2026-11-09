@@ -2,7 +2,7 @@
 
 use super::{CommandSpec, PtyChunk, PtyReceiver, TerminalSession};
 use muxel_core::control::AgentState;
-use muxel_core::recoverable_close::{CloseDecision, CloseFacts, decide};
+use muxel_core::recoverable_close::{CloseDecision, CloseFacts, decide, shell_close_evidence};
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -90,7 +90,12 @@ impl Shell {
         decide(
             CloseFacts {
                 status: AgentState::Idle,
-                evidence: self.session.shell_close_evidence(None, false),
+                evidence: shell_close_evidence(
+                    None,
+                    false,
+                    self.session.foreground_idle(),
+                    self.session.shell_at_prompt(),
+                ),
                 attributable: true,
                 awaiting_reply: false,
                 another_tmux_client: false,
@@ -109,16 +114,7 @@ impl Shell {
         // to finish: the test kills it and the shell explicitly reaps it.
         self.session
             .write_input(b"sleep 30 & muxel_job=$!; printf '\\nCHILD:%s\\n' \"$muxel_job\"\n");
-        // Wait for the command's PID output before accepting its next prompt.
-        self.read_until("\nCHILD:");
-        let pid_line = self.read_until("\n");
-        self.job = Some(
-            pid_line
-                .trim()
-                .parse()
-                .expect("the shell reported its child's pid"),
-        );
-        self.read_prompt();
+        self.read_job_pid();
         if foreground {
             self.session.write_input(b"fg\n");
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -137,6 +133,40 @@ impl Shell {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
+    }
+
+    /// Start a child of the shell that leads a session of its own, as zsh's
+    /// zpty worker does. With job control off, the job shares the shell's
+    /// group, so it isn't a group leader and `setsid` succeeds.
+    fn start_own_session_child(&mut self) {
+        self.session.write_input(
+            b"set +m; perl -MPOSIX -e 'POSIX::setsid() or exit 1; sleep 30' & muxel_job=$!; set -m; printf '\\nCHILD:%s\\n' \"$muxel_job\"\n",
+        );
+        self.read_job_pid();
+        let pid = self.job.expect("test job");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // SAFETY: getsid only reads the session id of this test's child.
+        while unsafe { libc::getsid(pid) } != pid {
+            assert!(
+                Instant::now() < deadline,
+                "the child never started its own session"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Read the pid the shell printed for `$muxel_job`, then its next prompt.
+    fn read_job_pid(&mut self) {
+        // Wait for the command's PID output before accepting its next prompt.
+        self.read_until("\nCHILD:");
+        let pid_line = self.read_until("\n");
+        self.job = Some(
+            pid_line
+                .trim()
+                .parse()
+                .expect("the shell reported its child's pid"),
+        );
+        self.read_prompt();
     }
 
     fn end_job(&mut self) {
@@ -168,7 +198,7 @@ impl Shell {
             Some(pid as libc::pid_t),
             "exec keeps the shell's foreground group"
         );
-        assert!(crate::process_tree_unix::shell_has_no_children(pid));
+        assert!(crate::process_tree_unix::shell_has_no_session_children(pid));
     }
 }
 
@@ -250,6 +280,23 @@ fn a_background_job_asks_before_close_until_that_pid_is_killed() {
             shell.close_decision(),
             CloseDecision::Hold { forced: false }
         );
+    }
+}
+
+#[test]
+fn a_child_in_a_session_of_its_own_does_not_ask() {
+    for marked in [false, true] {
+        let mut shell = Shell::start(marked);
+        shell.start_own_session_child();
+        assert!(
+            shell.session.is_idle_foreground(),
+            "a child on a terminal of its own made the shell busy (OSC 133: {marked})"
+        );
+        assert_eq!(
+            shell.close_decision(),
+            CloseDecision::Hold { forced: false }
+        );
+        shell.end_job();
     }
 }
 

@@ -1,5 +1,7 @@
-//! A Unix shell is quiet only when it has no child process, including jobs
-//! running behind its prompt. Failure to inspect children never proves idle.
+//! A Unix shell is quiet only when no child process shares its session,
+//! including jobs running behind its prompt. A child that started a session of
+//! its own runs on another terminal (zsh's zpty worker, used by zsh-async
+//! prompts), so it doesn't count. Failure to inspect children never proves idle.
 
 use std::path::{Path, PathBuf};
 
@@ -59,7 +61,9 @@ impl ProcessIdentity {
     }
 }
 
-pub(crate) fn shell_has_no_children(pid: u32) -> bool {
+/// Whether no child of the shell `pid` is in the shell's session. Always
+/// false on the BSDs and other Unixes, where muxel doesn't list children.
+pub(crate) fn shell_has_no_session_children(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
     };
@@ -69,30 +73,41 @@ pub(crate) fn shell_has_no_children(pid: u32) -> bool {
 
     #[cfg(target_os = "linux")]
     {
-        linux::has_no_children(std::path::Path::new("/proc"), pid).unwrap_or(false)
+        linux::has_no_session_children(std::path::Path::new("/proc"), pid).unwrap_or(false)
     }
     #[cfg(target_os = "macos")]
     {
-        // SAFETY: signal 0 only checks the shell's existence; no signal is sent.
-        if unsafe { libc::kill(pid, 0) } != 0 {
+        // SAFETY: getsid only reads a process's session id.
+        let session = unsafe { libc::getsid(pid) };
+        if session < 0 {
             return false;
         }
-        let mut child: libc::pid_t = 0;
-        // One slot suffices: any child means busy, even if more did not fit.
+        // A shell with this many children is busy; a full buffer may also
+        // have left some out, so it counts as busy.
+        let mut children: [libc::pid_t; 64] = [0; 64];
         // libproc maps some errors to a zero count, so clear and read errno
         // on this thread around the call to distinguish failure from no child.
-        // SAFETY: __error points to this thread's errno; child is a writable,
-        // aligned pid_t and the buffer size describes exactly that one slot.
+        // SAFETY: __error points to this thread's errno; children is a
+        // writable, aligned pid_t array and the size passed is exactly its own.
         let (count, error) = unsafe {
             *libc::__error() = 0;
             let count = libc::proc_listchildpids(
                 pid,
-                (&mut child as *mut libc::pid_t).cast(),
-                std::mem::size_of_val(&child) as libc::c_int,
+                children.as_mut_ptr().cast(),
+                std::mem::size_of_val(&children) as libc::c_int,
             );
             (count, *libc::__error())
         };
-        count == 0 && error == 0
+        let Ok(count) = usize::try_from(count) else {
+            return false;
+        };
+        error == 0
+            && count < children.len()
+            && children[..count].iter().all(|&child| {
+                // SAFETY: as above. An unreadable session counts as the shell's.
+                let child_session = unsafe { libc::getsid(child) };
+                child_session >= 0 && child_session != session
+            })
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -107,18 +122,28 @@ mod linux {
     use std::io::{self, ErrorKind};
     use std::path::Path;
 
-    pub(super) fn has_no_children(proc: &Path, pid: libc::pid_t) -> io::Result<bool> {
-        match task_children(proc, pid) {
+    pub(super) fn has_no_session_children(proc: &Path, pid: libc::pid_t) -> io::Result<bool> {
+        let session = session_id(&fs::read(proc.join(pid.to_string()).join("stat"))?)?;
+        match task_children(proc, pid, session) {
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 // A vanished shell task does not establish that the kernel
                 // lacks CONFIG_PROC_CHILDREN. Probe our own surviving task.
                 if !children_interface_missing(proc)? || !complete_visibility(proc)? {
                     return Err(error);
                 }
-                no_children_by_parent(proc, pid)
+                no_children_by_parent(proc, pid, session)
             }
             result => result,
         }
+    }
+
+    /// Whether `child` is in `session`. A child whose session can't be read
+    /// counts as in it: a failed read never proves idle.
+    fn in_session(proc: &Path, child: libc::pid_t, session: libc::pid_t) -> bool {
+        fs::read(proc.join(child.to_string()).join("stat"))
+            .ok()
+            .and_then(|stat| session_id(&stat).ok())
+            .is_none_or(|child_session| child_session == session)
     }
 
     pub(super) fn identity(proc: &Path, pid: libc::pid_t) -> io::Result<ProcessIdentity> {
@@ -190,12 +215,18 @@ mod linux {
         })
     }
 
-    fn task_children(proc: &Path, pid: libc::pid_t) -> io::Result<bool> {
+    fn task_children(proc: &Path, pid: libc::pid_t, session: libc::pid_t) -> io::Result<bool> {
         let mut saw_task = false;
         for task in fs::read_dir(proc.join(pid.to_string()).join("task"))? {
             let children = fs::read(task?.path().join("children"))?;
-            if children.iter().any(|byte| !byte.is_ascii_whitespace()) {
-                return Ok(false);
+            for child in fields(&children) {
+                let child = std::str::from_utf8(child)
+                    .ok()
+                    .and_then(|child| child.parse().ok())
+                    .ok_or_else(invalid_process)?;
+                if in_session(proc, child, session) {
+                    return Ok(false);
+                }
             }
             saw_task = true;
         }
@@ -203,7 +234,11 @@ mod linux {
         Ok(saw_task)
     }
 
-    pub(super) fn no_children_by_parent(proc: &Path, pid: libc::pid_t) -> io::Result<bool> {
+    pub(super) fn no_children_by_parent(
+        proc: &Path,
+        pid: libc::pid_t,
+        session: libc::pid_t,
+    ) -> io::Result<bool> {
         let mut saw_shell = false;
         for process in fs::read_dir(proc)? {
             let process = process?;
@@ -215,7 +250,7 @@ mod linux {
                 continue;
             };
             let stat = fs::read(process.path().join("stat"))?;
-            if parent_pid(&stat)? == pid {
+            if parent_pid(&stat)? == pid && session_id(&stat)? == session {
                 return Ok(false);
             }
             saw_shell |= process_pid == pid;
@@ -229,6 +264,14 @@ mod linux {
         std::str::from_utf8(stat_field(stat, 1)?)
             .ok()
             .and_then(|parent| parent.parse().ok())
+            .ok_or_else(invalid_process)
+    }
+
+    fn session_id(stat: &[u8]) -> io::Result<libc::pid_t> {
+        // Field 6: state, parent pid, process group, then session.
+        std::str::from_utf8(stat_field(stat, 3)?)
+            .ok()
+            .and_then(|session| session.parse().ok())
             .ok_or_else(invalid_process)
     }
 
@@ -262,7 +305,7 @@ mod linux {
 
     #[cfg(test)]
     mod tests {
-        use super::{has_no_children, parent_pid, start_time};
+        use super::{has_no_session_children, parent_pid, session_id, start_time};
         use std::fs;
         use std::path::PathBuf;
 
@@ -305,7 +348,24 @@ mod linux {
             let proc = Proc::new();
             proc.write("40/task/40/children", b"");
             proc.write("40/task/41/children", b"51 ");
-            assert!(!has_no_children(&proc.0, 40).unwrap());
+            proc.write("51/stat", b"51 (sleep) S 40 51 40");
+            assert!(!has_no_session_children(&proc.0, 40).unwrap());
+        }
+
+        #[test]
+        fn only_children_in_the_shells_session_count() {
+            let proc = Proc::new();
+            // zsh's zpty worker: the shell's child, in a session of its own.
+            proc.write("40/task/40/children", b"51");
+            proc.write("51/stat", b"51 (zsh) S 40 51 51");
+            assert!(has_no_session_children(&proc.0, 40).unwrap());
+            // A background job stays in the shell's session.
+            proc.write("40/task/40/children", b"51 52");
+            proc.write("52/stat", b"52 (sleep) S 40 52 40");
+            assert!(!has_no_session_children(&proc.0, 40).unwrap());
+            // A child whose session can't be read counts.
+            proc.write("40/task/40/children", b"51 53");
+            assert!(!has_no_session_children(&proc.0, 40).unwrap());
         }
 
         #[test]
@@ -314,11 +374,13 @@ mod linux {
                 let proc = Proc::new();
                 proc.mount_options(options);
                 proc.write("7/stat", b"7 (unrelated) S 1 7 7");
-                assert!(has_no_children(&proc.0, 40).unwrap());
+                assert!(has_no_session_children(&proc.0, 40).unwrap());
+                proc.write("52/stat", b"52 (zsh) S 40 52 52");
+                assert!(has_no_session_children(&proc.0, 40).unwrap());
                 proc.write("51/stat", b"51 (sleep) S 40 51 40");
-                assert!(!has_no_children(&proc.0, 40).unwrap());
+                assert!(!has_no_session_children(&proc.0, 40).unwrap());
                 fs::remove_dir_all(proc.0.join("51")).unwrap();
-                assert!(has_no_children(&proc.0, 40).unwrap());
+                assert!(has_no_session_children(&proc.0, 40).unwrap());
             }
         }
 
@@ -327,12 +389,12 @@ mod linux {
             let proc = Proc::new();
             // A directory in place of a file causes a read error even as root.
             fs::create_dir(proc.0.join("40/task/40/children")).unwrap();
-            assert!(has_no_children(&proc.0, 40).is_err());
+            assert!(has_no_session_children(&proc.0, 40).is_err());
             fs::remove_dir(proc.0.join("40/task/40/children")).unwrap();
             proc.write("7/stat", b"unreadable parent fields");
-            assert!(has_no_children(&proc.0, 40).is_err());
+            assert!(has_no_session_children(&proc.0, 40).is_err());
             fs::remove_dir_all(proc.0.join("7")).unwrap();
-            assert!(!has_no_children(&proc.0, 99).unwrap());
+            assert!(!has_no_session_children(&proc.0, 99).unwrap_or(false));
         }
 
         #[test]
@@ -347,6 +409,8 @@ mod linux {
                 987654321
             );
             assert!(start_time(b"40 (no start time) S 1").is_err());
+            assert_eq!(session_id(b"51 (a ) name) S 40 51 52").unwrap(), 52);
+            assert!(session_id(b"51 (no session) S 40 51").is_err());
         }
 
         #[test]
@@ -362,7 +426,10 @@ mod linux {
                 // Only the shell is visible. A restricted proc mount can omit
                 // a live child without producing a read error for that child.
                 proc.mount_options(options);
-                assert!(!has_no_children(&proc.0, 40).unwrap_or(false), "{options}");
+                assert!(
+                    !has_no_session_children(&proc.0, 40).unwrap_or(false),
+                    "{options}"
+                );
             }
         }
 
@@ -376,10 +443,10 @@ mod linux {
                 b"1 0 0:1 / /somewhere-else rw - proc proc rw\n",
             ] {
                 proc.write("self/mountinfo", mountinfo);
-                assert!(!has_no_children(&proc.0, 40).unwrap_or(false));
+                assert!(!has_no_session_children(&proc.0, 40).unwrap_or(false));
             }
             fs::remove_file(proc.0.join("self/mountinfo")).unwrap();
-            assert!(!has_no_children(&proc.0, 40).unwrap_or(false));
+            assert!(!has_no_session_children(&proc.0, 40).unwrap_or(false));
         }
 
         #[test]
@@ -388,14 +455,14 @@ mod linux {
             proc.write("40/task/40/children", b"");
             fs::create_dir_all(proc.0.join("40/task/41")).unwrap();
             proc.write(&format!("self/task/{}/children", std::process::id()), b"");
-            assert!(!has_no_children(&proc.0, 40).unwrap_or(false));
+            assert!(!has_no_session_children(&proc.0, 40).unwrap_or(false));
         }
 
         #[test]
         fn a_disappearing_proc_entry_cannot_prove_idle() {
             let proc = Proc::new();
             fs::create_dir_all(proc.0.join("51")).unwrap();
-            assert!(!has_no_children(&proc.0, 40).unwrap_or(false));
+            assert!(!has_no_session_children(&proc.0, 40).unwrap_or(false));
         }
     }
 }

@@ -2,12 +2,10 @@
 
 use super::*;
 use muxel_core::control::AgentState;
-#[cfg(not(unix))]
-use muxel_core::recoverable_close::shell_close_evidence;
 use muxel_core::recoverable_close::{
     CloseDecision, CloseEvidence, CloseFacts, CloseStage, ExpiredCloseSync, HeldLaunch, HeldView,
     LayoutWait, UndoLaunch, decide, departure_finalizes, exit_proves_closed, expired_close_sync,
-    held_launch, may_finalize, rehide_held, session_may_outlive, undo_launch,
+    held_launch, may_finalize, rehide_held, session_may_outlive, shell_close_evidence, undo_launch,
 };
 use muxel_terminal::TerminalStatusReason;
 use std::borrow::Cow;
@@ -211,19 +209,12 @@ impl MuxelApp {
                             .project(inst.project_id)
                             .is_some_and(Project::is_remote)
                 });
-                #[cfg(unix)]
-                {
-                    view.session().shell_close_evidence(program, via_client)
-                }
-                #[cfg(not(unix))]
-                {
-                    shell_close_evidence(
-                        program,
-                        via_client,
-                        false,
-                        view.session().shell_at_prompt(),
-                    )
-                }
+                shell_close_evidence(
+                    program,
+                    via_client,
+                    view.session().foreground_idle(),
+                    view.session().shell_at_prompt(),
+                )
             } else if !attributable {
                 CloseEvidence::Settling
             } else {

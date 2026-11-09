@@ -3333,10 +3333,12 @@ impl TerminalSession {
         self.last_output.lock().elapsed()
     }
 
-    /// Whether the child owns the foreground group, has no children and still
-    /// runs its original executable. Background jobs and executable changes
-    /// keep the pane busy even if its prompt marks remain. Used to skip the
-    /// close confirmation for an untouched shell pane.
+    /// Whether the child owns the foreground group, has no children in its own
+    /// session and still runs its original executable. Background jobs and
+    /// executable changes keep the pane busy even if its prompt marks remain.
+    /// A child in a session of its own, on a terminal of its own, such as
+    /// zsh's zpty worker, doesn't count. Used to skip the close confirmation
+    /// for an untouched shell pane.
     ///
     /// `false` when it can't be determined — no foreground group, an unknown child
     /// pid, an unverified executable, a failed child lookup, or no `tcgetpgrp`
@@ -3354,7 +3356,7 @@ impl TerminalSession {
             ) {
                 (Some(fg), Some(pid)) => {
                     fg == pid as libc::pid_t
-                        && crate::process_tree_unix::shell_has_no_children(pid)
+                        && crate::process_tree_unix::shell_has_no_session_children(pid)
                         && self
                             .child_identity
                             .as_ref()
@@ -3369,21 +3371,11 @@ impl TerminalSession {
         }
     }
 
-    /// Close evidence for a Unix shell. An OSC 133 prompt cannot override a
-    /// running job or an unreadable process tree.
-    #[cfg(unix)]
-    pub fn shell_close_evidence(
-        &self,
-        program: Option<&str>,
-        via_client: bool,
-    ) -> muxel_core::recoverable_close::CloseEvidence {
-        let idle = self.is_idle_foreground();
-        muxel_core::recoverable_close::shell_close_evidence(
-            program,
-            via_client,
-            idle,
-            idle && self.shell_at_prompt(),
-        )
+    /// [`Self::is_idle_foreground`] where the platform can check it; None on
+    /// Windows, which has no foreground group to ask. The close policy
+    /// (`shell_close_evidence`) decides what each means.
+    pub fn foreground_idle(&self) -> Option<bool> {
+        cfg!(unix).then(|| self.is_idle_foreground())
     }
 
     /// Kill the child process. On Unix this sends SIGHUP, at most once per
