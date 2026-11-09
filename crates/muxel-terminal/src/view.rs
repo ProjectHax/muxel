@@ -2030,6 +2030,10 @@ pub struct TerminalView {
     /// ([`CURSOR_HIDE_HOLD`]) set, while it is pending. A status repaint from
     /// any path waits for it too, so it can't draw the frame the hold skips.
     paint_hold_until: std::cell::Cell<Option<std::time::Instant>>,
+    /// Which windows display this terminal. See [`DisplayEpoch`].
+    displayed_in: std::cell::RefCell<DisplayStamps>,
+    /// While no window displays it: the facts its last repaint carried.
+    hidden_facts: Option<RenderFacts>,
     _drain: Task<()>,
     _runtime_events: Task<()>,
 }
@@ -2726,6 +2730,64 @@ pub struct TerminalFocusProfile {
     pub notify_pending: bool,
 }
 
+/// A window's render count, for telling which terminals it still displays.
+///
+/// The window advances it at the start of each render, and every terminal that
+/// render displays records the new count ([`TerminalView::mark_displayed`]). A
+/// window that never advances keeps its terminals displayed.
+#[derive(Clone, Default)]
+pub struct DisplayEpoch(std::rc::Rc<std::cell::Cell<u64>>);
+
+impl DisplayEpoch {
+    /// Call at the start of the window's render, before it displays anything.
+    pub fn advance(&self) {
+        self.0.set(self.0.get().wrapping_add(1));
+    }
+}
+
+/// The windows that displayed a terminal, each with its render count then.
+#[derive(Default)]
+struct DisplayStamps(Vec<(std::rc::Weak<std::cell::Cell<u64>>, u64)>);
+
+impl DisplayStamps {
+    fn record(&mut self, epoch: &DisplayEpoch) {
+        self.0.retain(|(window, _)| window.strong_count() > 0);
+        let count = epoch.0.get();
+        let window = std::rc::Rc::as_ptr(&epoch.0);
+        match self.0.iter_mut().find(|(seen, _)| seen.as_ptr() == window) {
+            Some((_, seen)) => *seen = count,
+            None => self.0.push((std::rc::Rc::downgrade(&epoch.0), count)),
+        }
+    }
+
+    /// Some open window displayed the terminal in its latest render, or hasn't
+    /// rendered since. One that never did counts as not displaying it.
+    fn displayed(&self) -> bool {
+        self.0.iter().any(|(window, count)| {
+            window
+                .upgrade()
+                .is_some_and(|current| current.get() == *count)
+        })
+    }
+}
+
+/// What the app reads from a terminal while rendering its sidebar rows, tab
+/// pills and dashboard, apart from the screen itself. A terminal no window
+/// displays still repaints when one of these changes.
+#[derive(Debug, PartialEq, Eq)]
+struct RenderFacts {
+    /// Advances with every public runtime change (status, reason, completion).
+    /// Input revisions aren't rendered, so typing alone isn't a change.
+    status_seq: u64,
+    submitted_turn: bool,
+    /// The title as the app names a pane by it: an agent's title without its
+    /// lifecycle glyph, so a spinner frame alone isn't a change.
+    title_name: Option<String>,
+    program_name: Option<String>,
+    has_visible_content: bool,
+    exited: bool,
+}
+
 impl Drop for TerminalView {
     fn drop(&mut self) {
         if let Some(startup) = &self.startup_turn {
@@ -2803,9 +2865,12 @@ impl TerminalLaunch {
                 // `{e:#}` includes the full anyhow context chain (e.g. the real
                 // OS error: "No such file or directory"), not just the top context.
                 let detail = launch_error.replace(['\'', '"', '\n', '\r'], " ");
-                let mut shell = fallback.with_startup_input(format!(
-                    "printf '%s\\n' 'muxel: could not launch {prog}: {detail}'"
-                ));
+                let mut shell = fallback
+                    .with_startup_input(format!(
+                        "printf '%s\\n' 'muxel: could not launch {prog}: {detail}'"
+                    ))
+                    // The fallback runs locally in the same pane, under its limit.
+                    .with_memory_limit(spec.memory_limit);
                 if let Some(instance_id) = instance_id {
                     // The fallback is a local program even when the failed command
                     // was ssh or tmux. Give it only its own id, not transport env.
@@ -3368,6 +3433,14 @@ impl TerminalView {
                             view.exit_read_error = info.read_error;
                         }
                         let runtime_changed = view.update_runtime(cx);
+                        // A screen no window shows needs no repaint, unless the
+                        // app's rows, pills or badges read something that changed.
+                        // A window that shows it again draws the current screen:
+                        // GPUI keeps no cached paint for a view its last frame
+                        // didn't draw.
+                        if !stop && view.skip_hidden_repaint() {
+                            return stop;
+                        }
                         // Priority scheduler (see docs/terminal-paint-architecture.md):
                         // Recent input ≫ stream; every throttled batch gets one
                         // trailing-edge notify if no later output arrives.
@@ -3442,6 +3515,8 @@ impl TerminalView {
             pending_paint_deadline: std::cell::Cell::new(None),
             paint_timer_generation: std::cell::Cell::new(0),
             paint_hold_until: std::cell::Cell::new(None),
+            displayed_in: Default::default(),
+            hidden_facts: None,
             _drain: drain,
             _runtime_events: runtime_event_task,
         };
@@ -3590,6 +3665,48 @@ impl TerminalView {
     /// their first text; those bytes must not dismiss loading UI.
     pub fn has_visible_content(&self) -> bool {
         self.has_visible_content
+    }
+
+    /// Record that the window behind `epoch` displays this terminal in the
+    /// render now running. Every render that displays it must call this.
+    pub fn mark_displayed(&self, epoch: &DisplayEpoch) {
+        self.displayed_in.borrow_mut().record(epoch);
+    }
+
+    /// Whether some window still displays this terminal (see [`DisplayEpoch`]).
+    pub fn is_displayed(&self) -> bool {
+        self.displayed_in.borrow().displayed()
+    }
+
+    /// Whether an output batch can skip its repaint: no window displays the
+    /// terminal, and nothing the app renders from it changed since its last.
+    fn skip_hidden_repaint(&mut self) -> bool {
+        if self.is_displayed() {
+            self.hidden_facts = None;
+            return false;
+        }
+        let facts = self.render_facts();
+        if self.hidden_facts.as_ref() == Some(&facts) {
+            return true;
+        }
+        self.hidden_facts = Some(facts);
+        false
+    }
+
+    fn render_facts(&self) -> RenderFacts {
+        let title = self.session.title();
+        let title_name = match self.title_provider {
+            TitleProvider::Other => title,
+            provider => title.and_then(|title| parse_agent_title(provider, Some(&title))?.name),
+        };
+        RenderFacts {
+            status_seq: self.runtime.snapshot_seq,
+            submitted_turn: self.session.has_submitted_turn(),
+            title_name,
+            program_name: self.program_auto_title(),
+            has_visible_content: self.has_visible_content,
+            exited: self.exited,
+        }
     }
 
     /// The child's exit code if it has exited and the OS reported one. `None`
@@ -10460,5 +10577,39 @@ mod provider_switch_tests {
         assert_eq!(status, AgentStatus::Idle, "no fabricated completion");
         assert_eq!((prev_raw, armed), (None, false));
         session.kill();
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::{DisplayEpoch, DisplayStamps};
+
+    #[test]
+    fn a_terminal_is_displayed_until_its_window_renders_without_it() {
+        let mut stamps = DisplayStamps::default();
+        assert!(!stamps.displayed(), "never shown");
+
+        let main = DisplayEpoch::default();
+        main.advance();
+        stamps.record(&main);
+        assert!(
+            stamps.displayed(),
+            "shown until its window renders again, so never if it doesn't"
+        );
+        main.advance();
+        assert!(!stamps.displayed(), "the next render left it out");
+
+        // Hidden in one window, shown in another.
+        let popout = DisplayEpoch::default();
+        popout.advance();
+        stamps.record(&popout);
+        main.advance();
+        assert!(stamps.displayed());
+        drop(popout);
+        assert!(!stamps.displayed(), "a closed window shows nothing");
+
+        main.advance();
+        stamps.record(&main);
+        assert!(stamps.displayed(), "shown again");
     }
 }

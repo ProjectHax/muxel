@@ -309,7 +309,13 @@ feature is added or changed, update the matching entry here in the same change**
   sibling-owned hints wait until ownership or binding changes. Launch,
   directory, hint or binding changes reset the delay. The name index is reread
   in full on a worker when its size or modification time changes; unchanged
-  indexes take one stat. Claude and Grok retry unresolved results with backoff.
+  indexes take one stat. A Claude pane reads its hook record when a watcher on
+  the hook directory reports it written, so `/clear` or `/resume` rebinds at
+  once, and otherwise every thirty seconds, for events a watcher loses. A
+  record that can't be adopted or read yet is retried every two seconds. Where
+  the watcher can't start, reports an error, stops, or loses its directory (it,
+  or the directory above it, was removed or renamed), Claude retries
+  unresolved results with backoff, as Grok does, for the rest of the run.
   Discovery continues in popped-out terminals. A result applies only when
   the pane still has the same launch, binding and directory, and no sibling owns it.
   On Windows, an accepted Grok conversation stays reserved to its pane even
@@ -1173,6 +1179,22 @@ feature is added or changed, update the matching entry here in the same change**
   that had already closed its terminal is not force-killed, as before. The
   operating system's own hangup when the pane's terminal closes is separate and
   outside muxel's control, so a program is not guaranteed those five seconds.
+- **Per-process memory limit (Windows)** — each local pane's process tree runs in
+  its own job object, and every process in it can commit at most 16 GB by default
+  (Settings → Behavior: Off, 8, 16, 32 or 64 GB; a change applies to panes started
+  after it). A process that asks for more is refused, which usually stops it, so
+  a single runaway doesn't take the machine down in the common case. It's no
+  guarantee: when less memory is free than the limit, or several large
+  processes share what is free, memory can still run out. The default fits
+  typical developer tools; large Java heaps, optimized links and local model
+  runners can need more. When Windows reports a hit (best effort), the
+  notifications feed names the process when it can, its PID, and whether it
+  stopped. The limit is per process, so a pane running many large processes at
+  once (parallel compilers) is unaffected. Processes started in the pane's first
+  instant are covered; programs started from a pane still outlive it and stay
+  under its limit. A child that asks to break away from the job, and processes a
+  remote host or tmux server runs, aren't covered. If Windows can't apply the
+  limit, the pane starts without one and the reason is logged.
 - **Selection & clipboard** — mouse text selection and copy/paste (`⌘C`/`⌘V` on
   macOS, `Ctrl+Shift+C`/`Ctrl+Shift+V` elsewhere). A global Settings → Behavior
   choice picks the mouse copy/paste style: **right-click copy/paste** (default —
@@ -1311,8 +1333,10 @@ feature is added or changed, update the matching entry here in the same change**
   the browser preview while HTML source panes offer a **Preview** action.
 - **External file freshness** — open local text files, including rendered Markdown,
   update within 500 ms when another tool writes them. Refresh keeps cursor and scroll
-  position. Automatic refresh waits for IME composition to finish. Cancelling
-  composition allows refresh; committed text stays local. Dirty buffers show
+  position and leaves keyboard focus where it was, so an agent rewriting an open file
+  doesn't pull your typing into it. Automatic refresh waits for IME composition to
+  finish. Cancellation that restores the clean text allows refresh; committed text
+  stays local. Dirty buffers show
   **Reload / Keep mine** instead of being overwritten. Explicit **Reload** discards
   local edits, including any active composition. Closing asks to save composing text,
   and popping out preserves it as unsaved. Deleted or unreadable files remain open

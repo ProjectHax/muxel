@@ -31,6 +31,9 @@ sha2 = "0.10"
 # `muxel ctl` requests reach the UI thread over this (already in the tree via
 # muxel-terminal).
 async-channel = "2.3"
+# Wakes session discovery when Claude's hook writes a pane's record (already in
+# the tree, with these features, through gpui-component).
+notify = "7.0.0"
 notify-rust = "4"
 # debug-embed: always bake files into the binary, even in debug builds.
 # Without this, rust-embed reads icons from disk under CARGO_MANIFEST_DIR
