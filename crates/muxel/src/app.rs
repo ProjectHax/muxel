@@ -11441,6 +11441,31 @@ impl MuxelApp {
                 cx.background_executor()
                     .timer(restore_wave_delay(wave_start, cfg!(target_os = "windows")))
                     .await;
+                // Open the wave at the sizes its panes are laid out at, not the
+                // grids they had in last session's window. Every shown pane is
+                // measured each frame, so after the first wave a wave whose
+                // panes all have a measurement needn't wait for another; that
+                // wait costs the full bound when the window draws nothing
+                // (minimized or occluded). Waiting before the decision keeps
+                // its move/size check last before any ConPTY work starts.
+                let measured = wave_start > 0
+                    && this
+                        .read_with(cx, |this, _| {
+                            let grids = this.pane_grids.borrow();
+                            instances[wave_start..]
+                                .iter()
+                                .all(|iid| grids.grid(*iid).is_some())
+                        })
+                        .unwrap_or(false);
+                if !measured && let Some(waited) = Self::await_pane_layout(&this, pid, cx).await {
+                    muxel_terminal::startup_event(
+                        instances[wave_start],
+                        "",
+                        "pane-layout",
+                        waited,
+                        0,
+                    );
+                }
                 let wave_end = loop {
                     let decision = this
                         .read_with(cx, |this, cx| {
@@ -11489,17 +11514,6 @@ impl MuxelApp {
                 let Some(wave_end) = wave_end else {
                     break;
                 };
-                // Open the wave at the sizes its panes are laid out at, not the
-                // grids they had in last session's window.
-                if let Some(waited) = Self::await_pane_layout(&this, pid, cx).await {
-                    muxel_terminal::startup_event(
-                        instances[wave_start],
-                        "",
-                        "pane-layout",
-                        waited,
-                        0,
-                    );
-                }
                 let mut preparations = Vec::new();
                 let mut order = Vec::new();
                 let mut cancelled = false;

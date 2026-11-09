@@ -341,3 +341,30 @@ fn an_immediate_exec_does_not_establish_an_idle_shell() {
     shell.wait_for_exec();
     assert_eq!(shell.close_decision(), CloseDecision::Ask);
 }
+
+#[test]
+fn an_exec_into_another_shell_stays_idle() {
+    // `exec zsh` from a bashrc replaces the launched image with another shell
+    // that waits at its own prompt; closing that pane needn't ask.
+    let Some(zsh) = ["/bin/zsh", "/usr/bin/zsh"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).exists())
+    else {
+        eprintln!("zsh not installed; skipping");
+        return;
+    };
+    let shell = Shell::start(false);
+    // `%%` echoes as typed but prompts as a single `%`, so only the prompt matches.
+    shell
+        .session
+        .write_input(format!("PS1='ZSH%%READY ' exec {zsh} -f -i\n").as_bytes());
+    shell.read_until("ZSH%READY ");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !shell.session.is_idle_foreground() {
+        assert!(
+            Instant::now() < deadline,
+            "zsh at its prompt never read idle"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}

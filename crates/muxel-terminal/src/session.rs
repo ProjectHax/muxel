@@ -14,7 +14,7 @@ use crate::profile;
 use crate::program_status::{
     Event as ProgramStatusEvent, Observer, ProgramStatusSnapshot, ThreadKey,
 };
-use crate::replies::{ImmediateReplies, Replies};
+use crate::replies::{GridSize, ImmediateReplies, Replies};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{
@@ -1296,6 +1296,8 @@ pub struct TerminalSession {
     scrollbar_drag: Mutex<Option<f32>>,
     /// Resize debounce state (skips redundant resizes + coalesces bursts).
     resize: Mutex<ResizeState>,
+    /// What the reader thread reports for `CSI 18 t`; see [`GridSize`].
+    grid_size: Arc<GridSize>,
     /// A resize away and back still invalidates a controller's input-frame proof.
     resize_revision: AtomicU64,
     /// Active search needle (lowercased not required — matching is ASCII-insensitive).
@@ -1760,8 +1762,13 @@ impl TerminalSession {
         if matches!(&spec.binding, LaunchBinding::Known(_)) {
             program_status.lock().adopt_binding(1);
         }
-        let immediate_replies =
-            ImmediateReplies::new(replies.clone(), palette.clone(), &term_config);
+        let grid_size = Arc::new(GridSize::new(cols, rows));
+        let immediate_replies = ImmediateReplies::new(
+            replies.clone(),
+            palette.clone(),
+            grid_size.clone(),
+            &term_config,
+        );
         let output_queue = tx.queue_state();
         let profile_reads =
             tx.carries_timing() && instance_id.is_some() && crate::profile::is_enabled();
@@ -1882,6 +1889,7 @@ impl TerminalSession {
             mouse_pressed_button: AtomicU8::new(NO_MOUSE_PRESS),
             scroll_accum: Mutex::new(0.0),
             scrollbar_drag: Mutex::new(None),
+            grid_size,
             resize: Mutex::new(ResizeState {
                 applied: (cols, rows),
                 target: (cols, rows),
@@ -2785,6 +2793,7 @@ impl TerminalSession {
             return true; // same target, still settling
         }
         // Settled — apply to the PTY (SIGWINCH) and the grid together.
+        self.grid_size.set(cols, rows);
         if let Some(master) = self.master.inner.lock().as_ref() {
             let _ = master.resize(PtySize {
                 rows,
@@ -3334,7 +3343,8 @@ impl TerminalSession {
     }
 
     /// Whether the child owns the foreground group, has no children in its own
-    /// session and still runs its original executable. Background jobs and
+    /// session and still runs its original executable or another interactive
+    /// shell it exec'd into. Background jobs and other
     /// executable changes keep the pane busy even if its prompt marks remain.
     /// A child in a session of its own, on a terminal of its own, such as
     /// zsh's zpty worker, doesn't count. Used to skip the close confirmation

@@ -29,8 +29,25 @@ impl ProcessIdentity {
         })
     }
 
+    /// Whether `pid` is still the process captured at launch. It may since
+    /// have replaced itself with another interactive shell (`exec zsh` in
+    /// `.bashrc`), which still waits at a prompt like the one launched; any
+    /// other replacement makes the pane busy.
     pub(crate) fn still_matches(&self, pid: u32) -> bool {
-        Self::read(pid).as_ref() == Some(self)
+        let Some(live) = Self::read(pid) else {
+            return false;
+        };
+        #[cfg(target_os = "linux")]
+        if live.started_at != self.started_at {
+            return false;
+        }
+        live.executable == self.executable
+            || is_interactive_shell(&live.executable)
+            // proc_pidpath can report a path that differs only by links or
+            // firmlinks. Touch the filesystem only when the cheap match fails.
+            || (cfg!(target_os = "macos")
+                && std::fs::canonicalize(&live.executable)
+                    .is_ok_and(|executable| executable == self.executable))
     }
 
     fn read(pid: u32) -> Option<Self> {
@@ -49,8 +66,7 @@ impl ProcessIdentity {
                 return None;
             }
             let path = std::ffi::CStr::from_bytes_until_nul(&path).ok()?;
-            let executable =
-                std::fs::canonicalize(std::ffi::OsStr::from_bytes(path.to_bytes())).ok()?;
+            let executable = PathBuf::from(std::ffi::OsStr::from_bytes(path.to_bytes()));
             Some(Self { executable })
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -59,6 +75,19 @@ impl ProcessIdentity {
             None
         }
     }
+}
+
+/// Shells that wait at a prompt the way the launched one did, by file name.
+const INTERACTIVE_SHELLS: &[&str] = &[
+    "bash", "zsh", "fish", "sh", "dash", "ksh", "mksh", "oksh", "loksh", "yash", "tcsh", "csh",
+    "nu", "elvish", "xonsh", "pwsh",
+];
+
+fn is_interactive_shell(executable: &Path) -> bool {
+    executable
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| INTERACTIVE_SHELLS.contains(&name))
 }
 
 /// Whether no child of the shell `pid` is in the shell's session. Always
@@ -120,7 +149,7 @@ mod linux {
     use super::ProcessIdentity;
     use std::fs;
     use std::io::{self, ErrorKind};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     pub(super) fn has_no_session_children(proc: &Path, pid: libc::pid_t) -> io::Result<bool> {
         let session = session_id(&fs::read(proc.join(pid.to_string()).join("stat"))?)?;
@@ -149,7 +178,11 @@ mod linux {
     pub(super) fn identity(proc: &Path, pid: libc::pid_t) -> io::Result<ProcessIdentity> {
         let process = proc.join(pid.to_string());
         let started_at = birth_time(proc, pid)?;
-        let executable = fs::canonicalize(fs::read_link(process.join("exe"))?)?;
+        // The kernel already reports the resolved path, so no filesystem
+        // walk is needed (a hung network mount must not block a close). A
+        // package upgrade that replaced the binary leaves it marked deleted;
+        // the start time below still pins the process.
+        let executable = without_deleted_marker(fs::read_link(process.join("exe"))?);
         // A reused pid must not combine the previous process's start time
         // with the new process's executable.
         if birth_time(proc, pid)? != started_at {
@@ -159,6 +192,15 @@ mod linux {
             executable,
             started_at,
         })
+    }
+
+    fn without_deleted_marker(path: PathBuf) -> PathBuf {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let bytes = path.as_os_str().as_bytes();
+        match bytes.strip_suffix(b" (deleted)") {
+            Some(kept) => PathBuf::from(std::ffi::OsString::from_vec(kept.to_vec())),
+            None => path,
+        }
     }
 
     pub(super) fn birth_time(proc: &Path, pid: libc::pid_t) -> io::Result<u64> {
@@ -305,7 +347,9 @@ mod linux {
 
     #[cfg(test)]
     mod tests {
-        use super::{has_no_session_children, parent_pid, session_id, start_time};
+        use super::{
+            has_no_session_children, parent_pid, session_id, start_time, without_deleted_marker,
+        };
         use std::fs;
         use std::path::PathBuf;
 
@@ -341,6 +385,18 @@ mod linux {
             fn drop(&mut self) {
                 let _ = fs::remove_dir_all(&self.0);
             }
+        }
+
+        #[test]
+        fn an_upgraded_binary_keeps_its_path() {
+            assert_eq!(
+                without_deleted_marker(PathBuf::from("/usr/bin/zsh (deleted)")),
+                PathBuf::from("/usr/bin/zsh")
+            );
+            assert_eq!(
+                without_deleted_marker(PathBuf::from("/usr/bin/zsh")),
+                PathBuf::from("/usr/bin/zsh")
+            );
         }
 
         #[test]
