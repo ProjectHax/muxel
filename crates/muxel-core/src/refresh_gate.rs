@@ -12,15 +12,32 @@ use std::time::{Duration, Instant};
 /// When each keyed probe last ran, and against which input stamp.
 #[derive(Debug, Clone)]
 pub struct RefreshGate<K, S> {
-    backstop: Duration,
+    backstop: Backstop<S>,
     seen: HashMap<K, (S, Instant)>,
+}
+
+/// How long an unchanged probe waits before it runs anyway.
+#[derive(Debug, Clone)]
+enum Backstop<S> {
+    Fixed(Duration),
+    /// Chosen by the stamp, so one that sees less of its inputs can re-run
+    /// sooner.
+    PerStamp(fn(&S) -> Duration),
 }
 
 impl<K: Eq + Hash, S: PartialEq> RefreshGate<K, S> {
     /// A gate that re-runs an unchanged probe after `backstop`.
     pub fn new(backstop: Duration) -> Self {
         Self {
-            backstop,
+            backstop: Backstop::Fixed(backstop),
+            seen: HashMap::new(),
+        }
+    }
+
+    /// A gate that re-runs an unchanged probe after `backstop(stamp)`.
+    pub fn per_stamp(backstop: fn(&S) -> Duration) -> Self {
+        Self {
+            backstop: Backstop::PerStamp(backstop),
             seen: HashMap::new(),
         }
     }
@@ -28,8 +45,12 @@ impl<K: Eq + Hash, S: PartialEq> RefreshGate<K, S> {
     /// Whether `key`'s probe needs to run: it never has, its stamp moved since,
     /// or the backstop has passed.
     pub fn due(&self, key: &K, stamp: &S, now: Instant) -> bool {
+        let backstop = match &self.backstop {
+            Backstop::Fixed(backstop) => *backstop,
+            Backstop::PerStamp(backstop) => backstop(stamp),
+        };
         self.seen.get(key).is_none_or(|(seen, at)| {
-            seen != stamp || now.saturating_duration_since(*at) >= self.backstop
+            seen != stamp || now.saturating_duration_since(*at) >= backstop
         })
     }
 
@@ -82,6 +103,18 @@ mod tests {
         let mut gate = RefreshGate::new(BACKSTOP);
         gate.record((), 0, t0);
         assert!(!gate.due(&(), &0, t0 - Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_per_stamp_backstop_is_the_stamps_own() {
+        let t0 = Instant::now();
+        let mut gate = RefreshGate::per_stamp(|secs: &u64| Duration::from_secs(*secs));
+        gate.record(1, 10, t0);
+        gate.record(2, 60, t0);
+        assert!(!gate.due(&1, &10, t0 + Duration::from_secs(9)));
+        assert!(gate.due(&1, &10, t0 + Duration::from_secs(10)));
+        assert!(!gate.due(&2, &60, t0 + Duration::from_secs(59)));
+        assert!(gate.due(&2, &60, t0 + Duration::from_secs(60)));
     }
 
     #[test]
