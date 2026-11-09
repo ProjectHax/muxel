@@ -358,7 +358,7 @@ fn r2_churn(day: &Path, tick: u64) {
 
 #[test]
 fn b9_r2_codex_sibling_rejection_stops_io_until_ownership_changes() {
-    use crate::session_discovery::{CodexLookupEvidence, SessionDiscoveries};
+    use crate::session_discovery::{LookupEvidence, SessionDiscoveries};
     use crate::{AgentPreset, Instance, Project, Workspace};
     use std::time::Duration;
     for change in ["generation", "released", "removed"] {
@@ -397,16 +397,17 @@ fn b9_r2_codex_sibling_rejection_stops_io_until_ownership_changes() {
                         row.id != key.pane && row.session_id.as_deref() == Some(&candidate.id)
                     })
                     .unwrap();
-                assert!(discovery.finish_with_codex_evidence(
+                assert!(discovery.finish_with_evidence(
                     &request,
                     Some(&key),
                     at,
                     false,
-                    CodexLookupEvidence {
+                    LookupEvidence {
                         miss: None,
                         rejected_owner: Some((owner.id, candidate.id)),
                         observed_hint: key.hint.clone(),
                         cached_rejection: false,
+                        hook_record: false,
                     }
                 ));
             }
@@ -436,16 +437,17 @@ fn b9_r2_codex_sibling_rejection_stops_io_until_ownership_changes() {
             .iter()
             .find(|row| row.id != key.pane && row.session_id.as_deref() == Some(&candidate.id))
             .map(|row| (row.id, candidate.id.clone()));
-        assert!(discovery.finish_with_codex_evidence(
+        assert!(discovery.finish_with_evidence(
             &request,
             Some(&key),
             at,
             blocker.is_none(),
-            CodexLookupEvidence {
+            LookupEvidence {
                 miss: None,
                 rejected_owner: blocker,
                 observed_hint: key.hint.clone(),
                 cached_rejection: false,
+                hook_record: false,
             }
         ));
         if change == "generation" {
@@ -460,12 +462,12 @@ fn b9_r2_codex_sibling_rejection_stops_io_until_ownership_changes() {
             let request = discovery.begin(key.clone(), at).unwrap();
             let candidate = super::codex_session_from_hint(&root, id, &key.cwd).unwrap();
             assert_eq!(candidate.path, path);
-            assert!(discovery.finish_with_codex_evidence(
+            assert!(discovery.finish_with_evidence(
                 &request,
                 Some(&key),
                 at,
                 true,
-                CodexLookupEvidence::default()
+                LookupEvidence::default()
             ));
         }
         assert_eq!(
