@@ -3,7 +3,9 @@
 //! Creation precedes PTY admission. Keep that interval distinct from the reply
 //! grace period. Enter admission is not provider acceptance.
 
-use super::{AgentState, REPLY_GRACE_MS, awaiting_reply};
+use super::{
+    AgentState, PromptDelivery, PromptOutcome, REPLY_GRACE_MS, StartupBlocker, awaiting_reply,
+};
 use crate::AgentActivity;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -51,6 +53,10 @@ impl StartupTurnState {
 struct Tracked {
     state: StartupTurnState,
     claimed: bool,
+    may_have_pasted: bool,
+    guard: Option<(uuid::Uuid, u64)>,
+    blocker: Option<StartupBlocker>,
+    write_error: Option<String>,
 }
 
 /// The controller's observation of a single startup task. Never persisted or
@@ -63,6 +69,10 @@ impl Default for StartupTurn {
         Self(Arc::new(Mutex::new(Tracked {
             state: StartupTurnState::Pending,
             claimed: false,
+            may_have_pasted: false,
+            guard: None,
+            blocker: None,
+            write_error: None,
         })))
     }
 }
@@ -128,6 +138,60 @@ impl StartupTurn {
             _ => None,
         }
     }
+
+    pub fn startup_error(&self) -> Option<String> {
+        let tracked = self.lock();
+        match (tracked.state, tracked.write_error.as_deref()) {
+            (StartupTurnState::Failed(StartupFailure::WriteFailed), Some(error)) => Some(format!("Startup task input was refused or could not be confirmed: {error}")),
+            (StartupTurnState::Failed(StartupFailure::NotReady), _) if tracked.may_have_pasted => Some(
+                "Startup task input may be in the composer, but submission was not confirmed. Inspect the pane before any more input.".into()
+            ),
+            (StartupTurnState::Failed(reason), _) => Some(reason.message().to_owned()),
+            _ => None,
+        }
+    }
+
+    pub fn can_inspect_draft(&self, launch: uuid::Uuid, input_revision: u64) -> bool {
+        let tracked = self.lock();
+        matches!(
+            tracked.state,
+            StartupTurnState::Failed(StartupFailure::NotReady)
+        ) && tracked.may_have_pasted
+            && tracked.blocker.is_none()
+            && tracked.guard == Some((launch, input_revision))
+    }
+
+    pub fn delivery(&self, agent: &str, exact_draft: bool) -> PromptDelivery {
+        let tracked = self.lock();
+        let outcome = match tracked.state {
+            StartupTurnState::Pending | StartupTurnState::AwaitingAcceptance(_) => {
+                return PromptDelivery::pending(agent);
+            }
+            StartupTurnState::Submitted(_) => PromptOutcome::Submitted,
+            StartupTurnState::Failed(StartupFailure::NotReady)
+                if exact_draft
+                    && tracked.may_have_pasted
+                    && tracked.guard.is_some()
+                    && tracked.blocker.is_none() =>
+            {
+                PromptOutcome::PendingInComposer
+            }
+            StartupTurnState::Failed(_) | StartupTurnState::Cancelled
+                if tracked.may_have_pasted =>
+            {
+                PromptOutcome::Unconfirmed
+            }
+            StartupTurnState::Failed(_) | StartupTurnState::Cancelled => {
+                PromptOutcome::NotDelivered
+            }
+        };
+        let mut delivery = PromptDelivery::new(agent, outcome);
+        if let Some(blocker) = &tracked.blocker {
+            delivery.blocked_by = Some(blocker.kind);
+            delivery.screen_excerpt = Some(blocker.excerpt.clone());
+        }
+        delivery
+    }
 }
 
 #[derive(Debug)]
@@ -144,6 +208,22 @@ impl Drop for Lease {
 pub struct StartupTurnOwner(Arc<Lease>);
 
 impl StartupTurnOwner {
+    pub fn record_guard(&self, launch: uuid::Uuid, input_revision: u64) {
+        self.0.0.lock().guard = Some((launch, input_revision));
+    }
+
+    pub fn record_paste(&self, may_have_pasted: bool) {
+        self.0.0.lock().may_have_pasted = may_have_pasted;
+    }
+
+    pub fn write_error(&self, error: String) {
+        self.0.0.lock().write_error = Some(error);
+    }
+
+    pub fn blocked(&self, blocker: StartupBlocker) {
+        self.0.0.lock().blocker = Some(blocker);
+    }
+
     pub fn signal(&self) -> StartupTurn {
         self.0.0.clone()
     }
@@ -191,6 +271,49 @@ mod tests {
     use super::{StartupFailure, StartupTurn, StartupTurnState};
     use crate::AgentActivity;
     use crate::control::{AgentState, WaitOutcome, wait_outcome};
+
+    #[test]
+    fn startup_receipts_keep_undelivered_pending_and_uncertain_input_distinct() {
+        use crate::control::{PromptOutcome, StartupBlocker, StartupBlockerKind};
+        let turn = StartupTurn::default();
+        let owner = turn.claim().unwrap();
+        assert!(turn.delivery("pane", false).prompt_pending);
+        owner.blocked(StartupBlocker {
+            kind: StartupBlockerKind::FolderTrust,
+            excerpt: "Trust this folder?".into(),
+        });
+        owner.fail(StartupFailure::NotReady);
+        let blocked = turn.delivery("pane", false);
+        assert_eq!(blocked.outcome, Some(PromptOutcome::NotDelivered));
+        assert_eq!(blocked.blocked_by, Some(StartupBlockerKind::FolderTrust));
+
+        let turn = StartupTurn::default();
+        let owner = turn.claim().unwrap();
+        let launch = uuid::Uuid::new_v4();
+        owner.record_guard(launch, 2);
+        owner.record_paste(true);
+        owner.fail(StartupFailure::NotReady);
+        assert!(turn.can_inspect_draft(launch, 2));
+        assert!(!turn.can_inspect_draft(launch, 3));
+        assert!(!turn.can_inspect_draft(uuid::Uuid::new_v4(), 2));
+        assert_eq!(
+            turn.delivery("pane", true).outcome,
+            Some(PromptOutcome::PendingInComposer)
+        );
+        assert_eq!(
+            turn.delivery("pane", false).outcome,
+            Some(PromptOutcome::Unconfirmed)
+        );
+        let uncertain = StartupTurn::default();
+        let owner = uncertain.claim().unwrap();
+        owner.record_guard(launch, 2);
+        owner.record_paste(true);
+        owner.fail(StartupFailure::NotAccepted);
+        assert_eq!(
+            uncertain.delivery("pane", true).outcome,
+            Some(PromptOutcome::Unconfirmed)
+        );
+    }
 
     #[test]
     fn startup_wait_covers_creation_paste_and_the_actual_submitted_turn() {

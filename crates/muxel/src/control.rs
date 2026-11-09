@@ -32,7 +32,7 @@ const MAX_REQUEST_BYTES: u64 = 1 << 20;
 /// Connections served at once; more are dropped rather than queued.
 const MAX_CONNECTIONS: usize = 16;
 /// How long a connection waits for the app to answer.
-const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+const REPLY_TIMEOUT: Duration = Duration::from_secs(90);
 /// Socket read/write timeout, so a stalled peer can't hold a thread.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often `wait` checks on the agent.
@@ -286,11 +286,25 @@ pub fn run_cli(args: &[String]) -> i32 {
                 .ok()
                 .and_then(|id| id.parse().ok());
             let no_wait = options.no_wait;
-            request(Command::New { project, options }).and_then(|value| {
+            let has_prompt = options.prompt.is_some();
+            request(Command::New { project, options }).and_then(|mut value| {
                 if no_wait {
+                    if has_prompt && value["pending"].as_bool() == Some(true) {
+                        value["outcome"] = Value::Null;
+                        value["prompt_pending"] = json!(true);
+                        value["next"] = value["request_id"]
+                            .as_str()
+                            .map(|id| json!(format!("muxel ctl new-status {id}")))
+                            .unwrap_or(Value::Null);
+                    }
                     Ok(value)
                 } else {
-                    wait_creation(value)
+                    let created = wait_creation(value)?;
+                    if has_prompt {
+                        wait_prompt_delivery(created)
+                    } else {
+                        Ok(created)
+                    }
                 }
             })
         }
@@ -351,8 +365,15 @@ fn fail(error: control::Error, status: i32) -> i32 {
 }
 
 fn failure_body(error: control::Error) -> Value {
-    let reply = serde_json::to_value(control::Response::err(error))
+    let outcome = if error.code.is_some() && error.pasted != Some(true) {
+        control::PromptOutcome::NotDelivered
+    } else {
+        control::PromptOutcome::Unconfirmed
+    };
+    let mut reply = serde_json::to_value(control::Response::err(error))
         .expect("control errors have a JSON representation");
+    reply["outcome"] = json!(outcome);
+    reply["next"] = json!("muxel ctl panes");
     with_host(reply)
 }
 
@@ -537,6 +558,72 @@ fn wait_creation_with(
     }
 }
 
+fn wait_prompt_delivery(created: Value) -> Result<Value, control::Error> {
+    wait_prompt_delivery_with(
+        created,
+        |agent| {
+            request(Command::Status {
+                agent: Some(agent.to_owned()),
+            })
+        },
+        || std::thread::sleep(WAIT_POLL),
+    )
+}
+
+/// Read-only polls of the created UUID. Creation and text are never reissued.
+fn wait_prompt_delivery_with(
+    mut created: Value,
+    mut status: impl FnMut(&str) -> Result<Value, control::Error>,
+    mut pause: impl FnMut(),
+) -> Result<Value, control::Error> {
+    let agent = created["uuid"]
+        .as_str()
+        .ok_or("muxel returned a creation without its pane UUID")?
+        .to_owned();
+    let started = Instant::now();
+    let mut unavailable = 0;
+    for _ in 0..90 {
+        if started.elapsed() >= Duration::from_secs(90) {
+            break;
+        }
+        match status(&agent) {
+            Ok(info) => {
+                unavailable = 0;
+                if let Some(error) = info.get("startup_error") {
+                    created["startup_error"] = error.clone();
+                }
+                let Some(value) = info.get("prompt_delivery") else {
+                    let mut delivery =
+                        control::PromptDelivery::new(&agent, control::PromptOutcome::Unconfirmed);
+                    delivery.submission_confirmed = None;
+                    delivery.apply(&mut created);
+                    return Ok(created);
+                };
+                let delivery: control::PromptDelivery = serde_json::from_value(value.clone())
+                    .map_err(|error| format!("invalid startup receipt: {error}; inspect `muxel ctl screen {agent}` before more input"))?;
+                if !delivery.prompt_pending {
+                    delivery.apply(&mut created);
+                    return Ok(created);
+                }
+            }
+            Err(error) => {
+                unavailable += 1;
+                if unavailable > 3 {
+                    created["startup_error"] =
+                        json!(format!("Could not observe the startup task: {error}"));
+                    break;
+                }
+            }
+        }
+        pause();
+    }
+    let mut delivery = control::PromptDelivery::new(&agent, control::PromptOutcome::Unconfirmed);
+    delivery.prompt_pending = true;
+    delivery.next = Some(format!("muxel ctl status {agent}"));
+    delivery.apply(&mut created);
+    Ok(created)
+}
+
 fn creation_poll_error(mut error: control::Error, request_id: Uuid) -> control::Error {
     error.message = format!(
         "{}; query this creation with `muxel ctl new-status {request_id}` when the host is available; do not repeat `new` because the original request may still be waiting",
@@ -634,12 +721,57 @@ fn wait(agent: &str, timeout: Duration, full: bool) -> Result<Value, control::Er
 mod tests {
     use super::{
         Server, dispatch, failure_body, process_alive, read_endpoint, request_at, same_secret,
-        wait_creation_with, write_endpoint,
+        wait_creation_with, wait_prompt_delivery_with, write_endpoint,
     };
     use muxel_core::control::{self, Command, Endpoint, ErrorCode, PROTOCOL_VERSION, Response};
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::net::{Ipv4Addr, TcpListener};
     use std::path::PathBuf;
+
+    #[test]
+    fn startup_wait_reads_the_created_uuid_until_a_terminal_receipt() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut reads = 0;
+        let reply = wait_prompt_delivery_with(
+            serde_json::json!({"uuid":id,"program":"codex","args":[]}),
+            |agent| {
+                assert_eq!(agent, id);
+                reads += 1;
+                let receipt = if reads == 1 {
+                    control::PromptDelivery::pending(agent)
+                } else {
+                    control::PromptDelivery::new(agent, control::PromptOutcome::Submitted)
+                };
+                Ok(serde_json::json!({"prompt_delivery":receipt}))
+            },
+            || {},
+        )
+        .unwrap();
+        assert_eq!(reads, 2);
+        assert_eq!(reply["outcome"], "submitted");
+        assert_eq!(reply["submission_confirmed"], true);
+        assert_eq!(reply["program"], "codex");
+        assert!(reply["next"].is_null());
+    }
+
+    #[test]
+    fn lost_startup_status_keeps_the_created_pane_and_never_recreates_it() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut reads = 0;
+        let reply = wait_prompt_delivery_with(
+            serde_json::json!({"uuid":id}),
+            |_| {
+                reads += 1;
+                Err("host unavailable".into())
+            },
+            || {},
+        )
+        .unwrap();
+        assert_eq!(reads, 4);
+        assert_eq!(reply["uuid"], id);
+        assert_eq!(reply["outcome"], "unconfirmed");
+        assert_eq!(reply["next"], format!("muxel ctl status {id}"));
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("muxel-ctl-{name}-{}", uuid::Uuid::new_v4()));

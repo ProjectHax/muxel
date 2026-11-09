@@ -1297,7 +1297,9 @@ pub struct TerminalSession {
     /// Remote handling for file/image uploads. See [`crate::LocalPaste`].
     local_paste: Mutex<Option<crate::LocalPasteHandler>>,
     path_paste_error: Mutex<Option<crate::PathPasteErrorHandler>>,
+    text_paste_error: Mutex<Option<crate::TextPasteErrorHandler>>,
     paste_shell: PasteShell,
+    control_paste: crate::control_paste::ControlPaste,
     /// The local working directory the child was spawned in — the base for
     /// resolving relative file paths on ctrl+click. Remote panes run `ssh`
     /// locally with no cwd set, so their relative paths stay unresolvable.
@@ -1522,7 +1524,7 @@ impl TerminalSession {
     }
 
     fn spawn_inner(
-        spec: CommandSpec,
+        mut spec: CommandSpec,
         cols: u16,
         rows: u16,
         instance_id: Option<uuid::Uuid>,
@@ -1564,6 +1566,26 @@ impl TerminalSession {
         // ERROR_BAD_EXE_FORMAT (193) "%1 is not a valid Win32 application".
         let phase = std::time::Instant::now();
         let program = spec.program_for_spawn()?;
+        let control_paste = crate::control_paste::ControlPaste::for_launch(
+            &spec.program,
+            &spec.args,
+            cfg!(windows),
+        );
+        let version = if control_paste != crate::control_paste::ControlPaste::Terminal
+            && (!spec.literal_argv
+                || control_paste == crate::control_paste::ControlPaste::WindowsCodexUnverified)
+        {
+            codex_control_version(&program)
+        } else {
+            None
+        };
+        let control_paste = crate::control_paste::ControlPaste::configure_launch(
+            &spec.program,
+            &mut spec.args,
+            cfg!(windows),
+            spec.literal_argv,
+            version.as_deref().unwrap_or_default(),
+        );
         if let Some(instance_id) = instance_id {
             crate::profile::startup_event(
                 instance_id,
@@ -1868,7 +1890,9 @@ impl TerminalSession {
             search: Mutex::new(Vec::new()),
             local_paste: Mutex::new(None),
             path_paste_error: Mutex::new(None),
+            text_paste_error: Mutex::new(None),
             paste_shell: spec.paste_shell,
+            control_paste,
             cwd,
             hovered_link: Mutex::new(None),
             pointer_hit: Mutex::new(None),
@@ -2356,7 +2380,13 @@ impl TerminalSession {
         use crate::{ControlInput, ControlWrite, ControlWriteError};
         let Some(tmux) = &self.tmux_input else {
             let written = match &input {
-                ControlInput::Paste(text) => self.try_paste(text),
+                ControlInput::Paste(text) => match self.control_paste.encode(text) {
+                    Ok(Some(encoded)) => self.try_write_input(encoded.as_bytes()),
+                    Ok(None) => self.try_paste(text),
+                    Err(why) => {
+                        return ControlWrite::done(Err(ControlWriteError::InvalidInput(why)));
+                    }
+                },
                 ControlInput::Keys { keys, app_cursor } => self.try_write_input(
                     &keys
                         .iter()
@@ -2485,6 +2515,15 @@ impl TerminalSession {
         self.path_paste_error.lock().clone()
     }
 
+    /// Report a refused clipboard text paste on the UI thread.
+    pub fn set_text_paste_error_handler(&self, handler: Option<crate::TextPasteErrorHandler>) {
+        *self.text_paste_error.lock() = handler;
+    }
+
+    pub(crate) fn text_paste_error_handler(&self) -> Option<crate::TextPasteErrorHandler> {
+        self.text_paste_error.lock().clone()
+    }
+
     /// When the user last sent this terminal input themselves, if ever.
     pub fn last_user_input(&self) -> Option<Instant> {
         *self.last_user_input.lock()
@@ -2582,6 +2621,13 @@ impl TerminalSession {
     /// Paste text and report admission to the PTY writer. Success does not
     /// confirm that the child consumed the text.
     pub fn try_paste(&self, text: &str) -> std::io::Result<()> {
+        if let Some(encoded) = self
+            .control_paste
+            .clipboard(text)
+            .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidInput, why))?
+        {
+            return self.try_write_input(encoded.as_bytes());
+        }
         let payload = if self.is_bracketed_paste() {
             format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', ""))
         } else {
@@ -2606,7 +2652,8 @@ impl TerminalSession {
     pub fn paste_path_strings(&self, paths: &[&str]) -> Result<(), PastePathError> {
         let text = muxel_core::path_paste::format_paths(self.paste_shell, paths)?;
         if !text.is_empty() {
-            self.paste(&text);
+            self.try_paste(&text)
+                .map_err(|_| PastePathError::InputRefused)?;
         }
         Ok(())
     }
@@ -3156,6 +3203,11 @@ impl TerminalSession {
         self.evidence.lock().binding_rev()
     }
 
+    /// Whether confirmation still observes the conversation that received its paste.
+    pub fn prompt_binding_is_current(&self, captured: u64) -> bool {
+        self.evidence.lock().prompt_binding_is_current(captured)
+    }
+
     /// The embedder owns vte's synchronized-update timeout. The view uses this
     /// deadline to revisit a title/report held by a BSU without more PTY bytes.
     pub(crate) fn program_status_sync_deadline(&self) -> Option<Instant> {
@@ -3489,6 +3541,48 @@ fn push_mouse_report(
         let enc = |v: usize| -> u8 { ((v + 1).min(223) + 32) as u8 };
         buf.extend_from_slice(&[0x1b, b'[', b'M', cb.saturating_add(32), enc(col), enc(row)]);
     }
+}
+
+#[cfg(windows)]
+fn codex_control_version(program: &str) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let program = literal_program_for_spawn(program).ok()?;
+    let mut child = Command::new(program)
+        .arg("--version")
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) => return None,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut output = String::new();
+    child
+        .stdout
+        .take()?
+        .take(4096)
+        .read_to_string(&mut output)
+        .ok()?;
+    Some(output)
+}
+
+#[cfg(not(windows))]
+fn codex_control_version(_program: &str) -> Option<String> {
+    None
 }
 
 /// Resolve a literal launch without permitting a batch interpreter to reparse
@@ -7837,6 +7931,71 @@ mod startup_tests {
         assert!(session.try_submit_input(b"\r").is_err());
         assert!(!session.has_submitted_turn());
         session.kill();
+    }
+}
+
+#[cfg(test)]
+mod clipboard_refusal_tests {
+    use super::{CommandSpec, TerminalSession};
+    use crate::control_paste::ControlPaste;
+    use gpui::{ClipboardItem, TestAppContext};
+    use parking_lot::Mutex;
+    use std::{
+        io::{self, Write},
+        sync::Arc,
+    };
+
+    struct RecordingWriter(Arc<Mutex<Vec<u8>>>);
+    impl Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn clipboard_refusal_reports_error_without_any_write() {
+        #[cfg(windows)]
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(not(windows))]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        let (mut session, _output) = TerminalSession::spawn(spec, 80, 24).unwrap();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let inner = Arc::get_mut(&mut session).expect("fresh session is not shared yet");
+        inner.control_paste = ControlPaste::WindowsCodex;
+        inner.writer = Arc::new(Mutex::new(Box::new(RecordingWriter(bytes.clone()))));
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let captured = errors.clone();
+        session.set_text_paste_error_handler(Some(Arc::new(move |error, _| {
+            captured.lock().push(error)
+        })));
+        let mut cx = TestAppContext::single();
+        cx.skip_drawing();
+        for control in ['\t', '\0', '\u{8}', '\u{7f}', '\u{85}'] {
+            cx.update(|cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(format!("prefix{control}suffix")));
+                crate::paste_clipboard_into_session(&session, cx);
+            });
+        }
+        let written = bytes.lock().clone();
+        let refused = errors.lock().clone();
+        session.kill();
+        assert!(
+            written.is_empty(),
+            "none of a refused clipboard paste may reach the writer"
+        );
+        assert_eq!(
+            refused.len(),
+            5,
+            "each refusal must reach the user-facing error handler"
+        );
+        assert!(refused[0].contains("U+0009"));
     }
 }
 
