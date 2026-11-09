@@ -29,8 +29,15 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.57", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
 ] }
+
+# Memory-limit tests detach a probe from its console the way a GUI program is.
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.57", features = ["Win32_System_Console"] }
 
 [target.'cfg(unix)'.dependencies]
 # The PTY reader waits on the master plus a wake pipe through epoll / kqueue;

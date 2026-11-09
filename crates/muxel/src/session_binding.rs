@@ -1088,10 +1088,13 @@ fn windows_batch_arg_is_safe(value: &str) -> bool {
         .any(|ch| matches!(ch, '"' | '%' | '&' | '|' | '<' | '>' | '^' | '\r' | '\n'))
 }
 
+/// Where the hook writes each pane's record (see [`claude_binding_path`]).
+pub(crate) fn claude_binding_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(CLAUDE_BINDING_DIR)
+}
+
 pub(crate) fn claude_binding_path(data_dir: &Path, instance_id: Uuid) -> PathBuf {
-    data_dir
-        .join(CLAUDE_BINDING_DIR)
-        .join(format!("{instance_id}.json"))
+    claude_binding_dir(data_dir).join(format!("{instance_id}.json"))
 }
 
 pub(crate) fn write_claude_binding_from_reader(
@@ -1259,25 +1262,31 @@ pub(crate) struct ClaudeBindingSnapshot {
 }
 
 /// Validate a pending claim before a newer shared hook, without changing either.
-/// Read bytes and modification time from the same open file.
+/// Read bytes and modification time from the same open file. `Ok(None)` means
+/// neither name exists; an error means a record may exist but couldn't be read
+/// (on Windows, another process holding it open without sharing).
 pub(crate) fn read_pending_claude_binding(
     data_dir: &Path,
     instance_id: Uuid,
-) -> Option<ClaudeBindingSnapshot> {
-    let mut file = match std::fs::File::open(claude_claimed_binding_path(data_dir, instance_id)) {
-        Ok(file) => file,
+) -> std::io::Result<Option<ClaudeBindingSnapshot>> {
+    let opened = match std::fs::File::open(claude_claimed_binding_path(data_dir, instance_id)) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::File::open(claude_binding_path(data_dir, instance_id)).ok()?
+            std::fs::File::open(claude_binding_path(data_dir, instance_id))
         }
-        Err(_) => return None,
+        claimed => claimed,
+    };
+    let mut file = match opened {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
     };
     let modified = file
         .metadata()
         .and_then(|metadata| metadata.modified())
         .ok();
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).ok()?;
-    Some(ClaudeBindingSnapshot { bytes, modified })
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(ClaudeBindingSnapshot { bytes, modified }))
 }
 
 pub(crate) struct ClaimedClaudeRecord {
@@ -1997,7 +2006,11 @@ mod tests {
         // would make C's record validate. Nothing is left to adopt it.
         let transcript = muxel_core::claude_session_path(&pending.home, &cwd, &cleared);
         std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
-        assert!(read_pending_claude_binding(&pending.data, pending.instance_id).is_none());
+        assert!(
+            read_pending_claude_binding(&pending.data, pending.instance_id)
+                .unwrap()
+                .is_none()
+        );
 
         // `/resume X` while a sibling owns X: not adoptable yet, and gone once
         // the pane relaunches, so a later release of X never rebinds it.
@@ -2028,7 +2041,11 @@ mod tests {
             sibling_owns,
         )
         .unwrap();
-        assert!(read_pending_claude_binding(&pending.data, pending.instance_id).is_none());
+        assert!(
+            read_pending_claude_binding(&pending.data, pending.instance_id)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(pending.saved_id(), Some(pending.new_id.clone()));
     }
 

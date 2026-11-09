@@ -240,8 +240,11 @@ in-process conversation switches.
   in exact order. Earlier frames, and a bell that rang before it, are retired;
   a bell after it, even in the same drained batch, survives.
 - Claude's `SessionStart` hook and Grok's session registry report a switch out
-  of band, on a clock that can't be ordered exactly against PTY output, and
-  muxel reads them up to a tick later. The report places the switch in an
+  of band, on a clock that can't be ordered exactly against PTY output. Muxel
+  reads Grok's up to a tick later, and Claude's when its directory watcher
+  reports the write (up to two seconds later without one, or while the record
+  can't be read; at worst thirty seconds later when the watcher loses the
+  event). The report places the switch in an
   interval: the hook's own timestamp (for an older muxel's hook, its record's
   write time); Grok's registration time through the last instant it can stand
   for (a time written in whole seconds, to the end of that second); or, for a

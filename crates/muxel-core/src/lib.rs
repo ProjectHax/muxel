@@ -22,10 +22,12 @@ pub mod muse;
 pub mod outage;
 mod pane;
 pub mod path_paste;
+pub mod placement;
 pub mod readaloud;
 pub mod recoverable_close;
 pub mod refresh_gate;
 pub mod remote_ops;
+pub mod rich_copy;
 pub mod session_discovery;
 mod shell;
 pub mod sound_alert;
@@ -2039,6 +2041,7 @@ pub fn dedupe_instances(workspace: &mut Workspace) {
                         pane_id: Uuid::new_v4(),
                         tabs: vec![id],
                         active: 0,
+                        split_from: None,
                     }))
                 }
             }
@@ -2906,6 +2909,33 @@ pub struct Settings {
     /// Turn the accomplishment log on for every project created from now on.
     #[serde(default)]
     pub new_project_accomplishments: bool,
+    /// Most memory, in GB, each process a local pane starts may commit
+    /// (Windows only; 0 = no limit). A process that asks for more is refused,
+    /// which usually stops it.
+    #[serde(default = "default_pane_memory_limit_gb")]
+    pub pane_memory_limit_gb: u32,
+}
+
+/// Default per-process memory limit for local panes, in GB, fitted to a
+/// measured developer workload: on a 64 GB machine the largest legitimate
+/// process peaked near 6 GB committed (a local Node service); rustc building
+/// and testing this workspace peaked under 5 GB and the linker near 2 GB.
+/// 16 GB is more than twice the largest of those. Workloads outside that
+/// (large JVM heaps, LTO links, local model runners) can legitimately need
+/// more, which is what the setting is for. The limit only bounds one process;
+/// it reserves nothing, so it can't stop a machine with less free commit than
+/// the limit from running out.
+pub const DEFAULT_PANE_MEMORY_LIMIT_GB: u32 = 16;
+
+fn default_pane_memory_limit_gb() -> u32 {
+    DEFAULT_PANE_MEMORY_LIMIT_GB
+}
+
+impl Settings {
+    /// The per-process limit for new local panes, in bytes; `None` when off.
+    pub fn pane_memory_limit_bytes(&self) -> Option<u64> {
+        (self.pane_memory_limit_gb > 0).then(|| u64::from(self.pane_memory_limit_gb) << 30)
+    }
 }
 
 fn default_stt_model() -> String {
@@ -3232,6 +3262,7 @@ impl Default for Settings {
             accomplishment_retention_days: default_accomplishment_retention_days(),
             new_project_memory: false,
             new_project_accomplishments: false,
+            pane_memory_limit_gb: default_pane_memory_limit_gb(),
         }
     }
 }
@@ -3645,6 +3676,16 @@ mod settings_tests {
         assert_eq!(s.read_aloud_scope, ReadAloudScope::WholeTurn);
         assert_eq!(s.read_aloud_auto, ReadAloudAuto::All);
         assert_eq!(s.speak_options().max_chars, 1000);
+    }
+
+    #[test]
+    fn pane_memory_limit_is_on_for_old_configs_and_zero_turns_it_off() {
+        let s: Settings = serde_json::from_str("{}").expect("parse");
+        assert_eq!(s.pane_memory_limit_bytes(), Some(16 << 30));
+        let s: Settings = serde_json::from_str(r#"{"pane_memory_limit_gb": 0}"#).expect("parse");
+        assert_eq!(s.pane_memory_limit_bytes(), None);
+        let s: Settings = serde_json::from_str(r#"{"pane_memory_limit_gb": 48}"#).expect("parse");
+        assert_eq!(s.pane_memory_limit_bytes(), Some(48 << 30));
     }
 
     #[test]
@@ -4092,6 +4133,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![id1, id2],
             active: 0,
+            split_from: None,
         }));
         ws.worktrees = vec![wt.clone(), wt2];
         ws.instances = vec![i1, i2, orphan];
@@ -4176,6 +4218,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![id1],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![i1];
         ws.projects = vec![proj.clone()];
@@ -4190,6 +4233,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![id1, id2],
             active: 0,
+            split_from: None,
         }));
         ws.instances.push(i2);
         let c = RemoteLayout::capture(&proj, &ws, 1);
@@ -4205,6 +4249,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![instance.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![instance];
         ws.projects = vec![proj.clone()];
@@ -4358,6 +4403,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![instance.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![instance];
         ws.worktrees = vec![wt];
@@ -4410,6 +4456,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![pane.id],
             active: 0,
+            split_from: None,
         }));
         proj.layout_updated_at = Some(100);
         ws.instances = vec![pane];
@@ -4457,6 +4504,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![a.id, x.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![a.clone(), x.clone()];
         ws.projects = vec![proj.clone()];
@@ -4499,6 +4547,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![a.id, x.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![a.clone(), x.clone()];
         ws.projects = vec![proj.clone()];
@@ -4896,11 +4945,13 @@ mod remote_layout_tests {
                     pane_id: Uuid::new_v4(),
                     tabs: vec![a.id],
                     active: 0,
+                    split_from: None,
                 }),
                 PaneNode::Leaf(LeafData {
                     pane_id: Uuid::new_v4(),
                     tabs: vec![b.id],
                     active: 0,
+                    split_from: None,
                 }),
             ],
         });
@@ -5058,6 +5109,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: ids.clone(),
             active: 0,
+            split_from: None,
         }));
         ws.instances = instances.clone();
         ws.projects = vec![project.clone()];
@@ -5106,6 +5158,7 @@ mod remote_layout_tests {
             pane_id: Uuid::new_v4(),
             tabs: vec![i1.id],
             active: 0,
+            split_from: None,
         }));
         ws.instances = vec![i1];
         ws.projects = vec![proj.clone()];

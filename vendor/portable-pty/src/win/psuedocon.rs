@@ -110,6 +110,26 @@ impl PsuedoCon {
     }
 
     pub fn spawn_command(&self, cmd: CommandBuilder) -> anyhow::Result<WinChild> {
+        let Some(job) = cmd.job_object() else {
+            return self.create_process(&cmd, None);
+        };
+        // A job Windows refuses (a parent job's limits, a handle without
+        // assign access) must not keep the program from starting. The retry
+        // runs without it; the caller can tell with `IsProcessInJob`.
+        match self.create_process(&cmd, Some(job as HANDLE)) {
+            Ok(child) => Ok(child),
+            Err(err) => {
+                log::warn!("starting the child in its job object failed, retrying without it: {err:#}");
+                self.create_process(&cmd, None)
+            }
+        }
+    }
+
+    fn create_process(
+        &self,
+        cmd: &CommandBuilder,
+        job: Option<HANDLE>,
+    ) -> anyhow::Result<WinChild> {
         let mut si: STARTUPINFOEXW = unsafe { mem::zeroed() };
         si.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
         // Explicitly set the stdio handles as invalid handles otherwise
@@ -123,8 +143,11 @@ impl PsuedoCon {
         si.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
         si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
 
-        let mut attrs = ProcThreadAttributeList::with_capacity(1)?;
+        let mut attrs = ProcThreadAttributeList::with_capacity(if job.is_some() { 2 } else { 1 })?;
         attrs.set_pty(self.con)?;
+        if let Some(job) = job {
+            attrs.set_job(job)?;
+        }
         si.lpAttributeList = attrs.as_mut_ptr();
 
         let mut pi: PROCESS_INFORMATION = unsafe { mem::zeroed() };
