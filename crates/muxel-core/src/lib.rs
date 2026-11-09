@@ -48,8 +48,8 @@ pub use agent::{
     codex_resume_path, codex_rollout_by_walk, codex_session_from_hint,
     codex_session_hint_from_title, codex_session_id_from_hint, codex_session_names,
     codex_terminal_title_override, discover_claude_sessions, file_link_instruction,
-    find_claude_session_path, is_known_agent_program, launches_known_agent, memory_header,
-    memory_instruction, memory_reference, muxel_file_reference, resolve_launch,
+    find_claude_session_path, git_bash_program, is_known_agent_program, launches_known_agent,
+    memory_header, memory_instruction, memory_reference, muxel_file_reference, resolve_launch,
     resolve_launch_for_session, session_resume_args, stored_claude_session_path,
 };
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};

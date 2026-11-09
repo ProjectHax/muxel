@@ -50,41 +50,94 @@ pub fn git_read_only(os: RemoteOs, repo: &str, args: &[&str]) -> String {
 }
 
 fn git_with_policy(os: RemoteOs, repo: &str, args: &[&str], read_only: bool) -> String {
-    let policy = if read_only {
-        " -c diff.autoRefreshIndex=false"
-    } else {
-        ""
-    };
     match os {
-        RemoteOs::Unix => {
-            let env = if read_only {
-                "GIT_OPTIONAL_LOCKS=0 "
-            } else {
-                ""
-            };
-            let mut c = format!("{env}git{policy} -C {}", sh_quote(repo));
-            for a in args {
-                c.push(' ');
-                c.push_str(&sh_quote(a));
-            }
-            c
-        }
-        RemoteOs::Windows => {
-            let env = if read_only {
-                "$env:GIT_OPTIONAL_LOCKS='0'; "
-            } else {
-                ""
-            };
-            let mut body = format!("{env}& git{policy} -C {}", ps_quote(repo));
-            for a in args {
-                body.push(' ');
-                body.push_str(&ps_quote(a));
-            }
-            // git signals failure by exit code, not a PowerShell error, so the
-            // strict prelude alone would not surface it.
-            body.push_str("; exit $LASTEXITCODE");
-            ps(&body)
-        }
+        RemoteOs::Unix => sh_git(repo, args, read_only),
+        // git signals failure by exit code, not a PowerShell error, so the
+        // strict prelude alone would not surface it.
+        RemoteOs::Windows => ps(&format!(
+            "{}; exit $LASTEXITCODE",
+            ps_git(repo, args, read_only)
+        )),
+    }
+}
+
+const READ_ONLY_POLICY: &str = " -c diff.autoRefreshIndex=false";
+
+/// `git -C <repo> <args…>` for `sh`.
+fn sh_git(repo: &str, args: &[&str], read_only: bool) -> String {
+    let (env, policy) = if read_only {
+        ("GIT_OPTIONAL_LOCKS=0 ", READ_ONLY_POLICY)
+    } else {
+        ("", "")
+    };
+    let mut c = format!("{env}git{policy} -C {}", sh_quote(repo));
+    for a in args {
+        c.push(' ');
+        c.push_str(&sh_quote(a));
+    }
+    c
+}
+
+/// `git -C <repo> <args…>` as PowerShell statements, git's exit code left in
+/// `$LASTEXITCODE`.
+fn ps_git(repo: &str, args: &[&str], read_only: bool) -> String {
+    let (env, policy) = if read_only {
+        ("$env:GIT_OPTIONAL_LOCKS='0'; ", READ_ONLY_POLICY)
+    } else {
+        ("", "")
+    };
+    let mut body = format!("{env}& git{policy} -C {}", ps_quote(repo));
+    for a in args {
+        body.push(' ');
+        body.push_str(&ps_quote(a));
+    }
+    body
+}
+
+/// What [`branches`] prints, on a line of its own, when git failed to list
+/// the branches of a repository. ssh's failures and sshpass's have exit codes
+/// of their own (sshpass's 5 is a wrong password), so the code alone can't
+/// say whose failure it was.
+pub const BRANCHES_FAILED: &str = "muxel: git could not list the branches";
+
+/// The local branches, one a line, `*` before HEAD's and a space before the
+/// others; then the branch HEAD names on a line of its own, since git's list
+/// has none for it before the first commit (exit 1 where HEAD names none).
+/// One command, so one ssh for both. Where the listing fails in a repository
+/// (a git older than 1.9 doesn't know `%(HEAD)`), git's message goes to
+/// stderr and [`BRANCHES_FAILED`] to stdout; in a folder holding no
+/// repository, or none at all, it prints nothing and succeeds. Telling the
+/// two apart costs a `git rev-parse` after a failure only, run in the folder
+/// rather than with `-C`: a git older than 1.8.5 has no `-C`, which fails the
+/// listing before `%(HEAD)` does. On Windows the check's `Test-Path` loads a
+/// module, which Windows PowerShell 5.1 reports as progress, and ssh's stderr
+/// would get it as XML after git's message; progress is turned off.
+pub fn branches(os: RemoteOs, repo: &str) -> String {
+    const LIST: &[&str] = &[
+        "for-each-ref",
+        "--format=%(HEAD)%(refname:short)",
+        "refs/heads/",
+    ];
+    const HEAD: &[&str] = &["symbolic-ref", "--quiet", "--short", "HEAD"];
+    match os {
+        RemoteOs::Unix => format!(
+            "{} || {{ {{ cd {} && git rev-parse --git-dir; }} >/dev/null 2>&1 || exit 0; \
+             echo {}; exit 2; }}; {}",
+            sh_git(repo, LIST, true),
+            sh_quote(repo),
+            sh_quote(BRANCHES_FAILED),
+            sh_git(repo, HEAD, true)
+        ),
+        RemoteOs::Windows => ps(&format!(
+            "$ProgressPreference='SilentlyContinue'; {}; if ($LASTEXITCODE -ne 0) {{ \
+             if (-not (Test-Path -LiteralPath {repo} -PathType Container)) {{ exit 0 }}; \
+             Set-Location -LiteralPath {repo}; & git rev-parse --git-dir | Out-Null; \
+             if ($LASTEXITCODE -ne 0) {{ exit 0 }}; {}; exit 2 }}; {}; exit $LASTEXITCODE",
+            ps_git(repo, LIST, true),
+            ps_quote(BRANCHES_FAILED),
+            ps_git(repo, HEAD, true),
+            repo = ps_quote(repo),
+        )),
     }
 }
 
@@ -426,8 +479,9 @@ pub fn paste_file_name(unique: &str, original: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_seeded_file, git, git_read_only, list_files, paste_file_name, push_prep, read_file,
-        scan_projects, test_dir, test_file, upload_paste, write_file,
+        BRANCHES_FAILED, branches, ensure_seeded_file, git, git_read_only, list_files,
+        paste_file_name, push_prep, read_file, scan_projects, test_dir, test_file, upload_paste,
+        write_file,
     };
     use crate::RemoteOs;
     use base64::Engine as _;
@@ -481,7 +535,133 @@ mod tests {
     }
 
     #[test]
+    fn branches_are_listed_and_head_named_in_one_command() {
+        // The Unix form runs in the app's tests (`integrations`); here, that
+        // Windows asks the same, in order, and says git failed only where a
+        // repository is.
+        let s = script_of(&branches(WIN, "C:/p"));
+        let list = s.find("'for-each-ref'").expect("lists");
+        let gone = s
+            .find("if (-not (Test-Path -LiteralPath 'C:/p' -PathType Container)) { exit 0 }")
+            .expect("no folder: no branch");
+        let repo = s
+            .find("Set-Location -LiteralPath 'C:/p'; & git rev-parse --git-dir | Out-Null")
+            .expect("checks for a repository in the folder");
+        let none = s[repo..]
+            .find("{ exit 0 }")
+            .expect("no repository: no branch")
+            + repo;
+        let said = s
+            .find(&format!("'{BRANCHES_FAILED}'; exit 2"))
+            .expect("marks git's failure");
+        let head = s.find("'symbolic-ref'").expect("names HEAD");
+        assert!(
+            list < gone && gone < repo && repo < none && none < said && said < head,
+            "{s}"
+        );
+        // A git older than 1.8.5 has no `-C`; the check mustn't need it.
+        assert!(!s[list..said].contains(" -C "), "{s}");
+        assert!(s[head..].contains("; exit $LASTEXITCODE"), "{s}");
+    }
+
+    /// [`branches`]' Windows form, run here by Windows PowerShell as ssh runs
+    /// it on a Windows host, after `prelude` (a stand-in for that host's
+    /// git): its exit code, stdout and stderr, trimmed.
+    #[cfg(windows)]
+    fn branches_in_windows_powershell(
+        dir: &std::path::Path,
+        prelude: &str,
+    ) -> (i32, String, String) {
+        use std::os::windows::process::CommandExt as _;
+        let dir = dir.to_string_lossy().replace('\\', "/");
+        let script = format!("{prelude}{}", script_of(&branches(WIN, &dir)));
+        let out = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                &crate::winshell::encoded_command(&script),
+            ])
+            // A folder outside any repository stays outside one.
+            .env("GIT_CEILING_DIRECTORIES", std::env::temp_dir())
+            .stdin(std::process::Stdio::null())
+            .creation_flags(0x0800_0000)
+            .output()
+            .unwrap();
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim().to_string();
+        let code = out.status.code().unwrap_or(-1);
+        (code, text(&out.stdout), text(&out.stderr))
+    }
+
+    /// Windows PowerShell 5.1 answers as the Unix form does, and where git
+    /// can't list the branches, stderr holds what git said and nothing else:
+    /// the notice shows it. (5.1 reports loading a cmdlet's module as progress,
+    /// which a redirected stderr, as over ssh, gets as a block of XML.)
+    #[cfg(windows)]
+    #[test]
+    fn windows_powershell_lists_branches_and_says_only_what_git_said() {
+        let root = std::env::temp_dir().join(format!("muxel-branches-{}", uuid::Uuid::new_v4()));
+        // Brackets for `-LiteralPath`, quotes for the quoting.
+        let repo = root.join("repo [x] 'q' \u{2019}q\u{2019}");
+        let plain = root.join("plain [x]");
+        let gone = root.join("gone");
+        std::fs::create_dir_all(&plain).unwrap();
+        let repo_arg = repo.to_string_lossy().into_owned();
+        for args in [
+            vec!["init", "-q", "-b", "main", &repo_arg],
+            vec![
+                "-C",
+                &repo_arg,
+                "-c",
+                "user.name=muxel",
+                "-c",
+                "user.email=muxel@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "one",
+            ],
+        ] {
+            let ok = std::process::Command::new("git").args(&args).status();
+            assert!(ok.is_ok_and(|s| s.success()), "git {args:?}");
+        }
+        // git dying at a field it doesn't know, as one older than 1.9 dies at
+        // `%(HEAD)`; and git with no `-C`, as one older than 1.8.5.
+        let old_git = "function git { $a = @($args | ForEach-Object { \
+                       if ($_ -eq '--format=%(HEAD)%(refname:short)') \
+                       { '--format=%(no-such-field)' } else { $_ } }); \
+                       & git.exe @a; $global:LASTEXITCODE = $LASTEXITCODE }; ";
+        let no_c_git = "function git { if ($args -contains '-C') \
+                        { & git.exe --muxel-no-such-option } else { & git.exe @args }; \
+                        $global:LASTEXITCODE = $LASTEXITCODE }; ";
+
+        let (code, out, err) = branches_in_windows_powershell(&repo, "");
+        assert_eq!(
+            (code, out.lines().collect::<Vec<_>>()),
+            (0, vec!["*main", "main"])
+        );
+        assert_eq!(err, "");
+        let (code, out, err) = branches_in_windows_powershell(&repo, old_git);
+        assert_eq!((code, out.as_str()), (2, BRANCHES_FAILED));
+        assert_eq!(err, "fatal: unknown field name: no-such-field");
+        let (code, out, err) = branches_in_windows_powershell(&repo, no_c_git);
+        assert_eq!((code, out.as_str()), (2, BRANCHES_FAILED));
+        assert!(
+            err.contains("--muxel-no-such-option") && !err.contains("CLIXML"),
+            "{err}"
+        );
+        // No repository, or no folder: no branch, and nothing said.
+        for (dir, prelude) in [(&plain, ""), (&plain, no_c_git), (&gone, no_c_git)] {
+            let (code, out, err) = branches_in_windows_powershell(dir, prelude);
+            assert_eq!((code, out.as_str()), (0, ""), "{dir:?}: {err}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn windows_commands_are_all_opaque_base64() {
+        assert_opaque(&branches(WIN, "C:/p"));
         assert_opaque(&git(WIN, "C:/p", &["status"]));
         assert_opaque(&list_files(WIN, "C:/p", 10));
         assert_opaque(&read_file(WIN, "C:/p/a.txt", 10));
