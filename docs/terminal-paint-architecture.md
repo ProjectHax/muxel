@@ -86,6 +86,25 @@ literal echo: full-screen TUIs redraw after input, and older stream output can
 already be queued ahead of that response. Every throttled update also schedules
 one trailing-edge paint, so the final batch cannot remain stale after output stops.
 
+**Hidden terminals skip screen repaints.** The sidebar and tab pills read every
+terminal while the window renders, so GPUI redraws the whole window on any
+terminal's notify, shown or not. A terminal no window displays still parses its
+output and updates its status, but doesn't notify for a screen nobody can see.
+It still repaints when something the app renders from it changes: status (any
+public runtime change), its title as a pane name, the program's own name, its
+first visible screen, a submitted turn, or exit.
+
+- *Displayed* means a window displayed it in its latest render, or hasn't
+  rendered since. Each window (main, project, pop-out) owns a `DisplayEpoch`,
+  advances it at the start of every render, and `terminal_pane_element` records it
+  on each terminal it draws. A window that never advances keeps its terminals
+  displayed; a terminal no window has drawn yet counts as hidden.
+- Showing it again needs no catch-up paint: switching tabs re-renders the window,
+  and GPUI keeps no cached paint for a view its last frame didn't draw.
+- Every display path must go through `terminal_pane_element` in a render that
+  runs every frame. Moving a terminal into a cached parent view would leave it
+  unstamped on frames that reuse the parent, so it would stop repainting.
+
 No per-paste special cases: large stream without echo naturally uses Stream 30 Hz.
 
 ### Validation

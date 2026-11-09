@@ -491,18 +491,17 @@ pub fn owned_session_keys<'a>(
             .entry(session.name.as_str())
             .or_insert(&session.socket);
     }
-    let listed = |name: &str, socket: &Socket| {
-        sessions
-            .iter()
-            .any(|s| s.name == name && s.socket == *socket)
-    };
+    let listed: HashSet<_> = sessions
+        .iter()
+        .map(|session| (session.name.as_str(), &session.socket))
+        .collect();
     owned
         .iter()
         .filter_map(|target| {
             target
                 .socket
                 .as_ref()
-                .filter(|socket| listed(&target.name, socket))
+                .filter(|socket| listed.contains(&(target.name.as_str(), *socket)))
                 .or_else(|| preferred.get(target.name.as_str()).copied())
                 .map(|socket| (target.name.as_str(), socket))
         })
@@ -532,11 +531,7 @@ pub fn orphan_sessions(
     closed: &[ClosedSession],
 ) -> Vec<RemoteSession> {
     let owned = owned_session_keys(sessions, owned);
-    let closed: HashSet<_> = closed
-        .iter()
-        .filter_map(|c| live_closed_session(sessions, c))
-        .map(|s| (s.name.as_str(), &s.socket))
-        .collect();
+    let closed = closed_session_keys(sessions, closed);
     sessions
         .iter()
         .filter(|s| s.name.starts_with(SESSION_PREFIX))
@@ -597,6 +592,36 @@ pub struct ClosedSession {
     /// muxel's feet (a renamed host, a session a peer created under its own slug),
     /// so the instance's `_<uuid8>` suffix is the durable half of the match.
     pub instance: Uuid,
+    /// A local close's generation claim. Only its original in-memory attempt
+    /// may stamp the session; persisted retries only compare this token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_close_token: Option<Uuid>,
+    /// Where the pane ran, so an unconfirmed kill holds up only its own worktree.
+    #[serde(default)]
+    pub worktree: ClosedWorktree,
+}
+
+/// Which worktree a closed pane ran in.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClosedWorktree {
+    /// Saved before muxel recorded this, so it could be any of the project's.
+    #[default]
+    Unknown,
+    /// The pane wasn't in a worktree.
+    Outside,
+    In(std::path::PathBuf),
+}
+
+impl ClosedWorktree {
+    /// Whether this kill could be for a pane that ran in the worktree at `path`.
+    pub fn may_be(&self, path: &std::path::Path) -> bool {
+        match self {
+            Self::Unknown => true,
+            Self::Outside => false,
+            Self::In(own) => own == path,
+        }
+    }
 }
 
 impl ClosedSession {
@@ -661,6 +686,38 @@ pub fn live_closed_session<'a>(
         .iter()
         .find(|s| closed.matches(s) && s.name == closed.name)
         .or_else(|| sessions.iter().find(|s| closed.matches(s)))
+}
+
+/// Index a host inventory once for Import and orphan adoption. Exact recorded
+/// names win; legacy suffix matching is used only when that name is absent.
+pub fn closed_session_keys<'a>(
+    sessions: &'a [RemoteSession],
+    closed: &[ClosedSession],
+) -> HashSet<(&'a str, &'a Socket)> {
+    let mut names = HashMap::new();
+    let mut suffixes = HashMap::new();
+    for session in sessions {
+        for socket in [None, Some(&session.socket)] {
+            names
+                .entry((socket, session.name.as_str()))
+                .or_insert(session);
+            if session.name.starts_with(SESSION_PREFIX)
+                && let Some((_, suffix)) = session.name.rsplit_once('_')
+            {
+                suffixes.entry((socket, suffix)).or_insert(session);
+            }
+        }
+    }
+    closed
+        .iter()
+        .filter_map(|closed| {
+            let suffix = instance_suffix(closed.instance);
+            names
+                .get(&(closed.socket.as_ref(), closed.name.as_str()))
+                .or_else(|| suffixes.get(&(closed.socket.as_ref(), &suffix[1..])))
+                .map(|session| (session.name.as_str(), &session.socket))
+        })
+        .collect()
 }
 
 /// The tmux session an instance uses: the name **recorded on the instance** wins;
@@ -1106,6 +1163,28 @@ pub fn kill_session_args(session: &str) -> Vec<String> {
         "-t".to_string(),
         format!("={session}"),
     ]
+}
+
+pub const LOCAL_CLOSE_GENERATION_OPTION: &str = "@muxel-close-generation";
+
+/// The tmux server compares both generation and id, then kills that exact id
+/// without yielding to another client's restart. No session name enters the
+/// nested command, and ids must contain only tmux's `$` and decimal digits.
+pub fn kill_local_generation_args(session: &str, id: &str, token: Uuid) -> Option<Vec<String>> {
+    let digits = id.strip_prefix('$')?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(vec![
+        "if-shell".into(),
+        "-F".into(),
+        "-t".into(),
+        format!("={session}:"),
+        format!(
+            "#{{&&:#{{==:#{{{LOCAL_CLOSE_GENERATION_OPTION}}},{token}}},#{{==:#{{session_id}},{id}}}}}"
+        ),
+        format!("kill-session -t '{id}'"),
+    ])
 }
 
 /// Atomically unset an option only while it matches this send's claim pattern.
@@ -2432,6 +2511,8 @@ mod tests {
                 name: "work".into(),
                 socket: Some(socket),
                 instance: Uuid::new_v4(),
+                local_close_token: None,
+                worktree: Default::default(),
             };
             let json = serde_json::to_string(&closed).unwrap();
             let restored: ClosedSession = serde_json::from_str(&json).unwrap();
@@ -2607,6 +2688,8 @@ mod tests {
                 name: "work".into(),
                 socket: prior,
                 instance: instance.id,
+                local_close_token: None,
+                worktree: Default::default(),
             };
             assert_eq!(
                 closed.resolve_owner(&found, socket.clone()).target(),
@@ -2636,6 +2719,8 @@ mod tests {
             name: name.into(),
             socket: Some(Socket::Private),
             instance: Uuid::nil(),
+            local_close_token: None,
+            worktree: Default::default(),
         };
         assert_eq!(
             orphan_sessions(&found, "/p", &[], std::slice::from_ref(&closed)),
@@ -2684,6 +2769,8 @@ mod tests {
             name: "work".into(),
             socket: Some(Socket::Default),
             instance: Uuid::nil(),
+            local_close_token: None,
+            worktree: Default::default(),
         };
         assert_eq!(live_closed_session(&found, &closed), Some(&found[0]));
     }
@@ -2696,6 +2783,8 @@ mod tests {
             name: "work".into(),
             socket: None,
             instance: Uuid::new_v4(),
+            local_close_token: None,
+            worktree: Default::default(),
         };
         let resolved = pending.resolve_owner(&sessions, Socket::Private);
         let mut project = crate::Project::new("p", "/p");
@@ -2761,6 +2850,8 @@ mod tests {
             name: name.into(),
             socket: None,
             instance: Uuid::nil(),
+            local_close_token: None,
+            worktree: Default::default(),
         };
         // This resolved record is retained in the in-memory confirmed-close ledger.
         let reaped = legacy.resolve_owner(&sessions, Socket::Private);
@@ -2781,6 +2872,8 @@ mod tests {
             name: "work".into(),
             socket: None,
             instance: Uuid::nil(),
+            local_close_token: None,
+            worktree: Default::default(),
         };
         let reaped = legacy.resolve_owner(&[], Socket::Private);
         assert_eq!(reaped.socket, Some(Socket::Private));
@@ -2801,6 +2894,8 @@ mod tests {
             name: "muxel_new_12345678".into(),
             socket: None,
             instance: id,
+            local_close_token: None,
+            worktree: Default::default(),
         };
         assert_eq!(
             legacy.resolve_owner(&sessions, Socket::Private).target(),
@@ -2859,6 +2954,8 @@ mod tests {
             name: name.to_string(),
             socket: None,
             instance: id,
+            local_close_token: None,
+            worktree: Default::default(),
         }
     }
 

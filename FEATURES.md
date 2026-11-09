@@ -117,10 +117,17 @@ feature is added or changed, update the matching entry here in the same change**
   binding, input and completion before expiry; changed work gets Close / Keep.
   An OSC 7501 report counts as quiet only while idle or finished; an `error`
   report asks, and any turn a report finishes during the countdown is changed
-  work. Batch closes offer Close all, Close only the idle ones, or Cancel.
+  work. Batch closes offer Close all, Close only the idle ones, or Cancel; a
+  file answer needs the close to take every pane of its worktree, so leaving
+  one open, or one exiting or closed by a peer before the close is accepted,
+  drops the answer and that worktree asks again later.
   Queued input, written to the terminal or sent through tmux, is cancelled
   across close and Undo, and hidden panes leave ctl listings; writes refuse
-  with `closing` and `undo_until`. A shell counts down only with prompt
+  with `closing`. Reads by id or name (`status`, `show`, `screen`, `wait`)
+  still work. `undo_until` is present only during the countdown; checks,
+  Close / Keep and restoration report their state without an expired deadline.
+  If the pane disappears while `wait` polls or collects its result, `wait`
+  returns `exited` with an explanation. A shell counts down only with prompt
   evidence, so local tmux shells on Unix, which can't pass OSC 133 through,
   always ask. A tmux pane that only looks dead here (never connected, a
   failed restart, a detached client) asks too, since closing it kills a
@@ -133,18 +140,41 @@ feature is added or changed, update the matching entry here in the same change**
   layout, showing "Checking before close…" until then, so edits a peer made
   while this machine slept are adopted, not overwritten. When that layout
   can't be read (its host is offline or reconnecting, or no read lands within
-  30 seconds), the close asks Close or Keep instead.
+  30 seconds), the close asks Close or Keep instead. Explicit Close also waits
+  for a read begun after the click; a Close offered because the layout cannot
+  be read explicitly proceeds without it.
 - **Resource and worktree close** — dirty editors offer Save / Don't Save /
   Cancel; clean editors, diffs and browsers close immediately. The last pane of
-  a muxel worktree with changes or unmerged commits uses its disposal choice
-  directly; a clean, landed worktree follows the terminal countdown policy. A
+  a muxel worktree with changes or unmerged commits asks what to do with its files,
+  then follows the same busy confirmation and countdown with Undo as other
+  terminals. Commit / Merge / Discard / Keep run only after the close finishes
+  and tmux teardown is confirmed; Undo, Cancel, Quit, switching workspace or a
+  failed tmux kill cancels the file action and keeps the files, with the worktree
+  listed in the sidebar. A
   pane opened in that worktree while its question is showing gets its own
   prompt and countdown, and a pane brought back by Undo leaves the question.
   Client checks show progress, beside any running countdown, with their own
   Cancel; a batch member closed during the check leaves the others to their
   decision. Ordinary saves preserve held panes for crash recovery; workspace
-  switch and quit (or logout) finish running countdowns, but keep a pane
+  switch and quit (or logout) finish unshared running countdowns, but keep shared
+  closes until a fresh layout read can run on the next visit. A layout is shared
+  for a remote project and whenever the tmux setting is on, which is the default,
+  so unshared means a local project with that setting off. An explicit Close of a
+  shared pane also waits for the next layout read. They also keep a pane
   still being checked or waiting for Close / Keep, which reopens next time.
+  Local tmux closes save a pending kill before teardown and retry it on project
+  activation after layout reconciliation. A pane that reappeared or now shows
+  that session cancels its retry. Retries match the original close's generation
+  token; a same-name replacement is kept, and unverified legacy closes are
+  cancelled without killing. The event log records the retained target; Import
+  keeps its existing server-discovery scope and excludes pending kills on that host.
+  Local worktree cleanup waits for confirmed session death. A remote close keeps
+  its worktree on the host and logs why. Legacy worktrees are kept when
+  dirty, unmerged or still shared by another pane.
+  Removing a project never waits on those kills. One already running finishes in
+  the background and an older unconfirmed one gets a last try, but nothing retries
+  after that. A session that survives keeps running, the removal says so, and
+  Import lists it. A held pane's file answer is dropped, and its files stay.
   Removing a project waits for that decision. If that save fails, the first
   switch stops with a notice and the next one leaves anyway; the pane reopens
   next time. Saving an untitled editor on close writes the path picked in the
@@ -281,7 +311,13 @@ feature is added or changed, update the matching entry here in the same change**
   sibling-owned hints wait until ownership or binding changes. Launch,
   directory, hint or binding changes reset the delay. The name index is reread
   in full on a worker when its size or modification time changes; unchanged
-  indexes take one stat. Claude and Grok retry unresolved results with backoff.
+  indexes take one stat. A Claude pane reads its hook record when a watcher on
+  the hook directory reports it written, so `/clear` or `/resume` rebinds at
+  once, and otherwise every thirty seconds, for events a watcher loses. A
+  record that can't be adopted or read yet is retried every two seconds. Where
+  the watcher can't start, reports an error, stops, or loses its directory (it,
+  or the directory above it, was removed or renamed), Claude retries
+  unresolved results with backoff, as Grok does, for the rest of the run.
   Discovery continues in popped-out terminals. A result applies only when
   the pane still has the same launch, binding and directory, and no sibling owns it.
   On Windows, an accepted Grok conversation stays reserved to its pane even
@@ -472,7 +508,9 @@ feature is added or changed, update the matching entry here in the same change**
   supplying lifecycle status; a title in the current root report takes precedence.
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
-  icon, dashboard, and notification dots. Screen checks, markers included, skip
+  icon, dashboard, and notification dots. A **done** you haven't looked at stays
+  bright green; once you focus its pane, its sidebar and dashboard icons dim and
+  its sidebar pill turns to a green outline, so unread finishes stand out. Screen checks, markers included, skip
   Claude's input box, so a typed or pasted draft doesn't set a Claude pane's
   status, while permission forms and hints outside the box still do. A draft can
   still count, as before, where muxel can't pick out the box whole: a rule drawn
@@ -1143,6 +1181,22 @@ feature is added or changed, update the matching entry here in the same change**
   that had already closed its terminal is not force-killed, as before. The
   operating system's own hangup when the pane's terminal closes is separate and
   outside muxel's control, so a program is not guaranteed those five seconds.
+- **Per-process memory limit (Windows)** — each local pane's process tree runs in
+  its own job object, and every process in it can commit at most 16 GB by default
+  (Settings → Behavior: Off, 8, 16, 32 or 64 GB; a change applies to panes started
+  after it). A process that asks for more is refused, which usually stops it, so
+  a single runaway doesn't take the machine down in the common case. It's no
+  guarantee: when less memory is free than the limit, or several large
+  processes share what is free, memory can still run out. The default fits
+  typical developer tools; large Java heaps, optimized links and local model
+  runners can need more. When Windows reports a hit (best effort), the
+  notifications feed names the process when it can, its PID, and whether it
+  stopped. The limit is per process, so a pane running many large processes at
+  once (parallel compilers) is unaffected. Processes started in the pane's first
+  instant are covered; programs started from a pane still outlive it and stay
+  under its limit. A child that asks to break away from the job, and processes a
+  remote host or tmux server runs, aren't covered. If Windows can't apply the
+  limit, the pane starts without one and the reason is logged.
 - **Selection & clipboard** — mouse text selection and copy/paste (`⌘C`/`⌘V` on
   macOS, `Ctrl+Shift+C`/`Ctrl+Shift+V` elsewhere). A global Settings → Behavior
   choice picks the mouse copy/paste style: **right-click copy/paste** (default —
@@ -1281,7 +1335,8 @@ feature is added or changed, update the matching entry here in the same change**
   the browser preview while HTML source panes offer a **Preview** action.
 - **External file freshness** — open local text files, including rendered Markdown,
   update within 500 ms when another tool writes them. Refresh keeps cursor and scroll
-  position. Dirty buffers show **Reload / Keep mine** instead of being overwritten;
+  position and leaves keyboard focus where it was, so an agent rewriting an open file
+  doesn't pull your typing into it. Dirty buffers show **Reload / Keep mine** instead of being overwritten;
   deleted or unreadable files remain open with a warning. The same behavior works in
   main, secondary, and popped-out editor windows.
 - **Resource tab grouping** — files, diffs, and browser pages opened by default join
