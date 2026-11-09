@@ -13446,11 +13446,14 @@ impl MuxelApp {
                             }
                             polls.branches.record(id, stamp, now);
                             let loc = integrations::RepoLoc::Local(root);
-                            Some((
-                                id,
-                                integrations::repo_current_branch(&loc),
-                                integrations::list_branches(&loc),
-                            ))
+                            let (branch, branches) = match integrations::read_branches(&loc) {
+                                integrations::BranchRead::Read(branch, branches) => {
+                                    (branch, branches)
+                                }
+                                // Only a remote read comes back without one.
+                                _ => (None, Vec::new()),
+                            };
+                            Some((id, branch, branches))
                         })
                         .collect();
                     drop(git_caller);

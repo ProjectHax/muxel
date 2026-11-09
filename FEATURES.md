@@ -1430,10 +1430,10 @@ feature is added or changed, update the matching entry here in the same change**
 - **Project list** — projects with live per-agent status rows; collapse a project.
 - **Branch label** — each project row shows its git repo's current branch with a
   branch icon (refreshed live), including a new repo's branch before its first
-  commit, spelled as the switch-branch menu spells it. A local repo's branch is
-  read from its HEAD file without starting git whenever the files settle what
-  git would print; unusual setups (a bare repo, a symbolic branch, a name
-  another ref shares, `GIT_DIR` and similar variables) ask git.
+  commit, spelled as the switch-branch menu spells it. A local repo's branch
+  comes from the git run that lists its branches, which runs when its HEAD or
+  branch files change and otherwise every five minutes (every minute where
+  those files can't show what git reads, as with `GIT_DIR` set).
 - **Project git** — right-click a git project for: git diff (opens the diff pane;
   local projects), switch branch (submenu), new branch, commit, pull, push, fetch,
   and stash / pop / drop stash; each runs off the main thread and toasts its
