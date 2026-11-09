@@ -1110,11 +1110,12 @@ pub fn repo_current_branch(loc: &RepoLoc) -> Option<String> {
     // commit, where it exits 128. Only then is `symbolic-ref` worth a second
     // launch: ssh failing to connect exits 255.
     let out = git_output(loc, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
+    let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if out.status.success() {
-        let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
         return (!head.is_empty() && head != "HEAD").then_some(head);
     }
-    if out.status.code() != Some(128) {
+    // Where there's no repository git exits 128 too, printing nothing.
+    if out.status.code() != Some(128) || head != "HEAD" {
         return None;
     }
     git_line_loc(loc, &["symbolic-ref", "--quiet", "--short", "HEAD"])
@@ -8284,6 +8285,25 @@ mod tests {
             panic!("a local read is always read");
         };
         assert_eq!(branch.as_deref(), Some("heads/origin"));
+    }
+
+    /// `rev-parse` exits 128 both before the first commit and where there's no
+    /// repository, over ssh too; only before the first commit is there a branch
+    /// for `symbolic-ref` to name.
+    #[test]
+    fn the_branch_read_asks_symbolic_ref_only_before_the_first_commit() {
+        let plain = lib_temp_dir();
+        let loc = RepoLoc::Local(plain.clone());
+        let read = launches(|| repo_current_branch(&loc));
+        assert_eq!(read, (None, 1), "no repository");
+        lib_cleanup(&plain);
+        let repo = TestRepo::init();
+        let loc = RepoLoc::Local(repo.path().to_path_buf());
+        let main = Some("main".to_string());
+        let read = launches(|| repo_current_branch(&loc));
+        assert_eq!(read, (main.clone(), 2), "before the first commit");
+        repo.commit(&[("a.txt", "one\n")], "init");
+        assert_eq!(launches(|| repo_current_branch(&loc)), (main, 1), "on a branch");
     }
 
     /// `git init` a reftable repository on `branch`; `false`, with a note, when
