@@ -8253,7 +8253,11 @@ mod tests {
         assert_eq!(read(), (BranchRead::Read(None, listed), 2), "detached");
         let plain = lib_temp_dir();
         let read_plain = launches(|| read_branches(&RepoLoc::Local(plain.clone())));
-        assert_eq!(read_plain, (BranchRead::Read(None, vec![]), 1), "no repository");
+        assert_eq!(
+            read_plain,
+            (BranchRead::Read(None, vec![]), 1),
+            "no repository"
+        );
         lib_cleanup(&plain);
     }
 
@@ -8278,7 +8282,11 @@ mod tests {
             return;
         }
         let names = repo.git(&["symbolic-ref", "refs/remotes/origin/HEAD"]);
-        assert_eq!(names.trim(), "refs/remotes/origin/main", "git reads the link");
+        assert_eq!(
+            names.trim(),
+            "refs/remotes/origin/main",
+            "git reads the link"
+        );
         let loc = RepoLoc::Local(repo.path().to_path_buf());
         assert_eq!(repo_current_branch(&loc).as_deref(), Some("heads/origin"));
         let BranchRead::Read(branch, _) = read_branches(&loc) else {
@@ -8303,7 +8311,11 @@ mod tests {
         let read = launches(|| repo_current_branch(&loc));
         assert_eq!(read, (main.clone(), 2), "before the first commit");
         repo.commit(&[("a.txt", "one\n")], "init");
-        assert_eq!(launches(|| repo_current_branch(&loc)), (main, 1), "on a branch");
+        assert_eq!(
+            launches(|| repo_current_branch(&loc)),
+            (main, 1),
+            "on a branch"
+        );
     }
 
     /// `git init` a reftable repository on `branch`; `false`, with a note, when
