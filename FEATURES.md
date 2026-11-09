@@ -1332,6 +1332,15 @@ feature is added or changed, update the matching entry here in the same change**
   images, both by default, with a header **Raw / Rendered** toggle to view the
   source (e.g. an SVG's XML or the markdown text). Paragraphs combining inline
   images and line breaks render without crashing, including linked HTML images.
+- **Copy as rich text** — a rendered Markdown pane's header has a **Copy as rich
+  text** button (also in the Ctrl+P palette) that copies the whole document as
+  formatted HTML, with the Markdown source as the plain-text fallback. Pasting into
+  Outlook, Gmail or a word processor keeps headings, lists, bold, links, code and
+  bordered tables; task items show ☐/☑, web images come along, and local images
+  become an `[Image: alt]` placeholder to insert by hand. Links to files beside the
+  document become their text; links within it keep their targets. Raw HTML keeps
+  only the elements and attributes mail understands and only web and mail links;
+  script and style tags paste as text, as GitHub shows them.
 - **Rendered-text copy parity** — Ctrl+C and Ctrl+Insert copy the exact selected
   text in rendered Markdown, images, and settings fields without intercepting Ctrl+C
   from a focused terminal.
