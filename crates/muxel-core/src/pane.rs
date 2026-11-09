@@ -7,6 +7,7 @@
 //! Adapted from okena's `LayoutNode` (MIT).
 
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 /// How a split arranges its children.
@@ -169,11 +170,19 @@ pub struct LeafData {
     pub pane_id: Uuid,
     pub tabs: Vec<Uuid>,
     pub active: usize,
+    /// The pane (by `pane_id`) whose space this one was split out of. When this
+    /// pane leaves its split, the space goes back to the sibling holding that
+    /// pane, so opening a pane and closing it again leaves the others where they
+    /// were. Local history like `pane_id`: `None` in layouts saved before it
+    /// existed and in layouts a peer synced without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_from: Option<Uuid>,
 }
 
 impl PartialEq for LeafData {
     fn eq(&self, other: &Self) -> bool {
-        // `pane_id` is renderer identity, not user-visible layout content.
+        // `pane_id` and `split_from` are renderer identity and local history,
+        // not user-visible layout content.
         self.tabs == other.tabs && self.active == other.active
     }
 }
@@ -225,6 +234,7 @@ impl LeafData {
             pane_id: Uuid::new_v4(),
             tabs: vec![instance],
             active: 0,
+            split_from: None,
         }
     }
 
@@ -249,12 +259,14 @@ impl<'de> Deserialize<'de> for LeafData {
                 let mut tabs: Option<Vec<Uuid>> = None;
                 let mut instance: Option<Uuid> = None;
                 let mut pane_id: Option<Uuid> = None;
+                let mut split_from: Option<Uuid> = None;
                 let mut active: usize = 0;
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "tabs" => tabs = Some(map.next_value()?),
                         "instance" => instance = Some(map.next_value()?),
                         "pane_id" => pane_id = Some(map.next_value()?),
+                        "split_from" => split_from = map.next_value()?,
                         "active" => active = map.next_value()?,
                         // Ignore unknowns — including the enum's "kind" tag, which
                         // serde leaves in the buffered map for newtype variants.
@@ -276,6 +288,7 @@ impl<'de> Deserialize<'de> for LeafData {
                     pane_id: pane_id.unwrap_or_else(Uuid::new_v4),
                     tabs,
                     active,
+                    split_from,
                 })
             }
         }
@@ -571,28 +584,140 @@ impl PaneNode {
     }
 
     /// Remove the child at `path`, collapsing a split that's left with one child.
-    /// Returns the removed node, or `None` if the path is invalid/empty.
+    /// Its share of the split goes to one sibling, so every other pane keeps its
+    /// size (see [`Self::detach_at_path`]). Returns the removed node, or `None`
+    /// if the path is invalid/empty.
     pub fn remove_at_path(&mut self, path: &[usize]) -> Option<PaneNode> {
+        self.detach_at_path(path, None)
+    }
+
+    /// [`Self::remove_at_path`], called on the root. The removed child's share
+    /// goes to the sibling holding the pane it was split from; failing that, to
+    /// an adjacent sibling holding `toward` (where its tab is going); failing
+    /// that, to the previous sibling, or the next one if it was first. Panes that
+    /// were split from a removed leaf then count as split from that leaf's own
+    /// origin, which is where its space went.
+    fn detach_at_path(&mut self, path: &[usize], toward: Option<Uuid>) -> Option<PaneNode> {
         let (&idx, parent_path) = path.split_last()?;
         let parent = self.get_at_path_mut(parent_path)?;
-        match parent {
-            PaneNode::Leaf(..) => None,
-            PaneNode::Split {
-                children, sizes, ..
-            } => {
-                if idx >= children.len() {
-                    return None;
-                }
-                let removed = children.remove(idx);
-                if idx < sizes.len() {
-                    sizes.remove(idx);
-                }
-                if children.len() == 1 {
-                    let only = children.remove(0);
-                    *parent = only;
-                }
-                Some(removed)
+        let PaneNode::Split {
+            children, sizes, ..
+        } = &mut *parent
+        else {
+            return None;
+        };
+        if idx >= children.len() {
+            return None;
+        }
+        let removed = children.remove(idx);
+        if sizes.len() == children.len() + 1 {
+            let freed = sizes.remove(idx);
+            if let Some(heir) = heir_index(children, idx, &removed, toward) {
+                sizes[heir] += freed;
             }
+        } else if idx < sizes.len() {
+            sizes.remove(idx);
+        }
+        if children.len() == 1 {
+            let only = children.remove(0);
+            *parent = only;
+        }
+        if let PaneNode::Leaf(leaf) = &removed {
+            let (gone, origin) = (leaf.pane_id, leaf.split_from);
+            self.for_each_split_origin(&mut |from| {
+                if *from == Some(gone) {
+                    *from = origin;
+                }
+            });
+        }
+        Some(removed)
+    }
+
+    /// Whether the pane with identity `pane_id` is in this subtree.
+    fn holds_pane(&self, pane_id: Uuid) -> bool {
+        match self {
+            PaneNode::Leaf(leaf) => leaf.pane_id == pane_id,
+            PaneNode::Split { children, .. } => children.iter().any(|c| c.holds_pane(pane_id)),
+        }
+    }
+
+    /// Re-point split history that names a pane no longer in this layout, as
+    /// removing that pane would have (see [`Self::detach_at_path`]): to the pane
+    /// it was split from in `earlier`, and so on until one is here, else none.
+    pub fn repoint_missing_origins(&mut self, earlier: &PaneNode) {
+        let mut history = HashMap::new();
+        earlier.visit_leaves(&mut |leaf| {
+            history.insert(leaf.pane_id, leaf.split_from);
+        });
+        let mut here = HashSet::new();
+        self.visit_leaves(&mut |leaf| {
+            here.insert(leaf.pane_id);
+        });
+        self.for_each_split_origin(&mut |from| {
+            // Each step moves to another recorded pane, so a walk longer than
+            // the history has gone round a loop.
+            for _ in 0..=history.len() {
+                match *from {
+                    Some(gone) if !here.contains(&gone) => {
+                        *from = history.get(&gone).copied().flatten();
+                    }
+                    _ => return,
+                }
+            }
+            *from = None;
+        });
+    }
+
+    fn visit_leaves(&self, f: &mut impl FnMut(&LeafData)) {
+        match self {
+            PaneNode::Leaf(leaf) => f(leaf),
+            PaneNode::Split { children, .. } => {
+                for child in children {
+                    child.visit_leaves(f);
+                }
+            }
+        }
+    }
+
+    fn for_each_split_origin(&mut self, f: &mut impl FnMut(&mut Option<Uuid>)) {
+        match self {
+            PaneNode::Leaf(leaf) => f(&mut leaf.split_from),
+            PaneNode::Split { children, .. } => {
+                for child in children {
+                    child.for_each_split_origin(f);
+                }
+            }
+        }
+    }
+
+    /// Whether `other` has the same panes, tabs and splits, with sizes equal up
+    /// to float rounding. A pane leaving a split adds its size to a sibling, so
+    /// the same panes closed in another order can differ in the last bits.
+    pub fn same_layout(&self, other: &PaneNode) -> bool {
+        match (self, other) {
+            (PaneNode::Leaf(a), PaneNode::Leaf(b)) => a == b,
+            (
+                PaneNode::Split {
+                    direction: da,
+                    sizes: sa,
+                    children: ca,
+                },
+                PaneNode::Split {
+                    direction: db,
+                    sizes: sb,
+                    children: cb,
+                },
+            ) => {
+                da == db
+                    && sa.len() == sb.len()
+                    && ca.len() == cb.len()
+                    && sa
+                        .iter()
+                        .zip(sb)
+                        .all(|(a, b)| (a - b).abs() <= 1e-5 * a.abs().max(b.abs()))
+                    && ca.iter().zip(cb).all(|(a, b)| a.same_layout(b))
+            }
+            _ => false,
         }
     }
 
@@ -674,10 +799,41 @@ impl PaneNode {
     }
 }
 
+/// Which of `siblings` inherits the share of a child just removed from index
+/// `removed_at`, as [`PaneNode::detach_at_path`] describes.
+fn heir_index(
+    siblings: &[PaneNode],
+    removed_at: usize,
+    removed: &PaneNode,
+    toward: Option<Uuid>,
+) -> Option<usize> {
+    if let PaneNode::Leaf(LeafData {
+        split_from: Some(origin),
+        ..
+    }) = removed
+        && let Some(heir) = siblings.iter().position(|s| s.holds_pane(*origin))
+    {
+        return Some(heir);
+    }
+    // The removed child's neighbours now sit at `removed_at - 1` and `removed_at`.
+    let previous = removed_at.checked_sub(1);
+    let next = (removed_at < siblings.len()).then_some(removed_at);
+    if let Some(toward) = toward
+        && let Some(heir) = [previous, next]
+            .into_iter()
+            .flatten()
+            .find(|&i| siblings[i].find_path(toward).is_some())
+    {
+        return Some(heir);
+    }
+    previous.or(next)
+}
+
 /// Split the pane holding `target` in two, placing `new_instance` alongside it.
-/// The new pane takes half of the target's space. Returns `false` if `target`
-/// isn't present. Splitting a multi-tab pane keeps the whole tab group together
-/// as one child and adds a fresh single-tab pane beside it.
+/// The new pane takes half of the target's space and gives it back when it
+/// leaves. Returns `false` if `target` isn't present. Splitting a multi-tab pane
+/// keeps the whole tab group together as one child and adds a fresh single-tab
+/// pane beside it.
 pub fn split(
     tree: &mut Option<PaneNode>,
     target: Uuid,
@@ -705,11 +861,19 @@ pub fn split_beside(
     let Some(node) = root.get_at_path_mut(&path) else {
         return false;
     };
+    // `find_path` always ends at a leaf.
+    let PaneNode::Leaf(target_leaf) = &*node else {
+        return false;
+    };
+    let fresh = PaneNode::Leaf(LeafData {
+        split_from: Some(target_leaf.pane_id),
+        ..LeafData::new(new_instance)
+    });
     let old = node.clone();
     let children = if before {
-        vec![PaneNode::leaf(new_instance), old]
+        vec![fresh, old]
     } else {
-        vec![old, PaneNode::leaf(new_instance)]
+        vec![old, fresh]
     };
     *node = PaneNode::Split {
         direction,
@@ -818,11 +982,12 @@ pub fn move_pane_beside(
         }
     }
     // Snapshot the source leaf before mutating the tree.
-    let src_leaf = match tree.as_ref().and_then(|r| r.get_at_path(&src_path)) {
-        Some(node @ PaneNode::Leaf(_)) => node.clone(),
+    let mut src_leaf = match tree.as_ref().and_then(|r| r.get_at_path(&src_path)) {
+        Some(PaneNode::Leaf(leaf)) => leaf.clone(),
         _ => return false,
     };
-    // Detach the source leaf node (collapses its parent split if left singular).
+    // Detach the source leaf node (collapses its parent split if left singular,
+    // and gives its space back to the pane it was split from).
     {
         let Some(root) = tree.as_mut() else {
             return false;
@@ -840,6 +1005,12 @@ pub fn move_pane_beside(
     let Some(node) = root.get_at_path_mut(&tgt_path) else {
         return false;
     };
+    let PaneNode::Leaf(target_leaf) = &*node else {
+        return false;
+    };
+    // It takes half of the target's space, as a new pane would.
+    src_leaf.split_from = Some(target_leaf.pane_id);
+    let src_leaf = PaneNode::Leaf(src_leaf);
     let old = node.clone();
     let children = if before {
         vec![src_leaf, old]
@@ -1038,60 +1209,26 @@ pub fn move_tab_to(
     }
     // Cross-leaf: detach (fixes source active / collapses empty source), then
     // re-find the target (a collapse can shift paths) and insert at `index`.
-    // When the source leaf vanishes beside the target, give its split span to
-    // the destination. Otherwise the remaining siblings absorb that space and
-    // the pane the user dropped onto stays roughly its old width.
-    transfer_vanishing_leaf_size(tree, &pd, &pt);
-    if !remove(tree, dragged) {
+    // A source pane that empties gives its space to the pane it was split from,
+    // or else to the destination when that sits beside it.
+    if !remove_toward(tree, dragged, Some(target_anchor)) {
         return false;
     }
     add_tab_at(tree, target_anchor, dragged, index)
 }
 
-fn transfer_vanishing_leaf_size(
-    tree: &mut Option<PaneNode>,
-    source_path: &[usize],
-    target_path: &[usize],
-) {
-    let Some((&source_index, source_parent)) = source_path.split_last() else {
-        return;
-    };
-    if !target_path.starts_with(source_parent) || target_path.len() <= source_parent.len() {
-        return;
-    }
-    // The destination leaf may be nested inside the adjacent column. Transfer
-    // to that direct child of the source split, not the leaf's immediate parent.
-    let target_index = target_path[source_parent.len()];
-    if source_index.abs_diff(target_index) != 1 {
-        return;
-    }
-    let Some(root) = tree.as_mut() else {
-        return;
-    };
-    let source_is_sole_tab = root
-        .get_at_path(source_path)
-        .and_then(PaneNode::tabs)
-        .is_some_and(|(tabs, _)| tabs.len() == 1);
-    if !source_is_sole_tab {
-        return;
-    }
-    let Some(PaneNode::Split {
-        children, sizes, ..
-    }) = root.get_at_path_mut(source_parent)
-    else {
-        return;
-    };
-    if sizes.len() != children.len() || source_index >= sizes.len() || target_index >= sizes.len() {
-        return;
-    }
-    sizes[target_index] += sizes[source_index];
-}
-
 /// Remove `target` from the tree. If it's one of several tabs in its pane, only
 /// that tab is removed (and the pane's active index fixed up); if it's the last
-/// tab, the pane is removed and the tree collapses. If it was the last pane, the
-/// tree becomes empty (`None`). Returns `false` if `target` is absent.
+/// tab, the pane is removed, its space goes back to the pane it was split from,
+/// and the tree collapses. If it was the last pane, the tree becomes empty
+/// (`None`). Returns `false` if `target` is absent.
 pub fn remove(tree: &mut Option<PaneNode>, target: Uuid) -> bool {
+    remove_toward(tree, target, None)
+}
+
+/// [`remove`], with `toward` as the fallback heir of an emptied pane's space
+/// (see [`PaneNode::detach_at_path`]).
+fn remove_toward(tree: &mut Option<PaneNode>, target: Uuid, toward: Option<Uuid>) -> bool {
     let Some(path) = tree.as_ref().and_then(|r| r.find_path(target)) else {
         return false;
     };
@@ -1122,7 +1259,7 @@ pub fn remove(tree: &mut Option<PaneNode>, target: Uuid) -> bool {
         if path.is_empty() {
             *tree = None;
         } else if let Some(root) = tree.as_mut() {
-            root.remove_at_path(&path);
+            root.detach_at_path(&path, toward);
             root.normalize();
         }
     }
@@ -1182,18 +1319,30 @@ pub fn swap_panes(tree: &mut Option<PaneNode>, a: Uuid, b: Uuid) -> bool {
     if pa == pb {
         return false; // same pane
     }
-    let (Some(PaneNode::Leaf(da)), Some(PaneNode::Leaf(db))) = (
+    let (Some(PaneNode::Leaf(mut da)), Some(PaneNode::Leaf(mut db))) = (
         root.get_at_path(&pa).cloned(),
         root.get_at_path(&pb).cloned(),
     ) else {
         return false;
     };
+    // Split history belongs to places, not panes: each place keeps the record
+    // of where its space came from, and a record naming either place now names
+    // the pane that moved into it.
+    std::mem::swap(&mut da.split_from, &mut db.split_from);
+    let (ia, ib) = (da.pane_id, db.pane_id);
     if let Some(PaneNode::Leaf(slot)) = root.get_at_path_mut(&pa) {
         *slot = db;
     }
     if let Some(PaneNode::Leaf(slot)) = root.get_at_path_mut(&pb) {
         *slot = da;
     }
+    root.for_each_split_origin(&mut |from| {
+        if *from == Some(ia) {
+            *from = Some(ib);
+        } else if *from == Some(ib) {
+            *from = Some(ia);
+        }
+    });
     true
 }
 
@@ -1296,6 +1445,7 @@ mod tests {
             pane_id: id(),
             tabs,
             active,
+            split_from: None,
         })
     }
 
@@ -1671,7 +1821,8 @@ mod tests {
         else {
             panic!("expected the three relocated columns");
         };
-        assert_eq!(sizes, &[300.0, 250.0, 250.0]);
+        // `a`'s 200 goes to its neighbour `b`; `a` then takes half of `c`'s 500.
+        assert_eq!(sizes, &[500.0, 250.0, 250.0]);
         assert_eq!(
             children
                 .iter()
@@ -1827,7 +1978,8 @@ mod tests {
             PaneNode::Leaf(LeafData {
                 pane_id: id(),
                 tabs: vec![u],
-                active: 0
+                active: 0,
+                split_from: None,
             })
         );
     }
@@ -2402,5 +2554,364 @@ mod tests {
         let (r0, r1) = (id(), id());
         let tree = hsplit(PaneNode::leaf(l), tabs_leaf(vec![r0, r1], 1));
         assert_eq!(focus_in_direction(&tree, l, FocusDir::Right), Some(r1));
+    }
+
+    // ---- split geometry: a pane that leaves gives its space back ----------
+    //
+    // Sizes are relative weights, so a row of [1000, 500, 500] renders at those
+    // pixels in a 2000px window. Every expected value below is worked out by hand
+    // from that: a split halves the target's weight, and a departing pane's weight
+    // goes to the pane it was split from.
+
+    /// A horizontal row of single-tab columns with these sizes.
+    fn row(sizes: &[f32]) -> (Option<PaneNode>, Vec<Uuid>) {
+        let ids: Vec<Uuid> = sizes.iter().map(|_| id()).collect();
+        let tree = Some(PaneNode::Split {
+            direction: SplitDirection::Horizontal,
+            sizes: sizes.to_vec(),
+            children: ids.iter().map(|&i| PaneNode::leaf(i)).collect(),
+        });
+        (tree, ids)
+    }
+
+    fn root_sizes(tree: &Option<PaneNode>) -> Vec<f32> {
+        match tree {
+            Some(PaneNode::Split { sizes, .. }) => sizes.clone(),
+            other => panic!("expected a split at the root, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn closing_a_split_pane_gives_its_width_back_to_the_pane_it_split_from() {
+        let (mut tree, ids) = row(&[1000.0, 500.0, 500.0]);
+        let new = id();
+        assert!(split(&mut tree, ids[2], SplitDirection::Horizontal, new));
+        assert_eq!(root_sizes(&tree), [1000.0, 500.0, 250.0, 250.0]);
+        assert!(remove(&mut tree, new));
+        assert_eq!(root_sizes(&tree), [1000.0, 500.0, 500.0]);
+    }
+
+    #[test]
+    fn a_pane_split_off_before_its_origin_gives_its_width_back_rightward() {
+        let (mut tree, ids) = row(&[1000.0, 500.0, 500.0]);
+        let new = id();
+        assert!(split_beside(
+            &mut tree,
+            ids[1],
+            SplitDirection::Horizontal,
+            new,
+            true
+        ));
+        assert_eq!(root_sizes(&tree), [1000.0, 250.0, 250.0, 500.0]);
+        assert!(remove(&mut tree, new));
+        assert_eq!(root_sizes(&tree), [1000.0, 500.0, 500.0]);
+    }
+
+    #[test]
+    fn closing_the_last_tab_of_a_split_off_pane_gives_its_width_back() {
+        let (mut tree, ids) = row(&[1000.0, 500.0, 500.0]);
+        let (new, tab) = (id(), id());
+        assert!(split(&mut tree, ids[2], SplitDirection::Horizontal, new));
+        assert!(add_tab(&mut tree, new, tab));
+        assert!(remove(&mut tree, new));
+        // The pane is still open (it holds `tab`), so nothing moves yet.
+        assert_eq!(root_sizes(&tree), [1000.0, 500.0, 250.0, 250.0]);
+        assert!(remove(&mut tree, tab));
+        assert_eq!(root_sizes(&tree), [1000.0, 500.0, 500.0]);
+    }
+
+    #[test]
+    fn dragging_a_split_off_tab_into_another_pane_gives_its_width_back() {
+        // Into a pane that isn't beside it.
+        let (mut tree, ids) = row(&[1000.0, 500.0, 500.0]);
+        let new = id();
+        assert!(split(&mut tree, ids[2], SplitDirection::Horizontal, new));
+        assert!(move_tab_to(&mut tree, new, ids[0], usize::MAX));
+        assert_eq!(root_sizes(&tree), [1000.0, 500.0, 500.0]);
+        assert_eq!(leaf_tabs(&tree, ids[0]), [ids[0], new]);
+
+        // Into the neighbour on the other side: the width still goes back to the
+        // pane it came from, not to the pane it was dropped on.
+        let (mut tree, ids) = row(&[1000.0, 500.0, 500.0]);
+        let new = id();
+        assert!(split(&mut tree, ids[1], SplitDirection::Horizontal, new));
+        assert_eq!(root_sizes(&tree), [1000.0, 250.0, 250.0, 500.0]);
+        assert!(move_into_tabs(&mut tree, new, ids[2]));
+        assert_eq!(root_sizes(&tree), [1000.0, 500.0, 500.0]);
+    }
+
+    #[test]
+    fn moving_a_split_off_pane_gives_its_width_back_and_halves_its_new_neighbour() {
+        let (mut tree, ids) = row(&[1000.0, 500.0, 500.0]);
+        let new = id();
+        assert!(split(&mut tree, ids[2], SplitDirection::Horizontal, new));
+        assert!(move_pane_beside(
+            &mut tree,
+            new,
+            ids[0],
+            SplitDirection::Horizontal,
+            false
+        ));
+        assert_eq!(
+            tree.as_ref().unwrap().collect_instances(),
+            [ids[0], new, ids[1], ids[2]]
+        );
+        assert_eq!(root_sizes(&tree), [500.0, 500.0, 500.0, 500.0]);
+        // It now came from the pane it was dropped beside.
+        assert!(remove(&mut tree, new));
+        assert_eq!(root_sizes(&tree), [1000.0, 500.0, 500.0]);
+    }
+
+    #[test]
+    fn a_chain_of_splits_returns_width_through_a_closed_link() {
+        let (mut tree, ids) = row(&[1000.0, 1000.0]);
+        let (first, second) = (id(), id());
+        // Split the right column leftward, then split the new pane leftward again.
+        assert!(split_beside(
+            &mut tree,
+            ids[1],
+            SplitDirection::Horizontal,
+            first,
+            true
+        ));
+        assert!(split_beside(
+            &mut tree,
+            first,
+            SplitDirection::Horizontal,
+            second,
+            true
+        ));
+        assert_eq!(root_sizes(&tree), [1000.0, 250.0, 250.0, 500.0]);
+        assert!(remove(&mut tree, first));
+        assert_eq!(root_sizes(&tree), [1000.0, 250.0, 750.0]);
+        // `second` came from `first`, which came from the right column. With
+        // `first` gone, its width goes where `first`'s went, not to the left column.
+        assert!(remove(&mut tree, second));
+        assert_eq!(root_sizes(&tree), [1000.0, 1000.0]);
+    }
+
+    #[test]
+    fn a_pane_flattened_into_a_row_gives_its_width_back_to_its_origin() {
+        let (mut tree, ids) = row(&[600.0, 400.0]);
+        let (below, beside) = (id(), id());
+        assert!(split(&mut tree, ids[1], SplitDirection::Vertical, below));
+        assert!(split(&mut tree, below, SplitDirection::Horizontal, beside));
+        // Closing the top of the right column unwraps it: its bottom row joins
+        // the outer row, sharing the column's 400.
+        assert!(remove(&mut tree, ids[1]));
+        assert_eq!(root_sizes(&tree), [600.0, 200.0, 200.0]);
+        assert!(remove(&mut tree, beside));
+        assert_eq!(root_sizes(&tree), [600.0, 400.0]);
+    }
+
+    #[test]
+    fn an_origin_split_the_other_way_still_takes_its_width_back() {
+        let (mut tree, ids) = row(&[1000.0, 500.0, 500.0]);
+        let (new, below) = (id(), id());
+        assert!(split(&mut tree, ids[2], SplitDirection::Horizontal, new));
+        // The origin is now the top of a column; that column gets the width.
+        assert!(split(&mut tree, ids[2], SplitDirection::Vertical, below));
+        assert!(remove(&mut tree, new));
+        assert_eq!(root_sizes(&tree), [1000.0, 500.0, 500.0]);
+        let Some(PaneNode::Split { children, .. }) = &tree else {
+            unreachable!()
+        };
+        assert_eq!(children[2].collect_instances(), [ids[2], below]);
+    }
+
+    #[test]
+    fn a_pane_with_no_recorded_origin_gives_its_width_to_a_neighbour() {
+        // Layouts saved before split history existed: the previous column takes
+        // the width, or the next one when the first column closes.
+        let (mut tree, ids) = row(&[200.0, 300.0, 500.0]);
+        assert!(remove(&mut tree, ids[1]));
+        assert_eq!(root_sizes(&tree), [500.0, 500.0]);
+        let (mut tree, ids) = row(&[200.0, 300.0, 500.0]);
+        assert!(remove(&mut tree, ids[0]));
+        assert_eq!(root_sizes(&tree), [500.0, 500.0]);
+    }
+
+    #[test]
+    fn swapped_panes_leave_split_history_with_the_places_they_left() {
+        let (mut tree, ids) = row(&[800.0, 400.0, 400.0]);
+        let new = id();
+        assert!(split(&mut tree, ids[0], SplitDirection::Horizontal, new));
+        assert_eq!(root_sizes(&tree), [400.0, 400.0, 400.0, 400.0]);
+        assert!(swap_panes(&mut tree, new, ids[2]));
+        assert_eq!(
+            tree.as_ref().unwrap().collect_instances(),
+            [ids[0], ids[2], ids[1], new]
+        );
+        // `new` now sits at the end, far from the pane it was split from. Its
+        // width goes to its neighbour rather than jumping across the row.
+        assert!(remove(&mut tree, new));
+        assert_eq!(root_sizes(&tree), [400.0, 400.0, 800.0]);
+        // The pane now in the place `new` was split into gives that space back.
+        assert!(remove(&mut tree, ids[2]));
+        assert_eq!(root_sizes(&tree), [800.0, 800.0]);
+    }
+
+    #[test]
+    fn split_history_survives_a_save_and_reload() {
+        // Split leftward, so a reload that dropped the history would hand the
+        // width to the left neighbour instead.
+        let (mut tree, ids) = row(&[1000.0, 500.0, 500.0]);
+        let new = id();
+        assert!(split_beside(
+            &mut tree,
+            ids[1],
+            SplitDirection::Horizontal,
+            new,
+            true
+        ));
+        let saved = serde_json::to_string(&tree).unwrap();
+        let mut reloaded: Option<PaneNode> = serde_json::from_str(&saved).unwrap();
+        assert!(remove(&mut reloaded, new));
+        assert_eq!(root_sizes(&reloaded), [1000.0, 500.0, 500.0]);
+    }
+
+    #[test]
+    fn closing_the_same_panes_in_another_order_gives_the_same_layout() {
+        // Pixel-like widths whose f32 sum depends on the order they're added in:
+        // 412.7 + (333.3 + 281.9) rounds to 1027.8999, (412.7 + 333.3) + 281.9 to
+        // 1027.9. Undo compares layouts closed in different orders (see
+        // `same_layout`), so this must still count as the same layout.
+        let (tree, ids) = row(&[412.7, 333.3, 281.9, 500.0]);
+        let mut forward = tree.clone();
+        assert!(remove(&mut forward, ids[1]));
+        assert!(remove(&mut forward, ids[2]));
+        let mut backward = tree;
+        assert!(remove(&mut backward, ids[2]));
+        assert!(remove(&mut backward, ids[1]));
+        let (forward, backward) = (forward.unwrap(), backward.unwrap());
+        // CONTROL: the rounding really differs, so an exact comparison fails.
+        assert_ne!(forward, backward);
+        assert!(forward.same_layout(&backward));
+    }
+
+    #[test]
+    fn same_layout_sees_every_change_beyond_rounding() {
+        // Undo restores the old layout outright only when nothing but rounding
+        // changed, so anything else must count as a different layout.
+        let (a, b, c, d) = (id(), id(), id(), id());
+        let tabs = |tabs: Vec<Uuid>, active: usize| {
+            PaneNode::Leaf(LeafData {
+                tabs,
+                active,
+                ..LeafData::new(a)
+            })
+        };
+        let layout = |outer: SplitDirection, sizes: Vec<f32>, right: PaneNode| PaneNode::Split {
+            direction: outer,
+            sizes,
+            children: vec![tabs(vec![a, b], 0), right],
+        };
+        let column = |children: Vec<PaneNode>| PaneNode::Split {
+            direction: SplitDirection::Vertical,
+            sizes: vec![1.0; children.len()],
+            children,
+        };
+        let base = layout(
+            SplitDirection::Horizontal,
+            vec![400.0, 600.0],
+            column(vec![PaneNode::leaf(c), PaneNode::leaf(d)]),
+        );
+        assert!(base.same_layout(&base.clone()));
+        let PaneNode::Split { children, .. } = &base else {
+            unreachable!()
+        };
+        let right = children[1].clone();
+        let changed = [
+            (
+                "tab order",
+                PaneNode::Split {
+                    direction: SplitDirection::Horizontal,
+                    sizes: vec![400.0, 600.0],
+                    children: vec![tabs(vec![b, a], 0), right.clone()],
+                },
+            ),
+            (
+                "active tab",
+                PaneNode::Split {
+                    direction: SplitDirection::Horizontal,
+                    sizes: vec![400.0, 600.0],
+                    children: vec![tabs(vec![a, b], 1), right.clone()],
+                },
+            ),
+            (
+                "direction",
+                layout(SplitDirection::Vertical, vec![400.0, 600.0], right.clone()),
+            ),
+            (
+                "a size",
+                layout(
+                    SplitDirection::Horizontal,
+                    vec![400.1, 600.0],
+                    right.clone(),
+                ),
+            ),
+            (
+                "pane count",
+                layout(
+                    SplitDirection::Horizontal,
+                    vec![400.0, 600.0],
+                    column(vec![
+                        PaneNode::leaf(c),
+                        PaneNode::leaf(d),
+                        PaneNode::leaf(id()),
+                    ]),
+                ),
+            ),
+            (
+                "nesting",
+                layout(
+                    SplitDirection::Horizontal,
+                    vec![400.0, 600.0],
+                    column(vec![PaneNode::leaf(c), column(vec![PaneNode::leaf(d)])]),
+                ),
+            ),
+        ];
+        for (what, other) in changed {
+            assert!(!base.same_layout(&other), "a changed {what} went unseen");
+        }
+    }
+
+    #[test]
+    fn a_pane_whose_origin_sits_outside_its_split_gives_its_width_to_a_neighbour() {
+        // Moves, swaps and undo can leave a pane's origin in another part of the
+        // layout. Its width stays inside its own split: the pane before it there
+        // takes it, and nothing outside that split moves.
+        let left = LeafData::new(id());
+        let pane = |from: Option<Uuid>| LeafData {
+            split_from: from,
+            ..LeafData::new(id())
+        };
+        let (top, middle, bottom) = (pane(None), pane(Some(left.pane_id)), pane(None));
+        let gone = middle.tabs[0];
+        let mut tree = Some(PaneNode::Split {
+            direction: SplitDirection::Horizontal,
+            sizes: vec![1000.0, 1000.0],
+            children: vec![
+                PaneNode::Leaf(left),
+                PaneNode::Split {
+                    direction: SplitDirection::Vertical,
+                    sizes: vec![300.0, 300.0, 400.0],
+                    children: vec![
+                        PaneNode::Leaf(top),
+                        PaneNode::Leaf(middle),
+                        PaneNode::Leaf(bottom),
+                    ],
+                },
+            ],
+        });
+        assert!(remove(&mut tree, gone));
+        assert_eq!(root_sizes(&tree), [1000.0, 1000.0]);
+        let Some(PaneNode::Split { children, .. }) = &tree else {
+            unreachable!()
+        };
+        let PaneNode::Split { sizes, .. } = &children[1] else {
+            panic!("the right column should still be split: {tree:?}");
+        };
+        assert_eq!(sizes, &[600.0, 400.0]);
     }
 }
