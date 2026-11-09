@@ -78,13 +78,26 @@ fn reason_close_evidence(reason: TerminalStatusReason) -> CloseEvidence {
         TerminalStatusReason::ProgramStatusError => CloseEvidence::Quiet,
         TerminalStatusReason::ProviderHook => CloseEvidence::Hook,
         TerminalStatusReason::ProviderTitle => CloseEvidence::Title,
-        TerminalStatusReason::ProviderScreen => CloseEvidence::Screen,
+        TerminalStatusReason::ProviderScreen | TerminalStatusReason::BackgroundWork => {
+            CloseEvidence::Screen
+        }
         TerminalStatusReason::BlockedMarker | TerminalStatusReason::WorkingMarker => {
             CloseEvidence::Output
         }
         TerminalStatusReason::Bell => CloseEvidence::Bell,
         TerminalStatusReason::RecentOutput => CloseEvidence::Output,
         TerminalStatusReason::Quiet => CloseEvidence::Quiet,
+    }
+}
+
+/// A close kills what runs beside a finished turn, so it counts as busy and asks.
+fn close_state(
+    state: AgentState,
+    background: Option<muxel_core::control::BackgroundWork>,
+) -> AgentState {
+    match state {
+        AgentState::Idle | AgentState::Done if background.is_some() => AgentState::Working,
+        state => state,
     }
 }
 
@@ -221,6 +234,7 @@ impl MuxelApp {
         if evidence == CloseEvidence::ShellPrompt && state != AgentState::Exited {
             state = AgentState::Idle;
         }
+        state = close_state(state, snapshot.and_then(|snapshot| snapshot.background));
         let awaiting_reply = inst.is_some_and(|inst| {
             self.control_turns.get(&iid).is_some_and(|turn| {
                 turn.awaiting_reply(
@@ -362,6 +376,18 @@ impl MuxelApp {
                         return tf(
                             "{name}'s tmux session may still be running.",
                             &[("name", inst.display_name())],
+                        );
+                    }
+                    if let Some(work) = self
+                        .terminal_view(iid)
+                        .and_then(|view| view.read(cx).runtime_snapshot().background)
+                    {
+                        return tf(
+                            "{name} is still running {work}.",
+                            &[
+                                ("name", inst.display_name()),
+                                ("work", &super::background_label(work)),
+                            ],
                         );
                     }
                     let state = match facts.status {
@@ -1525,7 +1551,7 @@ impl MuxelApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{CloseGroup, reason_close_evidence};
+    use super::{CloseGroup, close_state, reason_close_evidence};
     use muxel_core::control::AgentState;
     use muxel_core::recoverable_close::{
         CloseDecision, CloseFacts, CloseStage, decide, departure_finalizes,
@@ -1548,6 +1574,22 @@ mod tests {
             input_rev: 0,
             completion_rev: 0,
         }
+    }
+
+    /// A dev server past its hold reads done, and a close would still kill it.
+    #[test]
+    fn a_close_asks_while_anything_runs_beside_a_finished_turn() {
+        let shell = muxel_core::control::BackgroundWork {
+            shells: 1,
+            ..Default::default()
+        };
+        let program = TerminalStatusReason::ProgramStatus(None);
+        let ask = |state, background| {
+            decide(facts(close_state(state, background), program), true) == CloseDecision::Ask
+        };
+        assert!(!ask(AgentState::Done, None), "a finished turn counts down");
+        assert!(ask(AgentState::Done, Some(shell)));
+        assert!(ask(AgentState::Idle, Some(shell)));
     }
 
     #[test]

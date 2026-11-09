@@ -49,6 +49,7 @@ mod tests {
         let loop_id = Uuid::new_v4();
         let launch = Uuid::new_v4();
         let runtime = TerminalRuntimeSnapshot {
+            background: None,
             status: AgentStatus::Working,
             attributable: true,
             reason: TerminalStatusReason::Quiet,

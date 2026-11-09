@@ -456,6 +456,37 @@ a provider has no hidden background work, so the snapshot reports
 `ActivityOnly`, `VisibleMarkers`, or `ProviderVisible` coverage rather than
 claiming more than the terminal shows.
 
+Background work is read from the same screen. Claude 2.1.318's footer lists it live
+in every permission mode, as `1 shell`, `1 monitor` or `/tasks to see subagents`, and
+clears by itself. Its `← 4 agents` is on every footer and is not a running count, and
+a finished turn's `1 shell still running` row stays on screen after the shell ends, so
+an empty footer outranks that row. Grok 1.0.70 draws no 7501 report; its panel above
+the composer lists `Tasks`, `Watchers` and `Subagents`, and a `Loop` under Watchers
+is a scheduled wake, not running work. Codex's report already stays Working while a
+background terminal runs. Its parent reads finished while a spawned agent runs, and
+nothing on its terminal says so.
+
+Plain `ctl wait` now follows the background hold rather than returning at the
+foreground turn's end. `ctl wait --turn` stops at an observable turn end with
+background work still listed. It cannot override a provider's continuing Working
+report. Send admission and the background turn-end decision require the hold's
+binding revision to match the current conversation. Completion attribution stays
+separate: a surviving footer after `/clear` can still leave the current composer
+free without updating activity. Foreground working/blocked markers prevent that
+background-only exception. Cached holds from before reconciliation cannot authorize
+input or finish a wait.
+
+A held turn takes no completion: the report that started the hold would otherwise stamp
+the pane as finished. The release is its own status change. A switch reads the same way:
+`/clear` beside a running shell leaves no report until the next turn, and only a title
+reading Working would end the screen hold, which no title does between turns. So the pane
+holds and takes prompts, and the screen hold only keeps it from alerting. Both Windows
+paths need a real run: a plain build uses the system console, where Claude sends no
+reports, and a `conpty.dll` with a recent `OpenConsole.exe` beside the exe gets them.
+A hook would add exact kinds
+but fires only at turn end, so it can't see work ending between turns, and it needs a
+helper on the host.
+
 ## Popout refresh
 
 Popout roots observe their pane entity for title, status and content, and the

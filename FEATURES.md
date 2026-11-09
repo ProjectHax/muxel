@@ -525,8 +525,20 @@ feature is added or changed, update the matching entry here in the same change**
   updates on known agent panes are accepted only from that provider's semantic
   title shape; existing marker, bell, and process-exit signals still apply.
   Provider-owned screen rows can add precise state that titles omit: Claude
-  permission forms report **blocked**, while positive background counts displayed
-  by Claude and Grok remain **working** even when their titles look idle. Claude's
+  permission forms report **blocked**, and background work listed by Claude's footer
+  or Grok's panel holds a finished turn at **working**, labelled with what's running
+  (`working · 1 shell`). That covers tmux and SSH panes too, and it beats Claude's own
+  finished report. A held turn doesn't alert or move in Recent, and it reads **done**
+  once when the work ends and the agent has had a moment to wake for it. Shells and
+  monitors hold for 30 minutes, since a long-lived dev server looks the same as a shell
+  the agent is waiting on; past that the pane reads `done · 1 shell` and alerts as a
+  finished turn. Subagents hold until they end. Closing a pane asks while anything is
+  listed as running, and `ctl status` reports it as `background`. `ctl send` still
+  delivers to a held pane, since its prompt is free. `ctl wait` follows the pane and
+  keeps waiting through a hold, changing its previous behavior of returning when
+  the foreground turn finished. It lists what's still running if it times out
+  first; `ctl wait --turn` stops at an observable turn end even if background work
+  remains. It cannot override a provider still reporting **working**. Claude's
   visible foreground progress row also preserves **working** when a narrow tmux
   pane truncates the usual interrupt marker. Brief
   Grok redraw gaps do not forge completion. Panes judged by output activity

@@ -13,6 +13,7 @@ use crate::session::{
 use alacritty_terminal::term::ClipboardType;
 use anyhow::Context as _;
 use gpui::*;
+use muxel_core::control::BackgroundWork;
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -186,6 +187,8 @@ pub enum TerminalStatusReason {
     WorkingMarker,
     ProviderTitle,
     ProviderScreen,
+    /// A finished turn held at Working: see [`BackgroundHold`].
+    BackgroundWork,
     Bell,
     /// A provider's own lifecycle hook (Muse's root-session hooks).
     ProviderHook,
@@ -223,6 +226,8 @@ pub struct TerminalRuntimeSnapshot {
     /// New provider-owned completions in this launch and binding. Consumers
     /// compare this value even when two turns end at the same Done badge.
     pub completion_revision: u64,
+    /// What the provider's own screen says is still running beside its turn.
+    pub background: Option<BackgroundWork>,
 }
 
 impl TerminalRuntimeSnapshot {
@@ -257,6 +262,9 @@ struct RuntimeStatusState {
     working_marker: bool,
     blocked_marker: bool,
     provider_screen: Option<AgentStatus>,
+    provider_background: Option<BackgroundWork>,
+    background_hold: BackgroundHold,
+    background: Option<BackgroundWork>,
     prev_raw: Option<AgentStatus>,
     done_latch: bool,
     completion_armed: bool,
@@ -304,6 +312,9 @@ impl RuntimeStatusState {
             working_marker: false,
             blocked_marker: false,
             provider_screen: None,
+            provider_background: None,
+            background_hold: BackgroundHold::default(),
+            background: None,
             prev_raw: None,
             done_latch: false,
             completion_armed: false,
@@ -340,6 +351,7 @@ impl RuntimeStatusState {
             } else {
                 0
             },
+            background: self.background.filter(|_| current_binding),
         }
     }
 
@@ -385,6 +397,8 @@ impl RuntimeStatusState {
             self.working_marker = false;
             self.blocked_marker = false;
             self.provider_screen = None;
+            self.provider_background = None;
+            self.background_hold = BackgroundHold::default();
             self.program_explicit_completions = 0;
             self.program_idle_completions = 0;
             self.completion_revision = 0;
@@ -515,7 +529,8 @@ impl RuntimeStatusState {
                 let screen = status_screen_context(title_provider, &captured);
                 self.working_marker = working_markers.iter().any(|marker| screen.contains(marker));
                 self.blocked_marker = blocked_markers.iter().any(|marker| screen.contains(marker));
-                self.provider_screen = provider_screen_status(title_provider, &screen);
+                (self.provider_screen, self.provider_background) =
+                    provider_screen_read(title_provider, &screen);
             }
             StatusScreenCapture::At(deadline) => next_deadline = Some(deadline),
             StatusScreenCapture::None if !has_visible_sources => {
@@ -525,6 +540,7 @@ impl RuntimeStatusState {
                 self.working_marker = false;
                 self.blocked_marker = false;
                 self.provider_screen = None;
+                self.provider_background = None;
             }
             StatusScreenCapture::None => {}
         }
@@ -547,7 +563,37 @@ impl RuntimeStatusState {
             activity_fallback,
             idle,
         );
-        let provider_screen = self.provider_screen;
+        let turn_over = match program_root {
+            Some(root) => matches!(root.state, ProgramState::Done | ProgramState::Idle),
+            None => {
+                !matches!(title, Some(AgentStatus::Working | AgentStatus::Blocked))
+                    && self.provider_screen.is_none()
+                    && !self.working_marker
+                    && !self.blocked_marker
+            }
+        };
+        // A switch doesn't change this. Until a new turn says otherwise the pane has
+        // nothing running in its foreground. Only a title reading Working would end the
+        // screen hold, and between turns Claude's title reads Idle, or has no glyph at all
+        // once it has reported, so waiting on that would pin it busy for the shell's whole
+        // life. The screen hold still keeps it from alerting, and work that ends under it
+        // gets no wake grace: this conversation has run no turn.
+        let ended_before_a_turn =
+            self.provider_background.is_none() && self.screen_held && program_root.is_none();
+        let (background_holds, background_deadline) = self.background_hold.observe(
+            self.provider_background,
+            exited || !turn_over || ended_before_a_turn,
+            now,
+        );
+        if let Some(deadline) = background_deadline {
+            next_deadline = Some(next_deadline.map_or(deadline, |old| old.min(deadline)));
+        }
+        // Only an expired hold stops listed work reading as Working.
+        let background_reads_working =
+            background_holds || (self.provider_background.is_some() && !turn_over);
+        let provider_screen = self
+            .provider_screen
+            .or(background_reads_working.then_some(AgentStatus::Working));
         let working_marker = self.working_marker;
         let blocked_marker = self.blocked_marker;
         let mut screen_working = working_marker || provider_screen == Some(AgentStatus::Working);
@@ -555,10 +601,18 @@ impl RuntimeStatusState {
             .or(blocked_marker.then_some(AgentStatus::Blocked))
             .or(working_marker.then_some(AgentStatus::Working));
         // Only a title read after the window can confirm a held marker; one
-        // the settle deadline accepted may be the old conversation's too.
+        // the settle deadline accepted may be the old conversation's too. Listed work
+        // can't pin that on a reporting pane, whose title stays without a glyph.
+        let held_marker = if program_root.is_some() {
+            self.provider_screen
+                .or(blocked_marker.then_some(AgentStatus::Blocked))
+                .or(working_marker.then_some(AgentStatus::Working))
+        } else {
+            screen_marker
+        };
         self.screen_held = screen_hold_after(
             self.screen_held,
-            screen_marker,
+            held_marker,
             fresh_title.filter(|_| evidence.title_fresh),
         );
         // The two-second evidence settle accepts uncertain titles as level
@@ -615,7 +669,12 @@ impl RuntimeStatusState {
 
             let (working, last_seen, hold_deadline) = grok_screen_working_state(
                 screen_working,
-                provider_screen == Some(AgentStatus::Working) && !settling && !self.screen_held,
+                // A held row gets the wake grace once it goes, so this repaint hold
+                // only covers a row beside a running turn.
+                provider_screen == Some(AgentStatus::Working)
+                    && !settling
+                    && !self.screen_held
+                    && !background_holds,
                 self.grok_screen_working_at,
                 now,
             );
@@ -678,7 +737,14 @@ impl RuntimeStatusState {
         {
             self.codex_idle_done = false;
         }
-        let new_completions = new_explicit + codex_idle_completions;
+        // A report held at Working has finished nothing yet. Counting it would
+        // stamp the pane as finished and float it. The release is its own event.
+        let background_held = background_holds && program_root.is_some();
+        let new_completions = if background_held {
+            0
+        } else {
+            new_explicit + codex_idle_completions
+        };
         let previous_completion_revision = self.completion_revision;
         self.completion_revision = self.completion_revision.wrapping_add(new_completions);
         let masked_blocked = program_root
@@ -687,34 +753,38 @@ impl RuntimeStatusState {
         let raw = program_root.map_or(fallback_raw, |root| {
             if masked_blocked.is_some() {
                 AgentStatus::Blocked
+            } else if background_held {
+                AgentStatus::Working
             } else if root.state == ProgramState::Idle && self.codex_idle_done {
                 AgentStatus::Done
             } else {
                 program_status_state(root)
             }
         });
-        let raw_reason = masked_blocked.unwrap_or_else(|| {
-            program_root.map_or_else(
-                || {
-                    if silent_switch_settled && !exited && !bell {
-                        TerminalStatusReason::Quiet
-                    } else if hook == Some(raw) {
-                        TerminalStatusReason::ProviderHook
-                    } else {
-                        status_reason(
-                            raw,
-                            exited,
-                            bell,
-                            title,
-                            provider_screen,
-                            working_marker,
-                            blocked_marker,
-                        )
-                    }
-                },
-                program_status_reason,
-            )
-        });
+        let raw_reason = masked_blocked
+            .or(background_held.then_some(TerminalStatusReason::BackgroundWork))
+            .unwrap_or_else(|| {
+                program_root.map_or_else(
+                    || {
+                        if silent_switch_settled && !exited && !bell {
+                            TerminalStatusReason::Quiet
+                        } else if hook == Some(raw) {
+                            TerminalStatusReason::ProviderHook
+                        } else {
+                            status_reason(
+                                raw,
+                                exited,
+                                bell,
+                                title,
+                                provider_screen,
+                                working_marker,
+                                blocked_marker,
+                            )
+                        }
+                    },
+                    program_status_reason,
+                )
+            });
         let raw_attributable = status_is_attributable(settling, self.screen_held, raw_reason);
         let (status, latch, armed) = if program_root.is_some() {
             // Authoritative protocol states bypass the visible-source latch.
@@ -770,28 +840,35 @@ impl RuntimeStatusState {
             next_deadline = Some(next_deadline.map_or(deadline, |old| old.min(deadline)));
         }
 
-        let reason = masked_blocked.unwrap_or_else(|| {
-            program_root.map_or_else(
-                || {
-                    if silent_switch_settled {
-                        TerminalStatusReason::Quiet
-                    } else if hook == Some(status) {
-                        TerminalStatusReason::ProviderHook
-                    } else {
-                        status_reason(
-                            status,
-                            exited,
-                            bell,
-                            title,
-                            provider_screen,
-                            working_marker,
-                            blocked_marker,
-                        )
-                    }
-                },
-                program_status_reason,
-            )
-        });
+        let reason = masked_blocked
+            .or(background_held.then_some(TerminalStatusReason::BackgroundWork))
+            .unwrap_or_else(|| {
+                program_root.map_or_else(
+                    || {
+                        if silent_switch_settled {
+                            TerminalStatusReason::Quiet
+                        } else if hook == Some(status) {
+                            TerminalStatusReason::ProviderHook
+                        } else {
+                            status_reason(
+                                status,
+                                exited,
+                                bell,
+                                title,
+                                provider_screen,
+                                working_marker,
+                                blocked_marker,
+                            )
+                        }
+                    },
+                    program_status_reason,
+                )
+            });
+        let reason = if background_holds && reason == TerminalStatusReason::ProviderScreen {
+            TerminalStatusReason::BackgroundWork
+        } else {
+            reason
+        };
         let attributable = status_is_attributable(settling, self.screen_held, reason);
         if exited {
             next_deadline = None;
@@ -808,7 +885,9 @@ impl RuntimeStatusState {
         } else {
             self.fallback_coverage
         };
+        let background = self.provider_background.filter(|_| !exited);
         let public_changed = status != self.status
+            || background != self.background
             || reason != self.reason
             || coverage != self.coverage
             || attributable != self.attributable
@@ -820,6 +899,7 @@ impl RuntimeStatusState {
             self.snapshot_seq = self.snapshot_seq.wrapping_add(1);
         }
         self.status = status;
+        self.background = background;
         self.reason = reason;
         self.coverage = coverage;
         self.attributable = attributable;
@@ -1150,26 +1230,150 @@ fn status_screen_context(provider: TitleProvider, screen: &crate::startup::Scree
 
 /// Provider-owned visible UI that adds state not carried by the terminal title.
 fn provider_screen_status(provider: TitleProvider, screen: &str) -> Option<AgentStatus> {
+    let (status, background) = provider_screen_read(provider, screen);
+    status.or(background.map(|_| AgentStatus::Working))
+}
+
+/// What the turn itself is doing, and apart from that what runs beside it.
+fn provider_screen_read(
+    provider: TitleProvider,
+    screen: &str,
+) -> (Option<AgentStatus>, Option<BackgroundWork>) {
     match provider {
-        TitleProvider::Claude if is_claude_blocked_prompt(screen) => Some(AgentStatus::Blocked),
-        TitleProvider::Claude if claude_screen_has_current_work(screen) => {
-            Some(AgentStatus::Working)
+        TitleProvider::Claude => {
+            let work = claude_screen_work(screen);
+            let status = if is_claude_blocked_prompt(screen) {
+                Some(AgentStatus::Blocked)
+            } else {
+                work.foreground.then_some(AgentStatus::Working)
+            };
+            (status, work.background)
         }
-        TitleProvider::Grok if is_grok_question(screen) => Some(AgentStatus::Blocked),
-        TitleProvider::Grok
-            if screen.lines().any(|line| {
-                is_live_background_row(
-                    line,
-                    &["◎", "·"],
-                    &["command", "monitor", "loop", "subagent"],
-                    false,
-                )
-            }) =>
-        {
-            Some(AgentStatus::Working)
-        }
-        _ => None,
+        TitleProvider::Grok => (
+            is_grok_question(screen).then_some(AgentStatus::Blocked),
+            grok_background(screen),
+        ),
+        _ => (None, None),
     }
+}
+
+/// A finished turn beside live background work does not need anyone, so it
+/// reads Working. Nothing on screen separates a shell the agent waits on from a
+/// long-lived server, so shells and monitors hold only for a time: past that the
+/// turn reads finished, with its work still listed. 30 minutes covers 95% of the
+/// background shells measured from real sessions. Subagents come back on their
+/// own, so they hold until they end.
+const BACKGROUND_HOLD: Duration = Duration::from_secs(30 * 60);
+/// When background work ends the agent wakes for it, moments later. Done in that
+/// gap would alert and float the pane just before it starts working again.
+const BACKGROUND_WAKE_GRACE: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BackgroundHold {
+    turn_ended_at: Option<Instant>,
+    holding: bool,
+    cleared_at: Option<Instant>,
+}
+
+impl BackgroundHold {
+    /// Whether this finished turn still reads Working, and when that may change.
+    fn observe(
+        &mut self,
+        work: Option<BackgroundWork>,
+        turn_running: bool,
+        now: Instant,
+    ) -> (bool, Option<Instant>) {
+        if turn_running {
+            *self = Self::default();
+            return (false, None);
+        }
+        if let Some(work) = work {
+            let until = *self.turn_ended_at.get_or_insert(now) + BACKGROUND_HOLD;
+            self.cleared_at = None;
+            self.holding = work.subagents || now < until;
+            return (
+                self.holding,
+                (self.holding && !work.subagents).then_some(until),
+            );
+        }
+        if self.holding {
+            let until = *self.cleared_at.get_or_insert(now) + BACKGROUND_WAKE_GRACE;
+            if now < until {
+                return (true, Some(until));
+            }
+        }
+        *self = Self::default();
+        (false, None)
+    }
+}
+
+/// Grok's panel sits directly above its composer: a header with a count, then a
+/// row per item. `v Tasks 1` / `· Run Sleep 45 seconds`. A loop under Watchers is
+/// a scheduled wake, not running work.
+fn grok_panel_background(screen: &str) -> BackgroundWork {
+    let rows: Vec<&str> = screen
+        .lines()
+        .map(str::trim)
+        .filter(|row| !row.is_empty())
+        .collect();
+    let mut work = BackgroundWork::default();
+    let Some(composer) = rows.iter().rposition(|row| row.starts_with('╭')) else {
+        return work;
+    };
+    let mut items: Vec<&str> = Vec::new();
+    for row in rows[..composer].iter().rev().take(24) {
+        let mut words = row.split_whitespace();
+        let header = match (words.next(), words.next(), words.next(), words.next()) {
+            (Some("v" | ">"), Some(group), Some(count), None) => {
+                count.parse::<u32>().ok().map(|count| (group, count))
+            }
+            _ => None,
+        };
+        let Some((group, count)) = header else {
+            items.push(row);
+            continue;
+        };
+        if items.len() > count as usize {
+            break;
+        }
+        match group {
+            "Tasks" => work.shells += count,
+            "Subagents" => work.subagents = true,
+            "Watchers" => {
+                work.monitors += items
+                    .iter()
+                    .filter(|item| item.split_whitespace().nth(1) == Some("Monitor"))
+                    .count() as u32;
+            }
+            _ => break,
+        }
+        items.clear();
+    }
+    work
+}
+
+fn grok_background(screen: &str) -> Option<BackgroundWork> {
+    let mut work = grok_panel_background(screen);
+    if !work.is_empty() {
+        return Some(work);
+    }
+    // Older Grok draws counted rows instead of the panel.
+    for line in screen.lines() {
+        let counts = live_background_counts(
+            line,
+            &["◎", "·"],
+            &["command", "monitor", "loop", "subagent"],
+            false,
+        );
+        for (count, kind) in counts.into_iter().flatten() {
+            match kind.trim_end_matches('s') {
+                "command" => work.shells += count,
+                "monitor" | "loop" => work.monitors += count,
+                _ => work.subagents = true,
+            }
+        }
+    }
+    (!work.is_empty()).then_some(work)
 }
 
 /// Grok's unanswered question card, read only while the card's own footer is
@@ -1210,48 +1414,124 @@ fn is_grok_question(screen: &str) -> bool {
             >= 2
 }
 
-fn claude_screen_has_current_work(screen: &str) -> bool {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClaudeScreenWork {
+    foreground: bool,
+    background: Option<BackgroundWork>,
+}
+
+/// Newest row first, as a redraw leaves older rows above. The footer is live, so
+/// once it has said what's running a finished turn's old count means nothing.
+fn claude_screen_work(screen: &str) -> ClaudeScreenWork {
     let mut newer_rows = [None, None];
+    let mut footer_read = false;
+    let mut background = None;
     for line in screen.lines().rev() {
-        if is_claude_live_task_footer(line, newer_rows)
-            || is_claude_live_foreground_row(line)
-            || is_claude_live_background_row(line)
-        {
-            return true;
+        if !footer_read && let Some(listed) = claude_mode_footer(line) {
+            footer_read = true;
+            background = listed;
+        }
+        if is_claude_live_foreground_row(line) {
+            return ClaudeScreenWork {
+                foreground: true,
+                background,
+            };
+        }
+        if !footer_read {
+            let found = claude_live_task_footer(line, newer_rows)
+                .as_deref()
+                .map(claude_task_footer_work)
+                .or_else(|| claude_background_row_work(line));
+            if found.is_some() {
+                return ClaudeScreenWork {
+                    foreground: false,
+                    background: found,
+                };
+            }
         }
         if is_claude_completed_foreground_row(line) {
-            return false;
+            return ClaudeScreenWork {
+                foreground: false,
+                background,
+            };
         }
         newer_rows[1] = newer_rows[0];
         newer_rows[0] = Some(line);
     }
-    false
+    ClaudeScreenWork {
+        foreground: false,
+        background,
+    }
 }
 
-fn is_claude_live_task_footer(line: &str, newer_rows: [Option<&str>; 2]) -> bool {
+/// Claude's footer in every permission mode: `⏵⏵ auto mode on · 3 shells · ← 4
+/// agents`. `← 4 agents` is on every footer and is not a running count. Outer
+/// `None` when this isn't the footer, inner when it lists nothing.
+fn claude_mode_footer(line: &str) -> Option<Option<BackgroundWork>> {
+    let mut segments = line.trim().split(" · ").peekable();
+    let mode = segments.peek()?;
+    if !(mode.starts_with('⏵') || mode.starts_with('⏸') || mode.ends_with("for shortcuts")) {
+        return None;
+    }
+    let mut work = BackgroundWork::default();
+    for segment in segments.skip(1) {
+        let segment = segment.trim();
+        if segment == "/tasks to see subagents" {
+            work.subagents = true;
+        } else if let Some((count, kind)) = segment.split_once(' ')
+            && let Ok(count) = count.parse::<u32>()
+        {
+            match kind {
+                "shell" | "shells" => work.shells += count,
+                "monitor" | "monitors" => work.monitors += count,
+                _ => {}
+            }
+        }
+    }
+    Some((!work.is_empty()).then_some(work))
+}
+
+fn claude_task_footer_work(footer: &str) -> BackgroundWork {
+    let mut work = BackgroundWork::default();
+    let summary = footer.trim().trim_start_matches("Auto mode on · ");
+    for task in summary.split(" · ").flat_map(|group| group.split(", ")) {
+        if let Some((count, kind)) = task.split_once(' ')
+            && let Ok(count) = count.parse::<u32>()
+        {
+            match kind {
+                "shell" | "shells" => work.shells += count,
+                "monitor" | "monitors" => work.monitors += count,
+                _ => work.subagents = true,
+            }
+        }
+    }
+    work
+}
+
+fn claude_live_task_footer(line: &str, newer_rows: [Option<&str>; 2]) -> Option<String> {
     if is_claude_live_task_footer_line(line) {
-        return true;
+        return Some(line.trim().to_string());
     }
     if !line.trim().starts_with("Auto mode") {
-        return false;
+        return None;
     }
 
     let mut footer = line.trim().to_string();
     let mut previous = line;
     for row in newer_rows.into_iter().flatten() {
         if row.trim().is_empty() {
-            return false;
+            return None;
         }
         if previous.ends_with(char::is_whitespace) || row.starts_with(char::is_whitespace) {
             footer.push(' ');
         }
         footer.push_str(row.trim());
         if is_claude_live_task_footer_line(&footer) {
-            return true;
+            return Some(footer);
         }
         previous = row;
     }
-    false
+    None
 }
 
 fn is_claude_live_task_footer_line(line: &str) -> bool {
@@ -1411,19 +1691,23 @@ fn is_claude_elapsed(value: &str) -> bool {
     previous_rank != 4
 }
 
-fn is_claude_live_background_row(line: &str) -> bool {
-    if is_live_background_row(line, &["·"], &["command"], true) {
-        return true;
+fn claude_background_row_work(line: &str) -> Option<BackgroundWork> {
+    fn total(counts: Vec<(u32, &str)>) -> u32 {
+        counts.into_iter().map(|(count, _)| count).sum()
     }
-
-    let line = line.trim();
-    let Some((activity, summary)) = line.rsplit_once(" · ") else {
-        return false;
-    };
-    if !activity.trim().starts_with("✻ ") {
-        return false;
-    }
-    is_live_background_row(&format!("· {summary}"), &["·"], &["shell"], false)
+    let shells = live_background_counts(line, &["·"], &["command"], true)
+        .map(total)
+        .or_else(|| {
+            let (activity, summary) = line.trim().rsplit_once(" · ")?;
+            if !activity.trim().starts_with("✻ ") {
+                return None;
+            }
+            live_background_counts(&format!("· {summary}"), &["·"], &["shell"], false).map(total)
+        })?;
+    Some(BackgroundWork {
+        shells,
+        ..BackgroundWork::default()
+    })
 }
 
 fn is_claude_blocked_prompt(screen: &str) -> bool {
@@ -1470,58 +1754,57 @@ fn is_claude_blocked_prompt(screen: &str) -> bool {
     recent.contains("enter to confirm") || (recent.contains("enter to select") && has_navigation)
 }
 
-fn is_live_background_row(
-    line: &str,
+/// The counts in a provider's `N kind still running` row, or `None` for any other row.
+fn live_background_counts<'a>(
+    line: &'a str,
     provider_markers: &[&str],
     allowed_kinds: &[&str],
     require_interrupt_hint: bool,
-) -> bool {
+) -> Option<Vec<(u32, &'a str)>> {
     let words: Vec<_> = line.split_whitespace().collect();
     if words
         .first()
         .is_none_or(|word| !provider_markers.contains(word))
     {
-        return false;
+        return None;
     }
 
     const INTERRUPT_HINT: [&str; 6] = ["·", "send", "a", "message", "to", "interrupt"];
     let summary_end = if words.ends_with(&INTERRUPT_HINT) {
         words.len() - INTERRUPT_HINT.len()
     } else if require_interrupt_hint {
-        return false;
+        return None;
     } else {
         words.len()
     };
     if summary_end < 4 || words[summary_end - 2..summary_end] != ["still", "running"] {
-        return false;
+        return None;
     }
 
     let summary = &words[1..summary_end - 2];
+    let mut counts = Vec::new();
     let mut index = 0;
     while index < summary.len() {
-        let Some(kind) = summary.get(index + 1) else {
-            return false;
-        };
-        let Ok(count) = summary[index].parse::<usize>() else {
-            return false;
-        };
+        let kind = summary.get(index + 1)?;
+        let count = summary[index].parse::<u32>().ok()?;
         if count == 0
             || !allowed_kinds.iter().any(|base| {
                 (count == 1 && kind == base) || (count > 1 && kind.strip_suffix('s') == Some(*base))
             })
         {
-            return false;
+            return None;
         }
+        counts.push((count, *kind));
         index += 2;
         if index == summary.len() {
-            return true;
+            return Some(counts);
         }
         if summary[index] != "·" {
-            return false;
+            return None;
         }
         index += 1;
     }
-    false
+    None
 }
 
 fn is_grok_spinner(part: &str) -> bool {
@@ -1802,6 +2085,7 @@ fn status_is_attributable(settling: bool, screen_held: bool, reason: TerminalSta
         // provider-owned evidence even while an older title is settling.
         TerminalStatusReason::ProgramStatus(_) | TerminalStatusReason::ProgramStatusError => true,
         TerminalStatusReason::ProviderScreen
+        | TerminalStatusReason::BackgroundWork
         | TerminalStatusReason::BlockedMarker
         | TerminalStatusReason::WorkingMarker
             if screen_held =>
@@ -2267,7 +2551,7 @@ fn ctl_title_can_confirm(
             Some(AgentStatus::Working | AgentStatus::Blocked)
         )
         && !matches!(
-            provider_screen_status(provider, &screen.text),
+            provider_screen_read(provider, &screen.text).0,
             Some(AgentStatus::Working | AgentStatus::Blocked)
         )
 }
@@ -3544,12 +3828,15 @@ impl TerminalView {
         let resize_revision = self.session.resize_revision();
         let (before_title, title) = self.session.title_snapshot();
         let screen = self.session.startup_screen();
-        let allow_working_title = ctl_title_can_confirm(
-            self.title_provider,
-            &screen,
-            title.as_deref(),
-            self.status(),
-        );
+        // A turn held for its background work is over, so a new turn's title can
+        // confirm this prompt.
+        let status = if self.runtime.reason == TerminalStatusReason::BackgroundWork {
+            AgentStatus::Done
+        } else {
+            self.status()
+        };
+        let allow_working_title =
+            ctl_title_can_confirm(self.title_provider, &screen, title.as_deref(), status);
         let before_prompt = ctl_transcript_prompt(self.title_provider, &screen, || {
             self.session.recent_text(500)
         })
@@ -4999,6 +5286,32 @@ mod startup_readiness_tests {
                 status
             ));
         }
+    }
+
+    /// A held turn is over, so a new turn's title can confirm a send. A turn the
+    /// screen shows still running can't, whatever runs beside it.
+    #[test]
+    fn a_send_to_a_held_turn_can_confirm_from_its_title() {
+        use super::AgentStatus;
+        let screen = |text: &str| Screen {
+            text: text.to_string(),
+            ..codex_screen("")
+        };
+        let footer = "  [>_>] pane\n  ⏵⏵ auto mode on · 1 shell · ← 4 agents";
+        assert!(ctl_title_can_confirm(
+            TitleProvider::Claude,
+            &screen(&format!("● Done.\n\n{footer}")),
+            Some("✳ scratch"),
+            AgentStatus::Done
+        ));
+        assert!(!ctl_title_can_confirm(
+            TitleProvider::Claude,
+            &screen(&format!(
+                "● Done.\n\n✻ Chewing on it… (20s · ↓ 171 tokens)\n\n{footer}"
+            )),
+            Some("✳ scratch"),
+            AgentStatus::Done
+        ));
     }
 
     #[test]
@@ -8500,6 +8813,549 @@ mod provider_switch_tests {
             }
         }
 
+        /// Claude reports `done` when a turn ends, whatever the turn left running.
+        /// A Done here would alert and float the pane while it waits on a shell. The
+        /// rows are real ones captured from Claude 2.1.318.
+        #[test]
+        fn a_finished_turn_holds_at_working_beside_background_work() {
+            use crate::view::{BACKGROUND_WAKE_GRACE, TerminalStatusReason};
+            use muxel_core::control::BackgroundWork;
+            use std::time::Duration;
+            let (working, blocked) = builtin();
+            let (session, _receiver) = fixture();
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            let start = Instant::now();
+            let mut report = |at: u64, row: &str, footer: &str, state: Option<&[u8]>| {
+                let screen = format!(
+                    "{HEADER}\n● Waiting on the eight checks.\n\n{row}\n\n{}\n❯ \n{}\n  {footer}",
+                    rule(),
+                    rule()
+                );
+                draw(&session, Some("✳ Waiting on checks"), &screen);
+                if let Some(state) = state {
+                    session.test_program_status(state);
+                }
+                let now = start + Duration::from_secs(at);
+                let (_, deadline) = runtime.reconcile(
+                    &session,
+                    TitleProvider::Claude,
+                    &working,
+                    &blocked,
+                    false,
+                    now,
+                );
+                (runtime.snapshot(&session), deadline, now)
+            };
+            const WORKING: &[u8] = b"\x1b]7501;state=working\x07";
+            const DONE: &[u8] = b"\x1b]7501;state=done\x07";
+            const BUSY: &str = "✻ Brewing… (27m 39s · 12.3k tokens)";
+            const RUNNING: &str = "✻ Brewed for 27m 40s · done 5:42 AM · 1 shell still running";
+            const ONE_SHELL: &str = "⏵⏵ auto mode on · 1 shell · ← 4 agents";
+            const NOTHING: &str = "⏵⏵ auto mode on (shift+tab to cycle) · ← 4 agents";
+
+            report(0, BUSY, ONE_SHELL, Some(WORKING));
+            let (held, deadline, now) = report(1, RUNNING, ONE_SHELL, Some(DONE));
+            assert_eq!(held.status, AgentStatus::Working);
+            assert_eq!(held.reason, TerminalStatusReason::BackgroundWork);
+            assert_eq!(held.coverage, TerminalStatusCoverage::ProgramStatus);
+            assert!(held.attributable);
+            assert_eq!(
+                held.background,
+                Some(BackgroundWork {
+                    shells: 1,
+                    ..Default::default()
+                })
+            );
+            assert_eq!(held.completion_revision, 0, "a count would float the pane");
+            assert!(
+                deadline.is_some_and(|at| at > now),
+                "the limit needs a wake"
+            );
+
+            // The shell ends. The agent gets a moment to wake before this reads done.
+            let (waiting, deadline, now) = report(60, "● Done.", NOTHING, None);
+            assert_eq!(waiting.status, AgentStatus::Working);
+            assert_eq!(waiting.background, None);
+            assert_eq!(deadline, Some(now + BACKGROUND_WAKE_GRACE));
+
+            // It does wake, finishes, and that is the one completion.
+            let (awake, _, _) = report(61, BUSY, NOTHING, Some(WORKING));
+            assert_eq!(awake.status, AgentStatus::Working);
+            assert_eq!(awake.reason, TerminalStatusReason::ProgramStatus(None));
+            let (finished, _, _) =
+                report(62, "✻ Worked for 12s · done 5:43 AM", NOTHING, Some(DONE));
+            assert_eq!(finished.status, AgentStatus::Done);
+            assert_eq!(finished.reason, TerminalStatusReason::ProgramStatus(None));
+            assert_eq!(finished.completion_revision, 1);
+
+            // No wake comes: the release itself is the change of status.
+            report(70, BUSY, ONE_SHELL, Some(WORKING));
+            report(71, RUNNING, ONE_SHELL, Some(DONE));
+            report(90, "● Done.", NOTHING, None);
+            let (released, _, _) = report(96, "● Done.", NOTHING, None);
+            assert_eq!(released.status, AgentStatus::Done);
+
+            // A count left on screen above an empty footer says nothing.
+            report(100, BUSY, NOTHING, Some(WORKING));
+            let (stale, _, _) = report(101, RUNNING, NOTHING, Some(DONE));
+            assert_eq!(stale.status, AgentStatus::Done);
+            assert_eq!(stale.background, None);
+
+            // A failed turn needs looking at, whatever it left behind.
+            report(110, BUSY, ONE_SHELL, Some(WORKING));
+            let (failed, _, _) =
+                report(111, RUNNING, ONE_SHELL, Some(b"\x1b]7501;state=error\x07"));
+            assert_eq!(failed.status, AgentStatus::Done);
+            assert_eq!(failed.reason, TerminalStatusReason::ProgramStatusError);
+            session.kill();
+        }
+
+        /// A long-lived server looks the same as a shell the agent waits on, so the
+        /// hold ends. Subagents come back by themselves, so theirs doesn't.
+        #[test]
+        fn only_subagents_hold_a_finished_turn_past_the_limit() {
+            use crate::view::{BACKGROUND_HOLD, TerminalStatusReason};
+            use std::time::Duration;
+            let (working, blocked) = builtin();
+            for (footer, limited) in [
+                ("⏵⏵ auto mode on · 1 shell · ← 4 agents", true),
+                ("⏵⏵ auto mode on · 1 monitor · ← 4 agents", true),
+                (
+                    "⏵⏵ auto mode on (shift+tab to cycle) · /tasks to see subagents · ← 4 agents",
+                    false,
+                ),
+            ] {
+                let (session, _receiver) = fixture();
+                let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+                let start = Instant::now();
+                let screen = format!(
+                    "{HEADER}\n● Left it running.\n\n{}\n❯ \n{}\n  {footer}",
+                    rule(),
+                    rule()
+                );
+                let mut sample = |at: Duration, state: Option<&[u8]>| {
+                    draw(&session, Some("✳ Left it running"), &screen);
+                    if let Some(state) = state {
+                        session.test_program_status(state);
+                    }
+                    runtime.reconcile(
+                        &session,
+                        TitleProvider::Claude,
+                        &working,
+                        &blocked,
+                        false,
+                        start + at,
+                    );
+                    runtime.snapshot(&session)
+                };
+                sample(Duration::ZERO, Some(b"\x1b]7501;state=working\x07"));
+                let ended = Duration::from_secs(1);
+                let held = sample(ended, Some(b"\x1b]7501;state=done\x07"));
+                assert_eq!(held.status, AgentStatus::Working, "{footer}");
+                let near = sample(ended + BACKGROUND_HOLD - Duration::from_secs(1), None);
+                assert_eq!(near.status, AgentStatus::Working, "{footer}");
+                let past = sample(ended + BACKGROUND_HOLD, None);
+                if limited {
+                    assert_eq!(past.status, AgentStatus::Done, "{footer}");
+                    assert_eq!(past.reason, TerminalStatusReason::ProgramStatus(None));
+                    assert!(past.background.is_some(), "the row still lists the work");
+                } else {
+                    assert_eq!(past.status, AgentStatus::Working, "{footer}");
+                }
+                session.kill();
+            }
+        }
+
+        /// `/clear` and `/resume` switch the conversation while a shell lives on. The
+        /// next turn's own report decides. Between turns no title reads Working, the only
+        /// thing that would confirm the footer, so nothing else can release the guard.
+        #[test]
+        fn a_finished_turn_still_holds_after_a_conversation_switch() {
+            use crate::view::TerminalStatusReason;
+            use std::time::{Duration, SystemTime};
+            let (working, blocked) = builtin();
+            let (session, _receiver) = fixture();
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            let start = Instant::now();
+            let screen = format!(
+                "{HEADER}\n● Sure.\n\n{}\n❯ \n{}\n  ⏵⏵ auto mode on · 1 shell · ← 4 agents",
+                rule(),
+                rule()
+            );
+            let mut sample = |at: u64, state: Option<&[u8]>| {
+                draw(&session, Some("Sure"), &screen);
+                if let Some(state) = state {
+                    session.test_program_status(state);
+                }
+                runtime.reconcile(
+                    &session,
+                    TitleProvider::Claude,
+                    &working,
+                    &blocked,
+                    false,
+                    start + Duration::from_secs(at),
+                );
+                runtime.snapshot(&session)
+            };
+            let hook = SystemTime::now() - Duration::from_secs(30);
+            session.provider_switched_at(hook, hook, hook + Duration::from_millis(400));
+            let during = sample(0, None);
+            assert_eq!(
+                during.status,
+                AgentStatus::Working,
+                "the old row still reads as work"
+            );
+            assert!(!during.attributable);
+
+            session.mark_turn_submitted();
+            sample(1, Some(b"\x1b]7501;state=working\x07"));
+            let held = sample(2, Some(b"\x1b]7501;state=done\x07"));
+            assert_eq!(held.status, AgentStatus::Working);
+            assert_eq!(held.reason, TerminalStatusReason::BackgroundWork);
+            assert!(held.attributable, "this is the new conversation's own turn");
+            assert_eq!(held.completion_revision, 0, "a count would float the pane");
+            session.kill();
+        }
+
+        /// A foreground marker must not become the background-only control exception.
+        #[test]
+        fn foreground_markers_prevent_a_background_only_hold() {
+            for (marker, expected) in [
+                ("FOREGROUND_BUSY", AgentStatus::Working),
+                ("FOREGROUND_PERMISSION", AgentStatus::Blocked),
+            ] {
+                let (session, _receiver) = fixture();
+                let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+                let screen = format!(
+                    "{HEADER}\n{marker}\n\n{}\n❯ \n{}\n  ⏵⏵ auto mode on · 1 shell · ← 4 agents",
+                    rule(),
+                    rule()
+                );
+                draw(&session, None, &screen);
+                runtime.reconcile(
+                    &session,
+                    TitleProvider::Claude,
+                    &["FOREGROUND_BUSY".into()],
+                    &["FOREGROUND_PERMISSION".into()],
+                    false,
+                    Instant::now(),
+                );
+                let observed = runtime.snapshot(&session);
+                assert_eq!(observed.status, expected);
+                assert_ne!(
+                    observed.reason,
+                    crate::view::TerminalStatusReason::BackgroundWork
+                );
+                assert!(!runtime.background_hold.holding);
+                assert!(observed.background.is_some());
+                session.kill();
+            }
+        }
+
+        /// A switch leaves no report until the next turn, and between turns no title reads
+        /// Working, the only thing that would confirm a footer. So the footer alone must
+        /// not pin the pane busy: its composer is free and the limit still runs.
+        #[test]
+        fn listed_work_after_a_switch_leaves_the_composer_free() {
+            use crate::view::{BACKGROUND_HOLD, TerminalStatusReason};
+            use std::time::{Duration, SystemTime};
+            let (working, blocked) = builtin();
+            let (session, _receiver) = fixture();
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            let start = Instant::now();
+            let screen = format!(
+                "{HEADER}\n> /clear\n\n{}\n❯ \n{}\n  ⏵⏵ auto mode on · 1 shell · ← 4 agents",
+                rule(),
+                rule()
+            );
+            let hook = SystemTime::now() - Duration::from_secs(30);
+            session.provider_switched_at(hook, hook, hook + Duration::from_millis(400));
+            let mut sample = |at: Duration| {
+                draw(&session, Some("Claude Code"), &screen);
+                runtime.reconcile(
+                    &session,
+                    TitleProvider::Claude,
+                    &working,
+                    &blocked,
+                    false,
+                    start + at,
+                );
+                runtime.snapshot(&session)
+            };
+            let cleared = sample(Duration::ZERO);
+            assert_eq!(cleared.status, AgentStatus::Working);
+            assert_eq!(
+                cleared.reason,
+                TerminalStatusReason::BackgroundWork,
+                "a send admits on this reason"
+            );
+            assert!(!cleared.attributable);
+            let past = sample(BACKGROUND_HOLD + Duration::from_secs(1));
+            assert_ne!(past.status, AgentStatus::Working, "a dev server isn't work");
+            assert!(past.background.is_some());
+            assert_eq!(past.completion_revision, 0, "no turn ran");
+            session.kill();
+        }
+
+        /// The binding switch clears the old report, so one read while the switch settles
+        /// is this conversation's own. It holds as it would a moment later.
+        #[test]
+        fn a_report_during_a_switch_settle_holds_too() {
+            use crate::listener::SWITCH_SLACK;
+            use crate::session::PtyOutput;
+            use crate::view::TerminalStatusReason;
+            use std::time::{Duration, SystemTime};
+            let (working, blocked) = builtin();
+            let (session, _receiver) = fixture();
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            let start = Instant::now();
+            let screen = format!(
+                "{HEADER}\n● Sure.\n\n{}\n❯ \n{}\n  ⏵⏵ auto mode on · 1 shell · ← 4 agents",
+                rule(),
+                rule()
+            );
+            let hook = SystemTime::now();
+            session.provider_switched_at(hook, hook, hook);
+            // A title read inside the window can't end the settle.
+            draw(&session, Some("Sure"), &screen);
+            session.mark_turn_submitted();
+            let mut report = |state: &str, after_ms: u64| {
+                let mut output = PtyOutput::default();
+                output.push(
+                    format!("\x1b]7501;state={state}\x07").as_bytes(),
+                    hook + SWITCH_SLACK + Duration::from_millis(after_ms),
+                );
+                session.process_drained(&output);
+                runtime.reconcile(
+                    &session,
+                    TitleProvider::Claude,
+                    &working,
+                    &blocked,
+                    false,
+                    start + Duration::from_millis(after_ms),
+                );
+                runtime.snapshot(&session)
+            };
+            report("working", 100);
+            let held = report("done", 200);
+            assert_eq!(held.status, AgentStatus::Working);
+            assert_eq!(held.reason, TerminalStatusReason::BackgroundWork);
+            assert_eq!(held.completion_revision, 0, "a count would float the pane");
+            session.kill();
+        }
+
+        /// A pane in tmux gets no report, only titles. Same rule.
+        #[test]
+        fn a_finished_turn_holds_without_a_program_report_too() {
+            use crate::view::{BACKGROUND_HOLD, TerminalStatusReason};
+            use std::time::Duration;
+            let (working, blocked) = builtin();
+            let (session, _receiver) = fixture();
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            let start = Instant::now();
+            let screen = format!(
+                "{HEADER}\n● Left it running.\n\n{}\n❯ \n{}\n  ⏵⏵ auto mode on · 1 shell · ← 4 agents",
+                rule(),
+                rule()
+            );
+            session.mark_turn_submitted();
+            let mut sample = |at: Duration, title: &str| {
+                draw(&session, Some(title), &screen);
+                runtime.reconcile(
+                    &session,
+                    TitleProvider::Claude,
+                    &working,
+                    &blocked,
+                    false,
+                    start + at,
+                );
+                runtime.snapshot(&session)
+            };
+            sample(Duration::ZERO, "⠂ Left it running");
+            let ended = Duration::from_secs(1);
+            let held = sample(ended, "✳ Left it running");
+            assert_eq!(held.status, AgentStatus::Working);
+            assert_eq!(held.reason, TerminalStatusReason::BackgroundWork);
+            let past = sample(ended + BACKGROUND_HOLD, "✳ Left it running");
+            assert_eq!(past.status, AgentStatus::Done);
+            assert!(past.background.is_some());
+            session.kill();
+        }
+
+        /// Real footers from Claude 2.1.318, including every permission mode and a
+        /// row a narrow pane cut short. `← 4 agents` is on all of them, idle or not.
+        #[test]
+        fn claude_footers_say_what_is_running() {
+            use muxel_core::control::BackgroundWork;
+            let read = |footer: &str| {
+                crate::view::provider_screen_read(
+                    TitleProvider::Claude,
+                    &format!("{HEADER}\n● Done.\n\n  [>_>] pane · 397k · sonnet med\n  {footer}"),
+                )
+            };
+            let shells = |shells| BackgroundWork {
+                shells,
+                ..Default::default()
+            };
+            for (footer, expected) in [
+                ("⏵⏵ auto mode on · 1 shell · ← 4 agents", shells(1)),
+                ("⏸ manual mode on · 1 shell · ← 4 agents", shells(1)),
+                ("⏵⏵ accept edits on · 1 shell · ← 4 agents", shells(1)),
+                ("⏸ plan mode on · 1 shell · ← 4 agents", shells(1)),
+                ("⏵⏵ bypass permissions on · 1 shell · ← 4 agents", shells(1)),
+                ("⏵⏵ auto mode on · 3 shells · ⧉ X · ← 4 agents", shells(3)),
+                (
+                    "⏵⏵ auto mode on · 1 shell · ← 4 agents · 1 feedback…",
+                    shells(1),
+                ),
+                ("⏵⏵ auto mode on · 2 shells · ← 4 age…", shells(2)),
+                (
+                    "⏵⏵ auto mode on · 1 monitor · ← 4 agents",
+                    BackgroundWork {
+                        monitors: 1,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "⏵⏵ auto mode on (shift+tab to cycle) · /tasks to see subagents · ← 4 agents",
+                    BackgroundWork {
+                        subagents: true,
+                        ..Default::default()
+                    },
+                ),
+            ] {
+                assert_eq!(read(footer), (None, Some(expected)), "{footer}");
+            }
+            for footer in [
+                "⏵⏵ auto mode on (shift+tab to cycle) · ← 4 agents",
+                "⏵⏵ auto mode on (shift+tab to cycle) · ← 4 agents · PR #12",
+                "? for shortcuts",
+            ] {
+                assert_eq!(read(footer), (None, None), "{footer}");
+            }
+            // Nor does a quoted row stand against an empty footer.
+            let row = "· 1 command still running · send a message to interrupt";
+            let quoted_row = crate::view::provider_screen_read(
+                TitleProvider::Claude,
+                &format!(
+                    "{HEADER}\n● The row read:\n{row}\n\n  [>_>] pane\n  ⏵⏵ auto mode on (shift+tab to cycle) · ← 4 agents"
+                ),
+            );
+            assert_eq!(quoted_row, (None, None));
+            // A reply quoting a footer is not one, and the real footer below decides.
+            let quoted = crate::view::provider_screen_read(
+                TitleProvider::Claude,
+                &format!(
+                    "{HEADER}\n● The row read:\n  ⏵⏵ auto mode on · 1 shell · ← 4 agents\n\n  [>_>] pane\n  ⏵⏵ auto mode on (shift+tab to cycle) · ← 4 agents"
+                ),
+            );
+            assert_eq!(quoted, (None, None));
+            // A turn still running is the turn, whatever runs beside it.
+            let running = crate::view::provider_screen_read(
+                TitleProvider::Claude,
+                &format!(
+                    "{HEADER}\n● Reading.\n\n✻ Chewing on it… (20s · ↓ 171 tokens)\n\n  [>_>] pane\n  ⏵⏵ auto mode on · 1 shell · ← 4 agents"
+                ),
+            );
+            assert_eq!(running, (Some(AgentStatus::Working), Some(shells(1))));
+        }
+
+        /// Real panels from Grok 1.0.70. A loop is a scheduled wake, not running work.
+        #[test]
+        fn grok_panels_say_what_is_running() {
+            use muxel_core::control::BackgroundWork;
+            let read = |panel: &str| {
+                let screen = format!(
+                    "> Start it.\n\nI started it.\n\n{panel}\n╭─────────────╮\n│ >           │\n╰─────────────╯\n[>_>] pane · grok xh\nShift+Tab:mode  │  Ctrl+x:shortcuts"
+                );
+                crate::view::provider_screen_read(TitleProvider::Grok, &screen).1
+            };
+            assert_eq!(
+                read("v Tasks 1\n· Run Sleep 45 seconds in the background"),
+                Some(BackgroundWork {
+                    shells: 1,
+                    ..Default::default()
+                })
+            );
+            assert_eq!(
+                read("v Watchers 1\n· Monitor Watch sleep then finished"),
+                Some(BackgroundWork {
+                    monitors: 1,
+                    ..Default::default()
+                })
+            );
+            assert_eq!(
+                read("v Subagents 1\n. Subagent Sleep 40s then OK · Sleep for 40 seconds…"),
+                Some(BackgroundWork {
+                    subagents: true,
+                    ..Default::default()
+                })
+            );
+            assert_eq!(
+                read(
+                    "v Tasks 1\n· Run Build\nv Watchers 1\n♦ Loop say the word tick   every 2 minutes (next in 1m9s)"
+                ),
+                Some(BackgroundWork {
+                    shells: 1,
+                    ..Default::default()
+                })
+            );
+            assert_eq!(
+                read("v Watchers 1\n♦ Loop say the word tick   every 2 minutes (next in 1m9s)"),
+                None
+            );
+            // One command is one shell, even if an older row is still drawn too.
+            assert_eq!(
+                read("◎ 1 command still running\nv Tasks 1\n· Run Build"),
+                Some(BackgroundWork {
+                    shells: 1,
+                    ..Default::default()
+                })
+            );
+            // A reply describing a panel is not directly above the composer.
+            assert_eq!(
+                read("v Tasks 1\nthat is the row\nand this row\nand this one"),
+                None
+            );
+        }
+
+        /// The agent's prompt is free once its turn is over, whatever runs beside it.
+        #[test]
+        fn background_hold_wakes_for_its_limit_only_when_one_applies() {
+            use crate::view::{BACKGROUND_HOLD, BackgroundHold};
+            use muxel_core::control::BackgroundWork;
+            use std::time::Duration;
+            let now = Instant::now();
+            let shell = BackgroundWork {
+                shells: 1,
+                ..Default::default()
+            };
+            let subagents = BackgroundWork {
+                subagents: true,
+                ..Default::default()
+            };
+            let mut hold = BackgroundHold::default();
+            assert_eq!(
+                hold.observe(Some(shell), false, now),
+                (true, Some(now + BACKGROUND_HOLD))
+            );
+            let mut hold = BackgroundHold::default();
+            assert_eq!(hold.observe(Some(subagents), false, now), (true, None));
+            // A new turn restarts the clock: the limit counts from the last finish.
+            let mut hold = BackgroundHold::default();
+            hold.observe(Some(shell), false, now);
+            let later = now + Duration::from_secs(600);
+            assert_eq!(hold.observe(Some(shell), true, later), (false, None));
+            assert_eq!(
+                hold.observe(Some(shell), false, later),
+                (true, Some(later + BACKGROUND_HOLD))
+            );
+            // Past the limit nothing is held, so the shell ending changes nothing.
+            let past = later + BACKGROUND_HOLD;
+            assert_eq!(hold.observe(Some(shell), false, past), (false, None));
+            assert_eq!(hold.observe(None, false, past), (false, None));
+        }
+
         #[test]
         fn visible_dialog_beats_a_working_program_report() {
             // A Working report can miss the form Claude waits on, as #110
@@ -9830,22 +10686,63 @@ mod provider_switch_tests {
             "no old hold expires into Done"
         );
 
-        // A newly drawn row is attributable and retains the original two-second
-        // repaint hold; its eventual absence may complete this submitted turn.
+        // A newly drawn row is attributable, so this finished turn holds for it.
+        // Once it goes the agent gets a moment to wake, and its absence may then
+        // complete this submitted turn.
         session.process_drained(&drained(&[(row, fresh + Duration::from_millis(2))]));
         let seen_at = clock + Duration::from_secs(4);
         let (snapshot, _) = viewer.sample_at(&session, seen_at);
         assert_eq!(snapshot.status, AgentStatus::Working);
+        assert_eq!(
+            snapshot.reason,
+            crate::view::TerminalStatusReason::BackgroundWork
+        );
         assert!(snapshot.attributable);
-        assert_eq!(viewer.runtime.grok_screen_working_at, Some(seen_at));
         session.process_drained(&drained(&[(
             "\x1b[2J\x1b[H",
             fresh + Duration::from_millis(3),
         )]));
-        let (snapshot, deadline) = viewer.sample_at(&session, seen_at + Duration::from_millis(60));
+        let cleared_at = seen_at + Duration::from_millis(60);
+        let (snapshot, deadline) = viewer.sample_at(&session, cleared_at);
         assert_eq!(snapshot.status, AgentStatus::Working);
         assert!(snapshot.attributable);
-        let deadline = deadline.expect("attributable Working hold");
+        let deadline = deadline.expect("the wake grace");
+        assert_eq!(deadline, cleared_at + crate::view::BACKGROUND_WAKE_GRACE);
+        let (snapshot, _) = viewer.sample_at(&session, deadline - Duration::from_millis(1));
+        assert_eq!(snapshot.status, AgentStatus::Working);
+        let (snapshot, _) = viewer.sample_at(&session, deadline);
+        assert_eq!(snapshot.status, AgentStatus::Done, "no second hold follows");
+        assert!(snapshot.attributable);
+    }
+
+    /// Grok redraws its rows, so one beside a running turn can blink out without
+    /// the work having ended.
+    #[test]
+    fn grok_keeps_its_repaint_hold_for_a_row_beside_a_running_turn() {
+        let (session, _receiver) = fixture();
+        let mut viewer = Viewer::new(TitleProvider::Grok);
+        let clock = viewer.clock;
+        let at = SystemTime::now();
+        session.mark_turn_submitted();
+        session.process_drained(&drained(&[
+            ("\x1b]0;⠙ - New - grok\x07", at),
+            (
+                "◎ 1 command still running · send a message to interrupt",
+                at,
+            ),
+        ]));
+        let seen_at = clock + Duration::from_millis(100);
+        let (snapshot, _) = viewer.sample_at(&session, seen_at);
+        assert_eq!(snapshot.status, AgentStatus::Working);
+        assert_eq!(viewer.runtime.grok_screen_working_at, Some(seen_at));
+
+        session.process_drained(&drained(&[
+            ("\x1b]0;New - grok\x07", at + Duration::from_millis(1)),
+            ("\x1b[2J\x1b[H", at + Duration::from_millis(1)),
+        ]));
+        let (snapshot, deadline) = viewer.sample_at(&session, seen_at + Duration::from_millis(60));
+        assert_eq!(snapshot.status, AgentStatus::Working);
+        let deadline = deadline.expect("the repaint hold");
         assert_eq!(
             deadline,
             seen_at + super::GROK_SCREEN_WORKING_HOLD + Duration::from_millis(1)
