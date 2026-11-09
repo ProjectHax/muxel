@@ -1870,7 +1870,9 @@ feature is added or changed, update the matching entry here in the same change**
   `MUXEL_PROFILE_KEEP_DAYS` and `MUXEL_PROFILE_MAX_BYTES`). Quiet terminal
   intervals aggregate totals and maxima over 30 seconds. Records contain fixed
   labels, timings and short pane ids, with no
-  terminal content, session ids, titles or paths.
+  terminal content, session ids, titles or paths. A git record carries unsalted
+  64-bit FNV-1a hashes of its folder and its whole command line instead, so a
+  guessed path can be checked against them.
 - **Profiler isolation** — muxel's profiler settings, including future knobs, stay with the
   process that enabled them. Panes, runners and helper commands start without
   those settings; a nested muxel can enable its own profiler independently.
