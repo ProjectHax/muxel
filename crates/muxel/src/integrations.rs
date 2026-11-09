@@ -3986,19 +3986,121 @@ pub fn open_microphone_settings() {
         .output();
 }
 
-/// Local branch names (e.g. `["main", "feature/x"]`) at `loc`.
+/// Local branch names (e.g. `["main", "feature/x"]`) at `loc`. Read with
+/// `for-each-ref`, which lists branches only: `git branch` adds a line for a
+/// detached HEAD, a rebase or a bisect (`(HEAD detached at 1a2b3c4)`).
 pub fn list_branches(loc: &RepoLoc) -> Vec<String> {
-    git_output(loc, &["branch", "--format=%(refname:short)"])
+    git_output(
+        loc,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+    )
+    .ok()
+    .filter(|o| o.status.success())
+    .map(|o| {
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// What a branch poll read at a repository.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BranchRead {
+    /// The branch HEAD names (`None` when it names none, or the folder holds
+    /// no repository), spelled as [`list_branches`] spells it, and the local
+    /// branches.
+    Read(Option<String>, Vec<String>),
+    /// Nothing came back: ssh or sshpass failed, couldn't start, or was
+    /// stopped.
+    Unknown,
+    /// git failed to list a remote repository's branches, saying this (or
+    /// nothing). A git older than 1.9 does, at `%(HEAD)`.
+    Failed(String),
+}
+
+/// What the branch poll shows for a project at `loc`. One git round, so one
+/// ssh for a remote one, where a [`repo_current_branch`] and a
+/// [`list_branches`] were two. A local failure reads as no branches.
+pub fn read_branches(loc: &RepoLoc) -> BranchRead {
+    const LIST: &[&str] = &[
+        "for-each-ref",
+        "--format=%(HEAD)%(refname:short)",
+        "refs/heads/",
+    ];
+    let out = match loc {
+        RepoLoc::Remote(c) => {
+            return remote_branch_read(
+                remote_ssh_command(c, remote_ops::branches(c.host.os, &c.remote_path)).output(),
+            );
+        }
+        // The same two reads, the second only where the first marks no branch.
+        RepoLoc::Local(_) => git_output(loc, LIST).and_then(|mut out| {
+            let marked = out
+                .stdout
+                .split(|byte| *byte == b'\n')
+                .any(|line| line.starts_with(b"*"));
+            if out.status.success() && !marked {
+                let head = git_output(loc, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+                out.stdout.extend_from_slice(&head.stdout);
+                out.status = head.status;
+            }
+            Ok(out)
+        }),
+    };
+    let (branch, branches) = out
         .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+        // 1: HEAD names no branch.
+        .filter(|out| matches!(out.status.code(), Some(0 | 1)))
+        .map(|out| parse_branches(&out.stdout))
+        .unwrap_or_default();
+    BranchRead::Read(branch, branches)
+}
+
+/// How [`remote_ops::branches`]' ssh command ended: git's failure is told by
+/// the line it prints after one, since ssh (255) and sshpass (5 for a wrong
+/// password, 6 for an unknown host key) end with codes of their own.
+fn remote_branch_read(out: std::io::Result<std::process::Output>) -> BranchRead {
+    let Ok(out) = out else {
+        return BranchRead::Unknown;
+    };
+    let failed = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|line| line.trim_end_matches('\r') == remote_ops::BRANCHES_FAILED);
+    if failed {
+        return BranchRead::Failed(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    match out.status.code() {
+        // 1: HEAD names no branch.
+        Some(0 | 1) => {
+            let (branch, branches) = parse_branches(&out.stdout);
+            BranchRead::Read(branch, branches)
+        }
+        _ => BranchRead::Unknown,
+    }
+}
+
+/// [`read_branches`]' output: `*name` for HEAD's branch and ` name` for the
+/// others, then the branch HEAD names, if any, on a line of its own.
+fn parse_branches(stdout: &[u8]) -> (Option<String>, Vec<String>) {
+    let text = String::from_utf8_lossy(stdout);
+    let (mut marked, mut named, mut branches) = (None, None, Vec::new());
+    // A branch's name holds neither `*` nor a space.
+    for line in text.lines().map(|line| line.trim_end_matches('\r')) {
+        if let Some(name) = line.strip_prefix('*') {
+            marked = Some(name.to_string());
+            branches.push(name.to_string());
+        } else if let Some(name) = line.strip_prefix(' ') {
+            branches.push(name.to_string());
+        } else if !line.is_empty() {
+            named = Some(line.to_string());
+        }
+    }
+    // The list's spelling (`heads/main` where a tag shares the name), else the
+    // name of a branch with no commit yet.
+    (marked.or(named), branches)
 }
 
 /// Check out an existing branch.
@@ -4862,6 +4964,162 @@ fn clear_read_only(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the branch poll reads: the branch HEAD names, and the local
+    /// branches. Detached, mid-bisect and mid-rebase, HEAD names none, and
+    /// `git branch` adds a line saying so (`(no branch, rebasing side)`),
+    /// which isn't a branch. Before the first commit HEAD's branch has no ref
+    /// to list, but is still named.
+    #[test]
+    fn branches_read_names_head_and_lists_only_branches() {
+        let repo = crate::test_support::TestRepo::init();
+        let loc = RepoLoc::Local(repo.path().to_path_buf());
+        let read = || match read_branches(&loc) {
+            BranchRead::Read(branch, branches) => (branch, branches),
+            other => panic!("unreadable: {other:?}"),
+        };
+        let main = || Some("main".to_string());
+        assert_eq!(read(), (main(), Vec::new()), "no commit yet");
+        repo.commit(&[("a.txt", "one\n")], "one");
+        repo.git(&["switch", "-q", "-c", "side"]);
+        repo.commit(&[("b.txt", "side\n")], "side");
+        repo.git(&["switch", "-q", "main"]);
+        repo.commit(&[("a.txt", "two\n")], "two");
+        repo.commit(&[("a.txt", "three\n")], "three");
+        let both = vec!["main".to_string(), "side".to_string()];
+        assert_eq!(read(), (main(), both.clone()));
+        let none_named = |what: &str| {
+            assert_eq!(read(), (None, both.clone()), "{what}");
+            assert_eq!(list_branches(&loc), both, "{what}");
+        };
+        repo.git(&["switch", "-q", "--detach", "HEAD"]);
+        none_named("detached");
+        repo.git(&["switch", "-q", "main"]);
+        repo.git(&["bisect", "start", "HEAD", "HEAD~2"]);
+        none_named("bisecting");
+        repo.git(&["bisect", "reset"]);
+        // `--exec false` stops the rebase after its one pick.
+        repo.git(&["switch", "-q", "side"]);
+        let stopped = Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args([
+                "-c",
+                "user.name=muxel-test",
+                "-c",
+                "user.email=muxel-test@example.invalid",
+            ])
+            .args(["rebase", "--exec", "false", "main"])
+            .output()
+            .unwrap();
+        assert!(!stopped.status.success(), "the rebase stopped");
+        none_named("rebasing");
+        repo.git(&["rebase", "--abort"]);
+        assert_eq!(read(), (Some("side".to_string()), both.clone()));
+    }
+
+    /// A Unix host's shell, to run its commands here. On Windows that's Git for
+    /// Windows' bash, found where the Git Bash preset finds it: a bare `sh` is
+    /// on PATH only in a shell that put Git's `bin` there, and without it every
+    /// spawn would fail and read as ssh's failure.
+    fn host_sh() -> Command {
+        if !cfg!(windows) {
+            return command("sh");
+        }
+        let bash = muxel_core::git_bash_program();
+        assert!(
+            Path::new(&bash).is_file(),
+            "no Git for Windows bash to run a Unix host's command (tried {bash}; \
+             MUXEL_GIT_BASH names another)"
+        );
+        command(bash)
+    }
+
+    /// [`remote_ops::branches`]' Unix command, run here by a Unix shell as ssh
+    /// runs it there, after `prelude` (a stand-in for that host's git).
+    fn remote_branches_here(dir: &Path, prelude: &str) -> std::io::Result<std::process::Output> {
+        let script = remote_ops::branches(
+            muxel_core::RemoteOs::Unix,
+            &dir.to_string_lossy().replace('\\', "/"),
+        );
+        host_sh()
+            .arg("-c")
+            .arg(format!("{prelude}{script}"))
+            // A folder outside any repository stays outside one.
+            .env("GIT_CEILING_DIRECTORIES", std::env::temp_dir())
+            .stdin(Stdio::null())
+            .output()
+    }
+
+    /// git before 1.9 dies at `%(HEAD)` as today's does at a field it doesn't
+    /// know. That reads as git's failure, with what git said; a folder with no
+    /// repository reads as no branch, as it did before the listing could fail.
+    #[test]
+    fn a_remote_git_that_cant_list_branches_says_so() {
+        let repo = crate::test_support::TestRepo::init();
+        repo.commit(&[("a.txt", "one\n")], "one");
+        let old_git = "git() { case \"$*\" in *'%(HEAD)'*) \
+                       echo 'fatal: unknown field name: HEAD' >&2; return 128;; esac; \
+                       command git \"$@\"; }; ";
+        assert_eq!(
+            remote_branch_read(remote_branches_here(repo.path(), old_git)),
+            BranchRead::Failed("fatal: unknown field name: HEAD".into())
+        );
+        assert_eq!(
+            remote_branch_read(remote_branches_here(repo.path(), "")),
+            BranchRead::Read(Some("main".into()), vec!["main".into()])
+        );
+        // git before 1.8.5 has no `-C` either, so the listing fails before it
+        // reaches `%(HEAD)`; telling a repository apart mustn't need `-C`.
+        let older_git = "git() { case \" $* \" in *' -C '*) \
+                         echo 'Unknown option: -C' >&2; return 129;; esac; \
+                         command git \"$@\"; }; ";
+        assert_eq!(
+            remote_branch_read(remote_branches_here(repo.path(), older_git)),
+            BranchRead::Failed("Unknown option: -C".into())
+        );
+        let plain = crate::test_support::short_temp_path();
+        std::fs::create_dir_all(&plain).unwrap();
+        let read = remote_branch_read(remote_branches_here(&plain, ""));
+        let older = remote_branch_read(remote_branches_here(&plain, older_git));
+        let _ = std::fs::remove_dir_all(&plain);
+        assert_eq!(read, BranchRead::Read(None, Vec::new()), "no repository");
+        assert_eq!(
+            older,
+            BranchRead::Read(None, Vec::new()),
+            "nor with that git"
+        );
+        // A folder that's gone is no repository either, wherever ssh starts.
+        let gone = remote_branch_read(remote_branches_here(&plain, older_git));
+        assert_eq!(
+            gone,
+            BranchRead::Read(None, Vec::new()),
+            "a folder that's gone"
+        );
+    }
+
+    /// ssh's own failure is 255; sshpass's wrong password is 5 and its unknown
+    /// host key 6. None of them is git's, whatever they printed.
+    #[test]
+    fn a_failure_before_git_ran_is_not_blamed_on_git() {
+        for code in [255, 5, 6] {
+            // The shell has to run, or this reads Unknown for the wrong reason.
+            let out = host_sh()
+                .arg("-c")
+                .arg(format!("echo 'Permission denied' >&2; exit {code}"))
+                .stdin(Stdio::null())
+                .output()
+                .expect("the host shell runs");
+            assert_eq!(out.status.code(), Some(code), "the host shell exits {code}");
+            assert_eq!(
+                remote_branch_read(Ok(out)),
+                BranchRead::Unknown,
+                "exit {code}"
+            );
+        }
+        let missing = command("muxel-no-such-ssh").output();
+        assert_eq!(remote_branch_read(missing), BranchRead::Unknown);
+    }
 
     #[test]
     fn review_close_retry_cannot_kill_when_the_original_generation_is_gone() {

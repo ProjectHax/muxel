@@ -5773,6 +5773,9 @@ pub struct MuxelApp {
     /// slow or unreachable host would otherwise stack one more batch of ssh
     /// round trips every few seconds.
     remote_branch_poll_inflight: bool,
+    /// Each host whose git failed to list branches, with what it said: said
+    /// once, until a poll where every read on that host succeeds.
+    branch_read_failures: HashSet<(Uuid, String)>,
     remote_layout_poll_inflight: bool,
     /// Per project, the layout polls begun and applied: a close whose
     /// countdown ran out waits for one begun after it did.
@@ -8287,6 +8290,7 @@ impl MuxelApp {
             remote_connect_failed: HashMap::new(),
             remote_poll_count: 0,
             remote_branch_poll_inflight: false,
+            branch_read_failures: HashSet::new(),
             remote_layout_poll_inflight: false,
             layout_reads: HashMap::new(),
             close_layout_poll: false,
@@ -13539,7 +13543,7 @@ impl MuxelApp {
         if self.remote_branch_poll_inflight {
             return;
         }
-        let jobs: Vec<(Uuid, integrations::RepoLoc)> = self
+        let jobs: Vec<(Uuid, Uuid, String, integrations::RepoLoc)> = self
             .workspace
             .projects
             .iter()
@@ -13552,6 +13556,8 @@ impl MuxelApp {
                     .effective(&self.identities);
                 Some((
                     p.id,
+                    host.id,
+                    host.name.clone(),
                     integrations::RepoLoc::remote(
                         host,
                         r.remote_root.clone(),
@@ -13570,19 +13576,23 @@ impl MuxelApp {
                 .background_executor()
                 .spawn(async move {
                     jobs.into_iter()
-                        .map(|(pid, loc)| {
-                            let branch = integrations::repo_current_branch(&loc);
-                            let branches = integrations::list_branches(&loc);
-                            (pid, branch, branches)
+                        // One ssh for both: the branch and the list.
+                        .map(|(pid, host, name, loc)| {
+                            (pid, host, name, integrations::read_branches(&loc))
                         })
                         .collect::<Vec<_>>()
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.remote_branch_poll_inflight = false;
-                for (pid, branch, branches) in results {
-                    this.project_branches.insert(pid, branch);
-                    this.project_branch_lists.insert(pid, branches);
+                let notices = land_branch_reads(
+                    &mut this.project_branches,
+                    &mut this.project_branch_lists,
+                    &mut this.branch_read_failures,
+                    results,
+                );
+                for (title, detail) in notices {
+                    this.add_event(NotifKind::Error, title, detail);
                 }
                 cx.notify();
             });
@@ -37357,6 +37367,120 @@ mod agent_notification_tests {
             assert_eq!(notifications.len(), 1);
             assert_eq!(notifications[0].id, card_id);
         }
+    }
+}
+
+/// One remote branch poll's reads, landed: each `(project, host, host's
+/// name, read)`. A read replaces its project's branch and list; a project
+/// whose read failed, or got nothing back, keeps the last ones read, with no
+/// expiry, until a read succeeds. git
+/// failing is said once per host and message, and said again only after a
+/// poll where every read on that host succeeded (a host can hold a folder
+/// with no repository, which reads fine, beside one git fails in). Returns
+/// the notices to raise, each a title and its detail.
+fn land_branch_reads(
+    branches: &mut HashMap<Uuid, Option<String>>,
+    lists: &mut HashMap<Uuid, Vec<String>>,
+    failures: &mut HashSet<(Uuid, String)>,
+    reads: Vec<(Uuid, Uuid, String, integrations::BranchRead)>,
+) -> Vec<(String, String)> {
+    // The hosts with a read that worked, and those with one that didn't:
+    // git's failure, or nothing back at all.
+    let (mut read_on, mut unread_on) = (HashSet::new(), HashSet::new());
+    let mut notices = Vec::new();
+    for (project, host, name, read) in reads {
+        match read {
+            integrations::BranchRead::Read(branch, list) => {
+                read_on.insert(host);
+                branches.insert(project, branch);
+                lists.insert(project, list);
+            }
+            integrations::BranchRead::Unknown => {
+                unread_on.insert(host);
+            }
+            integrations::BranchRead::Failed(said) => {
+                unread_on.insert(host);
+                if failures.insert((host, said.clone())) {
+                    let hint = t("muxel needs git 1.9 or newer there.");
+                    notices.push((
+                        tf("Can't read branches on {host}", &[("host", &name)]),
+                        if said.is_empty() {
+                            hint.to_string()
+                        } else {
+                            format!("{said}\n{hint}")
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    failures.retain(|(host, _)| unread_on.contains(host) || !read_on.contains(host));
+    notices
+}
+
+#[cfg(test)]
+mod branch_read_tests {
+    use super::{integrations, land_branch_reads};
+    use std::collections::{HashMap, HashSet};
+    use uuid::Uuid;
+
+    #[test]
+    fn a_hosts_git_failure_is_said_once_until_its_reads_succeed() {
+        use integrations::BranchRead::{Failed, Read, Unknown};
+        let (host, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let (repo, plain, elsewhere) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        #[derive(Default)]
+        struct Polls {
+            branches: HashMap<Uuid, Option<String>>,
+            lists: HashMap<Uuid, Vec<String>>,
+            failures: HashSet<(Uuid, String)>,
+        }
+        impl Polls {
+            /// The notices one poll's reads raise.
+            fn round(&mut self, reads: Vec<(Uuid, Uuid, integrations::BranchRead)>) -> usize {
+                let reads = reads
+                    .into_iter()
+                    .map(|(project, host, read)| (project, host, "box".to_string(), read))
+                    .collect();
+                land_branch_reads(
+                    &mut self.branches,
+                    &mut self.lists,
+                    &mut self.failures,
+                    reads,
+                )
+                .len()
+            }
+        }
+        let mut polls = Polls::default();
+        let old = || Failed("fatal: unknown field name: HEAD".to_string());
+        let main = || Read(Some("main".to_string()), vec!["main".to_string()]);
+        assert_eq!(polls.round(vec![(repo, host, main())]), 0);
+        // git there fails; the project keeps what it last read.
+        assert_eq!(polls.round(vec![(repo, host, old())]), 1);
+        assert_eq!(polls.branches.get(&repo), Some(&Some("main".to_string())));
+        assert_eq!(polls.lists.get(&repo), Some(&vec!["main".to_string()]));
+        // Every 5 s after, with another project on the host reading fine (a
+        // folder with no repository) and another host's read: still once.
+        for _ in 0..3 {
+            let reads = vec![
+                (plain, host, Read(None, Vec::new())),
+                (repo, host, old()),
+                (elsewhere, other, main()),
+            ];
+            assert_eq!(polls.round(reads), 0);
+        }
+        // Unreachable for a while: nothing said, nothing forgotten.
+        assert_eq!(polls.round(vec![(repo, host, Unknown)]), 0);
+        assert_eq!(polls.branches.get(&repo), Some(&Some("main".to_string())));
+        assert_eq!(polls.round(vec![(repo, host, old())]), 0);
+        // ssh failing for it while the folder with no repository on the same
+        // host reads: not every read there succeeded, so still once.
+        let reads = vec![(plain, host, Read(None, Vec::new())), (repo, host, Unknown)];
+        assert_eq!(polls.round(reads), 0);
+        assert_eq!(polls.round(vec![(repo, host, old())]), 0);
+        // git upgraded there: the next failure is news again.
+        assert_eq!(polls.round(vec![(repo, host, main())]), 0);
+        assert_eq!(polls.round(vec![(repo, host, old())]), 1);
     }
 }
 
