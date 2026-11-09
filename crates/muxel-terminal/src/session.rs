@@ -727,6 +727,9 @@ pub struct CommandSpec {
     pub binding: LaunchBinding,
     /// Whether the command actually resumes an existing provider conversation.
     pub launch_resumed: bool,
+    /// Most memory, in bytes, each process in the pane's local tree may
+    /// commit (Windows; see [`crate::pane_job`]). `None` = no limit.
+    pub memory_limit: Option<u64>,
 }
 
 impl CommandSpec {
@@ -758,6 +761,7 @@ impl CommandSpec {
             startup_delay_ms: 0,
             binding: LaunchBinding::Unknown,
             launch_resumed: false,
+            memory_limit: None,
         }
     }
 
@@ -785,6 +789,7 @@ impl CommandSpec {
             startup_delay_ms: 0,
             binding: LaunchBinding::Unknown,
             launch_resumed: false,
+            memory_limit: None,
         }
     }
 
@@ -865,6 +870,11 @@ impl CommandSpec {
 
     pub fn with_tmux_input(mut self, route: crate::TmuxInputRoute) -> Self {
         self.tmux_input = Some(route);
+        self
+    }
+
+    pub fn with_memory_limit(mut self, bytes: Option<u64>) -> Self {
+        self.memory_limit = bytes;
         self
     }
 }
@@ -1340,6 +1350,11 @@ pub struct TerminalSession {
     /// The tmux route for outside-control input, when this terminal's program
     /// is a tmux client (see [`crate::control_input`]).
     tmux_input: Option<crate::control_input::TmuxInput>,
+    /// The job this pane's local process tree runs in, when it has a memory
+    /// limit (see [`crate::pane_job`]). Dropped after the child is killed;
+    /// processes still in it keep running.
+    #[cfg(windows)]
+    pane_job: Option<crate::pane_job::PaneJob>,
     _reader: JoinHandle<()>,
     #[cfg(all(test, windows))]
     _monitor: JoinHandle<()>,
@@ -1581,8 +1596,38 @@ impl TerminalSession {
         // program or argv that Muxel resolved.
         apply_windows_batch_runner_env(&mut builder, &program, &spec.args);
 
+        // The job is created before the child so the child starts inside it.
+        #[cfg(windows)]
+        let pane_job = spec
+            .memory_limit
+            .and_then(|limit| match crate::pane_job::PaneJob::create(limit) {
+                Ok(job) => Some(job),
+                Err(err) => {
+                    log::warn!(
+                        "pane memory limit: couldn't create the job object, starting `{program_name}` without a limit: {err}"
+                    );
+                    None
+                }
+            });
+        #[cfg(windows)]
+        if let Some(job) = &pane_job {
+            builder.set_job_object(job.spawn_handle());
+        }
+
         let phase = std::time::Instant::now();
         let child = pair.slave.spawn_command(builder).context("spawn command")?;
+        // portable-pty retries without a job Windows refused; only a child
+        // really inside it is limited.
+        #[cfg(windows)]
+        let pane_job = pane_job.filter(|job| {
+            let inside = child.as_raw_handle().is_some_and(|process| job.contains(process));
+            if !inside {
+                log::warn!(
+                    "pane memory limit: Windows refused the job object, `{program_name}` runs without a limit"
+                );
+            }
+            inside
+        });
         if let Some(instance_id) = instance_id {
             crate::profile::startup_event(
                 instance_id,
@@ -1845,6 +1890,8 @@ impl TerminalSession {
                 .tmux_input
                 .clone()
                 .map(|route| crate::control_input::TmuxInput::new(route, input_gate.clone())),
+            #[cfg(windows)]
+            pane_job,
             _reader: reader_handle,
             #[cfg(all(test, windows))]
             _monitor: monitor_handle,
@@ -2181,6 +2228,17 @@ impl TerminalSession {
         } else {
             false
         }
+    }
+
+    /// Whether the latest paint drew the screen as it is now. For app tests,
+    /// which can't see the generation the paint path checks.
+    #[doc(hidden)]
+    pub fn painted_current_screen(&self) -> bool {
+        let current = self.content_generation();
+        self.paint_list
+            .lock()
+            .as_ref()
+            .is_some_and(|list| list.content_gen == current)
     }
 
     /// Whether the child has produced any output yet.
@@ -3174,6 +3232,42 @@ impl TerminalSession {
     /// descendants of this PID.
     pub fn child_pid(&self) -> Option<u32> {
         self.child_pid
+    }
+
+    /// The per-process memory limit, in bytes, this pane's local processes
+    /// actually run under. `None` when the pane has none: none was asked for,
+    /// or Windows couldn't apply it (logged at launch), or not on Windows.
+    #[cfg(windows)]
+    pub fn memory_limit(&self) -> Option<u64> {
+        self.pane_job
+            .as_ref()
+            .map(crate::pane_job::PaneJob::limit_bytes)
+    }
+
+    #[cfg(not(windows))]
+    pub fn memory_limit(&self) -> Option<u64> {
+        None
+    }
+
+    /// Processes in this pane that reached its memory limit since the last
+    /// call, once each is ready to report (see [`crate::MemoryLimitHit`]).
+    /// Windows reports these on a best-effort basis, so one can be missing.
+    #[cfg(windows)]
+    pub fn take_memory_limit_hits(&self) -> Vec<crate::MemoryLimitHit> {
+        self.pane_job
+            .as_ref()
+            .map(|job| job.take_hits(Instant::now()))
+            .unwrap_or_default()
+    }
+
+    #[cfg(not(windows))]
+    pub fn take_memory_limit_hits(&self) -> Vec<crate::MemoryLimitHit> {
+        Vec::new()
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn pane_job(&self) -> Option<&crate::pane_job::PaneJob> {
+        self.pane_job.as_ref()
     }
 
     /// Drain the OSC-52 copies parsed since the last call. The view lands them

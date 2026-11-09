@@ -112,9 +112,14 @@ backup counts toward the budget and uses its modification date for age.
 Invalid or nonpositive retention settings use defaults. Separate terminal and
 UI paths each receive their own budget. Use a distinct live path per process.
 If rename fails (for example, a Windows tailer lacks delete sharing), truncate
-the live file; if truncation or required pruning fails, skip writes rather than
-grow beyond the bounds. This fallback can lose history; tailers should share
-read, write, and delete access.
+the live file; if truncation fails, skip writes rather than grow beyond the
+bounds. An archive that can't be removed (read-only, or held open without
+delete sharing) is skipped, and its bytes still count toward the budget, even
+past its keep days. The rest are still pruned, writes continue while the
+family fits its byte budget, and pruning tries it again at the next roll or
+date. Only a family still over budget skips writes. Each log names its
+first append or prune failure on stderr once. This fallback can lose history;
+tailers should share read, write, and delete access.
 
 **Terminal log** (`term-prof`): ~500 ms intervals while interesting work
 happens (keys, paint spikes, high felt latency). Fields: PTY writer queue/write,
@@ -211,6 +216,42 @@ queue drops shows up only in `deferred_dropped`, so check that before reading a
 quiet log as no launches. The calling thread builds the record and copies
 stdout (hashing it itself only when 16 MiB of copies are already queued); the
 writer thread hashes and formats it.
+
+**Frame attribution** (`ui-frame`, `ui_profile/frame.rs`): every root-view
+draw is one frame, from `Window::draw` start (from its build, without GPUI's
+frame trace) to GPUI's arena clear after presenting. A frame of at least 50 ms
+writes `ui-frame[v1 slow]`; every ten seconds `ui-frame[v1 sum]` totals all
+frames. Both split the frame into GPUI-ordered intervals that add up to its
+`wall` (`pre` invalidation and Root render, `build`, `layout`
+request-layout, `compute` Root's request-layout around the app element plus
+taffy, `prepaint` through GPUI's deferred draws such as tooltips, `paint`,
+`tail` draw finalization, `present` platform present and arena clear; without
+GPUI's frame trace there is no `pre`, and `tail` and `present` are one
+`post`), then into window regions: `prep`,
+`actions`, `titlebar`, `sidebar`, `toolbar`, `hotbar`, `panes` (split
+containers), `panes_sb` (the pane row's scrollbar), `shell` (the body's
+sidebar and side-panel resizable groups and main column), `overlay`, and per
+tab group `stripN`, `bodyN` (the card) and `contentN` (the shown tab). Region
+values are self times per element phase (`build/layout/prepaint/paint`).
+`other` is the rest of each interval: the interval minus the region time that
+ran in it. GPUI lays some subtrees out inside an ancestor's prepaint, so a
+region's request-layout can run in the prepaint interval; `layout_late` is
+that time, and `other` doesn't count it twice. `cycles` is the UI thread's
+cycle count (Windows `QueryThreadCycleTime`) over `cpu_span`, which is the
+frame without `pre`. GPUI has no hook at draw start to read it sooner.
+Cycles are a count, not a duration. Windows warns against converting them to
+elapsed time, and the rate can differ between frames and other work, so the
+records don't convert them. `faults` is the process page-fault count. The
+summary adds `duty` (frame wall time over the interval), `ui_cpu` (the
+thread's CPU time from `GetThreadTimes`, charged per scheduler tick, so usable
+over ten seconds though not per frame), `frame_cycle_share` (the frames' share
+of the thread's cycles over the interval, `pre` outside it; a share of cycles,
+not of `ui_cpu`), `queue` (first invalidation to draw start) and a frame-time
+histogram. A counter that didn't read says `unavailable`, and a cycle share
+whose frames exceed the interval's cycles says `inconsistent`. Its interval
+averages take `pre`, `tail` and `present` over traced frames (`traced=T/F`)
+and `post` over the rest. Records hold fixed labels, counts and durations
+only.
 
 When GPUI reports that nothing in the newly rendered dispatch tree owns focus,
 `ui-prof[focus path v2]` records fixed owner classes and pane UUIDs for the

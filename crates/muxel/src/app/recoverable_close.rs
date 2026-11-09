@@ -34,21 +34,25 @@ pub(super) struct CloseGroup {
     pub undo_until: i64,
     pub needs_decision: bool,
     pub checking: bool,
+    /// Explicit Close is waiting for a fresh layout read, then skips the work check.
+    pub finalizing: bool,
     pub undoing: bool,
-    /// Past the deadline: when it was first seen passed, and each
-    /// layout-shared project's read mark then. The close waits for a later
-    /// read of each (`expired_close_sync`).
+    /// The deadline was seen passed, or Close was clicked: that moment and
+    /// each shared project's read mark. Wait for a later read of each.
     pub sync_marks: Option<(Instant, Vec<(Uuid, u64)>)>,
     /// The decision is whether to close without reading the shared layout.
     pub layout_unread: bool,
     pub layouts: HashMap<Uuid, Option<PaneNode>>,
+    /// Each project's live layout just before and just after this close hid
+    /// its panes. Undo puts the first back while the second is still live.
+    pub hides: HashMap<Uuid, recoverable_layout::LiveHide>,
     pub focus: Option<Uuid>,
     pub caller: Option<String>,
 }
 
 impl CloseGroup {
-    /// Past its deadline, waiting to read what peers did to the shared
-    /// layout. Leaving the workspace still finishes it as a running countdown.
+    /// Waiting to read what peers did to the shared layout, before expiry or
+    /// an explicit Close can finish.
     pub fn syncing(&self) -> bool {
         self.sync_marks.is_some() && !self.checking && !self.needs_decision && !self.undoing
     }
@@ -58,7 +62,7 @@ impl CloseGroup {
             CloseStage::Undoing
         } else if self.needs_decision {
             CloseStage::AwaitingDecision
-        } else if self.checking {
+        } else if self.checking || self.syncing() {
             CloseStage::Checking
         } else {
             CloseStage::CountingDown
@@ -92,6 +96,17 @@ pub(super) struct ClientCount {
     count: Option<usize>,
 }
 
+/// What an accepted close does with one pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceptedClose {
+    Now,
+    Hold {
+        forced: bool,
+    },
+    /// Left open: "Close only the idle ones" skipped it, or it has unsaved edits.
+    Stays,
+}
+
 impl MuxelApp {
     pub(super) fn is_closing(&self, iid: Uuid) -> bool {
         self.closing.contains_key(&iid)
@@ -102,7 +117,43 @@ impl MuxelApp {
         self.close_groups
             .iter()
             .find(|g| g.id == held.group)
+            .filter(|g| {
+                g.stage() == CloseStage::CountingDown
+                    && !g.syncing()
+                    && Instant::now() < g.deadline
+                    && chrono::Local::now().timestamp_millis() < g.undo_until
+            })
             .map(|g| g.undo_until)
+    }
+
+    pub(super) fn closing_control_error(&self, iid: Uuid) -> Option<muxel_core::control::Error> {
+        let held = self.closing.get(&iid)?;
+        let group = self.close_groups.iter().find(|g| g.id == held.group)?;
+        if let Some(until) = self.closing_until(iid) {
+            return Some(muxel_core::control::Error::closing(until));
+        }
+        let (reason, message) = match group.stage() {
+            CloseStage::Undoing => (
+                "restoring",
+                "the pane is being restored. Wait for restoration before sending input",
+            ),
+            CloseStage::AwaitingDecision => (
+                "awaiting_decision",
+                "the pane is waiting for Close / Keep. Choose Keep in muxel before sending input",
+            ),
+            CloseStage::Checking => (
+                "checking",
+                "the pane is being checked before close. Use Undo in muxel before sending input",
+            ),
+            CloseStage::CountingDown => (
+                "counting_down",
+                "the pane is held for closing. Use Undo in muxel before sending input",
+            ),
+        };
+        Some(
+            muxel_core::control::Error::new(muxel_core::control::ErrorCode::Closing, message)
+                .with_reason(reason),
+        )
     }
 
     pub(super) fn project_has_closes(&self, pid: Uuid) -> bool {
@@ -126,7 +177,7 @@ impl MuxelApp {
     /// Whether closing this pane kills a tmux session, here or on its host,
     /// which may still be running the agent whatever the local client shows.
     /// The same panes `teardown_closed_instance` kills or ledgers a session for.
-    fn close_session_may_outlive(&self, inst: &Instance) -> bool {
+    pub(super) fn close_session_may_outlive(&self, inst: &Instance) -> bool {
         let remote_unix = match self.workspace.project(inst.project_id) {
             Some(project) if project.is_remote() => Some(
                 self.remote_host_for_instance(inst.id)
@@ -203,8 +254,16 @@ impl MuxelApp {
         }
     }
 
-    /// Query real client counts off the UI thread. A failed probe is busy/unknown.
+    /// A close someone just asked for. It replaces any request these panes were
+    /// part of, and a file answer given for that request ends with it.
     pub(super) fn request_recoverable_close(&mut self, ids: Vec<Uuid>, cx: &mut Context<Self>) {
+        self.drop_unaccepted_worktree_answers(&ids);
+        self.continue_close_request(ids, cx);
+    }
+
+    /// The next step of a request already under way, such as after a file answer.
+    /// Query real client counts off the UI thread. A failed probe is busy/unknown.
+    pub(super) fn continue_close_request(&mut self, ids: Vec<Uuid>, cx: &mut Context<Self>) {
         let ids: Vec<_> = ids
             .into_iter()
             .filter(|id| !self.is_closing(*id) && self.workspace.instance(*id).is_some())
@@ -264,7 +323,7 @@ impl MuxelApp {
     fn plan_close_request(&mut self, ids: Vec<Uuid>, cx: &mut Context<Self>) {
         if let Some(&iid) = ids.iter().find(|&&iid| {
             self.close_editor(iid)
-                .is_some_and(|editor| editor.read(cx).is_dirty())
+                .is_some_and(|editor| editor.read(cx).is_dirty(cx))
         }) {
             self.request_confirm(
                 t("Save changes before closing?"),
@@ -352,7 +411,9 @@ impl MuxelApp {
         idle_only: bool,
         cx: &mut Context<Self>,
     ) {
-        let mut holds = Vec::new();
+        // Decide every pane first. Closing one can finish its worktree, and a file
+        // answer has to know by then whether this close takes all its panes.
+        let mut steps = Vec::new();
         for iid in ids {
             let Some(inst) = self.workspace.instance(iid) else {
                 continue;
@@ -360,24 +421,90 @@ impl MuxelApp {
             if self.is_closing(iid) {
                 continue;
             }
-            if inst.kind != InstanceKind::Terminal {
-                if !self
+            let step = if inst.kind != InstanceKind::Terminal {
+                if self
                     .close_editor(iid)
-                    .is_some_and(|editor| editor.read(cx).is_dirty())
+                    .is_some_and(|editor| editor.read(cx).is_dirty(cx))
                 {
-                    self.close_instance_inner(iid, "close", cx);
+                    AcceptedClose::Stays
+                } else {
+                    AcceptedClose::Now
                 }
-                continue;
-            }
-            let facts = self.close_facts(iid, cx);
-            match decide(facts, idle_only || self.settings.confirm_close_terminal) {
-                CloseDecision::Immediate => self.close_instance_inner(iid, "close", cx),
-                CloseDecision::Hold { forced } => holds.push((iid, forced)),
-                CloseDecision::Ask if !idle_only => holds.push((iid, true)),
-                CloseDecision::Ask => {}
+            } else {
+                let facts = self.close_facts(iid, cx);
+                match decide(facts, idle_only || self.settings.confirm_close_terminal) {
+                    CloseDecision::Immediate => AcceptedClose::Now,
+                    CloseDecision::Hold { forced } => AcceptedClose::Hold { forced },
+                    CloseDecision::Ask if !idle_only => AcceptedClose::Hold { forced: true },
+                    CloseDecision::Ask => AcceptedClose::Stays,
+                }
+            };
+            steps.push((iid, step));
+        }
+        self.settle_worktree_answers(&steps);
+        let mut holds = Vec::new();
+        for (iid, step) in steps {
+            match step {
+                AcceptedClose::Now => self.close_instance_inner(iid, "close", cx),
+                AcceptedClose::Hold { forced } => holds.push((iid, forced)),
+                AcceptedClose::Stays => {}
             }
         }
         self.hold_closes(holds, None, cx);
+    }
+
+    /// A file answer covers a close only if that close takes every pane it counted.
+    /// Otherwise it ends here, and the worktree asks again when its last pane goes.
+    fn settle_worktree_answers(&mut self, steps: &[(Uuid, AcceptedClose)]) {
+        let mut ended = Vec::new();
+        for (&project, answers) in &mut self.deferred_worktree_dispose {
+            for (&wid, answer) in answers.iter_mut().filter(|(_, answer)| !answer.accepted) {
+                // A captured pane removed since the answer without a local close
+                // (a peer closed it through the shared layout) left first. The
+                // panes still open can't cover what it wrote.
+                if answer
+                    .choice
+                    .close_after
+                    .iter()
+                    .any(|&iid| self.workspace.instance(iid).is_none())
+                {
+                    ended.push((project, wid));
+                    continue;
+                }
+                let open: Vec<_> = answer
+                    .choice
+                    .close_after
+                    .iter()
+                    .copied()
+                    .filter(|&iid| {
+                        self.workspace.instance(iid).is_some() && !self.closing.contains_key(&iid)
+                    })
+                    .collect();
+                // Another request's answer. Its own close decides it.
+                if !open
+                    .iter()
+                    .any(|iid| steps.iter().any(|(step, _)| step == iid))
+                {
+                    continue;
+                }
+                let takes_all = open.iter().all(|iid| {
+                    steps
+                        .iter()
+                        .any(|(step, close)| step == iid && *close != AcceptedClose::Stays)
+                });
+                if takes_all {
+                    answer.accepted = true;
+                } else {
+                    ended.push((project, wid));
+                }
+            }
+        }
+        for (project, wid) in ended {
+            self.take_deferred_worktree_dispose(project, wid);
+            muxel_store::append_event_log(&format!(
+                "close: dropped the file answer for worktree [{wid}]; this close doesn't take every pane it counted"
+            ));
+        }
     }
 
     pub(super) fn hold_closes(
@@ -394,10 +521,12 @@ impl MuxelApp {
             undo_until: chrono::Local::now().timestamp_millis() + CLOSE_GRACE.as_millis() as i64,
             needs_decision: false,
             checking: false,
+            finalizing: false,
             undoing: false,
             sync_marks: None,
             layout_unread: false,
             layouts: HashMap::new(),
+            hides: HashMap::new(),
             focus: self.active_instance,
             caller,
         };
@@ -423,7 +552,19 @@ impl MuxelApp {
                     .project(pid)
                     .and_then(|project| project.layout.clone())
             });
+            let hide = group.hides.entry(pid).or_insert_with(|| {
+                let live = self
+                    .workspace
+                    .project(pid)
+                    .and_then(|project| project.layout.clone());
+                recoverable_layout::LiveHide {
+                    before: live,
+                    after: None,
+                }
+            });
             if let Some(popout) = self.popouts.get(&iid) {
+                // Undo docks it where it would redock.
+                Self::restore_popout_layout(&mut hide.before, iid, popout.redock);
                 Self::restore_popout_layout(
                     group.layouts.get_mut(&pid).unwrap(),
                     iid,
@@ -450,6 +591,9 @@ impl MuxelApp {
         let gid = group.id;
         let members = group.members.clone();
         self.close_groups.push(group);
+        // They leave their layouts now, in this order.
+        self.close_history.retain(|iid| !members.contains(iid));
+        self.close_history.extend(&members);
         for iid in members {
             self.close_requests.remove(&iid);
             self.terminal_restarts.cancel(iid);
@@ -479,6 +623,14 @@ impl MuxelApp {
             }
             if self.active_instance == Some(iid) {
                 self.active_instance = self.workspace.active().and_then(Project::first_instance);
+            }
+        }
+        if let Some(group) = self.close_groups.iter_mut().find(|group| group.id == gid) {
+            for (pid, hide) in &mut group.hides {
+                hide.after = self
+                    .workspace
+                    .project(*pid)
+                    .and_then(|project| project.layout.clone());
             }
         }
         self.persist();
@@ -513,7 +665,8 @@ impl MuxelApp {
     }
 
     /// Put every held pane of project `pid` back into `layout`, where the
-    /// durable document keeps it until its close is final.
+    /// durable document keeps it until its close is final. Newest close first,
+    /// so each undoes onto the layout its own hide left.
     fn restore_held_layout(&self, pid: Uuid, layout: &mut Option<PaneNode>) {
         for group in self.close_groups.iter().rev() {
             let Some(original) = group.layouts.get(&pid) else {
@@ -527,8 +680,27 @@ impl MuxelApp {
                 })
                 .copied()
                 .collect();
-            recoverable_layout::restore_layout(layout, original, &ids);
+            recoverable_layout::restore_hidden(
+                layout,
+                group.hides.get(&pid),
+                original,
+                &ids,
+                &self.close_history,
+            );
         }
+    }
+
+    /// Forget the closes no held snapshot holds any more. Their order can't
+    /// change a restore.
+    fn prune_close_history(&mut self) {
+        let held: HashSet<_> = self
+            .close_groups
+            .iter()
+            .flat_map(|group| group.layouts.values())
+            .flatten()
+            .flat_map(PaneNode::collect_instances)
+            .collect();
+        self.close_history.retain(|iid| held.contains(iid));
     }
 
     /// The project as the saved and shared documents hold it: a held pane is
@@ -590,12 +762,27 @@ impl MuxelApp {
             return;
         };
         let durable = project.layout.clone();
-        let gone = rehide_held(&mut project.layout, &held);
+        let mut gone = Vec::new();
+        // Hide them close by close, oldest first, so each close's before and
+        // after are the adopted layout's.
         for group in &mut self.close_groups {
             if let Some(original) = group.layouts.get_mut(&pid) {
                 *original = durable.clone();
             }
+            let members: Vec<_> = group
+                .members
+                .iter()
+                .copied()
+                .filter(|iid| held.contains(iid))
+                .collect();
+            let before = project.layout.clone();
+            gone.extend(rehide_held(&mut project.layout, &members));
+            if let Some(hide) = group.hides.get_mut(&pid) {
+                hide.before = before;
+                hide.after = project.layout.clone();
+            }
         }
+        self.prune_close_history();
         for iid in gone {
             muxel_store::append_event_log(&format!("close: a peer closed held pane [{iid}]"));
             self.forget_close(iid);
@@ -719,12 +906,22 @@ impl MuxelApp {
             .or_else(|| group.members.iter().copied().find(|iid| ids.contains(iid)));
         for (&pid, original) in &group.layouts {
             if let Some(project) = self.workspace.project_mut(pid) {
-                recoverable_layout::restore_layout(&mut project.layout, original, &ids);
+                recoverable_layout::restore_hidden(
+                    &mut project.layout,
+                    group.hides.get(&pid),
+                    original,
+                    &ids,
+                    &self.close_history,
+                );
             }
         }
+        // Back in their layouts, so no longer closed.
+        self.close_history.retain(|iid| !ids.contains(iid));
+        self.prune_close_history();
         let mut restored = Vec::new();
         for iid in group.members {
             if let Some(held) = self.closing.remove(&iid) {
+                self.cancel_deferred_worktree_closes(&[iid]);
                 // A pane brought back is no longer going away. A disposal
                 // question that counted it must ask again before it acts.
                 for pending in &mut self.pending_worktree_dispose {
@@ -755,7 +952,12 @@ impl MuxelApp {
         let due: Vec<_> = self
             .close_groups
             .iter()
-            .filter(|g| !g.needs_decision && !g.checking && !g.undoing && now >= g.deadline)
+            .filter(|g| {
+                !g.needs_decision
+                    && !g.checking
+                    && !g.undoing
+                    && (g.finalizing || now >= g.deadline)
+            })
             .map(|g| g.id)
             .collect();
         for gid in due {
@@ -766,6 +968,14 @@ impl MuxelApp {
                     self.ask_close_without_layout(gid);
                     continue;
                 }
+            }
+            if self
+                .close_groups
+                .iter()
+                .any(|g| g.id == gid && g.finalizing)
+            {
+                self.finish_close_group(gid, cx);
+                continue;
             }
             // A confirmed close is final at its deadline. It must not wait for
             // unrelated quiet members' remote client-count probes.
@@ -925,6 +1135,34 @@ impl MuxelApp {
     }
 
     pub(super) fn finalize_close_group(&mut self, gid: Uuid, cx: &mut Context<Self>) {
+        let Some(group) = self.close_groups.iter_mut().find(|group| group.id == gid) else {
+            return;
+        };
+        // A prior expiry read may predate suspend. A new explicit decision
+        // requires a read begun after the click. A labelled override for an
+        // unreadable layout remains an explicit choice to proceed without it.
+        if !group.layout_unread {
+            group.sync_marks = None;
+            group.needs_decision = false;
+            group.checking = false;
+            group.finalizing = true;
+            match self.close_layout_sync(gid, Instant::now()) {
+                ExpiredCloseSync::Wait => {
+                    cx.notify();
+                    return;
+                }
+                ExpiredCloseSync::Ask => {
+                    self.ask_close_without_layout(gid);
+                    cx.notify();
+                    return;
+                }
+                ExpiredCloseSync::Finish => {}
+            }
+        }
+        self.finish_close_group(gid, cx);
+    }
+
+    fn finish_close_group(&mut self, gid: Uuid, cx: &mut Context<Self>) {
         let Some(index) = self.close_groups.iter().position(|group| group.id == gid) else {
             return;
         };
@@ -939,7 +1177,7 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// Leaving the workspace: finish every running countdown, and keep the
+    /// Leaving the workspace: finish unshared running countdowns, and keep the
     /// panes of a group still being checked, waiting for Close / Keep, or being
     /// restored. A kept pane is back in its layout, so the save reopens it.
     pub(super) fn finalize_all_closes(&mut self, cx: &mut Context<Self>) -> bool {
@@ -952,8 +1190,15 @@ impl MuxelApp {
             .map(|group| (group.id, departure_finalizes(group.stage())))
             .collect();
         for (gid, finalize) in groups {
+            // Leaving cannot wait on a window's polling loop. If no fresh read
+            // is available, restore the panes and save them for the next visit.
+            if let Some(group) = self.close_groups.iter_mut().find(|g| g.id == gid) {
+                group.sync_marks = None;
+            }
+            let finalize =
+                finalize && self.close_layout_sync(gid, Instant::now()) == ExpiredCloseSync::Finish;
             if finalize {
-                self.finalize_close_group(gid, cx);
+                self.finish_close_group(gid, cx);
             } else if let Some(index) = self.close_groups.iter().position(|g| g.id == gid) {
                 for (iid, _) in self.release_close_group(index, cx).1 {
                     if let Some(inst) = self.workspace.instance(iid) {
@@ -966,6 +1211,15 @@ impl MuxelApp {
             }
         }
         self.preserve_close_worktrees = was_preserving;
+        // Commit, Merge and Discard run only through a hold's own final close,
+        // never on the way out. Files stay, and a pane-less worktree stays visible.
+        let abandoned: std::collections::HashSet<Uuid> = self
+            .deferred_worktree_dispose
+            .drain()
+            .flat_map(|(_, choices)| choices.into_keys())
+            .collect();
+        self.workspace
+            .detach_unused_worktrees(|worktree| abandoned.contains(&worktree.id));
         had_closes
     }
 
@@ -1076,12 +1330,18 @@ impl MuxelApp {
             group.members.retain(|&member| member != iid);
         }
         self.close_groups.retain(|group| !group.members.is_empty());
+        // Going final keeps the place it took when held. A pane closed at once
+        // leaves now, after every close held so far.
+        if !self.close_history.contains(&iid) {
+            self.close_history.push(iid);
+        }
+        self.prune_close_history();
         if self.close_groups.is_empty() {
             self.show_close_list = false;
         }
     }
 
-    /// A worktree choice is the sole confirmation and finalizes before touching git.
+    /// Ask about files before planning the terminal's busy check and Undo hold.
     /// Returns the ids to plan here, or `None` once a disposal question owns them.
     pub(super) fn preflight_close_worktrees(
         &mut self,
@@ -1144,6 +1404,13 @@ impl MuxelApp {
             let Some(worktree) = self.workspace.worktree(wid) else {
                 continue;
             };
+            if self
+                .deferred_worktree_dispose
+                .get(&worktree.project_id)
+                .is_some_and(|choices| choices.contains_key(&wid))
+            {
+                continue;
+            }
             let root = self
                 .workspace
                 .project(worktree.project_id)
@@ -1160,6 +1427,7 @@ impl MuxelApp {
                 continue;
             }
             self.pending_worktree_dispose.push_back(WorktreeDispose {
+                project_id: worktree.project_id,
                 wid,
                 name: worktree.name.clone(),
                 color: worktree.color,
@@ -1202,7 +1470,7 @@ impl MuxelApp {
             .iter()
             .any(|iid| !captured.contains(iid))
         {
-            self.request_recoverable_close(
+            self.continue_close_request(
                 choice
                     .close_after
                     .into_iter()
@@ -1214,15 +1482,6 @@ impl MuxelApp {
             return None;
         }
         Some(choice)
-    }
-
-    pub(super) fn finalize_worktree_choice(&mut self, ids: &[Uuid], cx: &mut Context<Self>) {
-        let was_preserving = self.preserve_close_worktrees;
-        self.preserve_close_worktrees = true;
-        for &iid in ids {
-            self.close_instance_inner(iid, "close (worktree decision)", cx);
-        }
-        self.preserve_close_worktrees = was_preserving;
     }
 
     pub(super) fn save_editor_before_close(
@@ -1323,7 +1582,7 @@ impl MuxelApp {
                             inst.editor_path = Some(saved_path);
                         }
                         this.persist();
-                        this.request_recoverable_close(rest, cx);
+                        this.continue_close_request(rest, cx);
                     }
                     Ok(()) => this.add_event(
                         NotifKind::Error,
@@ -1396,7 +1655,7 @@ mod tests {
     }
 
     #[test]
-    fn a_close_waiting_on_the_shared_layout_is_still_a_running_countdown() {
+    fn a_close_waiting_on_the_shared_layout_is_an_undecided_check() {
         let mut group = CloseGroup {
             id: Uuid::new_v4(),
             members: Vec::new(),
@@ -1404,19 +1663,22 @@ mod tests {
             undo_until: 0,
             needs_decision: false,
             checking: false,
+            finalizing: false,
             undoing: false,
             sync_marks: None,
             layout_unread: false,
             layouts: HashMap::new(),
+            hides: HashMap::new(),
             focus: None,
             caller: None,
         };
         assert_eq!(group.stage(), CloseStage::CountingDown);
         assert!(!group.syncing());
-        // Past its deadline, waiting for a read: leaving still finishes it.
+        // Waiting for a read: departure and project removal must preserve it.
         group.sync_marks = Some((Instant::now(), vec![(Uuid::new_v4(), 3)]));
         assert!(group.syncing());
-        assert!(departure_finalizes(group.stage()));
+        assert_eq!(group.stage(), CloseStage::Checking);
+        assert!(!departure_finalizes(group.stage()));
         // Once read, the check, decision and Undo keep their own stages.
         for (checking, needs_decision, undoing, stage) in [
             (true, false, false, CloseStage::Checking),

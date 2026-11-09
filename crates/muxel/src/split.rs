@@ -8,7 +8,7 @@ use gpui::{
     StatefulInteractiveElement, Style, Styled, Window, div, point, px, relative, size,
 };
 use gpui_component::ActiveTheme;
-use muxel_core::geometry::{fixed_panel_size, proportional_sizes};
+use muxel_core::geometry::{drag_divider, fixed_panel_size, proportional_sizes};
 use std::{ops::Range, rc::Rc};
 
 type ResizeCallback = Rc<dyn Fn(&Entity<SplitState>, &mut Window, &mut App)>;
@@ -127,30 +127,29 @@ impl SplitState {
         let Some(drag) = &mut self.drag else {
             return false;
         };
-        let ix = drag.index;
         let delta = pointer - drag.pointer;
         if delta == px(0.0) && !drag.moved {
             return false;
         }
-        let pair = drag.sizes[ix] + drag.sizes[ix + 1];
-        let lower = ranges[ix].start.max(pair - ranges[ix + 1].end);
-        let upper = ranges[ix].end.min(pair - ranges[ix + 1].start).max(lower);
-        let left = (drag.sizes[ix] + delta).clamp(lower, upper);
-        if !drag.moved && left == drag.sizes[ix] {
+        // Every pass starts from the sizes at drag start, so pushed neighbours
+        // recover in order when the pointer comes back within the same drag.
+        let start: Vec<f32> = drag.sizes.iter().copied().map(f32::from).collect();
+        let minimums: Vec<f32> = ranges.iter().map(|range| f32::from(range.start)).collect();
+        let maximums: Vec<f32> = ranges.iter().map(|range| f32::from(range.end)).collect();
+        let sizes = drag_divider(&start, &minimums, &maximums, drag.index, f32::from(delta));
+        if !drag.moved && sizes == start {
             return false;
         }
         self.preferred.clone_from(&drag.preferred);
-        if fixed {
-            self.preferred[ix] = left;
-            self.preferred[ix + 1] = pair - left;
+        // A fixed panel's preference is its pixels. Unclamped children share a
+        // weight/pixel scale; minimum-clamped children have a smaller ratio, so
+        // the maximum recovers that scale. Convert the moved children's desired
+        // pixels back to weights at that scale; retaining their old total weight
+        // would move untouched siblings when one of them was minimum-clamped.
+        let scale = if fixed {
+            1.0
         } else {
-            // Unclamped children share a weight/pixel scale. Minimum-clamped
-            // children have a smaller ratio, so the maximum recovers that scale.
-            // Convert this pair's desired pixels back to weights at that scale;
-            // retaining its old total weight would move untouched siblings when
-            // one of the dragged children was previously minimum-clamped.
-            let scale = drag
-                .preferred
+            drag.preferred
                 .iter()
                 .zip(&drag.sizes)
                 .map(|(&preferred, &measured)| {
@@ -162,9 +161,12 @@ impl SplitState {
                     };
                     weight / f32::from(measured).max(f32::MIN_POSITIVE)
                 })
-                .fold(0.0_f32, f32::max);
-            self.preferred[ix] = left * scale;
-            self.preferred[ix + 1] = (pair - left) * scale;
+                .fold(0.0_f32, f32::max)
+        };
+        for (index, (&size, &was)) in sizes.iter().zip(&start).enumerate() {
+            if size != was {
+                self.preferred[index] = px(size * scale);
+            }
         }
         drag.moved = true;
         true
@@ -440,8 +442,138 @@ impl Element for Split {
 
 #[cfg(test)]
 mod tests {
-    use super::SplitState;
-    use gpui::px;
+    use super::{SplitState, h_resizable, resizable_panel};
+    use gpui::{
+        Bounds, Context, IntoElement, Modifiers, MouseButton, ParentElement, Pixels, Render,
+        Styled, TestAppContext, Window, canvas, div, point, px, size,
+    };
+    use std::{cell::RefCell, rc::Rc};
+
+    /// Three columns, each with the pane minimum, through the real element. A
+    /// finished drag is saved back into the view and read on the next frame, as
+    /// the app saves it into the layout.
+    struct Columns {
+        widths: Vec<f32>,
+        bounds: Rc<RefCell<Vec<Bounds<Pixels>>>>,
+    }
+
+    impl Render for Columns {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let view = cx.entity().downgrade();
+            let mut split = h_resizable("columns").on_resize(move |state, _, cx| {
+                let sizes = state.read(cx).sizes().iter().copied().map(f32::from);
+                let sizes = sizes.collect();
+                let _ = view.update(cx, |columns, cx| {
+                    columns.widths = sizes;
+                    cx.notify();
+                });
+            });
+            for (index, width) in self.widths.iter().enumerate() {
+                let bounds = self.bounds.clone();
+                let probe = canvas(
+                    move |measured, _, _| bounds.borrow_mut()[index] = measured,
+                    |_, _, _, _| {},
+                );
+                split = split.child(
+                    resizable_panel()
+                        .size(px(*width))
+                        .size_range(px(340.0)..Pixels::MAX)
+                        .child(probe.size_full()),
+                );
+            }
+            div().size_full().child(split)
+        }
+    }
+
+    #[test]
+    fn a_divider_drag_pushes_through_panes_held_at_their_minimum() {
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_component::init);
+        let bounds = Rc::new(RefCell::new(vec![Bounds::default(); 3]));
+        let probes = bounds.clone();
+        let (_view, cx) = cx.add_window_view(move |_, _| Columns {
+            widths: vec![400.0, 500.0, 700.0],
+            bounds: probes,
+        });
+        cx.simulate_resize(size(px(1600.0), px(600.0)));
+        cx.run_until_parked();
+        let widths = || -> Vec<f32> {
+            let bounds = bounds.borrow();
+            bounds.iter().map(|b| f32::from(b.size.width)).collect()
+        };
+        let assert_widths = |expected: [f32; 3], when: &str| {
+            let actual = widths();
+            assert!(
+                actual
+                    .iter()
+                    .zip(expected)
+                    .all(|(a, e)| (a - e).abs() < 0.5),
+                "{when}: columns are {actual:?}, expected {expected:?}"
+            );
+        };
+        let at = |x: f32| point(px(x), px(300.0));
+        let none = Modifiers::none;
+        assert_widths([400.0, 500.0, 700.0], "before dragging");
+
+        // The divider between the left and middle columns, dragged 500px right:
+        // the middle column stops at 340 and the right one gives the rest.
+        cx.simulate_mouse_down(at(400.0), MouseButton::Left, none());
+        for x in [410.0, 600.0, 900.0] {
+            cx.simulate_mouse_move(at(x), MouseButton::Left, none());
+        }
+        assert_widths([900.0, 340.0, 360.0], "while dragging right");
+        cx.simulate_mouse_up(at(900.0), MouseButton::Left, none());
+        assert_widths([900.0, 340.0, 360.0], "after dragging right");
+
+        // The divider between the middle and right columns, dragged left further
+        // than both columns on that side can give: both end at their minimum.
+        cx.simulate_mouse_down(at(1240.0), MouseButton::Left, none());
+        for x in [1230.0, 900.0, 500.0] {
+            cx.simulate_mouse_move(at(x), MouseButton::Left, none());
+        }
+        cx.simulate_mouse_up(at(500.0), MouseButton::Left, none());
+        assert_widths([340.0, 340.0, 920.0], "after dragging left");
+    }
+
+    #[test]
+    fn dragging_past_a_neighbours_minimum_pushes_the_panes_beyond_it() {
+        let ranges = vec![px(340.0)..Pixels::MAX; 3];
+        let allocate = |split: &SplitState| {
+            let weights: Vec<f32> = split.sizes().iter().copied().map(f32::from).collect();
+            muxel_core::geometry::proportional_sizes(1600.0, &weights, &[340.0; 3])
+        };
+        let start = vec![px(400.0), px(500.0), px(700.0)];
+        let mut split = SplitState {
+            preferred: start.clone(),
+            measured: start,
+            pressed_at: None,
+            drag: None,
+        };
+        split.start_drag(0, px(396.0), px(4.0));
+        assert!(split.drag_to(px(900.0), &ranges, false));
+        assert_eq!(allocate(&split), [900.0, 340.0, 360.0]);
+        // Past what the right side can give: it stops with both at the minimum.
+        assert!(split.drag_to(px(1300.0), &ranges, false));
+        assert_eq!(allocate(&split), [920.0, 340.0, 340.0]);
+        // Coming back within the same drag releases the pushed panes in order.
+        assert!(split.drag_to(px(500.0), &ranges, false));
+        assert_eq!(allocate(&split), [500.0, 400.0, 700.0]);
+        // Back past where it started: now the left column gives, down to its
+        // minimum, and the middle takes it. The right column is back untouched.
+        assert!(split.drag_to(px(200.0), &ranges, false));
+        assert_eq!(allocate(&split), [340.0, 560.0, 700.0]);
+
+        let start = vec![px(700.0), px(500.0), px(400.0)];
+        let mut split = SplitState {
+            preferred: start.clone(),
+            measured: start,
+            pressed_at: None,
+            drag: None,
+        };
+        split.start_drag(1, px(1196.0), px(4.0));
+        assert!(split.drag_to(px(700.0), &ranges, false));
+        assert_eq!(allocate(&split), [360.0, 340.0, 900.0]);
+    }
 
     #[test]
     fn drag_includes_movement_before_the_gpui_drag_threshold() {
