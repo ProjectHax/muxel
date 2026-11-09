@@ -6,7 +6,7 @@
 use crate::i18n::{t, tf};
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputEvent, InputState, Position, TabSize};
+use gpui_component::input::{Input, InputEvent, InputState, Position, RopeExt as _, TabSize};
 use gpui_component::text::markdown;
 use gpui_component::{ActiveTheme, Sizable};
 use std::path::{Path, PathBuf};
@@ -415,6 +415,12 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Swap in the file's contents from disk, keeping the cursor and scroll
+    /// position, and without moving focus. The cursor goes back with
+    /// `set_selected_range`, which only moves it. gpui-component's
+    /// `set_cursor_position` also focuses the input, and then a file an agent
+    /// rewrites while it's open in a clean editor would take the keys from
+    /// whatever had them, the agent's own terminal included.
     fn replace_disk_content(
         &mut self,
         content: String,
@@ -428,8 +434,10 @@ impl EditorView {
             let offset = s.scroll_offset();
             let cursor = s.cursor_position();
             s.set_value(content, window, cx);
+            let at = s.text().position_to_offset(&cursor);
+            s.set_selected_range(at..at, cx);
+            // Restoring the cursor scrolls it into view once layout exists.
             s.set_scroll_offset(offset, cx);
-            s.set_cursor_position(cursor, window, cx);
         });
         self.dirty = false;
         cx.notify();
@@ -701,8 +709,15 @@ pub fn language_for_path(path: &Path) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiskChange, disk_stamp, language_for_path, read_disk_change};
-    use std::path::Path;
+    use super::{
+        DiskChange, EditorConfig, EditorView, Position, disk_stamp, language_for_path,
+        read_disk_change,
+    };
+    use gpui::{
+        AppContext, Context, Entity, FocusHandle, IntoElement, Render, TestAppContext, Window,
+        WindowHandle,
+    };
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn detects_languages_by_extension() {
@@ -763,5 +778,226 @@ mod tests {
             Some(DiskChange::Unavailable { .. })
         ));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A test window's root. The editor under test isn't drawn.
+    struct Blank;
+
+    impl Render for Blank {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            gpui::div()
+        }
+    }
+
+    /// A clean editor on `notes.txt`, in a test window with nothing focused.
+    /// Fields drop in order, and `cx` checks for leaked entities when it
+    /// drops, so it comes last.
+    struct Reload {
+        editor: Entity<EditorView>,
+        window: WindowHandle<Blank>,
+        root: PathBuf,
+        path: PathBuf,
+        cx: TestAppContext,
+    }
+
+    impl Reload {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "muxel-editor-reload-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("notes.txt");
+            std::fs::write(&path, "one\n").unwrap();
+            let mut cx = TestAppContext::single();
+            cx.skip_drawing();
+            cx.update(gpui_component::init);
+            let window = cx.add_window(|_, _| Blank);
+            let open = Some(path.clone());
+            let editor = window
+                .update(&mut cx, |_, window, cx| {
+                    cx.new(|cx| EditorView::open(open, EditorConfig::default(), window, cx))
+                })
+                .unwrap();
+            Self {
+                editor,
+                window,
+                root,
+                path,
+                cx,
+            }
+        }
+
+        fn focused(&mut self) -> Option<FocusHandle> {
+            self.window
+                .update(&mut self.cx, |_, window, cx| window.focused(cx))
+                .unwrap()
+        }
+
+        fn focus(&mut self, handle: &FocusHandle) {
+            self.window
+                .update(&mut self.cx, |_, window, cx| window.focus(handle, cx))
+                .unwrap();
+        }
+
+        fn cursor(&self) -> Position {
+            self.editor
+                .read_with(&self.cx, |editor, cx| editor.cursor(cx))
+        }
+
+        fn goto(&mut self, line: u32, character: u32) {
+            let editor = self.editor.clone();
+            self.window
+                .update(&mut self.cx, |_, window, cx| {
+                    editor.update(cx, |editor, cx| {
+                        editor.goto_position(line, character, window, cx)
+                    })
+                })
+                .unwrap();
+        }
+
+        /// The disk poll finding the file rewritten as `text`, by an agent say.
+        /// The poll compares modified time and length, and a quick rewrite can
+        /// keep the time, so `text` is a different length from what's there.
+        fn poll(&mut self, text: &str) {
+            let editor = self.editor.clone();
+            let stamp = editor.read_with(&self.cx, |editor, _| editor.disk_stamp());
+            std::fs::write(&self.path, text).unwrap();
+            let change = read_disk_change(&self.path, stamp).expect("the poll saw no change");
+            self.window
+                .update(&mut self.cx, |_, window, cx| {
+                    editor.update(cx, |editor, cx| {
+                        editor.apply_disk_change(change, window, cx)
+                    })
+                })
+                .unwrap();
+            assert_eq!(
+                editor.read_with(&self.cx, |editor, cx| editor.text(cx)),
+                text
+            );
+        }
+
+        /// Reopening the file after it was rewritten as `text`.
+        fn reopen(&mut self, text: &str) {
+            let editor = self.editor.clone();
+            std::fs::write(&self.path, text).unwrap();
+            self.window
+                .update(&mut self.cx, |_, window, cx| {
+                    editor.update(cx, |editor, cx| editor.reload_if_clean(window, cx))
+                })
+                .unwrap();
+            assert_eq!(
+                editor.read_with(&self.cx, |editor, cx| editor.text(cx)),
+                text
+            );
+        }
+    }
+
+    impl Drop for Reload {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn a_reload_from_disk_leaves_focus_with_the_pane_that_has_it() {
+        let mut reload = Reload::new("elsewhere");
+        // Another pane has focus: the terminal of the agent rewriting the file, say.
+        let elsewhere = reload.cx.update(|cx| cx.focus_handle());
+        reload.focus(&elsewhere);
+        reload.poll("two lines\n");
+        assert_eq!(
+            reload.focused(),
+            Some(elsewhere.clone()),
+            "the poll's reload took focus"
+        );
+        reload.reopen("three lines now\n");
+        assert_eq!(
+            reload.focused(),
+            Some(elsewhere),
+            "reopening the file took focus"
+        );
+    }
+
+    #[test]
+    fn a_reload_from_disk_with_nothing_focused_focuses_nothing() {
+        let mut reload = Reload::new("unfocused");
+        assert_eq!(reload.focused(), None);
+        reload.poll("two lines\n");
+        assert_eq!(reload.focused(), None, "the poll's reload took focus");
+    }
+
+    #[test]
+    fn a_reload_from_disk_keeps_the_cursor_on_its_line() {
+        let mut reload = Reload::new("cursor");
+        reload.poll("one\nsecond line\n");
+        reload.goto(1, 5);
+        // The line above the cursor grows.
+        reload.poll("one more\nsecond line\n");
+        assert_eq!(reload.cursor(), Position::new(1, 5));
+        // The cursor's own line shrinks past it, leaving it at the line's end.
+        reload.poll("one more\nsec\n");
+        assert_eq!(reload.cursor(), Position::new(1, 3));
+    }
+
+    // On macOS, gpui-component's Root installs native accessibility hooks;
+    // GPUI test windows have no native window handle for that constructor.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_drawn_editor_keeps_its_scroll_and_cursor_after_disk_reload() {
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_component::init);
+        let original = (0..200).map(|i| format!("line {i}\n")).collect::<String>();
+        let mut editor = None;
+        let window = cx.add_window(|window, cx| {
+            let view = cx.new(|cx| {
+                EditorView::build(
+                    None,
+                    original.clone(),
+                    "text".into(),
+                    Some(Position::new(2, 3)),
+                    false,
+                    EditorConfig::default(),
+                    window,
+                    cx,
+                )
+            });
+            editor = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let editor = editor.unwrap();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), &cx);
+        visual.run_until_parked();
+        // Scroll away from the cursor, as when reading further down the file.
+        visual.update(|_, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.input.update(cx, |input, cx| {
+                    input.set_scroll_offset(gpui::point(gpui::px(0.), gpui::px(-500.)), cx)
+                })
+            })
+        });
+        visual.run_until_parked();
+        let before = visual.update(|_, cx| {
+            let editor = editor.read(cx);
+            (editor.input.read(cx).scroll_offset(), editor.cursor(cx))
+        });
+        assert!(
+            before.0.y < gpui::px(0.),
+            "the drawn editor must be scrolled"
+        );
+        assert_eq!(before.1, Position::new(2, 3));
+
+        visual.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.replace_disk_content(format!("{original}extra\n"), window, cx)
+            })
+        });
+        visual.run_until_parked();
+        let after = visual.update(|_, cx| {
+            let editor = editor.read(cx);
+            (editor.input.read(cx).scroll_offset(), editor.cursor(cx))
+        });
+        assert_eq!(after, before, "disk reload moved the viewport or cursor");
     }
 }
