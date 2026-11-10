@@ -81,13 +81,34 @@ fn reason_close_evidence(reason: TerminalStatusReason) -> CloseEvidence {
         TerminalStatusReason::ProgramStatusError => CloseEvidence::Quiet,
         TerminalStatusReason::ProviderHook => CloseEvidence::Hook,
         TerminalStatusReason::ProviderTitle => CloseEvidence::Title,
-        TerminalStatusReason::ProviderScreen => CloseEvidence::Screen,
+        TerminalStatusReason::ProviderScreen | TerminalStatusReason::BackgroundWork => {
+            CloseEvidence::Screen
+        }
         TerminalStatusReason::BlockedMarker | TerminalStatusReason::WorkingMarker => {
             CloseEvidence::Output
         }
         TerminalStatusReason::Bell => CloseEvidence::Bell,
         TerminalStatusReason::RecentOutput => CloseEvidence::Output,
         TerminalStatusReason::Quiet => CloseEvidence::Quiet,
+    }
+}
+
+/// Whether the close prompt should name a pane's listed work: only when that is
+/// why the pane counts as busy. A pane waiting for input or working in the
+/// foreground says so instead.
+fn listed_work_is_why_busy(status: AgentStatus, reason: TerminalStatusReason) -> bool {
+    matches!(status, AgentStatus::Idle | AgentStatus::Done)
+        || reason == TerminalStatusReason::BackgroundWork
+}
+
+/// A close kills what runs beside a finished turn, so it counts as busy and asks.
+fn close_state(
+    state: AgentState,
+    background: Option<muxel_core::control::BackgroundWork>,
+) -> AgentState {
+    match state {
+        AgentState::Idle | AgentState::Done if background.is_some() => AgentState::Working,
+        state => state,
     }
 }
 
@@ -226,6 +247,7 @@ impl MuxelApp {
         if evidence == CloseEvidence::ShellPrompt && state != AgentState::Exited {
             state = AgentState::Idle;
         }
+        state = close_state(state, snapshot.and_then(|snapshot| snapshot.background));
         let awaiting_reply = inst.is_some_and(|inst| {
             self.control_turns.get(&iid).is_some_and(|turn| {
                 turn.awaiting_reply(
@@ -367,6 +389,20 @@ impl MuxelApp {
                         return tf(
                             "{name}'s tmux session may still be running.",
                             &[("name", inst.display_name())],
+                        );
+                    }
+                    if let Some(work) = self.terminal_view(iid).and_then(|view| {
+                        let view = view.read(cx);
+                        let runtime = view.runtime_snapshot();
+                        view.background_work()
+                            .filter(|_| listed_work_is_why_busy(runtime.status, runtime.reason))
+                    }) {
+                        return tf(
+                            "{name} is still running {work}.",
+                            &[
+                                ("name", inst.display_name()),
+                                ("work", &super::background_label(work)),
+                            ],
                         );
                     }
                     let state = match facts.status {
@@ -1604,12 +1640,12 @@ impl MuxelApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{CloseGroup, reason_close_evidence};
+    use super::{CloseGroup, close_state, listed_work_is_why_busy, reason_close_evidence};
     use muxel_core::control::AgentState;
     use muxel_core::recoverable_close::{
         CloseDecision, CloseFacts, CloseStage, decide, departure_finalizes,
     };
-    use muxel_terminal::{ProgramStatusKind, TerminalStatusReason};
+    use muxel_terminal::{AgentStatus, ProgramStatusKind, TerminalStatusReason};
     use std::collections::HashMap;
     use std::time::Instant;
     use uuid::Uuid;
@@ -1627,6 +1663,22 @@ mod tests {
             input_rev: 0,
             completion_rev: 0,
         }
+    }
+
+    /// A dev server past its hold reads done, and a close would still kill it.
+    #[test]
+    fn a_close_asks_while_anything_runs_beside_a_finished_turn() {
+        let shell = muxel_core::control::BackgroundWork {
+            shells: 1,
+            ..Default::default()
+        };
+        let program = TerminalStatusReason::ProgramStatus(None);
+        let ask = |state, background| {
+            decide(facts(close_state(state, background), program), true) == CloseDecision::Ask
+        };
+        assert!(!ask(AgentState::Done, None), "a finished turn counts down");
+        assert!(ask(AgentState::Done, Some(shell)));
+        assert!(ask(AgentState::Idle, Some(shell)));
     }
 
     #[test]
@@ -1693,6 +1745,24 @@ mod tests {
             assert_eq!(group.stage(), stage);
             assert!(!group.syncing(), "{stage:?}");
             assert!(!departure_finalizes(stage), "{stage:?}");
+        }
+    }
+
+    #[test]
+    fn the_close_prompt_names_listed_work_only_when_it_makes_the_pane_busy() {
+        use TerminalStatusReason::{BackgroundWork, BlockedMarker, ProviderScreen, ProviderTitle};
+        for (status, reason, named) in [
+            (AgentStatus::Done, ProviderTitle, true),
+            (AgentStatus::Idle, ProviderTitle, true),
+            (AgentStatus::Working, BackgroundWork, true),
+            (AgentStatus::Working, ProviderScreen, false),
+            (AgentStatus::Blocked, BlockedMarker, false),
+        ] {
+            assert_eq!(
+                listed_work_is_why_busy(status, reason),
+                named,
+                "{status:?} by {reason:?}"
+            );
         }
     }
 }
