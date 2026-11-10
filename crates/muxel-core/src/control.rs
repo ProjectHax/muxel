@@ -586,8 +586,8 @@ fn id_matches(id: Uuid, query: &str) -> bool {
 }
 
 /// Resolve an agent reference: `focused`, a UUID or short id (any unique prefix of
-/// four or more hex digits, optionally prefixed by `pane`), a name, or
-/// `project/name` when names repeat.
+/// four or more hex digits), a name, `project/name` when names repeat, or an id
+/// prefixed by `pane` that no agent's name matches.
 pub fn resolve_agent(
     query: &str,
     agents: &[AgentEntry],
@@ -602,20 +602,21 @@ pub fn resolve_agent(
             .filter(|id| agents.iter().any(|a| a.id == *id))
             .ok_or_else(|| "no pane is focused".into());
     }
-    let id_query = query
-        .strip_prefix("pane")
-        .filter(|id| id_like(id))
-        .unwrap_or(query);
-    if id_like(id_query) {
+    let by_id = |id_query: &str| -> Option<Result<Uuid, String>> {
         let hits: Vec<&AgentEntry> = agents
             .iter()
             .filter(|a| id_matches(a.id, id_query))
             .collect();
         match hits.as_slice() {
-            [one] => return Ok(one.id),
-            [] => {}
-            many => return Err(ambiguous(query, many)),
+            [one] => Some(Ok(one.id)),
+            [] => None,
+            many => Some(Err(ambiguous(query, many))),
         }
+    };
+    if id_like(query)
+        && let Some(found) = by_id(query)
+    {
+        return found;
     }
     let (project, name) = match query.split_once('/') {
         Some((project, name)) => (Some(normalize(project)), normalize(name)),
@@ -628,9 +629,16 @@ pub fn resolve_agent(
         .collect();
     match hits.as_slice() {
         [one] => Ok(one.id),
-        [] => Err(format!(
-            "no agent matches '{query}' — run `muxel ctl panes` to list them"
-        )),
+        // `pane<ID>` only once no agent has that name.
+        [] => query
+            .strip_prefix("pane")
+            .filter(|id| id_like(id))
+            .and_then(&by_id)
+            .unwrap_or_else(|| {
+                Err(format!(
+                    "no agent matches '{query}' — run `muxel ctl panes` to list them"
+                ))
+            }),
         many => Err(ambiguous(query, many)),
     }
 }
@@ -2531,6 +2539,26 @@ mod tests {
                 .contains("more than one")
         );
         assert_eq!(resolve_agent("panebench", &agents, None), Ok(a));
+    }
+
+    #[test]
+    fn a_name_spelled_like_a_pane_id_resolves_to_its_own_agent() {
+        let named = id(0x0000aaaa_0000_0000_0000_000000000001);
+        let other = id(0x12340000_0000_0000_0000_000000000002);
+        let agents = [
+            AgentEntry {
+                id: named,
+                name: "pane1234",
+                project: "sample",
+            },
+            AgentEntry {
+                id: other,
+                name: "other",
+                project: "sample",
+            },
+        ];
+        assert_eq!(resolve_agent("pane1234", &agents, None), Ok(named));
+        assert_eq!(resolve_agent("pane12340000", &agents, None), Ok(other));
     }
 
     #[test]

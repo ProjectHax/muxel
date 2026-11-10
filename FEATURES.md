@@ -1133,7 +1133,7 @@ feature is added or changed, update the matching entry here in the same change**
   before any input; other commands' failures carry no outcome. A send watches
   for its receipt for ten seconds, a second longer for each thousand characters
   past the first, up to a minute. Agent IDs also accept the `pane<ID>`
-  spelling.
+  spelling when no agent has that name.
 - **Startup input waits for the provider** — a `new --prompt` task waits for a
   real editable composer and provider acceptance. The reply comes once the pane
   exists, with the task submitted, refused, or `prompt_pending` and a `status`
