@@ -10,6 +10,12 @@
 //! Knowing the token is the whole of the authorization; anyone able to read it
 //! can exercise the enabled control authority.
 //!
+//! Several muxel windows (each its own process) can run at once. Each also
+//! publishes its endpoint as `<data dir>/workspaces/<id>/control.json` for the
+//! workspace it has open, and `ctl` run in a pane goes to the window holding that
+//! pane's workspace (see [`choose_endpoint`]). Other callers reach the window
+//! that wrote `control.json` last, as long as it has a workspace open.
+//!
 //! The protocol and the decisions in it live in `muxel_core::control`; the app
 //! answers requests in `app/control_api.rs`. This file is only sockets and files.
 
@@ -59,6 +65,8 @@ pub struct Server {
     port: u16,
     path: PathBuf,
     token: String,
+    /// The open workspace this endpoint is also published for, and that file.
+    workspace: Option<(Uuid, PathBuf)>,
 }
 
 impl Server {
@@ -123,8 +131,54 @@ impl Server {
             port,
             path,
             token,
+            workspace: None,
         })
     }
+
+    /// Publish this endpoint in workspace `id`'s folder too (withdrawing it from
+    /// the previous one), so `ctl` from that workspace's panes finds this window
+    /// when other windows run. Cheap when nothing changed; called every tick.
+    pub fn set_workspace(&mut self, id: Option<Uuid>) {
+        if self.workspace.as_ref().map(|(current, _)| *current) == id {
+            return;
+        }
+        self.withdraw_workspace();
+        let Some(id) = id else { return };
+        let Some(path) = workspace_endpoint_path(&self.path, id) else {
+            return;
+        };
+        let endpoint = Endpoint {
+            version: PROTOCOL_VERSION,
+            port: self.port,
+            token: self.token.clone(),
+            pid: std::process::id(),
+            exe: Some(exe_path()),
+        };
+        // The workspace's folder exists while its lock is held.
+        if let Err(error) = write_endpoint(&path, &endpoint) {
+            log::warn!("couldn't write {}: {error:#}", path.display());
+        }
+        // Remembered even on failure, so a broken folder isn't retried every tick.
+        self.workspace = Some((id, path));
+    }
+
+    fn withdraw_workspace(&mut self) {
+        if let Some((_, path)) = self.workspace.take()
+            && read_endpoint(&path).is_some_and(|e| e.token == self.token)
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Where the endpoint for workspace `id` goes, beside the main endpoint file.
+fn workspace_endpoint_path(main: &Path, id: Uuid) -> Option<PathBuf> {
+    Some(
+        main.parent()?
+            .join("workspaces")
+            .join(id.to_string())
+            .join(control::ENDPOINT_FILE),
+    )
 }
 
 impl Drop for Server {
@@ -139,6 +193,7 @@ impl Drop for Server {
         if read_endpoint(&self.path).is_some_and(|e| e.token == self.token) {
             let _ = std::fs::remove_file(&self.path);
         }
+        self.withdraw_workspace();
     }
 }
 
@@ -596,7 +651,69 @@ fn process_alive(pid: u32) -> bool {
 fn request(command: Command) -> Result<Value, control::Error> {
     let path = endpoint_path()?
         .ok_or_else(|| control::Error::new(ErrorCode::HostUnavailable, "no data directory"))?;
-    request_at(&path, command)
+    // Chosen once per `ctl` run, so `wait`'s repeated checks stay on one window.
+    static CHOSEN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let path = CHOSEN.get_or_init(|| {
+        let caller = std::env::var(control::INSTANCE_ID_ENV)
+            .ok()
+            .and_then(|id| id.parse().ok());
+        choose_endpoint(&path, caller)
+    });
+    request_at(path, command)
+}
+
+/// Which window's endpoint a request goes to, given the main endpoint file and
+/// the calling pane. A pane's request goes to the window holding the workspace
+/// that pane belongs to. Otherwise it goes to the main file's window while that
+/// runs with a workspace open, and failing that to the window that published
+/// most recently. So neither a new window still on the workspace selector nor
+/// closing the window that wrote the main file cuts the other windows off.
+fn choose_endpoint(main: &Path, caller: Option<Uuid>) -> PathBuf {
+    let Some(dir) = main.parent().map(|dir| dir.join("workspaces")) else {
+        return main.to_path_buf();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return main.to_path_buf();
+    };
+    let live: Vec<(PathBuf, Endpoint, std::time::SystemTime)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path().join(control::ENDPOINT_FILE);
+            let endpoint = read_endpoint(&path)?;
+            let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+            process_alive(endpoint.pid).then_some((path, endpoint, modified))
+        })
+        .collect();
+    let main_endpoint = read_endpoint(main).filter(|e| process_alive(e.pid));
+    // One window (or only the main one) running: nothing to choose between.
+    if live.iter().all(|(_, endpoint, _)| {
+        main_endpoint
+            .as_ref()
+            .is_some_and(|main| main.token == endpoint.token)
+    }) {
+        return main.to_path_buf();
+    }
+    if let Some(caller) = caller {
+        let owner = live.iter().find(|(path, _, _)| {
+            path.parent()
+                .map(|ws| ws.join("workspace.json"))
+                .and_then(|doc| muxel_store::load_workspace_from(&doc))
+                .is_some_and(|ws| ws.instances.iter().any(|i| i.id == caller))
+        });
+        if let Some((path, _, _)) = owner {
+            return path.clone();
+        }
+    }
+    let main_has_workspace = main_endpoint.as_ref().is_some_and(|main| {
+        live.iter()
+            .any(|(_, endpoint, _)| endpoint.token == main.token)
+    });
+    if main_has_workspace {
+        return main.to_path_buf();
+    }
+    live.into_iter()
+        .max_by_key(|(_, _, modified)| *modified)
+        .map_or_else(|| main.to_path_buf(), |(path, _, _)| path)
 }
 
 /// Poll a pending creation until muxel answers it. Each poll owns a fresh
@@ -797,9 +914,9 @@ fn wait(agent: &str, timeout: Duration, full: bool, turn: bool) -> Result<Value,
 #[cfg(test)]
 mod tests {
     use super::{
-        DELIVERY_WAIT, Server, Task, create, dispatch, failure_body, process_alive, read_endpoint,
-        request_at, same_secret, task_of, wait_creation_with, wait_prompt_delivery_with,
-        write_endpoint,
+        DELIVERY_WAIT, Server, Task, choose_endpoint, create, dispatch, failure_body,
+        process_alive, read_endpoint, request_at, same_secret, task_of, wait_creation_with,
+        wait_prompt_delivery_with, write_endpoint,
     };
     use muxel_core::control::{
         self, CliCommand, Command, Endpoint, ErrorCode, PROTOCOL_VERSION, Response,
@@ -959,6 +1076,118 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("muxel-ctl-{name}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// An endpoint file for a window with `token`, run by `pid`.
+    fn publish(path: &std::path::Path, token: &str, pid: u32) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let endpoint = Endpoint {
+            version: PROTOCOL_VERSION,
+            port: 1,
+            token: token.into(),
+            pid,
+            exe: None,
+        };
+        write_endpoint(path, &endpoint).unwrap();
+    }
+
+    /// Workspace `ws` under `data`, holding the pane `instance`, published by
+    /// the window with `token`. Returns its endpoint file.
+    fn workspace_window(
+        data: &std::path::Path,
+        ws: uuid::Uuid,
+        instance: uuid::Uuid,
+        token: &str,
+    ) -> PathBuf {
+        let dir = data.join("workspaces").join(ws.to_string());
+        let mut pane = muxel_core::Instance::shell(uuid::Uuid::new_v4());
+        pane.id = instance;
+        let doc = muxel_core::Workspace {
+            instances: vec![pane],
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        muxel_store::save_workspace_to(&dir.join("workspace.json"), &doc).unwrap();
+        let path = dir.join(control::ENDPOINT_FILE);
+        publish(&path, token, std::process::id());
+        path
+    }
+
+    #[test]
+    fn a_pane_reaches_the_window_holding_its_workspace() {
+        let data = scratch("route");
+        let main = data.join(control::ENDPOINT_FILE);
+        let me = std::process::id();
+        // Nothing but the main file: it's used, as before.
+        publish(&main, "first", me);
+        assert_eq!(choose_endpoint(&main, Some(uuid::Uuid::new_v4())), main);
+
+        let (pane_a, pane_b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let a = workspace_window(&data, uuid::Uuid::new_v4(), pane_a, "first");
+        // One window publishing under both names: still the main file.
+        assert_eq!(choose_endpoint(&main, Some(pane_b)), main);
+
+        // A second window, which didn't write the main file, holds pane B.
+        let b = workspace_window(&data, uuid::Uuid::new_v4(), pane_b, "second");
+        assert_eq!(choose_endpoint(&main, Some(pane_b)), b);
+        let to_a = choose_endpoint(&main, Some(pane_a));
+        assert_eq!(read_endpoint(&to_a).unwrap().token, "first");
+        // Outside tools and unknown panes go to the main file's window.
+        assert_eq!(choose_endpoint(&main, None), main);
+        assert_eq!(choose_endpoint(&main, Some(uuid::Uuid::new_v4())), main);
+
+        // A new window still on the workspace selector wrote the main file last:
+        // outside tools go to a window with a workspace open instead.
+        publish(&main, "selector", me);
+        let newest = choose_endpoint(&main, None);
+        assert!(newest == a || newest == b, "{}", newest.display());
+        assert_eq!(choose_endpoint(&main, Some(pane_b)), b);
+        publish(&main, "first", me);
+
+        // The main file's window exited: the others are still reachable.
+        std::fs::remove_file(&main).unwrap();
+        std::fs::remove_file(&a).unwrap();
+        assert_eq!(choose_endpoint(&main, None), b);
+
+        // A window that died without cleaning up isn't chosen.
+        let dead = (1..)
+            .map(|n| u32::MAX / 2 - n)
+            .find(|pid| !process_alive(*pid))
+            .unwrap();
+        publish(&b, "second", dead);
+        assert_eq!(choose_endpoint(&main, Some(pane_b)), main);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn a_server_publishes_for_the_open_workspace_and_withdraws_after() {
+        let data = scratch("publish-workspace");
+        let (one, two) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let file = |id: uuid::Uuid| {
+            data.join("workspaces")
+                .join(id.to_string())
+                .join(control::ENDPOINT_FILE)
+        };
+        for id in [one, two] {
+            std::fs::create_dir_all(file(id).parent().unwrap()).unwrap();
+        }
+        let (tx, _rx) = async_channel::unbounded();
+        let mut server = Server::start_in(&data, tx).unwrap();
+        let main = read_endpoint(&data.join(control::ENDPOINT_FILE)).unwrap();
+
+        server.set_workspace(Some(one));
+        assert_eq!(read_endpoint(&file(one)).unwrap(), main);
+        server.set_workspace(Some(two));
+        assert!(!file(one).exists());
+        assert_eq!(read_endpoint(&file(two)).unwrap().port, main.port);
+        server.set_workspace(None);
+        assert!(!file(two).exists());
+
+        server.set_workspace(Some(one));
+        drop(server);
+        assert!(!file(one).exists());
+        assert!(!data.join(control::ENDPOINT_FILE).exists());
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]

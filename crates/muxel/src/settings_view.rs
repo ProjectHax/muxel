@@ -69,6 +69,8 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str, Option<&str>)] = &[
     // OS fullscreen; the sidebar hides until revealed or fullscreen exits.
     ("ToggleFullScreen", "f11", None),
     ("ToggleDevConsole", "f12", None),
+    // Another muxel window, on the workspace selector.
+    ("NewWindow", "ctrl-shift-n", None),
     // Editor save — auto !Terminal so Claude stash (Ctrl+S) reaches the PTY.
     ("SaveFile", "ctrl-s", None),
     ("SaveFileAs", "ctrl-shift-s", None),

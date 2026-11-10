@@ -501,6 +501,12 @@ impl MuxelApp {
                 self.control_task = None;
             }
         }
+        // Also published for the open workspace, so its panes' `ctl` finds this
+        // window when other muxel windows run.
+        let workspace = self.current_workspace;
+        if let Some(server) = &mut self.control {
+            server.set_workspace(workspace);
+        }
     }
 
     // --- Settings → Outside control ------------------------------------------------

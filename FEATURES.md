@@ -1199,6 +1199,12 @@ feature is added or changed, update the matching entry here in the same change**
   trusted. The check goes by process id alone, so if that id has since gone to
   another process, the file still passes. On Linux and macOS that is any process;
   on Windows it is one the user may open, such as one of their own.
+- **With several windows open** — each muxel window also writes its endpoint
+  into the folder of the workspace it has open, so `muxel ctl` run in a pane
+  reaches the window holding that pane, not whichever window started last.
+  Outside tools reach the window that wrote `control.json` most recently while
+  it has a workspace open; otherwise (it's still on the workspace selector, or
+  it has closed) they reach the window with a workspace that published last.
 - **Settings → Outside control** — a setup page that walks through connecting
   another agent in four steps: turn on outside control (with a live status: on and
   listening, starting, or off), let the agent run commands on this computer (with
@@ -1788,12 +1794,23 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Workspaces** — multiple workspaces, each with its own projects + layout; a startup workspace
   selector.
+- **Multiple windows** — **New Window** (`Ctrl+Shift+N`, rebindable; also `Cmd+N`
+  on macOS, the macOS **File** and Dock menus, the command palette and the
+  workspace selector) opens another muxel window, so two workspaces can be worked
+  in at once on macOS, Windows and Linux. It opens on the workspace selector, a
+  little offset from the window that opened it. In a window that already has a
+  workspace, the selector's ↗ button beside another workspace opens that one in a
+  new window instead of switching. Each window is its own muxel process with the
+  same `--user-data-dir`, so closing or quitting one leaves the others running,
+  and each keeps its own tray icon.
 - **Single instance per workspace** — each workspace is locked while open, so two
   muxel windows can run side by side on **different** workspaces but never the same
-  one (which would clobber its layout). Picking a workspace another window already
-  holds is refused in the selector with an inline "in use" note; pick a different one
-  or close the other window. The lock releases when you switch workspaces or on exit
-  (even a crash), so no stale lock blocks the next launch.
+  one (which would clobber its layout). The selector marks workspaces another
+  window has open as "in use" and won't delete them; picking one is refused with an
+  inline note, so pick a different one or close the other window. Workspaces
+  created in one window are listed in the others, and changes to the workspace
+  list never drop one another window just made. The lock releases when you switch
+  workspaces or on exit (even a crash), so no stale lock blocks the next launch.
 - **Full restore** — pane layout, split sizes, window geometry, and sidebar width
   are persisted and restored on launch.
 - **Separate user data dir** — `muxel --user-data-dir DIR` puts settings in
