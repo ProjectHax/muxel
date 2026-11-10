@@ -477,7 +477,9 @@ foreground Done, completion alerts, Recent work or plain wait. `ctl wait --turn`
 stops at an observable turn end with
 background work still listed. It cannot override a provider's continuing Working
 report. Send admission and the background turn-end decision require the hold's
-binding revision to match the current conversation. Completion attribution stays
+binding revision to match the current conversation. Send admission also requires
+an attributable status, so a listing never admits input while a switch settles or
+the screen is held after one. Completion attribution stays
 separate: a surviving footer after `/clear` can still leave the current composer
 free without updating activity. Foreground working/blocked markers prevent that
 background-only exception. Released foreground turns with current-binding listed

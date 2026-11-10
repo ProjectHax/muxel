@@ -564,26 +564,16 @@ feature is added or changed, update the matching entry here in the same change**
   updates on known agent panes are accepted only from that provider's semantic
   title shape; existing marker, bell, and process-exit signals still apply.
   Provider-owned screen rows can add precise state that titles omit: Claude
-  permission forms report **blocked**, and subagents listed by Claude's footer
-  or Grok's panel hold a finished turn at **working**, labelled `working · subagents`.
-  Shell and monitor listings remain visible beside the foreground status
-  (`done · 3m · 1 shell`) without delaying completion alerts or Recent work.
-  Detection depends on supported footer and panel layouts and wording, including
-  tmux and SSH panes where those remain visible. A subagent hold overrides a finished
-  report, suppresses completion alerts and Recent movement, and releases when the
-  listing clears and the agent has had five seconds to wake, or after three hours.
-  A released turn
-  stays released through later footer redraws until new foreground work runs;
-  program transitions coalesced into one read still start a fresh turn clock.
-  Legacy `command still running` rows remain foreground Working and refuse input.
-  Unsupported legacy task kinds do not establish subagent work. Existing activity
-  ages remain beside the background label. Closing a pane asks while anything is
-  listed as running, and `ctl status` reports it as `background`. `ctl send` still
-  delivers to a held pane, since its prompt is free. Plain `ctl wait` follows subagent
-  holds; shell and monitor counts alone do not delay it. Its `background` field lists
-  remaining work on completion or timeout. `ctl wait --turn` stops at an observable
-  turn end even if subagents remain. It cannot override a provider still reporting
-  **working**. Claude's
+  permission forms report **blocked**. Subagents listed by Claude's footer or
+  Grok's panel hold a finished turn at **working** (`working · subagents`) for up
+  to three hours, with no done alert or Recent move until the listing clears; a
+  released turn isn't held again until new foreground work runs. Shell and monitor
+  listings show beside the status (`done · 3m · 1 shell`) without delaying
+  completion. Older Claude's `command still running` row reads **working** unless
+  a current empty footer is drawn below it. Closing a pane asks while anything is
+  listed, `ctl status` and `ctl wait` report it as `background`, plain `ctl wait`
+  waits out subagent holds (`--turn` doesn't), and `ctl send` still delivers to a
+  held pane once its status belongs to the current conversation. Claude's
   visible foreground progress row also preserves **working** when a narrow tmux
   pane truncates the usual interrupt marker. Brief
   Grok redraw gaps do not forge completion. Panes judged by output activity

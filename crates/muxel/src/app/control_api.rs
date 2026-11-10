@@ -414,6 +414,16 @@ fn background_turn_over(
                 && runtime.background.is_some_and(|work| !work.is_empty())))
 }
 
+/// Whether a background turn end also frees the prompt for `ctl send`. A listing
+/// says nothing about whose prompt is showing, so while a switch settles, or the
+/// screen is held after one, input stays refused as for any unattributable status.
+fn background_send_admitted(
+    runtime: muxel_terminal::TerminalRuntimeSnapshot,
+    binding_rev: u64,
+) -> bool {
+    runtime.is_attributable_to(binding_rev) && background_turn_over(runtime, binding_rev)
+}
+
 fn check_send_state(admission: SendAdmission) -> CtlResult<()> {
     if !admission.force {
         if admission.just_submitted {
@@ -1526,7 +1536,10 @@ impl MuxelApp {
             self.terminal_view(inst.id)
                 .filter(|view| {
                     let view = view.read(cx);
-                    background_turn_over(view.runtime_snapshot(), view.session().binding_revision())
+                    background_send_admitted(
+                        view.runtime_snapshot(),
+                        view.session().binding_revision(),
+                    )
                 })
                 .map(|_| muxel_terminal::TerminalStatusReason::BackgroundWork),
         )
@@ -4312,7 +4325,7 @@ mod runtime_control_tests {
                 attributable,
                 ..runtime
             };
-            let reason = super::background_turn_over(runtime, binding)
+            let reason = super::background_send_admitted(runtime, binding)
                 .then_some(TerminalStatusReason::BackgroundWork);
             let state =
                 super::send_admission_state(Some(runtime_control_state(runtime, binding)), reason);
@@ -4321,8 +4334,7 @@ mod runtime_control_tests {
                 just_submitted: false,
                 force: false,
             });
-            // Attribution belongs to activity, not to the free foreground composer.
-            assert_eq!(result.is_ok(), binding == 1);
+            assert_eq!(result.is_ok(), binding == 1 && attributable);
         }
     }
 
@@ -4350,18 +4362,23 @@ mod runtime_control_tests {
                 ..held_snapshot()
             };
             assert!(super::background_turn_over(runtime, 1));
-            let reason = super::background_turn_over(runtime, 1)
-                .then_some(TerminalStatusReason::BackgroundWork);
-            let state =
-                super::send_admission_state(Some(runtime_control_state(runtime, 1)), reason);
-            assert!(
-                check_send_state(SendAdmission {
+            for (attributable, admitted) in [(true, true), (false, false)] {
+                let runtime = TerminalRuntimeSnapshot {
+                    attributable,
+                    ..runtime
+                };
+                let reason = super::background_send_admitted(runtime, 1)
+                    .then_some(TerminalStatusReason::BackgroundWork);
+                let state =
+                    super::send_admission_state(Some(runtime_control_state(runtime, 1)), reason);
+                let result = check_send_state(SendAdmission {
                     state,
                     just_submitted: false,
                     force: false,
-                })
-                .is_ok()
-            );
+                });
+                // A listing can't vouch for a prompt a switch may have left.
+                assert_eq!(result.is_ok(), admitted, "attributable: {attributable}");
+            }
             assert!(
                 !super::background_turn_over(runtime, 2),
                 "an old binding never authorizes input"
