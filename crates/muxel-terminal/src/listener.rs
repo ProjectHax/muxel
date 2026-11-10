@@ -316,6 +316,14 @@ impl LifecycleEvidence {
         self.binding_rev
     }
 
+    pub(crate) fn prompt_binding_is_current(&self, captured: u64) -> bool {
+        captured == self.binding_rev
+            || (captured == 0
+                && self.binding_rev == 1
+                && matches!(self.launch, LaunchBinding::Unknown)
+                && self.window.is_none())
+    }
+
     /// Begin a new binding at sequence `since`, a provider title in the output
     /// itself. The order is exact: evidence before it belongs to the retired
     /// conversation, evidence from `since` on is the new one's, and no window
@@ -643,6 +651,28 @@ mod tests {
         assert_eq!(evidence.binding_rev(), 0);
         evidence.record_submission(at);
         assert_eq!(evidence.first_submission_binding(), None);
+    }
+
+    #[test]
+    fn ctl_ergonomics_first_binding_keeps_confirmation_but_a_switch_interrupts_it() {
+        let at = SystemTime::now();
+        let mut evidence = LifecycleEvidence::for_launch(&LaunchBinding::Unknown);
+        let captured = evidence.binding_rev();
+        evidence.record_prompt_submission(at);
+        evidence.begin_binding(1);
+        assert!(
+            evidence.prompt_binding_is_current(captured),
+            "learning the first thread must not interrupt confirmation of its prompt"
+        );
+        evidence.begin_binding(2);
+        assert!(!evidence.prompt_binding_is_current(captured));
+
+        let mut external = LifecycleEvidence::for_launch(&LaunchBinding::Unknown);
+        external.switch_binding(at, at, at);
+        assert!(
+            !external.prompt_binding_is_current(0),
+            "an out-of-band switch is never a first attachment"
+        );
     }
 
     #[test]

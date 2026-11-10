@@ -41,6 +41,9 @@ pub struct NewOptions {
     /// Client behavior only; the host always returns admission immediately.
     #[serde(skip)]
     pub no_wait: bool,
+    /// Client behavior only: read a `--prompt` task's delivery until it settles.
+    #[serde(skip)]
+    pub wait_delivery: bool,
 }
 
 /// The longest `--name` or `--from`, in characters.
@@ -260,6 +263,7 @@ pub(super) fn parse(args: &[String]) -> Result<CliCommand, String> {
             "--prompt" => options.prompt = Some(value()?),
             "--from" => options.from = Some(value()?),
             "--no-wait" => options.no_wait = true,
+            "--wait-delivery" => options.wait_delivery = true,
             "--focus" => options.focus = true,
             "--background" => {} // accepted for existing callers; background is the default
             "--tab" | "--split" => {
@@ -279,6 +283,9 @@ pub(super) fn parse(args: &[String]) -> Result<CliCommand, String> {
             }
             _ => return Err(format!("unexpected argument '{arg}'")),
         }
+    }
+    if options.wait_delivery && (options.no_wait || options.prompt.is_none()) {
+        return Err("--wait-delivery waits for a --prompt task, and not with --no-wait".into());
     }
     options.background = !options.focus;
     options.validate()?;

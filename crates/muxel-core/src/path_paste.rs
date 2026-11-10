@@ -70,6 +70,7 @@ pub enum PastePathError {
     UnsupportedCharacters,
     TrailingBackslash,
     NonUnicode,
+    InputRefused,
 }
 
 /// Build the complete paste before any PTY write. A bad later path cannot leave

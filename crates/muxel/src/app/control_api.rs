@@ -69,8 +69,7 @@ impl ControlTurn {
     fn startup_error(&self) -> Option<String> {
         self.startup
             .as_ref()
-            .and_then(ctl::StartupTurn::failure)
-            .map(|failure| failure.message().to_owned())
+            .and_then(ctl::StartupTurn::startup_error)
     }
 
     fn startup(prompt: String) -> Self {
@@ -341,7 +340,15 @@ const SUBMIT_DELAY_MS: u64 = 400;
 /// Codex 0.163's Windows detector needs >60ms of processed-character quiet;
 /// sleeping before a pipe write cannot establish that. Retry only visible proof.
 const SUBMISSION_RETRY_MS: u64 = 5_000;
+/// How long a send watches for its receipt, holding its ctl connection.
+/// A provider can take in a large paste slowly (Windows Codex receives two
+/// console input records per character), so the window grows with the text
+/// by [`SUBMISSION_CONFIRM_PER_KCHAR_MS`] for each thousand characters past
+/// the first, up to [`SUBMISSION_CONFIRM_MAX_MS`]. That rate is an
+/// allowance, not a measured provider speed.
 const SUBMISSION_CONFIRM_MS: u64 = 10_000;
+const SUBMISSION_CONFIRM_PER_KCHAR_MS: u64 = 1_000;
+const SUBMISSION_CONFIRM_MAX_MS: u64 = 60_000;
 const SUBMISSION_RETRY_GRACE_MS: u64 = 3_000;
 const SUBMISSION_POLL_MS: u64 = 100;
 /// Pause between the keys of one `keys` request.
@@ -1186,6 +1193,18 @@ impl MuxelApp {
                 .control_turns
                 .get(&inst.id)
                 .and_then(ControlTurn::startup_error),
+            prompt_delivery: self.control_turns.get(&inst.id).and_then(|turn| {
+                let startup = turn.startup.as_ref()?;
+                let exact_draft = self.terminal_view(inst.id).is_some_and(|view| {
+                    let view = view.read(cx);
+                    startup.can_inspect_draft(view.session().id, view.session().input_rev())
+                        && turn
+                            .prompt
+                            .as_deref()
+                            .is_some_and(|text| view.prompt_in_composer(text))
+                });
+                Some(startup.delivery(&inst.id.to_string(), exact_draft))
+            }),
             focused: self.active_instance == Some(inst.id),
             pane,
             worktree_branch: inst.worktree_branch.clone(),
@@ -1711,7 +1730,7 @@ impl MuxelApp {
                         return Ok(reply);
                     };
                     let started = std::time::Instant::now();
-                    let mut confirmation = PromptConfirmation::default();
+                    let mut confirmation = PromptConfirmation::new(&text);
                     let mut retries = 0_u8;
                     loop {
                         let action = this
@@ -1771,6 +1790,20 @@ impl MuxelApp {
                             Err(stop) => Err(stop),
                         };
                         submission_receipt(&mut reply, Some(outcome), retries);
+                        if outcome == Err(Unconfirmed::TimedOut) && retries == 0 {
+                            let retained = this.update(cx, |app, cx| {
+                                session.accepts_input_epoch(input_epoch)
+                                    && confirmation_verdict(app.control_writable(iid, cx), &session, revision, session.input_rev()).is_ok()
+                                    && app.terminal_view(iid).is_some_and(|view| {
+                                        let view = view.read(cx);
+                                            view.observe_prompt_submission(&attempt) == muxel_terminal::PromptSubmissionState::Retryable
+                                            && view.prompt_in_composer(&text)
+                                    })
+                            }).unwrap_or(false);
+                            if retained {
+                                ctl::PromptDelivery::new(&iid.to_string(), ctl::PromptOutcome::PendingInComposer).apply(&mut reply);
+                            }
+                        }
                         return Ok(reply);
                     }
                 })
@@ -1903,12 +1936,24 @@ enum PromptConfirmationAction {
     Unconfirmed,
 }
 
-#[derive(Default)]
 struct PromptConfirmation {
+    confirm: Duration,
     retried_at: Option<Duration>,
 }
 
 impl PromptConfirmation {
+    /// Watching for the receipt of `text`.
+    fn new(text: &str) -> Self {
+        let past_first = (text.chars().count() as u64).saturating_sub(1_000);
+        let extra = past_first.div_ceil(1_000) * SUBMISSION_CONFIRM_PER_KCHAR_MS;
+        Self {
+            confirm: Duration::from_millis(
+                (SUBMISSION_CONFIRM_MS + extra).min(SUBMISSION_CONFIRM_MAX_MS),
+            ),
+            retried_at: None,
+        }
+    }
+
     fn observe(
         &mut self,
         elapsed: Duration,
@@ -1919,7 +1964,7 @@ impl PromptConfirmation {
             return PromptConfirmationAction::Confirmed;
         }
         // A late retry still gets time to show its receipt.
-        let confirm = Duration::from_millis(SUBMISSION_CONFIRM_MS);
+        let confirm = self.confirm;
         let deadline = self.retried_at.map_or(confirm, |at| {
             confirm.max(at + Duration::from_millis(SUBMISSION_RETRY_GRACE_MS))
         });
@@ -1983,6 +2028,17 @@ fn submission_receipt(
     outcome: Option<Result<(), Unconfirmed>>,
     enter_retries: u8,
 ) {
+    let agent = reply["uuid"].as_str().or_else(|| reply["agent"].as_str());
+    let proven = if outcome == Some(Ok(())) {
+        ctl::PromptOutcome::Submitted
+    } else {
+        ctl::PromptOutcome::Unconfirmed
+    };
+    let mut delivery = ctl::PromptDelivery::new(agent.unwrap_or(""), proven);
+    if agent.is_none() && proven != ctl::PromptOutcome::Submitted {
+        delivery.next = Some("muxel ctl panes".into());
+    }
+    delivery.apply(reply);
     reply["submission_confirmed"] = outcome.map_or(Value::Null, |outcome| json!(outcome.is_ok()));
     reply["enter_retries"] = json!(enter_retries);
     if let Some(Err(reason)) = outcome {
@@ -2084,6 +2140,7 @@ async fn finish_prompt_enter(
 fn paste_failed(error: ControlWriteError) -> ctl::Error {
     let typed = error.may_have_typed();
     let failed: ctl::Error = match error {
+        ControlWriteError::InvalidInput(why) => ctl::Error::new(ErrorCode::UnsupportedInput, why),
         ControlWriteError::Closed(why) => format!(
             "couldn't finish pasting the prompt ({why}); input may be partial: check its `screen`"
         )
@@ -2093,9 +2150,10 @@ fn paste_failed(error: ControlWriteError) -> ctl::Error {
             format!("{why}. Nothing was typed"),
         ),
         ControlWriteError::InMode(why) => ctl::Error::new(ErrorCode::TmuxPaneInMode, why),
-        ControlWriteError::Refused(_) => {
-            format!("couldn't paste the prompt through tmux: {error}").into()
-        }
+        ControlWriteError::Refused(_) => ctl::Error::new(
+            ErrorCode::TmuxRefused,
+            format!("couldn't paste the prompt through tmux: {error}"),
+        ),
         ControlWriteError::Unknown(_) | ControlWriteError::Partial(_) => format!(
             "couldn't confirm the paste through tmux: {error}. Check its `screen` before sending again"
         )
@@ -2108,6 +2166,7 @@ fn paste_failed(error: ControlWriteError) -> ctl::Error {
 /// fails with `pasted: true`.
 fn enter_failed(error: ControlWriteError) -> ctl::Error {
     ctl::Error::from(match error {
+        ControlWriteError::InvalidInput(why) => why,
         ControlWriteError::Closed(why) => {
             format!("the prompt was pasted but Enter couldn't be admitted ({why}): check its `screen`")
         }
@@ -2149,6 +2208,7 @@ fn keys_failed(error: ControlWriteError, pressed_before: usize) -> ctl::Error {
     let typed = pressed_before > 0 || error.may_have_typed();
     let failed = if pressed_before > 0 || matches!(error, ControlWriteError::Partial(_)) {
         let then = match error {
+            ControlWriteError::InvalidInput(why) => why,
             ControlWriteError::Refused(why)
             | ControlWriteError::Unresolved(why)
             | ControlWriteError::InMode(why) => {
@@ -2172,6 +2232,10 @@ fn keys_failed(error: ControlWriteError, pressed_before: usize) -> ctl::Error {
                 ctl::Error::new(ErrorCode::TmuxPaneUnresolved, why)
             }
             ControlWriteError::InMode(why) => ctl::Error::new(ErrorCode::TmuxPaneInMode, why),
+            ControlWriteError::Refused(_) => ctl::Error::new(
+                ErrorCode::TmuxRefused,
+                format!("couldn't press a key through tmux: {error}"),
+            ),
             ControlWriteError::Closed(why) => {
                 format!("couldn't admit a key to the PTY writer: {why}").into()
             }
@@ -2777,11 +2841,19 @@ mod prompt_submission_tests {
         }
 
         let refused = paste_failed(ControlWriteError::Refused("target pane has exited".into()));
-        assert_eq!(refused.code, None);
         assert!(
             refused.message.contains("nothing was typed"),
             "{}",
             refused.message
+        );
+        let reply = crate::control::failure_body(refused, crate::control::Task::Unsent);
+        assert_eq!(
+            reply["outcome"], "not_delivered",
+            "a paste tmux refused typed nothing: {reply}"
+        );
+        assert_eq!(
+            keys_failed(ControlWriteError::Refused("lost server".into()), 0).code,
+            Some(ErrorCode::TmuxRefused)
         );
         let unknown = paste_failed(ControlWriteError::Unknown(
             "no answer within 10 seconds".into(),
@@ -3981,7 +4053,7 @@ mod prompt_submission_tests {
     fn submission_retry_needs_positive_proof_and_can_happen_only_once() {
         use PromptConfirmationAction::{Confirmed, Observe, RetryEnter, Unconfirmed};
         use PromptSubmissionState::{Accepted, Retryable, Unconfirmed as Unknown};
-        let mut confirm = PromptConfirmation::default();
+        let mut confirm = PromptConfirmation::new("fix the pager");
         assert_eq!(
             confirm.observe(Duration::from_millis(4_999), Retryable),
             Observe
@@ -4001,7 +4073,7 @@ mod prompt_submission_tests {
             confirm.observe(Duration::from_secs(10), Accepted),
             Confirmed
         );
-        let mut fast = PromptConfirmation::default();
+        let mut fast = PromptConfirmation::new("fix the pager");
         assert_eq!(fast.observe(Duration::ZERO, Accepted), Confirmed);
     }
 
@@ -4009,7 +4081,7 @@ mod prompt_submission_tests {
     fn a_late_retry_keeps_time_to_confirm() {
         use PromptConfirmationAction::{Observe, RetryEnter, Unconfirmed};
         use PromptSubmissionState::{Retryable, Unconfirmed as Unknown};
-        let mut confirm = PromptConfirmation::default();
+        let mut confirm = PromptConfirmation::new("fix the pager");
         assert_eq!(
             confirm.observe(Duration::from_millis(9_900), Retryable),
             RetryEnter
@@ -4018,6 +4090,27 @@ mod prompt_submission_tests {
         assert_eq!(
             confirm.observe(Duration::from_millis(12_900), Unknown),
             Unconfirmed
+        );
+    }
+
+    #[test]
+    fn an_ordinary_send_holds_its_connection_no_longer_than_on_master() {
+        use PromptSubmissionState::Unconfirmed as Unknown;
+        let mut confirm = PromptConfirmation::new(&"word ".repeat(200));
+        assert_eq!(
+            confirm.observe(Duration::from_secs(10), Unknown),
+            PromptConfirmationAction::Unconfirmed,
+            "a thousand characters get master's ten seconds"
+        );
+        let mut largest = PromptConfirmation::new(&"x".repeat(1_000_000));
+        assert_eq!(
+            largest.observe(Duration::from_secs(59), Unknown),
+            PromptConfirmationAction::Observe
+        );
+        assert_eq!(
+            largest.observe(Duration::from_secs(60), Unknown),
+            PromptConfirmationAction::Unconfirmed,
+            "no send watches longer than a minute"
         );
     }
 
@@ -4056,13 +4149,36 @@ mod prompt_submission_tests {
     }
 
     #[test]
+    fn ctl_ergonomics_unconfirmed_receipt_names_inspection_without_repasting() {
+        let mut reply = json!({"pasted": true, "agent": "abcd1234"});
+        submission_receipt(&mut reply, Some(Err(Unconfirmed::Interrupted)), 0);
+        assert_eq!(reply["outcome"], "unconfirmed");
+        assert_eq!(reply["next"], "muxel ctl screen abcd1234");
+        assert_eq!(reply["pasted"], true);
+    }
+
+    #[test]
+    fn ctl_ergonomics_large_paste_can_finish_after_twenty_seconds() {
+        let mut confirmation = PromptConfirmation::new(&"x".repeat(30_000));
+        assert_eq!(
+            confirmation.observe(Duration::from_secs(20), PromptSubmissionState::Unconfirmed),
+            PromptConfirmationAction::Observe,
+            "a large provider paste must not be reported unconfirmed while it is still processing"
+        );
+        assert_eq!(
+            confirmation.observe(Duration::from_secs(30), PromptSubmissionState::Accepted),
+            PromptConfirmationAction::Confirmed
+        );
+    }
+
+    #[test]
     fn checking_after_enter_only_ever_extends_the_success_receipt() {
         let pasted = json!({"pasted": true, "launch_id": "L"});
         let mut unwatched = pasted.clone();
         submission_receipt(&mut unwatched, None, 0);
         assert_eq!(
             unwatched,
-            json!({"pasted": true, "launch_id": "L", "submission_confirmed": null, "enter_retries": 0})
+            json!({"pasted": true, "launch_id": "L", "submission_confirmed": null, "enter_retries": 0, "outcome": "unconfirmed", "next": "muxel ctl panes"})
         );
         let mut confirmed = pasted.clone();
         submission_receipt(&mut confirmed, Some(Ok(())), 1);
