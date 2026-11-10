@@ -309,6 +309,8 @@ pub enum ErrorCode {
     TmuxPaneUnresolved,
     /// A tmux pane mode is open. Leave it before retrying; nothing was typed.
     TmuxPaneInMode,
+    /// tmux refused the input, or couldn't be run. Nothing was typed.
+    TmuxRefused,
     /// Some of a `keys` request's keys were pressed, then the rest failed.
     KeysPartlyPressed,
     /// The caller selected its own pane without explicitly forcing the action.
@@ -1282,7 +1284,7 @@ usage: muxel ctl <command> [args]
   projects                       list projects
   panes [PROJECT]                pane layout and agents (all projects, or one)
   new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down]
-              [--focus] [--prompt TEXT] [--from LABEL] [--no-wait]
+              [--focus] [--prompt TEXT [--wait-delivery]] [--from LABEL] [--no-wait]
               [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]
                                  open in background; --focus selects and raises;
                                  --background is a compatibility no-op; --prompt - reads stdin
@@ -1321,6 +1323,8 @@ Ask returns a pending request id immediately; the CLI polls once per second unti
 Connection and host-availability failures retry up to three times against the same id; creation is never reissued.
 Uncoded status errors also name the id to query with `new-status`; do not repeat `new` while the original may still wait.
 `--no-wait` returns that id for scripts; poll with `new-status REQUEST_ID`. Requests expire after 120 seconds.
+With --prompt the reply comes once the pane exists: its task submitted, refused, or prompt_pending with `status` as next.
+`--wait-delivery` keeps reading until the task settles, for up to 90 seconds.
 `--from` and the caller's MUXEL_INSTANCE_ID are declared labels, not verified identities.
 All raw argv (even agent argv) and shell presets/defaults ALSO require \"Also allow typing into shell panes\".
 All three grants default off; upgrades do not infer creation permission from the older grants.
@@ -1348,7 +1352,7 @@ pub fn command_help(command: &str) -> Option<&'static str> {
             "usage: muxel ctl panes [PROJECT]\nShow pane layout and agents in all projects or one project."
         }
         "new" => {
-            "usage: muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down] [--focus] [--prompt TEXT] [--from LABEL] [--no-wait] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]\nOpen a terminal as a tab in the calling pane's group (else the focused group); --split makes a pane beside it instead. --prompt - reads stdin and waits for its delivery outcome unless --no-wait. Blockers are reported as blocked_by with a screen excerpt; trust is never answered automatically. Never repeat new: its pane already exists. Never re-send text after an uncertain receipt; follow next. not_delivered means nothing was typed: resolve the blocker before sending the task to the existing pane. -- starts literal program arguments. Creation permissions apply."
+            "usage: muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down] [--focus] [--prompt TEXT [--wait-delivery]] [--from LABEL] [--no-wait] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]\nOpen a terminal as a tab in the calling pane's group (else the focused group); --split makes a pane beside it instead. --prompt - reads stdin. With --prompt the reply comes once the pane exists, with its task submitted, refused, or prompt_pending (follow next); --wait-delivery keeps reading until it settles, for up to 90 seconds. Blockers are reported as blocked_by with a screen excerpt; trust is never answered automatically. Never repeat new: its pane already exists. Never re-send text after an uncertain receipt; follow next. not_delivered means nothing was typed: resolve the blocker before sending the task to the existing pane. -- starts literal program arguments. Creation permissions apply."
         }
         "new-status" => {
             "usage: muxel ctl new-status REQUEST_ID\nPoll a pending creation by its full request UUID."
@@ -1979,6 +1983,8 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
   `screen` before pressing any again.
 - `tmux_pane_in_mode` - the pane is in copy mode; nothing was typed. Leave
   copy mode before retrying. A failure after a paste instead has `pasted: true`.
+- `tmux_refused` - tmux refused the input or couldn't be run; nothing was
+  typed. Check `screen` before retrying.
 - `self_target` - this command would type into its caller's own pane; select a
   different target or pass `--force` deliberately.
 - `host_unavailable`, `stale_endpoint` - no running muxel to ask.
@@ -2020,8 +2026,13 @@ also withhold Enter and return an error without a code; inspect the input first.
   describes an observed draft; it does not guard or authorize a later Enter.
   `not_delivered` means nothing was typed; resolve its refusal before
   sending the task. Never repeat `new`; use its existing pane. `new --prompt`
-  waits for provider input readiness and acceptance;
-  `--no-wait` returns `prompt_pending` and a read-only next command. `status` and
+  replies once the pane exists, with the task `submitted`, refused, or still
+  `prompt_pending` with `status` as `next`; `--wait-delivery` reads until it
+  settles, for up to 90 seconds. `--no-wait` replies before approval, with
+  `new-status` as `next`. A failed `send` or `new --prompt` has an `outcome`
+  too: `not_delivered` only for a coded refusal before any input, otherwise
+  `unconfirmed`, as when `new`'s approval poll is lost while the task can
+  still arrive. Other commands' failures carry no outcome. `status` and
   `show.agent` include `prompt_delivery`. A folder trust, update or login blocker
   reports `blocked_by` and `screen_excerpt`; leave trust decisions to the user.
 - Only type into shell panes (`"is_agent": false`) when the user asks; muxel
@@ -2274,6 +2285,7 @@ mod tests {
             (ErrorCode::InputChanged, "input_changed"),
             (ErrorCode::TmuxPaneUnresolved, "tmux_pane_unresolved"),
             (ErrorCode::TmuxPaneInMode, "tmux_pane_in_mode"),
+            (ErrorCode::TmuxRefused, "tmux_refused"),
             (ErrorCode::KeysPartlyPressed, "keys_partly_pressed"),
             (ErrorCode::SelfTarget, "self_target"),
             (ErrorCode::HostUnavailable, "host_unavailable"),

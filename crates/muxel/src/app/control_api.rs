@@ -340,7 +340,15 @@ const SUBMIT_DELAY_MS: u64 = 400;
 /// Codex 0.163's Windows detector needs >60ms of processed-character quiet;
 /// sleeping before a pipe write cannot establish that. Retry only visible proof.
 const SUBMISSION_RETRY_MS: u64 = 5_000;
-const SUBMISSION_CONFIRM_MS: u64 = 60_000;
+/// How long a send watches for its receipt, holding its ctl connection.
+/// A provider can take in a large paste slowly (Windows Codex receives two
+/// console input records per character), so the window grows with the text
+/// by [`SUBMISSION_CONFIRM_PER_KCHAR_MS`] for each thousand characters past
+/// the first, up to [`SUBMISSION_CONFIRM_MAX_MS`]. That rate is an
+/// allowance, not a measured provider speed.
+const SUBMISSION_CONFIRM_MS: u64 = 10_000;
+const SUBMISSION_CONFIRM_PER_KCHAR_MS: u64 = 1_000;
+const SUBMISSION_CONFIRM_MAX_MS: u64 = 60_000;
 const SUBMISSION_RETRY_GRACE_MS: u64 = 3_000;
 const SUBMISSION_POLL_MS: u64 = 100;
 /// Pause between the keys of one `keys` request.
@@ -1722,7 +1730,7 @@ impl MuxelApp {
                         return Ok(reply);
                     };
                     let started = std::time::Instant::now();
-                    let mut confirmation = PromptConfirmation::default();
+                    let mut confirmation = PromptConfirmation::new(&text);
                     let mut retries = 0_u8;
                     loop {
                         let action = this
@@ -1928,12 +1936,24 @@ enum PromptConfirmationAction {
     Unconfirmed,
 }
 
-#[derive(Default)]
 struct PromptConfirmation {
+    confirm: Duration,
     retried_at: Option<Duration>,
 }
 
 impl PromptConfirmation {
+    /// Watching for the receipt of `text`.
+    fn new(text: &str) -> Self {
+        let past_first = (text.chars().count() as u64).saturating_sub(1_000);
+        let extra = past_first.div_ceil(1_000) * SUBMISSION_CONFIRM_PER_KCHAR_MS;
+        Self {
+            confirm: Duration::from_millis(
+                (SUBMISSION_CONFIRM_MS + extra).min(SUBMISSION_CONFIRM_MAX_MS),
+            ),
+            retried_at: None,
+        }
+    }
+
     fn observe(
         &mut self,
         elapsed: Duration,
@@ -1944,7 +1964,7 @@ impl PromptConfirmation {
             return PromptConfirmationAction::Confirmed;
         }
         // A late retry still gets time to show its receipt.
-        let confirm = Duration::from_millis(SUBMISSION_CONFIRM_MS);
+        let confirm = self.confirm;
         let deadline = self.retried_at.map_or(confirm, |at| {
             confirm.max(at + Duration::from_millis(SUBMISSION_RETRY_GRACE_MS))
         });
@@ -2130,9 +2150,10 @@ fn paste_failed(error: ControlWriteError) -> ctl::Error {
             format!("{why}. Nothing was typed"),
         ),
         ControlWriteError::InMode(why) => ctl::Error::new(ErrorCode::TmuxPaneInMode, why),
-        ControlWriteError::Refused(_) => {
-            format!("couldn't paste the prompt through tmux: {error}").into()
-        }
+        ControlWriteError::Refused(_) => ctl::Error::new(
+            ErrorCode::TmuxRefused,
+            format!("couldn't paste the prompt through tmux: {error}"),
+        ),
         ControlWriteError::Unknown(_) | ControlWriteError::Partial(_) => format!(
             "couldn't confirm the paste through tmux: {error}. Check its `screen` before sending again"
         )
@@ -2211,6 +2232,10 @@ fn keys_failed(error: ControlWriteError, pressed_before: usize) -> ctl::Error {
                 ctl::Error::new(ErrorCode::TmuxPaneUnresolved, why)
             }
             ControlWriteError::InMode(why) => ctl::Error::new(ErrorCode::TmuxPaneInMode, why),
+            ControlWriteError::Refused(_) => ctl::Error::new(
+                ErrorCode::TmuxRefused,
+                format!("couldn't press a key through tmux: {error}"),
+            ),
             ControlWriteError::Closed(why) => {
                 format!("couldn't admit a key to the PTY writer: {why}").into()
             }
@@ -2816,11 +2841,19 @@ mod prompt_submission_tests {
         }
 
         let refused = paste_failed(ControlWriteError::Refused("target pane has exited".into()));
-        assert_eq!(refused.code, None);
         assert!(
             refused.message.contains("nothing was typed"),
             "{}",
             refused.message
+        );
+        let reply = crate::control::failure_body(refused, crate::control::Task::Unsent);
+        assert_eq!(
+            reply["outcome"], "not_delivered",
+            "a paste tmux refused typed nothing: {reply}"
+        );
+        assert_eq!(
+            keys_failed(ControlWriteError::Refused("lost server".into()), 0).code,
+            Some(ErrorCode::TmuxRefused)
         );
         let unknown = paste_failed(ControlWriteError::Unknown(
             "no answer within 10 seconds".into(),
@@ -4020,7 +4053,7 @@ mod prompt_submission_tests {
     fn submission_retry_needs_positive_proof_and_can_happen_only_once() {
         use PromptConfirmationAction::{Confirmed, Observe, RetryEnter, Unconfirmed};
         use PromptSubmissionState::{Accepted, Retryable, Unconfirmed as Unknown};
-        let mut confirm = PromptConfirmation::default();
+        let mut confirm = PromptConfirmation::new("fix the pager");
         assert_eq!(
             confirm.observe(Duration::from_millis(4_999), Retryable),
             Observe
@@ -4032,15 +4065,15 @@ mod prompt_submission_tests {
         );
         assert_eq!(confirm.observe(Duration::from_secs(7), Retryable), Observe);
         assert_eq!(
-            confirm.observe(Duration::from_secs(60), Retryable),
+            confirm.observe(Duration::from_secs(10), Retryable),
             Unconfirmed
         );
         // A genuine receipt is still usable when it arrives at the deadline.
         assert_eq!(
-            confirm.observe(Duration::from_secs(60), Accepted),
+            confirm.observe(Duration::from_secs(10), Accepted),
             Confirmed
         );
-        let mut fast = PromptConfirmation::default();
+        let mut fast = PromptConfirmation::new("fix the pager");
         assert_eq!(fast.observe(Duration::ZERO, Accepted), Confirmed);
     }
 
@@ -4048,15 +4081,36 @@ mod prompt_submission_tests {
     fn a_late_retry_keeps_time_to_confirm() {
         use PromptConfirmationAction::{Observe, RetryEnter, Unconfirmed};
         use PromptSubmissionState::{Retryable, Unconfirmed as Unknown};
-        let mut confirm = PromptConfirmation::default();
+        let mut confirm = PromptConfirmation::new("fix the pager");
         assert_eq!(
-            confirm.observe(Duration::from_millis(59_900), Retryable),
+            confirm.observe(Duration::from_millis(9_900), Retryable),
             RetryEnter
         );
-        assert_eq!(confirm.observe(Duration::from_secs(62), Unknown), Observe);
+        assert_eq!(confirm.observe(Duration::from_secs(12), Unknown), Observe);
         assert_eq!(
-            confirm.observe(Duration::from_millis(62_900), Unknown),
+            confirm.observe(Duration::from_millis(12_900), Unknown),
             Unconfirmed
+        );
+    }
+
+    #[test]
+    fn an_ordinary_send_holds_its_connection_no_longer_than_on_master() {
+        use PromptSubmissionState::Unconfirmed as Unknown;
+        let mut confirm = PromptConfirmation::new(&"word ".repeat(200));
+        assert_eq!(
+            confirm.observe(Duration::from_secs(10), Unknown),
+            PromptConfirmationAction::Unconfirmed,
+            "a thousand characters get master's ten seconds"
+        );
+        let mut largest = PromptConfirmation::new(&"x".repeat(1_000_000));
+        assert_eq!(
+            largest.observe(Duration::from_secs(59), Unknown),
+            PromptConfirmationAction::Observe
+        );
+        assert_eq!(
+            largest.observe(Duration::from_secs(60), Unknown),
+            PromptConfirmationAction::Unconfirmed,
+            "no send watches longer than a minute"
         );
     }
 
@@ -4105,7 +4159,7 @@ mod prompt_submission_tests {
 
     #[test]
     fn ctl_ergonomics_large_paste_can_finish_after_twenty_seconds() {
-        let mut confirmation = PromptConfirmation::default();
+        let mut confirmation = PromptConfirmation::new(&"x".repeat(30_000));
         assert_eq!(
             confirmation.observe(Duration::from_secs(20), PromptSubmissionState::Unconfirmed),
             PromptConfirmationAction::Observe,

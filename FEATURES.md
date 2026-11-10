@@ -1128,14 +1128,20 @@ feature is added or changed, update the matching entry here in the same change**
   All unsubmitted outcomes recommend read-only screen inspection. A pending
   receipt describes the draft observed at that time and cannot guard a later
   Enter; never paste the task again after uncertain delivery. Startup pending
-  proof preserves exact whitespace; ambiguous layout stays unconfirmed. Agent
-  IDs also
-  accept the `pane<ID>` spelling.
-- **Startup input waits for the provider** — `new --prompt` waits for a real
-  editable composer and provider acceptance. Known folder trust, update and
-  login menus stop delivery with `blocked_by` and a short `screen_excerpt`;
-  trust prompts are never answered automatically. `--no-wait` returns
-  `prompt_pending` and a polling command. Status exposes the same delivery facts.
+  proof preserves exact whitespace; ambiguous layout stays unconfirmed. A failed
+  `send` or `new --prompt` is `not_delivered` only when a coded refusal came
+  before any input; other commands' failures carry no outcome. A send watches
+  for its receipt for ten seconds, a second longer for each thousand characters
+  past the first, up to a minute. Agent IDs also accept the `pane<ID>`
+  spelling.
+- **Startup input waits for the provider** — a `new --prompt` task waits for a
+  real editable composer and provider acceptance. The reply comes once the pane
+  exists, with the task submitted, refused, or `prompt_pending` and a `status`
+  command to follow; `--wait-delivery` reads until it settles, for up to 90
+  seconds. Known folder trust, update and login menus stop delivery as soon as
+  they appear, with `blocked_by` and a short `screen_excerpt`; trust prompts are
+  never answered automatically. `--no-wait` returns before approval with a
+  polling command. Status exposes the same delivery facts.
   Codex launches carrying a startup task suppress its startup update menu.
 - **Windows Codex multiline control** — native presets disable heuristic paste
   bursts only after a version probe verifies the matching input codec. The
