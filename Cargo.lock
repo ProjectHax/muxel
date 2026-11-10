@@ -5070,7 +5070,7 @@ dependencies = [
 
 [[package]]
 name = "muxel"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "arboard",
@@ -5121,7 +5121,7 @@ dependencies = [
 
 [[package]]
 name = "muxel-core"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "ammonia",
  "base64",
@@ -5136,7 +5136,7 @@ dependencies = [
 
 [[package]]
 name = "muxel-store"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5149,7 +5149,7 @@ dependencies = [
 
 [[package]]
 name = "muxel-terminal"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -5170,7 +5170,7 @@ dependencies = [
 
 [[package]]
 name = "muxel-tray"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "ksni",
  "log",

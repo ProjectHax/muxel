@@ -5,6 +5,161 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.3.6] — 2026-11-10
+
+### Added
+- **Copy rendered Markdown as rich text** — copying from a rendered Markdown pane
+  gave plain text, so pasting an agent-written email or report into Outlook,
+  Gmail or a document lost every heading, list and table. A rendered Markdown
+  pane now has a **Copy as rich text** button, also in the Ctrl+P palette, that
+  copies the whole document with its headings, lists, links, code and bordered
+  tables intact; apps that only take plain text get the Markdown source. Local
+  images become an `[Image: …]` placeholder and links to files beside the
+  document become plain text. Thanks to
+  [@railapex](https://github.com/railapex) ([#130](https://github.com/ProjectHax/muxel/pull/130)).
+- **Finished agents you've already looked at dim** — a finished agent looked the
+  same whether or not you had read its result, so after a few turns you couldn't
+  tell which panes had something new. An unread Done stays solid green; once you
+  focus its pane, its sidebar and dashboard icons dim and its sidebar pill turns
+  to a green outline. Thanks to
+  [@ithielnor](https://github.com/ithielnor) ([#123](https://github.com/ProjectHax/muxel/pull/123)).
+- **A memory limit for each process in a pane, on Windows** — one runaway
+  process in a pane could use up all of the machine's memory until other
+  programs, muxel included, crashed. Each process a local pane starts can now
+  commit at most 16 GB by default; one that asks for more is refused, which
+  usually stops it, and the notification feed says which process hit the limit.
+  Settings → Behavior sets it to Off, 8, 16, 32 or 64 GB for panes started
+  afterwards. This is on by default, so if you run large Java heaps, optimized
+  links or local models in a pane, you may need to raise it. Thanks to
+  [@railapex](https://github.com/railapex) ([#133](https://github.com/ProjectHax/muxel/pull/133)).
+
+### Changed
+- **New agents open as a tab, and what a pane opens lands beside it** — the
+  toolbar's agent button and `Ctrl+Alt+1–9` added a new column every time, and a
+  file, diff or page opened from a pane joined the nearest pane of the same kind,
+  which could be several columns away. A new agent now opens as a tab in the
+  focused pane, and `muxel ctl new` run from a pane joins that pane's group; the
+  split commands still split. A link, a pane's diff button, an HTML preview or a
+  page's new-window link now opens in the pane next to it, splitting once if
+  there isn't one. In a project window on another monitor, the toolbar and
+  shortcuts now act on that window rather than the main one, links in popped-out
+  terminals open, and a file already open in another project is brought into
+  view. Thanks to
+  [@railapex](https://github.com/railapex) ([#129](https://github.com/ProjectHax/muxel/pull/129)).
+- **Closing a split gives its space back to the pane it came from** — closing a
+  pane spread its space across every pane left, which skewed the whole layout.
+  Its space now goes back to the pane it was split from, so the others stay where
+  they were, and Undo puts the exact layout back. Dragging a divider past a pane
+  already at its minimum size now keeps going and shrinks the panes beyond it,
+  where it used to stop. Layouts saved before this release don't know which pane
+  each came from, so a closed pane there gives its space to its neighbour. Thanks
+  to [@railapex](https://github.com/railapex) ([#132](https://github.com/ProjectHax/muxel/pull/132)).
+- **An agent stays Working while its subagents run** — a Claude or Grok turn that
+  ended with subagents still working showed Done, played the done chime and let
+  `ctl wait` return, though the agent wasn't finished. Now a pane stays Working
+  while the agent lists subagents (for at most three hours) and reads Done a few
+  seconds after they clear. Background shells and monitors, like a dev server,
+  don't hold the turn; they show beside the status instead (`done · 3m · 1
+  shell`), and a pane with any listed counts as busy when you close it, since
+  closing ends them. `ctl wait --turn` stops when the agent's own turn ends. muxel reads this
+  from what the agent shows on screen, so a change to its interface can stop it
+  working. Thanks to
+  [@railapex](https://github.com/railapex) ([#136](https://github.com/ProjectHax/muxel/pull/136)).
+- **`muxel ctl` says whether a prompt actually arrived** — `ctl send` and
+  `ctl new --prompt` now report whether the prompt was submitted, is waiting in
+  the agent's input, wasn't delivered, or can't be confirmed, along with the
+  command to run next, so an orchestrating agent knows whether to send again.
+  `ctl new --prompt` replies as soon as the pane exists instead of waiting up to
+  a minute and a half (`--wait-delivery` waits for the outcome), and it stops at a
+  trust, update or login menu instead of typing into it. On Windows, pasting into
+  Codex 0.167 or newer keeps line breaks, blank lines and non-ASCII text, and tabs
+  become spaces; snippets and dictation report a refused paste instead of
+  pressing Enter on nothing. Thanks to
+  [@railapex](https://github.com/railapex) ([#137](https://github.com/ProjectHax/muxel/pull/137)).
+- **muxel notices a new Claude conversation at once** — after `/clear`,
+  `/resume` or `/fork`, muxel could take up to two seconds to follow a Claude
+  pane to its new conversation, and idle Claude panes kept checking for one. It
+  now watches the folder where Claude records sessions and follows the switch
+  almost immediately, and falls back to checking if the watch fails. Thanks to
+  [@railapex](https://github.com/railapex) ([#127](https://github.com/ProjectHax/muxel/pull/127)).
+- **The window stays smoother with many tabs** — terminals in tabs you couldn't
+  see still redrew the window whenever they printed; in a 56-tab workspace, six
+  hidden terminals streaming output took about a quarter of the UI's time. They
+  no longer redraw until shown. The pane strip's buttons are cheaper to draw, and
+  a terminal whose program never prints stops showing its "Starting terminal…"
+  spinner after a minute instead of keeping the window redrawing. Thanks to
+  [@railapex](https://github.com/railapex) ([#124](https://github.com/ProjectHax/muxel/pull/124),
+  [#125](https://github.com/ProjectHax/muxel/pull/125),
+  [#126](https://github.com/ProjectHax/muxel/pull/126)).
+- **Branch names cost far fewer git and ssh runs** — with nothing changing,
+  muxel now starts git about once every three minutes instead of four times a
+  minute, and a checkout still shows up in the branch label within about a
+  second. A remote project reads its branch and branch list in one ssh call
+  instead of two, and a failed read keeps the last branch shown instead of
+  clearing it. A brand-new repository shows its branch before the first commit,
+  and the switch-branch menu no longer offers a detached HEAD, rebase or bisect
+  as if it were a branch. A remote host now needs git 1.9 or newer for branch
+  names; an older one gets a notice. Thanks to
+  [@railapex](https://github.com/railapex) ([#128](https://github.com/ProjectHax/muxel/pull/128),
+  [#138](https://github.com/ProjectHax/muxel/pull/138)).
+- **The opt-in profiler times frames and git runs** — with `MUXEL_PROFILE` set,
+  the profiler now breaks slow frames down by drawing phase and window region,
+  and records every git command muxel runs, so a slow window or a busy poll can
+  be traced. A profile archive that can't be deleted no longer stops the log.
+  Thanks to [@railapex](https://github.com/railapex) ([#126](https://github.com/ProjectHax/muxel/pull/126),
+  [#128](https://github.com/ProjectHax/muxel/pull/128)).
+
+### Fixed
+- **tmux no longer types `6c0;2501;1` into your panes** — with tmux 3.6 or newer,
+  usually on a remote host, stray text like `6c0;2501;1` could appear at an
+  agent's prompt, for instance when many panes reconnected at once after the
+  machine woke. tmux asks the terminal a few questions when it attaches or
+  resizes and gives up after five seconds; muxel held its answers behind one it
+  replied to only when the window got to it, so they arrived late and tmux typed
+  them in as if you had. muxel now answers at once.
+- **Terminals start at their pane's size** — new, restored and hidden-tab
+  terminals started at 80×24 or last session's size and resized when first
+  drawn, so PowerShell, for one, drew your first command on top of its prompt.
+  Terminals now start at the size their pane is laid out at, waiting at most a
+  quarter of a second for it. Thanks to
+  [@railapex](https://github.com/railapex) ([#139](https://github.com/ProjectHax/muxel/pull/139)).
+- **Closing a shell with work in the background asks first, on Linux and
+  macOS** — a shell sitting at its prompt with a job running behind it (`sleep 30
+  &`), or one that had `exec`'d into another program, counted as idle, so closing
+  it skipped the question and killed that work once Undo ran out. Those shells
+  now ask. A shell that switched to another shell (`exec zsh` in `.bashrc`), a
+  prompt's own helper processes, and a shell whose binary a package upgrade
+  replaced still close without asking. Thanks to
+  [@railapex](https://github.com/railapex) ([#134](https://github.com/ProjectHax/muxel/pull/134)).
+- **An editor reloading from disk stays out of your way** — when an agent
+  rewrote a file you had open, the reload moved keyboard focus into the editor,
+  so what you were typing into a terminal went into the file. Focus now stays
+  where it was, the scroll position is kept, a reload waits while you're
+  composing text with an input method, and closing or popping out an editor
+  treats text you're still composing as unsaved. Thanks to
+  [@railapex](https://github.com/railapex) ([#131](https://github.com/ProjectHax/muxel/pull/131),
+  [#135](https://github.com/ProjectHax/muxel/pull/135)).
+- **Closing panes and cleaning up worktrees is safer** — choosing Commit, Merge,
+  Discard or Keep for a worktree could end a busy agent at once; those answers
+  now get the same confirmation and Undo countdown as any other close, and the
+  worktree's files are removed only after its tmux session is confirmed gone. If
+  muxel quits partway through closing a tmux pane, it finishes the close next
+  time without touching a new session that has since taken the same name, and
+  `ctl status`, `show`, `screen` and `wait` keep working on a pane that's being
+  closed. Thanks to
+  [@railapex](https://github.com/railapex) ([#116](https://github.com/ProjectHax/muxel/pull/116)).
+- **`muxel ctl` input reaches the right tmux pane** — a tmux pane scrolled back in
+  copy mode took a pasted prompt without submitting it while `ctl` reported
+  success; that's now refused and your scroll position is left alone. A new
+  agent also remembers its own tmux pane, so input still reaches it after panes
+  are moved or split. Thanks to
+  [@railapex](https://github.com/railapex) ([#115](https://github.com/ProjectHax/muxel/pull/115)).
+- **`.gitignore` stays unmodified** — muxel added `.muxel/` to a project's
+  `.gitignore` even when git already ignored it through `.git/info/exclude` or a
+  global excludes file, leaving `.gitignore` modified after every agent launch.
+  It now asks git first. Thanks to
+  [@ithielnor](https://github.com/ithielnor) ([#122](https://github.com/ProjectHax/muxel/pull/122)).
+
 ## [0.3.5] — 2026-11-03
 
 ### Added
