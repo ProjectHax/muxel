@@ -8,6 +8,8 @@
 // master isn't `Sync`). Same trade-off gpui-component makes for its entities.
 #![allow(clippy::arc_with_non_send_sync)]
 
+#[cfg(windows)]
+mod codex_version;
 mod colors;
 mod control_input;
 mod control_paste;

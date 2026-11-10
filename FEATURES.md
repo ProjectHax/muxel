@@ -1138,9 +1138,11 @@ feature is added or changed, update the matching entry here in the same change**
   `prompt_pending` and a polling command. Status exposes the same delivery facts.
   Codex launches carrying a startup task suppress its startup update menu.
 - **Windows Codex multiline control** — native presets disable heuristic paste
-  bursts only after a version probe verifies the matching input codec. Older
-  versions and failed probes receive no automatic paste-burst override. With
-  verified, configured
+  bursts only after a version probe verifies the matching input codec. The
+  probe runs once per Codex executable (again after it changes) on its own
+  thread; a launch waits for it at most two seconds, and a slower probe still
+  answers later launches. Older versions and failed probes receive no automatic
+  paste-burst override. With verified, configured
   Codex 0.167 or newer, native control and clipboard paste preserve line breaks,
   blank lines and Unicode; CRLF becomes one newline. Unsupported control
   characters, including tabs, refuse the whole paste before any write.

@@ -3591,41 +3591,15 @@ fn push_mouse_report(
     }
 }
 
+/// The `--version` output of the Codex a launch runs, from
+/// [`crate::codex_version`]: asked once per executable, on its own thread.
 #[cfg(windows)]
 fn codex_control_version(program: &str) -> Option<String> {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let program = literal_program_for_spawn(program).ok()?;
-    let mut child = Command::new(program)
-        .arg("--version")
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => break,
-            Ok(Some(_)) => return None,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
-    let mut output = String::new();
-    child
-        .stdout
-        .take()?
-        .take(4096)
-        .read_to_string(&mut output)
-        .ok()?;
-    Some(output)
+    crate::codex_version::version(
+        std::path::Path::new(&program),
+        crate::codex_version::LAUNCH_WAIT,
+    )
 }
 
 #[cfg(not(windows))]
