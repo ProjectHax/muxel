@@ -532,6 +532,31 @@ fn tmux_fixture(socket: &str, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+/// `kill-server` can return while the old server is still exiting, and a
+/// client that connects in that gap fails with "server exited unexpectedly".
+/// So wait until tmux says no server is running, as `Server::stop` in
+/// integrations.rs does, before anything starts another.
+#[cfg(unix)]
+fn kill_tmux_server(socket: &str) {
+    tmux_fixture(socket, &["kill-server"]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let out = std::process::Command::new("tmux")
+            .args(["-L", socket, "list-sessions"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if muxel_core::tmux::confirmed_no_server(&stderr) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tmux server still answering 5 s after kill-server: {stderr}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn review_close_retry_preserves_peer_replacements_including_a_restarted_server() {
@@ -566,7 +591,7 @@ fn review_close_retry_preserves_peer_replacements_including_a_restarted_server()
             ],
         );
         if restart_server {
-            tmux_fixture(&socket, &["kill-server"]);
+            kill_tmux_server(&socket);
         } else {
             tmux_fixture(
                 &socket,
