@@ -99,10 +99,12 @@ feature is added or changed, update the matching entry here in the same change**
   active pane.
 - **New agents open as tabs** — the toolbar's agent button and `Ctrl+Alt+1–9`
   add the new agent as a tab in the focused pane, so starting an agent never adds
-  a column. An empty project gets its first pane. New Pane, Split Right/Down, the
-  split buttons and dragging a tab to an edge still make a new pane. In a
-  per-monitor project window, the toolbar and shortcuts act on that window's
-  project.
+  a column. Settings → Behavior → **New agents open** switches them to **In a new
+  pane** instead, which opens each one in a pane of its own to the right of the
+  focused pane. An empty project gets its first pane either way. New Tab, New
+  Pane, Split Right/Down, the split buttons and dragging a tab to an edge keep
+  doing what they say, whatever the setting. In a per-monitor project window,
+  the toolbar and shortcuts act on that window's project.
 - **Non-blocking agent creation** — a new agent tab paints and focuses first; PTY
   creation and child startup run on a worker, with stale launches discarded if the
   tab closes or is replaced before startup completes.

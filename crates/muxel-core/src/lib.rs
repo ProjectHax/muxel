@@ -2258,6 +2258,15 @@ fn default_terminal_mouse() -> String {
     "copy_paste".to_string()
 }
 
+fn default_new_agent_placement() -> String {
+    NEW_AGENT_TAB.to_string()
+}
+
+/// [`Settings::new_agent_placement`]: a new agent joins the focused pane as a tab.
+pub const NEW_AGENT_TAB: &str = "tab";
+/// [`Settings::new_agent_placement`]: a new agent gets a pane of its own.
+pub const NEW_AGENT_PANE: &str = "pane";
+
 /// A user keybinding override: an action name bound to a keystroke string.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KeyBindingCfg {
@@ -2717,6 +2726,11 @@ pub struct Settings {
     /// Terminal mouse copy/paste mode: "copy_paste" | "menu" | "copy_on_select".
     #[serde(default = "default_terminal_mouse")]
     pub terminal_mouse: String,
+    /// Where the toolbar's agent button and Ctrl+Alt+1–9 put a new agent:
+    /// [`NEW_AGENT_TAB`] (in the focused pane) or [`NEW_AGENT_PANE`] (a new pane
+    /// beside it). Anything else reads as a tab.
+    #[serde(default = "default_new_agent_placement")]
+    pub new_agent_placement: String,
     /// Diff window layout: `true` = side-by-side split, `false` = unified.
     #[serde(default)]
     pub diff_split_view: bool,
@@ -2935,6 +2949,12 @@ impl Settings {
     /// The per-process limit for new local panes, in bytes; `None` when off.
     pub fn pane_memory_limit_bytes(&self) -> Option<u64> {
         (self.pane_memory_limit_gb > 0).then(|| u64::from(self.pane_memory_limit_gb) << 30)
+    }
+
+    /// Whether new agents get a pane of their own rather than a tab in the
+    /// focused pane (see [`Settings::new_agent_placement`]).
+    pub fn new_agents_open_as_panes(&self) -> bool {
+        self.new_agent_placement == NEW_AGENT_PANE
     }
 }
 
@@ -3208,6 +3228,7 @@ impl Default for Settings {
             zoom: 1.0,
             pane_border: "subtle".to_string(),
             terminal_mouse: "copy_paste".to_string(),
+            new_agent_placement: default_new_agent_placement(),
             diff_split_view: false,
             minimize_to_tray: false,
             dev_console_enabled: false,
@@ -3957,6 +3978,32 @@ mod settings_tests {
         let s: Settings = serde_json::from_value(v).unwrap();
         assert!(s.confirm_close_terminal);
         assert!(!s.confirm_close_editor && !s.confirm_close_diff);
+    }
+
+    #[test]
+    fn new_agents_open_as_tabs_unless_set_to_panes() {
+        assert!(!Settings::default().new_agents_open_as_panes());
+        // A config from before the setting existed keeps opening tabs.
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("new_agent_placement");
+        let s: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(s.new_agent_placement, NEW_AGENT_TAB);
+        let panes = Settings {
+            new_agent_placement: NEW_AGENT_PANE.to_string(),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&panes).unwrap();
+        assert!(
+            serde_json::from_str::<Settings>(&json)
+                .unwrap()
+                .new_agents_open_as_panes()
+        );
+        // A value this version doesn't know reads as the default, a tab.
+        let odd = Settings {
+            new_agent_placement: "window".to_string(),
+            ..Settings::default()
+        };
+        assert!(!odd.new_agents_open_as_panes());
     }
 
     #[test]

@@ -15818,14 +15818,39 @@ impl MuxelApp {
         );
     }
 
-    /// Open preset number `n` (1-based, in the preset list order) as a new tab
-    /// in the active pane, like the toolbar's agent button (bound to
+    /// Open preset number `n` (1-based, in the preset list order) where the
+    /// setting puts new agents, like the toolbar's agent button (bound to
     /// Ctrl+Alt+1..9). Out-of-range `n` is ignored.
     fn new_agent_preset(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(idx) = n.checked_sub(1).filter(|i| *i < self.presets.len()) else {
             return;
         };
-        self.place_with_preset(self.active_instance, PlacementMode::Tab, idx, window, cx);
+        let placement = self.new_agent_placement();
+        self.place_with_preset(self.active_instance, placement, idx, window, cx);
+    }
+
+    /// The toolbar's agent button: the current preset, where the setting puts
+    /// new agents.
+    fn new_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let placement = self.new_agent_placement();
+        self.place_with_preset(
+            self.active_instance,
+            placement,
+            self.current_preset,
+            window,
+            cx,
+        );
+    }
+
+    /// Settings → Behavior → "New agents open": a tab in the focused pane, or a
+    /// pane of their own to its right. An empty project gets its first pane
+    /// either way.
+    fn new_agent_placement(&self) -> PlacementMode {
+        if self.settings.new_agents_open_as_panes() {
+            PlacementMode::Split(SplitDirection::Horizontal)
+        } else {
+            PlacementMode::Tab
+        }
     }
 
     /// Spawn an agent from `preset_idx` and place it (split or tab) at `target`,
@@ -28818,8 +28843,12 @@ impl MuxelApp {
                         .small()
                         .icon(current_icon)
                         .label(current_name.clone())
-                        .tooltip(t("New tab with the current preset"))
-                        .on_click(cx.listener(|this, _ev, window, cx| this.new_tab(window, cx))),
+                        .tooltip(if self.settings.new_agents_open_as_panes() {
+                            t("New pane with the current preset")
+                        } else {
+                            t("New tab with the current preset")
+                        })
+                        .on_click(cx.listener(|this, _ev, window, cx| this.new_agent(window, cx))),
                 )
                 .dropdown_menu(move |mut menu, _window, _cx| {
                     for (id, name, is_default, icon_path) in preset_items.iter() {
@@ -30702,6 +30731,29 @@ impl MuxelApp {
             self.settings.diff_split_view = split;
             self.persist_settings();
         }
+    }
+
+    fn new_agent_placement_btn(
+        &self,
+        value: &'static str,
+        label: &str,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        let selected = if value == muxel_core::NEW_AGENT_PANE {
+            self.settings.new_agents_open_as_panes()
+        } else {
+            !self.settings.new_agents_open_as_panes()
+        };
+        Button::new(SharedString::from(format!("nap-{value}")))
+            .ghost()
+            .small()
+            .selected(selected)
+            .label(label.to_string())
+            .on_click(cx.listener(move |this, _e, _w, cx| {
+                this.settings.new_agent_placement = value.to_string();
+                this.persist_settings();
+                cx.notify();
+            }))
     }
 
     fn terminal_mouse_btn(
@@ -34170,6 +34222,31 @@ impl MuxelApp {
                     .child(self.terminal_mouse_btn("copy_paste", &t("Right-click copy/paste"), cx))
                     .child(self.terminal_mouse_btn("menu", &t("Right-click menu"), cx))
                     .child(self.terminal_mouse_btn("copy_on_select", &t("Copy on select"), cx)),
+            )
+            .child(self.settings_label(&t("New agents open"), cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(self.new_agent_placement_btn(
+                        muxel_core::NEW_AGENT_TAB,
+                        &t("In a new tab"),
+                        cx,
+                    ))
+                    .child(self.new_agent_placement_btn(
+                        muxel_core::NEW_AGENT_PANE,
+                        &t("In a new pane"),
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(t(
+                        "For the toolbar's agent button and Ctrl+Alt+1–9. A new tab joins the focused pane; a new pane opens to its right.",
+                    )),
             )
             .child(
                 self.check_row(
