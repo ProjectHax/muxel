@@ -495,8 +495,9 @@ pub struct AgentInfo {
     /// What the agent's own screen says is still running beside its turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<BackgroundWork>,
-    /// The turn is over and only `background` keeps the pane Working. `wait --turn`
-    /// stops here.
+    /// The foreground turn is over with background work still listed. Only
+    /// subagents hold the pane Working; shells and monitors remain metadata.
+    /// `wait --turn` stops here even during a subagent hold.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub turn_over: bool,
     /// A startup task that failed before provider acceptance. The terminal itself
@@ -1380,7 +1381,7 @@ pub fn command_help(command: &str) -> Option<&'static str> {
             "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. --force overrides busy and own-pane refusal, but never a launch mismatch."
         }
         "wait" => {
-            "usage: muxel ctl wait AGENT [--timeout SECS] [--full] [--turn]\nWait for the turn and any background work it left to finish, or for the agent to block, exit or time out, then show its result. --turn stops at an observable turn end even if background work remains; it cannot override a provider still reporting Working."
+            "usage: muxel ctl wait AGENT [--timeout SECS] [--full] [--turn]\nWait for the turn and any subagent hold to finish, or for the agent to block, exit or time out, then show its result. Shell and monitor listings do not delay completion. Subagent holds last at most three hours. --turn stops at an observable turn end even during a subagent hold; it cannot override a provider still reporting Working."
         }
         "answer" => {
             "usage: muxel ctl answer AGENT OPTION [--force]\nPick a numbered option of a pending question. --force permits your own pane."
@@ -1886,11 +1887,12 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   a pending Enter never authorizes another.
   An unconfirmed receipt requires inspecting `screen` before more input.
 - `muxel ctl wait AGENT [--timeout SECS] [--full] [--turn]` - wait until the agent's
-  turn and any background work it left have finished (or it blocks on a question,
-  or exits), then print what `show` prints. A turn that ends beside a running shell
-  or subagent usually wakes when that work ends, so plain `wait` returns the reply
-  after it. `--turn` stops at the turn's end instead. Either way `wait.background`
-  lists anything still running.
+  turn and any subagent hold have finished (or it blocks on a question, or exits),
+  then print what `show` prints. Shell and monitor listings do not delay completion;
+  they remain visible in `wait.background`. Subagents hold a finished turn for at
+  most three hours. `--turn` stops at an observable foreground turn end instead,
+  even during a subagent hold; it cannot override a provider still reporting
+  Working. Either way `wait.background` lists anything still running.
   Startup tasks stay pending until fresh provider-owned acceptance, not merely
   our Enter. Codex may receive one extra Enter only while its exact task remains
   on one exact ASCII row in its live idle editor, with no new user row. Wrapped

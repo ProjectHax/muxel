@@ -653,8 +653,8 @@ impl RuntimeStatusState {
         }
         // Returning metadata cannot reopen a released turn. Foreground evidence
         // still reports Working independently of the background hold.
-        let background_reads_working =
-            background_holds || (self.provider_background.is_some() && !turn_over);
+        let background_reads_working = background_holds
+            || (self.provider_background.is_some_and(|work| work.subagents) && !turn_over);
         let provider_screen = self
             .provider_screen
             .or(background_reads_working.then_some(AgentStatus::Working));
@@ -1312,19 +1312,17 @@ fn provider_screen_read(
     }
 }
 
-/// A finished turn beside live background work does not need anyone, so it
-/// reads Working. Listed items may outlive the work, so every hold is bounded.
+/// A finished turn beside listed subagents reads Working. Shells and monitors
+/// remain metadata. Listings may outlive the work, so every hold is bounded.
 /// A released turn stays released until new foreground work is observed.
-const BACKGROUND_HOLD: Duration = Duration::from_secs(30 * 60);
-const BACKGROUND_SUBAGENT_HOLD: Duration = Duration::from_secs(3 * 60 * 60);
-/// When background work ends the agent wakes for it, moments later. Done in that
+const BACKGROUND_HOLD: Duration = Duration::from_secs(3 * 60 * 60);
+/// When subagent work ends the agent wakes for it, moments later. Done in that
 /// gap would alert and float the pane just before it starts working again.
 const BACKGROUND_WAKE_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Default)]
 struct BackgroundHold {
     turn_ended_at: Option<Instant>,
-    expires_at: Option<Instant>,
     holding: bool,
     cleared_at: Option<Instant>,
     released: bool,
@@ -1345,14 +1343,8 @@ impl BackgroundHold {
         if self.released {
             return (false, None);
         }
-        if let Some(work) = work {
-            let limit = if work.subagents {
-                BACKGROUND_SUBAGENT_HOLD
-            } else {
-                BACKGROUND_HOLD
-            };
-            let until = *self.turn_ended_at.get_or_insert(now) + limit;
-            self.expires_at = Some(until);
+        if work.is_some_and(|work| work.subagents) {
+            let until = *self.turn_ended_at.get_or_insert(now) + BACKGROUND_HOLD;
             self.cleared_at = None;
             if now < until {
                 self.holding = true;
@@ -1363,7 +1355,9 @@ impl BackgroundHold {
         }
         if self.holding {
             let until = *self.cleared_at.get_or_insert(now) + BACKGROUND_WAKE_GRACE;
-            let until = self.expires_at.map_or(until, |cap| until.min(cap));
+            let until = self
+                .turn_ended_at
+                .map_or(until, |ended| until.min(ended + BACKGROUND_HOLD));
             if now < until {
                 return (true, Some(until));
             }
@@ -8915,7 +8909,7 @@ mod provider_switch_tests {
         }
 
         /// Claude reports `done` when a turn ends, whatever the turn left running.
-        /// A Done here would alert and float the pane while it waits on a shell. The
+        /// A Done here would alert and float the pane while it waits on subagents. The
         /// rows are real ones captured from Claude 2.1.318.
         #[test]
         fn a_finished_turn_holds_at_working_beside_background_work() {
@@ -8951,11 +8945,12 @@ mod provider_switch_tests {
             const DONE: &[u8] = b"\x1b]7501;state=done\x07";
             const BUSY: &str = "✻ Brewing… (27m 39s · 12.3k tokens)";
             const RUNNING: &str = "✻ Brewed for 27m 40s · done 5:42 AM · 1 shell still running";
-            const ONE_SHELL: &str = "⏵⏵ auto mode on · 1 shell · ← 4 agents";
+            const BACKGROUND: &str =
+                "⏵⏵ auto mode on · 1 shell · /tasks to see subagents · ← 4 agents";
             const NOTHING: &str = "⏵⏵ auto mode on (shift+tab to cycle) · ← 4 agents";
 
-            report(0, BUSY, ONE_SHELL, Some(WORKING));
-            let (held, deadline, now) = report(1, RUNNING, ONE_SHELL, Some(DONE));
+            report(0, BUSY, BACKGROUND, Some(WORKING));
+            let (held, deadline, now) = report(1, RUNNING, BACKGROUND, Some(DONE));
             assert_eq!(held.status, AgentStatus::Working);
             assert_eq!(held.reason, TerminalStatusReason::BackgroundWork);
             assert_eq!(held.coverage, TerminalStatusCoverage::ProgramStatus);
@@ -8964,6 +8959,7 @@ mod provider_switch_tests {
                 held.background,
                 Some(BackgroundWork {
                     shells: 1,
+                    subagents: true,
                     ..Default::default()
                 })
             );
@@ -8973,7 +8969,7 @@ mod provider_switch_tests {
                 "the limit needs a wake"
             );
 
-            // The shell ends. The agent gets a moment to wake before this reads done.
+            // The listed work ends. The agent gets a moment to wake before this reads done.
             let (waiting, deadline, now) = report(60, "● Done.", NOTHING, None);
             assert_eq!(waiting.status, AgentStatus::Working);
             assert_eq!(waiting.background, None);
@@ -8990,8 +8986,8 @@ mod provider_switch_tests {
             assert_eq!(finished.completion_revision, 1);
 
             // No wake comes: the release itself is the change of status.
-            report(70, BUSY, ONE_SHELL, Some(WORKING));
-            report(71, RUNNING, ONE_SHELL, Some(DONE));
+            report(70, BUSY, BACKGROUND, Some(WORKING));
+            report(71, RUNNING, BACKGROUND, Some(DONE));
             report(90, "● Done.", NOTHING, None);
             let (released, _, _) = report(96, "● Done.", NOTHING, None);
             assert_eq!(released.status, AgentStatus::Done);
@@ -9003,18 +8999,17 @@ mod provider_switch_tests {
             assert_eq!(stale.background, None);
 
             // A failed turn needs looking at, whatever it left behind.
-            report(110, BUSY, ONE_SHELL, Some(WORKING));
+            report(110, BUSY, BACKGROUND, Some(WORKING));
             let (failed, _, _) =
-                report(111, RUNNING, ONE_SHELL, Some(b"\x1b]7501;state=error\x07"));
+                report(111, RUNNING, BACKGROUND, Some(b"\x1b]7501;state=error\x07"));
             assert_eq!(failed.status, AgentStatus::Done);
             assert_eq!(failed.reason, TerminalStatusReason::ProgramStatusError);
             session.kill();
         }
 
-        /// A long-lived server looks the same as a shell the agent waits on, so the
-        /// hold ends. Subagent listings get a longer, bounded window.
+        /// Shell and monitor listings finish normally; only subagents get a hold.
         #[test]
-        fn only_subagents_hold_a_finished_turn_past_the_limit() {
+        fn only_subagents_hold_a_finished_turn() {
             use crate::view::{BACKGROUND_HOLD, TerminalStatusReason};
             use std::time::Duration;
             let (working, blocked) = builtin();
@@ -9052,22 +9047,28 @@ mod provider_switch_tests {
                 sample(Duration::ZERO, Some(b"\x1b]7501;state=working\x07"));
                 let ended = Duration::from_secs(1);
                 let held = sample(ended, Some(b"\x1b]7501;state=done\x07"));
-                assert_eq!(held.status, AgentStatus::Working, "{footer}");
-                let near = sample(ended + BACKGROUND_HOLD - Duration::from_secs(1), None);
-                assert_eq!(near.status, AgentStatus::Working, "{footer}");
-                let past = sample(ended + BACKGROUND_HOLD, None);
-                if limited {
-                    assert_eq!(past.status, AgentStatus::Done, "{footer}");
-                    assert_eq!(past.reason, TerminalStatusReason::ProgramStatus(None));
-                    assert!(past.background.is_some(), "the row still lists the work");
+                let status = if limited {
+                    AgentStatus::Done
                 } else {
-                    assert_eq!(past.status, AgentStatus::Working, "{footer}");
-                }
+                    AgentStatus::Working
+                };
+                assert_eq!(held.status, status, "{footer}");
+                assert_eq!(held.completion_revision, u64::from(limited));
+                assert!(
+                    held.background.is_some(),
+                    "counts remain after foreground completion"
+                );
+                let near = sample(ended + BACKGROUND_HOLD - Duration::from_secs(1), None);
+                assert_eq!(near.status, status, "{footer}");
+                let past = sample(ended + BACKGROUND_HOLD, None);
+                assert_eq!(past.status, AgentStatus::Done, "{footer}");
+                assert_eq!(past.reason, TerminalStatusReason::ProgramStatus(None));
+                assert!(past.background.is_some(), "the row still lists the work");
                 session.kill();
             }
         }
 
-        /// `/clear` and `/resume` switch the conversation while a shell lives on. The
+        /// `/clear` and `/resume` switch the conversation while subagents live on. The
         /// next turn's own report decides. Between turns no title reads Working, the only
         /// thing that would confirm the footer, so nothing else can release the guard.
         #[test]
@@ -9079,7 +9080,7 @@ mod provider_switch_tests {
             let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
             let start = Instant::now();
             let screen = format!(
-                "{HEADER}\n● Sure.\n\n{}\n❯ \n{}\n  ⏵⏵ auto mode on · 1 shell · ← 4 agents",
+                "{HEADER}\n● Sure.\n\n{}\n❯ \n{}\n  ⏵⏵ auto mode on · /tasks to see subagents · ← 4 agents",
                 rule(),
                 rule()
             );
@@ -9155,10 +9156,10 @@ mod provider_switch_tests {
 
         /// A switch leaves no report until the next turn, and between turns no title reads
         /// Working, the only thing that would confirm a footer. So the footer alone must
-        /// not pin the pane busy: its composer is free and the limit still runs.
+        /// not pin the pane busy: shell metadata leaves its composer free immediately.
         #[test]
         fn listed_work_after_a_switch_leaves_the_composer_free() {
-            use crate::view::{BACKGROUND_HOLD, TerminalStatusReason};
+            use crate::view::BACKGROUND_HOLD;
             use std::time::{Duration, SystemTime};
             let (working, blocked) = builtin();
             let (session, _receiver) = fixture();
@@ -9184,13 +9185,12 @@ mod provider_switch_tests {
                 runtime.snapshot(&session)
             };
             let cleared = sample(Duration::ZERO);
-            assert_eq!(cleared.status, AgentStatus::Working);
-            assert_eq!(
-                cleared.reason,
-                TerminalStatusReason::BackgroundWork,
-                "a send admits on this reason"
+            assert_eq!(cleared.status, AgentStatus::Idle);
+            assert!(
+                cleared.background.is_some(),
+                "current metadata keeps the composer free"
             );
-            assert!(!cleared.attributable);
+            assert_eq!(cleared.completion_revision, 0, "no turn ran");
             let past = sample(BACKGROUND_HOLD + Duration::from_secs(1));
             assert_ne!(past.status, AgentStatus::Working, "a dev server isn't work");
             assert!(past.background.is_some());
@@ -9211,7 +9211,7 @@ mod provider_switch_tests {
             let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
             let start = Instant::now();
             let screen = format!(
-                "{HEADER}\n● Sure.\n\n{}\n❯ \n{}\n  ⏵⏵ auto mode on · 1 shell · ← 4 agents",
+                "{HEADER}\n● Sure.\n\n{}\n❯ \n{}\n  ⏵⏵ auto mode on · /tasks to see subagents · ← 4 agents",
                 rule(),
                 rule()
             );
@@ -9255,7 +9255,7 @@ mod provider_switch_tests {
             let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
             let start = Instant::now();
             let screen = format!(
-                "{HEADER}\n● Left it running.\n\n{}\n❯ \n{}\n  ⏵⏵ auto mode on · 1 shell · ← 4 agents",
+                "{HEADER}\n● Left it running.\n\n{}\n❯ \n{}\n  ⏵⏵ auto mode on · /tasks to see subagents · ← 4 agents",
                 rule(),
                 rule()
             );
@@ -9422,8 +9422,8 @@ mod provider_switch_tests {
 
         /// The agent's prompt is free once its turn is over, whatever runs beside it.
         #[test]
-        fn background_hold_wakes_at_each_safety_limit() {
-            use crate::view::{BACKGROUND_HOLD, BACKGROUND_SUBAGENT_HOLD, BackgroundHold};
+        fn subagent_hold_wakes_at_its_safety_limit() {
+            use crate::view::{BACKGROUND_HOLD, BackgroundHold};
             use muxel_core::control::BackgroundWork;
             use std::time::Duration;
             let now = Instant::now();
@@ -9436,27 +9436,24 @@ mod provider_switch_tests {
                 ..Default::default()
             };
             let mut hold = BackgroundHold::default();
-            assert_eq!(
-                hold.observe(Some(shell), false, now),
-                (true, Some(now + BACKGROUND_HOLD))
-            );
+            assert_eq!(hold.observe(Some(shell), false, now), (false, None));
             let mut hold = BackgroundHold::default();
             assert_eq!(
                 hold.observe(Some(subagents), false, now),
-                (true, Some(now + BACKGROUND_SUBAGENT_HOLD)),
+                (true, Some(now + BACKGROUND_HOLD)),
             );
             // A new turn restarts the clock: the limit counts from the last finish.
             let mut hold = BackgroundHold::default();
-            hold.observe(Some(shell), false, now);
+            hold.observe(Some(subagents), false, now);
             let later = now + Duration::from_secs(600);
-            assert_eq!(hold.observe(Some(shell), true, later), (false, None));
+            assert_eq!(hold.observe(Some(subagents), true, later), (false, None));
             assert_eq!(
-                hold.observe(Some(shell), false, later),
+                hold.observe(Some(subagents), false, later),
                 (true, Some(later + BACKGROUND_HOLD))
             );
-            // Past the limit nothing is held, so the shell ending changes nothing.
+            // Past the limit nothing is held, so the listing ending changes nothing.
             let past = later + BACKGROUND_HOLD;
-            assert_eq!(hold.observe(Some(shell), false, past), (false, None));
+            assert_eq!(hold.observe(Some(subagents), false, past), (false, None));
             assert_eq!(hold.observe(None, false, past), (false, None));
         }
 

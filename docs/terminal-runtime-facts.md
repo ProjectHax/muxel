@@ -458,8 +458,9 @@ claiming more than the terminal shows.
 
 Background listings are read from the same screen. Claude 2.1.318's captured footer
 uses `1 shell`, `1 monitor` or `/tasks to see subagents` in each permission mode.
-A listing is not a liveness guarantee, so subagent holds have a three-hour cap;
-shell and monitor holds have a thirty-minute cap. A turn released by its cap or
+A listing is not a liveness guarantee, so subagent holds have a three-hour cap.
+Shell and monitor counts remain metadata without delaying foreground completion.
+A turn released by its cap or
 missing-listing grace cannot be held again without a fresh foreground turn.
 Legacy agent, MCP-task and cloud-session labels do not establish subagents.
 Its `← 4 agents` is on every footer and is not a running count, and
@@ -468,10 +469,12 @@ an empty footer outranks that row. Grok 1.0.70 draws no 7501 report; its panel a
 the composer lists `Tasks`, `Watchers` and `Subagents`, and a `Loop` under Watchers
 is a scheduled wake, not running work. Codex's report already stays Working while a
 background terminal runs. Its parent reads finished while a spawned agent runs, and
-nothing on its terminal says so.
+nothing on its terminal says so. Screen detection depends on the supported footer
+and panel layouts and wording.
 
-Plain `ctl wait` now follows the background hold rather than returning at the
-foreground turn's end. `ctl wait --turn` stops at an observable turn end with
+Plain `ctl wait` follows subagent holds. Shell and monitor counts alone do not delay
+foreground Done, completion alerts, Recent work or plain wait. `ctl wait --turn`
+stops at an observable turn end with
 background work still listed. It cannot override a provider's continuing Working
 report. Send admission and the background turn-end decision require the hold's
 binding revision to match the current conversation. Completion attribution stays
@@ -484,7 +487,7 @@ from a previous binding cannot authorize input or finish a wait.
 
 A held turn takes no completion: the report that started the hold would otherwise stamp
 the pane as finished. The release is its own status change. A switch reads the same way:
-`/clear` beside a running shell leaves no report until the next turn, and only a title
+`/clear` beside listed subagents leaves no report until the next turn, and only a title
 reading Working would end the screen hold, which no title does between turns. So the pane
 holds and takes prompts, and the screen hold only keeps it from alerting. Both Windows
 paths need a real run: a plain build uses the system console, where Claude sends no
