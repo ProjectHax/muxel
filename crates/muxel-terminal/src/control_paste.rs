@@ -128,13 +128,15 @@ impl ControlPaste {
     }
 
     /// Clipboard paste shares the configured decoder so disabling bursts does
-    /// not drop its line breaks. Sanitize ESC as ordinary terminal paste does,
-    /// then refuse the whole paste if any remaining character is unsupported.
+    /// not drop its line breaks. Sanitize ESC as ordinary terminal paste does
+    /// and expand tabs (see [`expand_tabs`]), then refuse the whole paste if any
+    /// remaining character is unsupported. Runner and TypeIn startup text comes
+    /// this way too.
     pub(crate) fn clipboard(self, text: &str) -> Result<Option<String>, String> {
         match self {
             Self::Terminal | Self::WindowsCodexUnconfigured => Ok(None),
             Self::WindowsCodex | Self::WindowsCodexUnverified => {
-                self.encode(&text.replace('\x1b', ""))
+                self.encode(&expand_tabs(&text.replace('\x1b', "")))
             }
         }
     }
@@ -172,9 +174,63 @@ impl ControlPaste {
     }
 }
 
+/// Columns between tab stops: the editor's default tab width.
+const TAB_STOP: usize = 4;
+
+/// Each tab as spaces to its next stop, counting characters from the start of
+/// its line. An input record carrying a tab reaches Codex as the Tab key, not
+/// as text, so pasted code would otherwise be refused whole.
+fn expand_tabs(text: &str) -> String {
+    if !text.contains('\t') {
+        return text.to_owned();
+    }
+    let mut expanded = String::with_capacity(text.len());
+    let mut column = 0;
+    for ch in text.chars() {
+        match ch {
+            '\t' => {
+                let pad = TAB_STOP - column % TAB_STOP;
+                expanded.extend(std::iter::repeat_n(' ', pad));
+                column += pad;
+            }
+            '\r' | '\n' => {
+                expanded.push(ch);
+                column = 0;
+            }
+            ch => {
+                expanded.push(ch);
+                column += 1;
+            }
+        }
+    }
+    expanded
+}
+
 #[cfg(test)]
 mod tests {
     use super::ControlPaste;
+
+    #[test]
+    fn clipboard_tabs_reach_codex_as_spaces_to_the_next_stop() {
+        let codex = ControlPaste::WindowsCodex;
+        assert_eq!(
+            codex
+                .clipboard("\tif ok {\n\t\treturn\nab\tc\td\t")
+                .unwrap(),
+            codex
+                .clipboard("    if ok {\n        return\nab  c   d   ")
+                .unwrap(),
+        );
+        let unverified = ControlPaste::WindowsCodexUnverified;
+        assert_eq!(
+            unverified.clipboard("key\tvalue").unwrap(),
+            unverified.clipboard("key value").unwrap(),
+        );
+        assert!(
+            codex.encode("a\tb").is_err(),
+            "ctl input refuses a tab rather than type text other than the caller's"
+        );
+    }
 
     #[test]
     fn native_protocol_requires_a_known_enabled_launch() {
@@ -267,7 +323,7 @@ mod tests {
 
     #[test]
     fn clipboard_refuses_unsupported_controls_atomically() {
-        for control in ['\t', '\0', '\u{8}', '\u{7f}', '\u{85}'] {
+        for control in ['\0', '\u{8}', '\u{7f}', '\u{85}'] {
             let result = ControlPaste::WindowsCodex.clipboard(&format!("prefix{control}suffix"));
             assert!(
                 result.is_err(),
@@ -346,7 +402,7 @@ mod tests {
         let args = ["--config".into(), "disable_paste_burst=true".into()];
         for version in ["", "codex-cli 0.166.0", "unrecognized"] {
             let codec = ControlPaste::for_launch("codex", &args, true).with_version(version);
-            for text in ["first\nsecond", "café", "first\tsecond"] {
+            for text in ["first\nsecond", "café"] {
                 assert!(
                     codec.clipboard(text).is_err(),
                     "no legacy fallback with disabled detection"

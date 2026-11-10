@@ -1144,8 +1144,9 @@ feature is added or changed, update the matching entry here in the same change**
   answers later launches. Older versions and failed probes receive no automatic
   paste-burst override. With verified, configured
   Codex 0.167 or newer, native control and clipboard paste preserve line breaks,
-  blank lines and Unicode; CRLF becomes one newline. Unsupported control
-  characters, including tabs, refuse the whole paste before any write.
+  blank lines and Unicode; CRLF becomes one newline. Clipboard and startup text
+  turn tabs into spaces to the next four-column stop. Other control characters,
+  and tabs in ctl input, refuse the whole paste before any write.
   Clipboard refusals appear in the error feed; ordinary clipboard ESC
   sanitization remains. Saved snippets and dictated transcripts also report
   paste failures and cancel automatic submission. Unverified

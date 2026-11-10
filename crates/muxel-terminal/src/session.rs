@@ -7999,7 +7999,7 @@ mod clipboard_refusal_tests {
         })));
         let mut cx = TestAppContext::single();
         cx.skip_drawing();
-        for control in ['\t', '\0', '\u{8}', '\u{7f}', '\u{85}'] {
+        for control in ['\0', '\u{8}', '\u{7f}', '\u{85}'] {
             cx.update(|cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(format!("prefix{control}suffix")));
                 crate::paste_clipboard_into_session(&session, cx);
@@ -8014,10 +8014,10 @@ mod clipboard_refusal_tests {
         );
         assert_eq!(
             refused.len(),
-            5,
+            4,
             "each refusal must reach the user-facing error handler"
         );
-        assert!(refused[0].contains("U+0009"));
+        assert!(refused[0].contains("U+0000"));
     }
 }
 

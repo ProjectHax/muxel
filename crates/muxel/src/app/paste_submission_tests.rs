@@ -38,20 +38,20 @@ fn rejected_paste_keeps_draft(transcript: bool) {
                 assert!(before.1, "fixture must have a draft");
                 assert!(!session.has_submitted_turn());
                 assert_eq!(
-                    session.try_paste("prefix\tsuffix").unwrap_err().kind(),
+                    session.try_paste("prefix\u{8}suffix").unwrap_err().kind(),
                     std::io::ErrorKind::InvalidInput,
-                    "fixture must reject tabs before writer admission"
+                    "fixture must reject a backspace before writer admission"
                 );
                 let mut rejected = Vec::new();
                 for submit in [true, false] {
                     app.notifications.clear();
                     if transcript {
                         let admission = app.terminal_input_admission(pane, cx);
-                        app.insert_transcript(admission, "prefix\tsuffix", submit, window, cx);
+                        app.insert_transcript(admission, "prefix\u{8}suffix", submit, window, cx);
                     } else {
                         app.send_snippet_steps(
                             pane,
-                            &snippet_send_action("prefix\tsuffix", submit),
+                            &snippet_send_action("prefix\u{8}suffix", submit),
                             window,
                             cx,
                         );
@@ -61,7 +61,7 @@ fn rejected_paste_keeps_draft(transcript: bool) {
                         session.has_submitted_turn(),
                         app.notifications.iter().any(|notification| {
                             matches!(notification.kind, NotifKind::Error)
-                                && notification.subtitle.contains("U+0009")
+                                && notification.subtitle.contains("U+0008")
                         }),
                     ));
                 }
