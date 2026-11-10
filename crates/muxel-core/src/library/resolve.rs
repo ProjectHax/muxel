@@ -93,7 +93,7 @@ pub fn local_loop_copy(
 /// One step of sending a snippet to a terminal pane.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SnippetStep {
-    /// `TerminalSession::paste` of this text.
+    /// `TerminalSession::try_paste` of this text; stop on rejection.
     Paste(String),
     /// `TerminalSession::write_input` of these bytes.
     Write(&'static [u8]),

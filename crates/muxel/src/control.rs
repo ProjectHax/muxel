@@ -32,11 +32,13 @@ const MAX_REQUEST_BYTES: u64 = 1 << 20;
 /// Connections served at once; more are dropped rather than queued.
 const MAX_CONNECTIONS: usize = 16;
 /// How long a connection waits for the app to answer.
-const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+const REPLY_TIMEOUT: Duration = Duration::from_secs(90);
 /// Socket read/write timeout, so a stalled peer can't hold a thread.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often `wait` checks on the agent.
 const WAIT_POLL: Duration = Duration::from_secs(1);
+/// How long `new --prompt --wait-delivery` reads for its task to settle.
+const DELIVERY_WAIT: Duration = Duration::from_secs(90);
 
 const NOT_RUNNING: &str = "muxel isn't running, or outside control is off: open muxel and \
      turn on Settings > Outside control > \"Allow outside tools to control muxel\". (If it is \
@@ -234,8 +236,9 @@ fn read_endpoint(path: &Path) -> Option<Endpoint> {
 pub fn run_cli(args: &[String]) -> i32 {
     let command = match control::parse_cli(args) {
         Ok(command) => command,
-        Err(error) => return fail(error.into(), 2),
+        Err(error) => return fail(error.into(), 2, Task::None),
     };
+    let mut task = task_of(&command);
     let result = match command {
         CliCommand::Help(command) => {
             emit(
@@ -264,8 +267,14 @@ pub fn run_cli(args: &[String]) -> i32 {
                     force,
                     launch_id,
                 }),
-                Ok(_) => return fail("`send AGENT -` read no text from stdin".into(), 2),
-                Err(e) => return fail(format!("reading stdin: {e}").into(), 2),
+                Ok(_) => {
+                    return fail(
+                        "`send AGENT -` read no text from stdin".into(),
+                        2,
+                        Task::None,
+                    );
+                }
+                Err(e) => return fail(format!("reading stdin: {e}").into(), 2, Task::None),
             }
         }
         CliCommand::Request(Command::New {
@@ -278,20 +287,23 @@ pub fn run_cli(args: &[String]) -> i32 {
                     Ok(_) if !text.trim().is_empty() => {
                         options.prompt = Some(text.trim_end_matches(['\r', '\n']).to_string())
                     }
-                    Ok(_) => return fail("`new --prompt -` read no text from stdin".into(), 2),
-                    Err(error) => return fail(format!("reading stdin: {error}").into(), 2),
+                    Ok(_) => {
+                        return fail(
+                            "`new --prompt -` read no text from stdin".into(),
+                            2,
+                            Task::None,
+                        );
+                    }
+                    Err(error) => {
+                        return fail(format!("reading stdin: {error}").into(), 2, Task::None);
+                    }
                 }
             }
             options.requesting_pane = std::env::var(control::INSTANCE_ID_ENV)
                 .ok()
                 .and_then(|id| id.parse().ok());
-            let no_wait = options.no_wait;
-            request(Command::New { project, options }).and_then(|value| {
-                if no_wait {
-                    Ok(value)
-                } else {
-                    wait_creation(value)
-                }
+            create(project, options, &mut task, request, || {
+                std::thread::sleep(WAIT_POLL)
             })
         }
         CliCommand::Request(command) => request(command),
@@ -308,8 +320,85 @@ pub fn run_cli(args: &[String]) -> i32 {
             emit(&serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()));
             0
         }
-        Err(error) => fail(error, 1),
+        Err(error) => fail(error, 1, task),
     }
+}
+
+/// Where a failed command stood with the task (prompt text) it carried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Task {
+    /// It carried none, so its failure reports no outcome.
+    None,
+    /// No request carrying it was admitted.
+    Unsent,
+    /// muxel admitted a creation carrying it, which can still deliver it.
+    Admitted,
+}
+
+/// `send` and `new --prompt` carry a task; nothing else does.
+fn task_of(command: &CliCommand) -> Task {
+    match command {
+        CliCommand::Request(Command::Send { .. }) => Task::Unsent,
+        CliCommand::Request(Command::New { options, .. }) if options.prompt.is_some() => {
+            Task::Unsent
+        }
+        _ => Task::None,
+    }
+}
+
+/// `new`: ask for the pane, wait out its approval and, with `--prompt`, read
+/// where its task stands. `task` becomes [`Task::Admitted`] once muxel has taken
+/// a request carrying one. By default that read is a single one: the reply
+/// comes once the pane exists, with the task delivered, refused or still
+/// pending. `--wait-delivery` keeps reading until the task settles, for up to
+/// [`DELIVERY_WAIT`].
+fn create(
+    project: String,
+    options: control::NewOptions,
+    task: &mut Task,
+    mut request: impl FnMut(Command) -> Result<Value, control::Error>,
+    mut pause: impl FnMut(),
+) -> Result<Value, control::Error> {
+    let no_wait = options.no_wait;
+    let wait = if options.wait_delivery {
+        DELIVERY_WAIT
+    } else {
+        Duration::ZERO
+    };
+    let has_prompt = options.prompt.is_some();
+    let mut value = request(Command::New { project, options })?;
+    if has_prompt {
+        *task = Task::Admitted;
+    }
+    if no_wait {
+        if has_prompt && value["pending"].as_bool() == Some(true) {
+            value["outcome"] = Value::Null;
+            value["prompt_pending"] = json!(true);
+            value["next"] = value["request_id"]
+                .as_str()
+                .map(|id| json!(format!("muxel ctl new-status {id}")))
+                .unwrap_or(Value::Null);
+        }
+        return Ok(value);
+    }
+    let created = wait_creation_with(
+        value,
+        |request_id| request(Command::NewStatus { request_id }),
+        &mut pause,
+    )?;
+    if !has_prompt {
+        return Ok(created);
+    }
+    wait_prompt_delivery_with(
+        created,
+        wait,
+        |agent| {
+            request(Command::Status {
+                agent: Some(agent.to_owned()),
+            })
+        },
+        pause,
+    )
 }
 
 /// Attach Windows GUI builds to the invoking shell's console so ctl can print.
@@ -346,14 +435,33 @@ pub fn attach_parent_console() {
     }
 }
 
-fn fail(error: control::Error, status: i32) -> i32 {
-    emit(&failure_body(error).to_string());
+fn fail(error: control::Error, status: i32, task: Task) -> i32 {
+    emit(&failure_body(error, task).to_string());
     status
 }
 
-fn failure_body(error: control::Error) -> Value {
-    let reply = serde_json::to_value(control::Response::err(error))
+/// A failed command's reply. One that carried a task adds the task's `outcome`:
+/// `not_delivered` only for a coded refusal before any input, and otherwise
+/// `unconfirmed`, since the task may have gone in or, for an admitted creation,
+/// may still go in once it's approved.
+pub(crate) fn failure_body(error: control::Error, task: Task) -> Value {
+    let refused = error.pasted != Some(true)
+        && match (task, error.code) {
+            (_, None) => false,
+            // A lost poll says nothing of the creation it was asking after.
+            (Task::Admitted, Some(ErrorCode::HostUnavailable | ErrorCode::StaleEndpoint)) => false,
+            (_, Some(_)) => true,
+        };
+    let mut reply = serde_json::to_value(control::Response::err(error))
         .expect("control errors have a JSON representation");
+    if task != Task::None {
+        reply["outcome"] = json!(if refused {
+            control::PromptOutcome::NotDelivered
+        } else {
+            control::PromptOutcome::Unconfirmed
+        });
+        reply["next"] = json!("muxel ctl panes");
+    }
     with_host(reply)
 }
 
@@ -491,15 +599,8 @@ fn request(command: Command) -> Result<Value, control::Error> {
     request_at(&path, command)
 }
 
-/// Each poll owns a fresh socket; approvals never occupy a connection slot.
-fn wait_creation(value: Value) -> Result<Value, control::Error> {
-    wait_creation_with(
-        value,
-        |request_id| request(Command::NewStatus { request_id }),
-        || std::thread::sleep(WAIT_POLL),
-    )
-}
-
+/// Poll a pending creation until muxel answers it. Each poll owns a fresh
+/// socket; approvals never occupy a connection slot.
 fn wait_creation_with(
     value: Value,
     mut status: impl FnMut(Uuid) -> Result<Value, control::Error>,
@@ -535,6 +636,60 @@ fn wait_creation_with(
             }
             Err(error) => return Err(error),
         }
+    }
+}
+
+/// Read-only polls of the created UUID until its task settles or `wait` is up,
+/// whichever comes first; at least one. A task still pending then is reported
+/// as pending, with `status` as the next read. Creation and text are never
+/// reissued.
+fn wait_prompt_delivery_with(
+    mut created: Value,
+    wait: Duration,
+    mut status: impl FnMut(&str) -> Result<Value, control::Error>,
+    mut pause: impl FnMut(),
+) -> Result<Value, control::Error> {
+    let agent = created["uuid"]
+        .as_str()
+        .ok_or("muxel returned a creation without its pane UUID")?
+        .to_owned();
+    let started = Instant::now();
+    let mut unavailable = 0;
+    loop {
+        match status(&agent) {
+            Ok(info) => {
+                unavailable = 0;
+                if let Some(error) = info.get("startup_error") {
+                    created["startup_error"] = error.clone();
+                }
+                let Some(value) = info.get("prompt_delivery") else {
+                    let mut delivery =
+                        control::PromptDelivery::new(&agent, control::PromptOutcome::Unconfirmed);
+                    delivery.submission_confirmed = None;
+                    delivery.apply(&mut created);
+                    return Ok(created);
+                };
+                let delivery: control::PromptDelivery = serde_json::from_value(value.clone())
+                    .map_err(|error| format!("invalid startup receipt: {error}; inspect `muxel ctl screen {agent}` before more input"))?;
+                if !delivery.prompt_pending || started.elapsed() >= wait {
+                    delivery.apply(&mut created);
+                    return Ok(created);
+                }
+            }
+            Err(error) => {
+                unavailable += 1;
+                if unavailable > 3 {
+                    created["startup_error"] =
+                        json!(format!("Could not observe the startup task: {error}"));
+                    let mut delivery =
+                        control::PromptDelivery::new(&agent, control::PromptOutcome::Unconfirmed);
+                    delivery.next = Some(format!("muxel ctl status {agent}"));
+                    delivery.apply(&mut created);
+                    return Ok(created);
+                }
+            }
+        }
+        pause();
     }
 }
 
@@ -642,13 +797,163 @@ fn wait(agent: &str, timeout: Duration, full: bool, turn: bool) -> Result<Value,
 #[cfg(test)]
 mod tests {
     use super::{
-        Server, dispatch, failure_body, process_alive, read_endpoint, request_at, same_secret,
-        wait_creation_with, write_endpoint,
+        DELIVERY_WAIT, Server, Task, create, dispatch, failure_body, process_alive, read_endpoint,
+        request_at, same_secret, task_of, wait_creation_with, wait_prompt_delivery_with,
+        write_endpoint,
     };
-    use muxel_core::control::{self, Command, Endpoint, ErrorCode, PROTOCOL_VERSION, Response};
+    use muxel_core::control::{
+        self, CliCommand, Command, Endpoint, ErrorCode, PROTOCOL_VERSION, Response,
+    };
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::net::{Ipv4Addr, TcpListener};
     use std::path::PathBuf;
+
+    /// `muxel ctl new ARGS`, run against a muxel that answers each request
+    /// with `answer`: the reply, or the failure as the CLI prints it.
+    fn run_new(
+        args: &[&str],
+        mut answer: impl FnMut(Command) -> Result<serde_json::Value, control::Error>,
+    ) -> Result<serde_json::Value, serde_json::Value> {
+        let args: Vec<String> = ["new", "proj"]
+            .iter()
+            .chain(args)
+            .map(|arg| arg.to_string())
+            .collect();
+        let CliCommand::Request(Command::New { project, options }) =
+            control::parse_cli(&args).unwrap()
+        else {
+            panic!("not a new command");
+        };
+        let mut task = task_of(&control::parse_cli(&args).unwrap());
+        create(project, options, &mut task, &mut answer, || {})
+            .map_err(|error| failure_body(error, task))
+    }
+
+    /// The failure `muxel ctl ARGS` prints when its first request fails.
+    fn first_request_failure(args: &[&str], error: control::Error) -> serde_json::Value {
+        let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        failure_body(error, task_of(&control::parse_cli(&args).unwrap()))
+    }
+
+    #[test]
+    fn only_send_and_new_with_a_task_report_an_outcome() {
+        let lost = || control::Error::new(ErrorCode::HostUnavailable, "no muxel");
+        for args in [
+            &["screen", "claude"][..],
+            &["status", "claude"],
+            &["wait", "claude"],
+            &["panes"],
+            &["keys", "claude", "enter"],
+            &["new", "proj"],
+        ] {
+            let reply = first_request_failure(args, lost());
+            assert!(reply.get("outcome").is_none(), "{args:?}: {reply}");
+            assert!(reply.get("next").is_none(), "{args:?}: {reply}");
+        }
+        for args in [
+            &["send", "claude", "hi"][..],
+            &["new", "proj", "--prompt", "hi"],
+        ] {
+            let reply = first_request_failure(args, lost());
+            assert_eq!(reply["outcome"], "not_delivered", "{args:?}");
+            assert_eq!(reply["code"], "host_unavailable", "{args:?}");
+        }
+    }
+
+    #[test]
+    fn an_admitted_task_is_unconfirmed_when_muxel_stops_answering_its_poll() {
+        let id = uuid::Uuid::new_v4();
+        let creation = |poll: control::Error| {
+            run_new(&["--prompt", "hi"], |command| match command {
+                Command::New { .. } => Ok(serde_json::json!({"pending":true,"request_id":id})),
+                _ => Err(poll.clone()),
+            })
+            .unwrap_err()
+        };
+        let lost = creation(control::Error::new(
+            ErrorCode::HostUnavailable,
+            "connection lost",
+        ));
+        assert_eq!(lost["outcome"], "unconfirmed", "{lost}");
+        assert_eq!(lost["code"], "host_unavailable");
+        let denied = creation(control::Error::new(ErrorCode::ApprovalDenied, "denied"));
+        assert_eq!(denied["outcome"], "not_delivered", "{denied}");
+    }
+
+    #[test]
+    fn new_with_a_task_answers_once_the_pane_exists() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut reads = 0;
+        let reply = run_new(&["--prompt", "hi"], |command| match command {
+            Command::New { .. } => Ok(serde_json::json!({"uuid":id,"program":"codex"})),
+            Command::Status { agent } => {
+                assert_eq!(agent.as_deref(), Some(id.as_str()));
+                reads += 1;
+                Ok(serde_json::json!({"prompt_delivery":control::PromptDelivery::pending(&id)}))
+            }
+            _ => panic!("new reissued or polled something else"),
+        })
+        .unwrap();
+        assert_eq!(reads, 1, "one read of the created pane");
+        assert_eq!(reply["uuid"], id);
+        assert_eq!(reply["prompt_pending"], true);
+        assert!(
+            reply["outcome"].is_null(),
+            "pending isn't an outcome: {reply}"
+        );
+        assert_eq!(reply["next"], format!("muxel ctl status {id}"));
+    }
+
+    #[test]
+    fn wait_delivery_reads_the_created_uuid_until_a_terminal_receipt() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut reads = 0;
+        let reply = run_new(
+            &["--prompt", "hi", "--wait-delivery"],
+            |command| match command {
+                Command::New { .. } => {
+                    Ok(serde_json::json!({"uuid":id,"program":"codex","args":[]}))
+                }
+                Command::Status { agent } => {
+                    assert_eq!(agent.as_deref(), Some(id.as_str()));
+                    reads += 1;
+                    let receipt = if reads == 1 {
+                        control::PromptDelivery::pending(&id)
+                    } else {
+                        control::PromptDelivery::new(&id, control::PromptOutcome::Submitted)
+                    };
+                    Ok(serde_json::json!({"prompt_delivery":receipt}))
+                }
+                _ => panic!("new reissued or polled something else"),
+            },
+        )
+        .unwrap();
+        assert_eq!(reads, 2);
+        assert_eq!(reply["outcome"], "submitted");
+        assert_eq!(reply["submission_confirmed"], true);
+        assert_eq!(reply["program"], "codex");
+        assert!(reply["next"].is_null());
+    }
+
+    #[test]
+    fn lost_startup_status_keeps_the_created_pane_and_never_recreates_it() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut reads = 0;
+        let reply = wait_prompt_delivery_with(
+            serde_json::json!({"uuid":id}),
+            DELIVERY_WAIT,
+            |_| {
+                reads += 1;
+                Err("host unavailable".into())
+            },
+            || {},
+        )
+        .unwrap();
+        assert_eq!(reads, 4);
+        assert_eq!(reply["uuid"], id);
+        assert_eq!(reply["outcome"], "unconfirmed");
+        assert_eq!(reply["next"], format!("muxel ctl status {id}"));
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("muxel-ctl-{name}-{}", uuid::Uuid::new_v4()));
@@ -681,7 +986,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, Some(ErrorCode::Closing));
         assert_eq!(error.undo_until, Some(deadline));
-        let json = failure_body(error);
+        let json = failure_body(error, Task::None);
         assert_eq!(json["ok"], false);
         assert_eq!(json["code"], "closing");
         assert_eq!(json["undo_until"], deadline);
@@ -702,7 +1007,7 @@ mod tests {
             control::Error::new(ErrorCode::Working, "busy"),
             control::Error::from("no match"),
         ] {
-            let reply = failure_body(error);
+            let reply = failure_body(error, Task::Unsent);
             assert!(reply.get("undo_until").is_none());
             assert!(reply.get("result").is_none());
         }
@@ -713,6 +1018,7 @@ mod tests {
         let busy = failure_body(
             control::Error::new(ErrorCode::Working, "prior turn is open")
                 .with_reason("just_submitted"),
+            Task::Unsent,
         );
         assert_eq!(busy["ok"], false);
         assert_eq!(busy["code"], "working");
@@ -722,9 +1028,11 @@ mod tests {
 
         let pasted = failure_body(
             control::Error::new(ErrorCode::InputChanged, "Enter withheld").after_paste(),
+            Task::Unsent,
         );
         assert_eq!(pasted["pasted"], true);
         assert_eq!(pasted["error"], "Enter withheld");
+        assert_eq!(pasted["outcome"], "unconfirmed");
     }
 
     #[test]

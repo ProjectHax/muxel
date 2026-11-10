@@ -155,7 +155,7 @@ impl MuxelApp {
         // new pane, so only a request the user just clicked to approve may.
         // Under Allow, `--focus` opens it in the background like any other.
         let focused = options.focus && approved;
-        let result = json!({
+        let mut result = json!({
             "id": ctl::short_id(iid), "uuid": iid,
             "project": project.name, "project_id": pid,
             "focused": focused,
@@ -163,6 +163,9 @@ impl MuxelApp {
             "program": instance.program.clone().unwrap_or_else(|| CommandSpec::shell().program),
             "args": instance.args,
         });
+        if options.prompt.is_some() {
+            ctl::PromptDelivery::pending(&iid.to_string()).apply(&mut result);
+        }
         let placement = match options.placement {
             ctl::NewPlacement::Tab => PlacementMode::Tab,
             ctl::NewPlacement::Right => PlacementMode::Split(SplitDirection::Horizontal),

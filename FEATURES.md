@@ -1120,7 +1120,7 @@ feature is added or changed, update the matching entry here in the same change**
   literal text keeps those words as prompt text. Unknown verbs suggest a nearby
   command.
   Codex, Claude and Grok sends then observe fresh provider acceptance for about
-  ten seconds (three more after a retry) and report `submission_confirmed` and
+  sixty seconds (three more after a retry) and report `submission_confirmed` and
   `enter_retries`. Unknown acceptance is reported as false with an
   `unconfirmed_reason` (`timed_out`, `input_changed`, `interrupted`, or
   `retry_unanswered` when tmux didn't answer for the retry Enter); once
@@ -1133,10 +1133,50 @@ feature is added or changed, update the matching entry here in the same change**
   and input guards and an exact fully visible ASCII prose draft in its idle
   composer. A compact composer frame captured before paste and an added blank
   cursor line must prove that its first Enter was consumed, with no resize or
-  title change. Wrapped prose is supported; clipped, multiline, Unicode,
+  later title change. Learning the first provider thread does not cancel the
+  confirmation. Switch and input protection covers muxel-observed changes;
+  another tmux client's input is untracked. Wrapped prose is supported;
+  clipped, multiline, Unicode,
   completion or ambiguous drafts are left for inspection. Claude and Grok get no
   automatic retry. Text is never pasted again, and an unconfirmed receipt does
   not authorize resending it.
+- **Delivery outcomes and next commands** — `send` and `new --prompt` report
+  `submitted`, `pending_in_composer`, `not_delivered`, or `unconfirmed`, with a
+  `next` command when more action is needed. Existing receipt fields remain.
+  All unsubmitted outcomes recommend read-only screen inspection. A pending
+  receipt describes the draft observed at that time and cannot guard a later
+  Enter; never paste the task again after uncertain delivery. Startup pending
+  proof preserves exact whitespace; ambiguous layout stays unconfirmed. A failed
+  `send` or `new --prompt` is `not_delivered` only when a coded refusal came
+  before any input; other commands' failures carry no outcome. A send watches
+  for its receipt for ten seconds, a second longer for each thousand characters
+  past the first, up to a minute. Agent IDs also accept the `pane<ID>`
+  spelling when no agent has that name.
+- **Startup input waits for the provider** — a `new --prompt` task waits for a
+  real editable composer and provider acceptance. The reply comes once the pane
+  exists, with the task submitted, refused, or `prompt_pending` and a `status`
+  command to follow; `--wait-delivery` reads until it settles, for up to 90
+  seconds. Known folder trust, update and login menus stop delivery as soon as
+  they appear, with `blocked_by` and a short `screen_excerpt`; trust prompts are
+  never answered automatically. `--no-wait` returns before approval with a
+  polling command. Status exposes the same delivery facts.
+  Codex launches carrying a startup task suppress its startup update menu.
+- **Windows Codex multiline control** — native presets disable heuristic paste
+  bursts only after a version probe verifies the matching input codec. The
+  probe runs once per Codex executable (again after it changes) on its own
+  thread; a launch waits for it at most two seconds, and a slower probe still
+  answers later launches. Older versions and failed probes receive no automatic
+  paste-burst override. With verified, configured
+  Codex 0.167 or newer, native control and clipboard paste preserve line breaks,
+  blank lines and Unicode; CRLF becomes one newline. Clipboard and startup text
+  turn tabs into spaces to the next four-column stop. Other control characters,
+  and tabs in ctl input, refuse the whole paste before any write.
+  Clipboard refusals appear in the error feed; ordinary clipboard ESC
+  sanitization remains. Saved snippets and dictated transcripts also report
+  paste failures and cancel automatic submission. Unverified
+  multiline controller input reports `unsupported_input`; explicitly disabled
+  bursts without a verified codec also
+  refuse advanced clipboard text. Literal argv is never changed.
 - **Never touches your sessions to read them** — every read (`screen`, `show`,
   `wait`, and read-aloud) is answered from muxel's own terminal buffer, which holds
   10,000 lines per pane — five times the most any of these commands will return. It
@@ -1471,7 +1511,11 @@ feature is added or changed, update the matching entry here in the same change**
   the work area until the first project is added.
 - **Project list** — projects with live per-agent status rows; collapse a project.
 - **Branch label** — each project row shows its git repo's current branch with a
-  branch icon (refreshed live).
+  branch icon (refreshed live), including a new repo's branch before its first
+  commit, spelled as the switch-branch menu spells it. A local repo's branch
+  comes from the git run that lists its branches, which runs when its HEAD or
+  branch files change and otherwise every five minutes (every minute where
+  those files can't show what git reads, as with `GIT_DIR` set).
 - **Project git** — right-click a git project for: git diff (opens the diff pane;
   local projects), switch branch (submenu), new branch, commit, pull, push, fetch,
   and stash / pop / drop stash; each runs off the main thread and toasts its
@@ -1900,12 +1944,17 @@ feature is added or changed, update the matching entry here in the same change**
 - **Opt-in session diagnostics** — `MUXEL_PROFILE=1` records background
   session lookup hits, outcome changes and slow calls, with per-minute counts
   and maximum durations for all discovery polls. Launch-time resume lookups
-  always log. Both profiler logs keep stable live paths and dated history
+  always log. Local `git` runs get a record (which poll ran it, the
+  subcommand, its time, and whether it printed the same as last time), except
+  team-library jobs, and records a saturated queue drops are only counted.
+  Both profiler logs keep stable live paths and dated history
   (14 local dates and 256 MiB per family by default, tunable with
   `MUXEL_PROFILE_KEEP_DAYS` and `MUXEL_PROFILE_MAX_BYTES`). Quiet terminal
   intervals aggregate totals and maxima over 30 seconds. Records contain fixed
   labels, timings and short pane ids, with no
-  terminal content, session ids, titles or paths.
+  terminal content, session ids, titles or paths. A git record carries unsalted
+  64-bit FNV-1a hashes of its folder and its whole command line instead, so a
+  guessed path can be checked against them.
 - **Profiler isolation** — muxel's profiler settings, including future knobs, stay with the
   process that enabled them. Panes, runners and helper commands start without
   those settings; a nested muxel can enable its own profiler independently.
