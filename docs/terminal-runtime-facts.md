@@ -456,9 +456,13 @@ a provider has no hidden background work, so the snapshot reports
 `ActivityOnly`, `VisibleMarkers`, or `ProviderVisible` coverage rather than
 claiming more than the terminal shows.
 
-Background work is read from the same screen. Claude 2.1.318's footer lists it live
-in every permission mode, as `1 shell`, `1 monitor` or `/tasks to see subagents`, and
-clears by itself. Its `← 4 agents` is on every footer and is not a running count, and
+Background listings are read from the same screen. Claude 2.1.318's captured footer
+uses `1 shell`, `1 monitor` or `/tasks to see subagents` in each permission mode.
+A listing is not a liveness guarantee, so subagent holds have a three-hour cap;
+shell and monitor holds have a thirty-minute cap. A turn released by its cap or
+missing-listing grace cannot be held again without a fresh foreground turn.
+Legacy agent, MCP-task and cloud-session labels do not establish subagents.
+Its `← 4 agents` is on every footer and is not a running count, and
 a finished turn's `1 shell still running` row stays on screen after the shell ends, so
 an empty footer outranks that row. Grok 1.0.70 draws no 7501 report; its panel above
 the composer lists `Tasks`, `Watchers` and `Subagents`, and a `Loop` under Watchers
@@ -473,8 +477,10 @@ report. Send admission and the background turn-end decision require the hold's
 binding revision to match the current conversation. Completion attribution stays
 separate: a surviving footer after `/clear` can still leave the current composer
 free without updating activity. Foreground working/blocked markers prevent that
-background-only exception. Cached holds from before reconciliation cannot authorize
-input or finish a wait.
+background-only exception. Released foreground turns with current-binding listed
+work keep that admission behavior even when activity attribution is suppressed.
+Legacy foreground-command rows retain their Working refusal. Cached snapshots
+from a previous binding cannot authorize input or finish a wait.
 
 A held turn takes no completion: the report that started the hold would otherwise stamp
 the pane as finished. The release is its own status change. A switch reads the same way:

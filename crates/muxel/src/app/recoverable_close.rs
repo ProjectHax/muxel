@@ -385,7 +385,7 @@ impl MuxelApp {
                     }
                     if let Some(work) = self
                         .terminal_view(iid)
-                        .and_then(|view| view.read(cx).runtime_snapshot().background)
+                        .and_then(|view| view.read(cx).background_work())
                     {
                         return tf(
                             "{name} is still running {work}.",

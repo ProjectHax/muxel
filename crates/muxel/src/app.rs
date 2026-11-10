@@ -2376,9 +2376,55 @@ fn localized_activity_label(
         "stale" => t("stale").to_string(),
         _ => word.to_string(),
     };
-    match beside.as_deref().or(age) {
-        Some(detail) => format!("{word} · {detail}"),
-        None => word,
+    match (age, beside.as_deref()) {
+        (Some(age), Some(beside)) => format!("{word} · {age} · {beside}"),
+        (Some(detail), None) | (None, Some(detail)) => format!("{word} · {detail}"),
+        (None, None) => word,
+    }
+}
+
+#[cfg(test)]
+mod activity_label_tests {
+    use super::localized_activity_label;
+    use muxel_core::{AgentActivity, control::BackgroundWork};
+    use muxel_terminal::AgentStatus;
+
+    #[test]
+    fn pr136_shared_background_label_retains_activity_age() {
+        let activity = AgentActivity {
+            work_started_at: Some(60_000),
+            completed_at: Some(60_000),
+            blocked_at: Some(60_000),
+            ..AgentActivity::default()
+        };
+        let background = Some(BackgroundWork {
+            shells: 1,
+            ..BackgroundWork::default()
+        });
+        for (status, expected) in [
+            (AgentStatus::Working, "working · 1 shell"),
+            (AgentStatus::Idle, "idle · 3m · 1 shell"),
+            (AgentStatus::Done, "done · 3m · 1 shell"),
+            (AgentStatus::Blocked, "blocked · 3m"),
+        ] {
+            assert_eq!(
+                localized_activity_label(status, &activity, background, 240_000),
+                expected,
+                "{status:?} must retain its age beside background work"
+            );
+        }
+        for (status, expected) in [
+            (AgentStatus::Working, "working"),
+            (AgentStatus::Idle, "idle · 3m"),
+            (AgentStatus::Done, "done · 3m"),
+            (AgentStatus::Blocked, "blocked · 3m"),
+        ] {
+            assert_eq!(
+                localized_activity_label(status, &activity, None, 240_000),
+                expected,
+                "{status:?} without background work must retain its label"
+            );
+        }
     }
 }
 
@@ -26796,7 +26842,7 @@ impl MuxelApp {
                                                 status,
                                                 &instance.activity,
                                                 self.terminal_view(iid).and_then(|view| {
-                                                    view.read(cx).runtime_snapshot().background
+                                                    view.read(cx).background_work()
                                                 }),
                                                 chrono::Utc::now().timestamp_millis(),
                                             )
@@ -28424,9 +28470,8 @@ impl MuxelApp {
                                         localized_activity_label(
                                             status,
                                             &instance.activity,
-                                            self.terminal_view(iid).and_then(|view| {
-                                                view.read(cx).runtime_snapshot().background
-                                            }),
+                                            self.terminal_view(iid)
+                                                .and_then(|view| view.read(cx).background_work()),
                                             chrono::Utc::now().timestamp_millis(),
                                         )
                                     })

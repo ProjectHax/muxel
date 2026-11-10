@@ -571,7 +571,12 @@ feature is added or changed, update the matching entry here in the same change**
   once when the work ends and the agent has had a moment to wake for it. Shells and
   monitors hold for 30 minutes, since a long-lived dev server looks the same as a shell
   the agent is waiting on; past that the pane reads `done · 1 shell` and alerts as a
-  finished turn. Subagents hold until they end. Closing a pane asks while anything is
+  finished turn. Subagent listings hold for at most three hours. A released turn
+  stays released through later footer redraws until new foreground work runs;
+  program transitions coalesced into one read still start a fresh turn clock.
+  Legacy `command still running` rows remain foreground Working and refuse input.
+  Unsupported legacy task kinds do not establish subagent work. Existing activity
+  ages remain beside the background label. Closing a pane asks while anything is
   listed as running, and `ctl status` reports it as `background`. `ctl send` still
   delivers to a held pane, since its prompt is free. `ctl wait` follows the pane and
   keeps waiting through a hold, changing its previous behavior of returning when

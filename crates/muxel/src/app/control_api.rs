@@ -401,7 +401,10 @@ fn background_turn_over(
     binding_rev: u64,
 ) -> bool {
     runtime.binding_rev == binding_rev
-        && runtime.reason == muxel_terminal::TerminalStatusReason::BackgroundWork
+        && ((runtime.status == AgentStatus::Working
+            && runtime.reason == muxel_terminal::TerminalStatusReason::BackgroundWork)
+            || (matches!(runtime.status, AgentStatus::Idle | AgentStatus::Done)
+                && runtime.background.is_some_and(|work| !work.is_empty())))
 }
 
 fn check_send_state(admission: SendAdmission) -> CtlResult<()> {
@@ -1205,7 +1208,7 @@ impl MuxelApp {
                 .is_some_and(|turn| turn.awaiting_reply(status, &inst.activity, now)),
             background: self
                 .terminal_view(inst.id)
-                .and_then(|view| view.read(cx).runtime_snapshot().background),
+                .and_then(|view| view.read(cx).background_work()),
             turn_over: self.control_turn_over(inst, now, cx),
             startup_error: self
                 .control_turns
@@ -1485,8 +1488,8 @@ impl MuxelApp {
         })
     }
 
-    /// A turn held for its background work is over, unless a prompt sent since then
-    /// hasn't started yet, whose reply this would pass off as the previous one.
+    /// A current-binding foreground turn beside listed work is over, unless a prompt
+    /// sent since then hasn't started yet, whose reply this would pass off as the previous one.
     fn control_turn_over(&self, inst: &Instance, now: i64, cx: &App) -> bool {
         self.terminal_view(inst.id).is_some_and(|view| {
             let view = view.read(cx);
@@ -4219,6 +4222,66 @@ mod runtime_control_tests {
             },
             1,
         ));
+    }
+
+    #[test]
+    fn pr136_shared_released_foreground_keeps_current_binding_admission() {
+        for status in [AgentStatus::Idle, AgentStatus::Done] {
+            let runtime = TerminalRuntimeSnapshot {
+                status,
+                attributable: false,
+                reason: TerminalStatusReason::ProviderTitle,
+                ..held_snapshot()
+            };
+            assert!(super::background_turn_over(runtime, 1));
+            let reason = super::background_turn_over(runtime, 1)
+                .then_some(TerminalStatusReason::BackgroundWork);
+            let state =
+                super::send_admission_state(Some(runtime_control_state(runtime, 1)), reason);
+            assert!(
+                check_send_state(SendAdmission {
+                    state,
+                    just_submitted: false,
+                    force: false,
+                })
+                .is_ok()
+            );
+            assert!(
+                !super::background_turn_over(runtime, 2),
+                "an old binding never authorizes input"
+            );
+            assert!(
+                !super::background_turn_over(
+                    TerminalRuntimeSnapshot {
+                        background: None,
+                        ..runtime
+                    },
+                    1
+                ),
+                "an ordinary unattributed idle pane stays guarded"
+            );
+            assert!(
+                !super::background_turn_over(
+                    TerminalRuntimeSnapshot {
+                        background: Some(ctl::BackgroundWork::default()),
+                        ..runtime
+                    },
+                    1
+                ),
+                "an empty listing supplies no foreground evidence"
+            );
+        }
+        for status in [AgentStatus::Working, AgentStatus::Blocked] {
+            let runtime = TerminalRuntimeSnapshot {
+                status,
+                reason: TerminalStatusReason::ProviderScreen,
+                ..held_snapshot()
+            };
+            assert!(
+                !super::background_turn_over(runtime, 1),
+                "foreground evidence keeps its refusal"
+            );
+        }
     }
 
     #[test]

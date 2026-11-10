@@ -592,6 +592,12 @@ impl RuntimeStatusState {
             activity_fallback,
             idle,
         );
+        let new_explicit = program_status
+            .explicit_completions
+            .saturating_sub(self.program_explicit_completions);
+        let new_idle = program_status
+            .idle_completions
+            .saturating_sub(self.program_idle_completions);
         let turn_over = match program_root {
             Some(root) => matches!(root.state, ProgramState::Done | ProgramState::Idle),
             None => {
@@ -609,15 +615,44 @@ impl RuntimeStatusState {
         // gets no wake grace: this conversation has run no turn.
         let ended_before_a_turn =
             self.provider_background.is_none() && self.screen_held && program_root.is_none();
-        let (background_holds, background_deadline) = self.background_hold.observe(
-            self.provider_background,
-            exited || !turn_over || ended_before_a_turn,
-            now,
+        // Ordered parser facts retain a Working turn that ended in one batch.
+        // A repeated Done or a Blocked-only menu cannot reopen a released turn.
+        let turn_ran = if program_root.is_some() {
+            new_explicit > 0 || new_idle > 0
+        } else {
+            working_to_nonworking
+        };
+        if turn_ran {
+            self.background_hold = BackgroundHold::default();
+        }
+        let foreground_running = program_root.map_or_else(
+            || {
+                title == Some(AgentStatus::Working)
+                    || self.provider_screen == Some(AgentStatus::Working)
+                    || self.working_marker
+            },
+            |root| root.state == ProgramState::Working,
         );
+        let (background_holds, background_deadline) = if exited
+            || ended_before_a_turn
+            || program_root.is_some_and(|root| root.state == ProgramState::Error)
+        {
+            self.background_hold.release(now);
+            (false, None)
+        } else if !turn_over {
+            if foreground_running {
+                self.background_hold.observe(None, true, now);
+            }
+            (false, None)
+        } else {
+            self.background_hold
+                .observe(self.provider_background, false, now)
+        };
         if let Some(deadline) = background_deadline {
             next_deadline = Some(next_deadline.map_or(deadline, |old| old.min(deadline)));
         }
-        // Only an expired hold stops listed work reading as Working.
+        // Returning metadata cannot reopen a released turn. Foreground evidence
+        // still reports Working independently of the background hold.
         let background_reads_working =
             background_holds || (self.provider_background.is_some() && !turn_over);
         let provider_screen = self
@@ -738,12 +773,6 @@ impl RuntimeStatusState {
                 combine_title_status(exited, base, title, screen_working)
             }
         });
-        let new_explicit = program_status
-            .explicit_completions
-            .saturating_sub(self.program_explicit_completions);
-        let new_idle = program_status
-            .idle_completions
-            .saturating_sub(self.program_idle_completions);
         self.program_explicit_completions = program_status.explicit_completions;
         self.program_idle_completions = program_status.idle_completions;
         // Codex can receive an automated startup prompt before its first UUID
@@ -1278,21 +1307,16 @@ fn provider_screen_read(
             };
             (status, work.background)
         }
-        TitleProvider::Grok => (
-            is_grok_question(screen).then_some(AgentStatus::Blocked),
-            grok_background(screen),
-        ),
+        TitleProvider::Grok => grok_screen_read(screen),
         _ => (None, None),
     }
 }
 
 /// A finished turn beside live background work does not need anyone, so it
-/// reads Working. Nothing on screen separates a shell the agent waits on from a
-/// long-lived server, so shells and monitors hold only for a time: past that the
-/// turn reads finished, with its work still listed. 30 minutes covers 95% of the
-/// background shells measured from real sessions. Subagents come back on their
-/// own, so they hold until they end.
+/// reads Working. Listed items may outlive the work, so every hold is bounded.
+/// A released turn stays released until new foreground work is observed.
 const BACKGROUND_HOLD: Duration = Duration::from_secs(30 * 60);
+const BACKGROUND_SUBAGENT_HOLD: Duration = Duration::from_secs(3 * 60 * 60);
 /// When background work ends the agent wakes for it, moments later. Done in that
 /// gap would alert and float the pane just before it starts working again.
 const BACKGROUND_WAKE_GRACE: Duration = Duration::from_secs(5);
@@ -1300,8 +1324,10 @@ const BACKGROUND_WAKE_GRACE: Duration = Duration::from_secs(5);
 #[derive(Clone, Copy, Debug, Default)]
 struct BackgroundHold {
     turn_ended_at: Option<Instant>,
+    expires_at: Option<Instant>,
     holding: bool,
     cleared_at: Option<Instant>,
+    released: bool,
 }
 
 impl BackgroundHold {
@@ -1316,23 +1342,41 @@ impl BackgroundHold {
             *self = Self::default();
             return (false, None);
         }
+        if self.released {
+            return (false, None);
+        }
         if let Some(work) = work {
-            let until = *self.turn_ended_at.get_or_insert(now) + BACKGROUND_HOLD;
+            let limit = if work.subagents {
+                BACKGROUND_SUBAGENT_HOLD
+            } else {
+                BACKGROUND_HOLD
+            };
+            let until = *self.turn_ended_at.get_or_insert(now) + limit;
+            self.expires_at = Some(until);
             self.cleared_at = None;
-            self.holding = work.subagents || now < until;
-            return (
-                self.holding,
-                (self.holding && !work.subagents).then_some(until),
-            );
+            if now < until {
+                self.holding = true;
+                return (true, Some(until));
+            }
+            self.release(now);
+            return (false, None);
         }
         if self.holding {
             let until = *self.cleared_at.get_or_insert(now) + BACKGROUND_WAKE_GRACE;
+            let until = self.expires_at.map_or(until, |cap| until.min(cap));
             if now < until {
                 return (true, Some(until));
             }
         }
-        *self = Self::default();
+        self.release(now);
         (false, None)
+    }
+
+    fn release(&mut self, now: Instant) {
+        self.turn_ended_at.get_or_insert(now);
+        self.holding = false;
+        self.cleared_at = None;
+        self.released = true;
     }
 }
 
@@ -1367,7 +1411,7 @@ fn grok_panel_background(screen: &str) -> BackgroundWork {
         }
         match group {
             "Tasks" => work.shells += count,
-            "Subagents" => work.subagents = true,
+            "Subagents" => work.subagents |= count > 0,
             "Watchers" => {
                 work.monitors += items
                     .iter()
@@ -1381,11 +1425,10 @@ fn grok_panel_background(screen: &str) -> BackgroundWork {
     work
 }
 
-fn grok_background(screen: &str) -> Option<BackgroundWork> {
-    let mut work = grok_panel_background(screen);
-    if !work.is_empty() {
-        return Some(work);
-    }
+fn grok_screen_read(screen: &str) -> (Option<AgentStatus>, Option<BackgroundWork>) {
+    let panel = grok_panel_background(screen);
+    let mut work = BackgroundWork::default();
+    let mut foreground = false;
     // Older Grok draws counted rows instead of the panel.
     for line in screen.lines() {
         let counts = live_background_counts(
@@ -1396,13 +1439,22 @@ fn grok_background(screen: &str) -> Option<BackgroundWork> {
         );
         for (count, kind) in counts.into_iter().flatten() {
             match kind.trim_end_matches('s') {
-                "command" => work.shells += count,
+                "command" => {
+                    foreground = true;
+                    work.shells += count;
+                }
                 "monitor" | "loop" => work.monitors += count,
                 _ => work.subagents = true,
             }
         }
     }
-    (!work.is_empty()).then_some(work)
+    let background = if !panel.is_empty() { panel } else { work };
+    let status = if is_grok_question(screen) {
+        Some(AgentStatus::Blocked)
+    } else {
+        foreground.then_some(AgentStatus::Working)
+    };
+    (status, (!background.is_empty()).then_some(background))
 }
 
 /// Grok's unanswered question card, read only while the card's own footer is
@@ -1454,27 +1506,32 @@ struct ClaudeScreenWork {
 fn claude_screen_work(screen: &str) -> ClaudeScreenWork {
     let mut newer_rows = [None, None];
     let mut footer_read = false;
+    let mut footer_proves_empty = false;
     let mut background = None;
     for line in screen.lines().rev() {
         if !footer_read && let Some(listed) = claude_mode_footer(line) {
             footer_read = true;
+            footer_proves_empty = listed.is_none();
             background = listed;
         }
-        if is_claude_live_foreground_row(line) {
+        if is_claude_live_foreground_row(line)
+            || (!footer_proves_empty
+                && live_background_counts(line, &["·"], &["command"], true).is_some())
+        {
             return ClaudeScreenWork {
                 foreground: true,
                 background,
             };
         }
         if !footer_read {
-            let found = claude_live_task_footer(line, newer_rows)
-                .as_deref()
-                .map(claude_task_footer_work)
-                .or_else(|| claude_background_row_work(line));
-            if found.is_some() {
+            if let Some(footer) = claude_live_task_footer(line, newer_rows) {
+                let listed = claude_task_footer_work(&footer);
+                footer_read = true;
+                background = (!listed.is_empty()).then_some(listed);
+            } else if let Some(listed) = claude_background_row_work(line) {
                 return ClaudeScreenWork {
                     foreground: false,
-                    background: found,
+                    background: Some(listed),
                 };
             }
         }
@@ -1530,7 +1587,7 @@ fn claude_task_footer_work(footer: &str) -> BackgroundWork {
             match kind {
                 "shell" | "shells" => work.shells += count,
                 "monitor" | "monitors" => work.monitors += count,
-                _ => work.subagents = true,
+                _ => {}
             }
         }
     }
@@ -1721,18 +1778,14 @@ fn is_claude_elapsed(value: &str) -> bool {
 }
 
 fn claude_background_row_work(line: &str) -> Option<BackgroundWork> {
-    fn total(counts: Vec<(u32, &str)>) -> u32 {
-        counts.into_iter().map(|(count, _)| count).sum()
+    let (activity, summary) = line.trim().rsplit_once(" · ")?;
+    if !activity.trim().starts_with("✻ ") {
+        return None;
     }
-    let shells = live_background_counts(line, &["·"], &["command"], true)
-        .map(total)
-        .or_else(|| {
-            let (activity, summary) = line.trim().rsplit_once(" · ")?;
-            if !activity.trim().starts_with("✻ ") {
-                return None;
-            }
-            live_background_counts(&format!("· {summary}"), &["·"], &["shell"], false).map(total)
-        })?;
+    let shells = live_background_counts(&format!("· {summary}"), &["·"], &["shell"], false)?
+        .into_iter()
+        .map(|(count, _)| count)
+        .sum();
     Some(BackgroundWork {
         shells,
         ..BackgroundWork::default()
@@ -4128,6 +4181,13 @@ impl TerminalView {
         self.runtime.snapshot(&self.session)
     }
 
+    /// Current-binding background metadata, without capturing the input state.
+    pub fn background_work(&self) -> Option<BackgroundWork> {
+        self.runtime
+            .background
+            .filter(|_| self.runtime.binding_rev == self.session.binding_revision())
+    }
+
     /// Fresh completion edges observed in this PTY launch. Cached reads do
     /// not advance it; provider binding changes preserve the launch history.
     pub fn launch_completion_revision(&self) -> u64 {
@@ -5995,6 +6055,13 @@ mod startup_readiness_tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "background_hold_review_tests.rs"]
+mod background_hold_review_tests;
+#[cfg(test)]
+#[path = "background_parser_review_tests.rs"]
+mod background_parser_review_tests;
 
 #[cfg(test)]
 mod tests {
@@ -8945,7 +9012,7 @@ mod provider_switch_tests {
         }
 
         /// A long-lived server looks the same as a shell the agent waits on, so the
-        /// hold ends. Subagents come back by themselves, so theirs doesn't.
+        /// hold ends. Subagent listings get a longer, bounded window.
         #[test]
         fn only_subagents_hold_a_finished_turn_past_the_limit() {
             use crate::view::{BACKGROUND_HOLD, TerminalStatusReason};
@@ -9355,8 +9422,8 @@ mod provider_switch_tests {
 
         /// The agent's prompt is free once its turn is over, whatever runs beside it.
         #[test]
-        fn background_hold_wakes_for_its_limit_only_when_one_applies() {
-            use crate::view::{BACKGROUND_HOLD, BackgroundHold};
+        fn background_hold_wakes_at_each_safety_limit() {
+            use crate::view::{BACKGROUND_HOLD, BACKGROUND_SUBAGENT_HOLD, BackgroundHold};
             use muxel_core::control::BackgroundWork;
             use std::time::Duration;
             let now = Instant::now();
@@ -9374,7 +9441,10 @@ mod provider_switch_tests {
                 (true, Some(now + BACKGROUND_HOLD))
             );
             let mut hold = BackgroundHold::default();
-            assert_eq!(hold.observe(Some(subagents), false, now), (true, None));
+            assert_eq!(
+                hold.observe(Some(subagents), false, now),
+                (true, Some(now + BACKGROUND_SUBAGENT_HOLD)),
+            );
             // A new turn restarts the clock: the limit counts from the last finish.
             let mut hold = BackgroundHold::default();
             hold.observe(Some(shell), false, now);
@@ -10675,7 +10745,7 @@ mod provider_switch_tests {
         let mut viewer = Viewer::new(TitleProvider::Grok);
         let clock = viewer.clock;
         let hook = SystemTime::now() - Duration::from_secs(10);
-        let row = "◎ 1 command still running · send a message to interrupt";
+        let row = "v Subagents 1\r\n. Subagent Build\r\n╭─────────────╮\r\n│ >           │\r\n╰─────────────╯\r\nShift+Tab:mode  │  Ctrl+x:shortcuts";
         session.process_drained(&drained(&[(row, hook - Duration::from_secs(3))]));
         session.provider_switched_at(hook, hook, hook + Duration::from_millis(400));
         let (snapshot, _) = viewer.sample_at(&session, clock);
@@ -10720,10 +10790,16 @@ mod provider_switch_tests {
             "no old hold expires into Done"
         );
 
-        // A newly drawn row is attributable, so this finished turn holds for it.
-        // Once it goes the agent gets a moment to wake, and its absence may then
-        // complete this submitted turn.
-        session.process_drained(&drained(&[(row, fresh + Duration::from_millis(2))]));
+        // A new turn, retained even when its titles share a read, can hold for
+        // attributable subagents. A redraw alone cannot reopen the released turn.
+        // Once the listing goes the agent gets a moment to wake.
+        session.process_drained(&drained(&[
+            (
+                "\x1b]0;⠙ - New - grok\x07\x1b]0;New - grok\x07",
+                fresh + Duration::from_millis(2),
+            ),
+            (row, fresh + Duration::from_millis(3)),
+        ]));
         let seen_at = clock + Duration::from_secs(4);
         let (snapshot, _) = viewer.sample_at(&session, seen_at);
         assert_eq!(snapshot.status, AgentStatus::Working);
@@ -10734,7 +10810,7 @@ mod provider_switch_tests {
         assert!(snapshot.attributable);
         session.process_drained(&drained(&[(
             "\x1b[2J\x1b[H",
-            fresh + Duration::from_millis(3),
+            fresh + Duration::from_millis(4),
         )]));
         let cleared_at = seen_at + Duration::from_millis(60);
         let (snapshot, deadline) = viewer.sample_at(&session, cleared_at);
