@@ -73,6 +73,8 @@ jobs:
           echo "udid=$udid" >> "$GITHUB_OUTPUT"
           xcrun simctl list devices available | grep "$udid"
 
+      # SwiftTerm runs a build plugin, which Xcode only runs once someone has
+      # approved it in the IDE; CI has no one to ask.
       - name: Build and test
         run: |
           xcodebuild test \
@@ -81,6 +83,8 @@ jobs:
             -destination "id=${{ steps.sim.outputs.udid }}" \
             -clonedSourcePackagesDirPath .spm \
             -resultBundlePath TestResults.xcresult \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
             CODE_SIGNING_ALLOWED=NO \
             -quiet
 
