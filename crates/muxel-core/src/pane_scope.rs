@@ -242,14 +242,21 @@ mod tests {
         // Otherwise exactly as before.
         assert!(cmd.ends_with("; exec \"${SHELL:-/bin/sh}\" -ilc 'exec claude'"));
         assert!(!cmd.contains("MemoryMax"));
-        // It runs: without systemd-run on PATH, the program still starts.
-        let out = std::process::Command::new("sh")
-            .args(["-c", &remote_exec("echo ran")])
+    }
+
+    /// Without `systemd-run` on PATH, the program still starts. Unix only: the
+    /// command is for a remote Unix host, and Windows has no `/bin/sh`. Absolute
+    /// paths, because PATH is emptied for the child (and also used to find it).
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_program_starts_where_the_host_cannot_make_a_scope() {
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", &remote_exec("/bin/sh -c 'echo ran'")])
             .env("PATH", "/nonexistent")
-            .output();
-        if let Ok(out) = out {
-            assert_eq!(String::from_utf8_lossy(&out.stdout), "ran\n");
-        }
+            .output()
+            .expect("run /bin/sh");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "ran\n");
+        assert!(out.status.success());
     }
 
     #[test]
