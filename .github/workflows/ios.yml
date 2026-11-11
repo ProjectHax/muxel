@@ -1,0 +1,93 @@
+name: ios
+
+# Builds the iOS companion app and runs its unit tests on a simulator. The cargo
+# gate in ci.yml doesn't build it (it isn't a cargo crate), so without this a Swift
+# port of a Rust contract was only ever compiled when someone opened Xcode.
+#
+# Unsigned: the simulator needs no provisioning profile, and the app declares no
+# entitlements, so no Apple account or secrets are involved.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "ios/**"
+      - ".github/workflows/ios.yml"
+  pull_request:
+    paths:
+      - "ios/**"
+      - ".github/workflows/ios.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: ios
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun simctl list runtimes ios
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      # The .xcodeproj is generated from project.yml (and git-ignored).
+      - name: Generate the Xcode project
+        run: xcodegen generate
+
+      # Swift packages (Citadel, SwiftTerm) are resolved from project.yml's
+      # `from:` ranges; there is no committed Package.resolved to key on.
+      - uses: actions/cache@v4
+        with:
+          path: ios/.spm
+          key: spm-${{ runner.os }}-${{ hashFiles('ios/project.yml') }}
+          restore-keys: spm-${{ runner.os }}-
+
+      # Any available iPhone simulator on the newest installed iOS runtime, so
+      # the job doesn't break when the runner image renames its devices.
+      - name: Pick a simulator
+        id: sim
+        run: |
+          udid=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          def version(runtime):
+              return [int(p) for p in runtime.rsplit("iOS-", 1)[1].split("-")]
+          ios = sorted((r for r in devices if "iOS-" in r), key=version, reverse=True)
+          for runtime in ios:
+              for d in devices[runtime]:
+                  if d["name"].startswith("iPhone"):
+                      print(d["udid"]); sys.exit()
+          sys.exit("no available iPhone simulator")
+          ')
+          echo "udid=$udid" >> "$GITHUB_OUTPUT"
+          xcrun simctl list devices available | grep "$udid"
+
+      - name: Build and test
+        run: |
+          xcodebuild test \
+            -project Muxel.xcodeproj \
+            -scheme Muxel \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -clonedSourcePackagesDirPath .spm \
+            -resultBundlePath TestResults.xcresult \
+            CODE_SIGNING_ALLOWED=NO \
+            -quiet
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-test-results
+          path: ios/TestResults.xcresult
+          if-no-files-found: ignore

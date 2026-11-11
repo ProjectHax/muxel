@@ -16,3 +16,6 @@ Package.resolved
 
 # macOS
 .DS_Store
+
+.spm/
+*.xcresult

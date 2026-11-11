@@ -9,7 +9,9 @@ reads/writes the same per-project `.muxel/workspace.json` and uses muxel's exact
 tmux session naming, so the phone and desktop see the same sessions.
 
 This app is **independent of the Rust cargo workspace** — `cargo` does not build it,
-and the CI gate (`cargo fmt/clippy/test/build`) does not cover it. It re-implements
+and the cargo gate (`cargo fmt/clippy/test/build`) does not cover it. A separate
+workflow, `.github/workflows/ios.yml`, builds it unsigned and runs `MuxelTests` on a
+simulator whenever `ios/` changes. It re-implements
 (ports) a small, versioned slice of `muxel-core`'s *remote protocol* and must track
 it (see the contract below).
 
