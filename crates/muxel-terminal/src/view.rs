@@ -1659,7 +1659,11 @@ fn is_claude_live_task_count(task: &str) -> bool {
 }
 
 fn is_claude_live_foreground_row(line: &str) -> bool {
-    let Some(status) = line.trim().strip_prefix("✻ ") else {
+    // Claude cycles its spinner glyph every frame; any frame is the same row.
+    let Some(status) = ["✻ ", "✶ ", "✽ ", "✢ ", "✳ ", "· ", "* "]
+        .iter()
+        .find_map(|glyph| line.trim().strip_prefix(glyph))
+    else {
         return false;
     };
     let Some((activity, metrics)) = status.rsplit_once(" (") else {
@@ -1721,12 +1725,11 @@ fn is_claude_clock_time(value: &str) -> bool {
 }
 
 fn is_claude_token_count(value: &str) -> bool {
-    let Some(value) = value
+    // Claude 2.1.318 draws the count without an arrow between streams.
+    let value = value
         .strip_prefix("↑ ")
         .or_else(|| value.strip_prefix("↓ "))
-    else {
-        return false;
-    };
+        .unwrap_or(value);
     let (number, scaled) = value
         .strip_suffix('k')
         .or_else(|| value.strip_suffix('m'))

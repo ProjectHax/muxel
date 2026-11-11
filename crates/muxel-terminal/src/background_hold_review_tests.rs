@@ -510,3 +510,63 @@ fn pr136_shared_hidden_footer_releases_once_in_the_runtime() {
     assert_eq!(returned.completion_revision, released.completion_revision);
     assert_eq!(probe.runtime.launch_completion_revision, 1);
 }
+
+/// A tmux pane forwards neither Claude's title nor its 7501 reports, so its
+/// spinner row is the turn's only evidence, and Claude redraws that row with a
+/// new glyph every frame. Each frame must read Working: one that doesn't is a
+/// Working→Idle edge, which latches Done, and the pane flashes Done/Working.
+#[test]
+fn every_claude_spinner_frame_reads_working_without_a_title() {
+    use crate::session::CommandSpec;
+    let rule = "─".repeat(100);
+    let screen = |row: &str| {
+        format!(
+            "Claude Code v2.1.318\n❯ Run the tests.\n● Running the suite.\n\n{row}\n\n{rule}\n❯ \n{rule}\n  ⏵⏵ auto mode on (shift+tab to cycle) · ← 4 agents"
+        )
+    };
+    let (session, _receiver) =
+        TerminalSession::spawn(CommandSpec::program("/bin/cat", vec![]), 100, 24).unwrap();
+    let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+    let working = vec!["esc to interrupt".to_string()];
+    let start = Instant::now();
+    let mut seen = Vec::new();
+    let frames = ["✻", "✶", "✽", "✢", "·", "✳"];
+    for (index, row) in std::iter::once(String::new())
+        .chain(
+            frames
+                .iter()
+                .map(|g| format!("{g} Brewing… (5s · ↓ 120 tokens)")),
+        )
+        .chain(std::iter::once(
+            "✻ Brewing… (27m 39s · 12.3k tokens)".to_string(),
+        ))
+        .enumerate()
+    {
+        if index == 1 {
+            session.mark_turn_submitted();
+        }
+        let mut wire = "\x1b[2J\x1b[H\x1b[?2004h".to_string();
+        for (line, text) in screen(&row).lines().enumerate() {
+            wire.push_str(&format!("\x1b[{};1H{text}", line + 1));
+        }
+        wire.push_str("\x1b[8;3H\x1b[?25h");
+        session.process_output(wire.as_bytes());
+        runtime.reconcile(
+            &session,
+            TitleProvider::Claude,
+            &working,
+            &[],
+            false,
+            start + Duration::from_millis(100 * index as u64),
+        );
+        seen.push(runtime.snapshot(&session).status);
+    }
+    session.kill();
+    assert_eq!(seen[0], AgentStatus::Idle);
+    assert!(
+        seen[1..]
+            .iter()
+            .all(|status| *status == AgentStatus::Working),
+        "{seen:?}"
+    );
+}
