@@ -283,7 +283,9 @@ fn main() {
             std::process::exit(2);
         }
     }
-    // `--new-window` / `--workspace ID`, as New Window passes them.
+    // `--new-window` / `--workspace ID`, as New Window passes them. What's left
+    // is read again only by Linux's `--browser` below.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     let args = match new_window::configure(args) {
         Ok(args) => args,
         Err(error) => {
