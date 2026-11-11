@@ -4181,23 +4181,23 @@ pub fn kill_remote_tmux(
     }
 }
 
-/// Give this machine's tmux client for `session` on `host` the window size again
-/// (see [`ssh::claim_window_size_command`]), over the host's ControlMaster. Only a
-/// failure to reach the host is an error: a client that never recorded itself, or
-/// has since gone, simply has nothing to claim.
-pub fn claim_tmux_window_size(
+/// Give this machine's tmux clients for `sessions` on `host` the window size again
+/// (see [`ssh::claim_window_sizes_command`]), in one ssh over the host's
+/// ControlMaster. Only a failure to reach the host is an error: a client that never
+/// recorded itself, or has since gone, simply has nothing to claim.
+pub fn claim_tmux_window_sizes(
     host: &RemoteHost,
     control_path: &str,
     password: Option<&str>,
-    session: &SessionTarget,
+    sessions: &[SessionTarget],
     tag: &str,
 ) -> Result<()> {
-    let session = profile_tmux_target(session);
+    let sessions: Vec<SessionTarget> = sessions.iter().map(profile_tmux_target).collect();
     let out = ssh_run(
         host,
         control_path,
         password,
-        &ssh::claim_window_size_command(&session, tag),
+        &ssh::claim_window_sizes_command(&sessions, tag),
     )?;
     // ssh reports its own failures as 255; anything else is the command's answer.
     if out.status.code() == Some(255) {

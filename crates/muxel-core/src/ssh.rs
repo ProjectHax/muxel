@@ -799,19 +799,35 @@ fn exec_tmux(targs: &[String], program: Option<&str>, tail: &[String]) -> String
 /// older than 3.2) or is no longer attached to the session, since its tty name may
 /// have passed to someone else's client.
 pub fn claim_window_size_command(session: &crate::tmux::SessionTarget, tag: &str) -> String {
-    let pane = sh_quote(&format!("={}:", session.name));
-    let target = sh_quote(&format!("={}", session.name));
+    claim_window_sizes_command(std::slice::from_ref(session), tag)
+}
+
+/// [`claim_window_size_command`] for several sessions on one host, as one remote
+/// command line. Each session is claimed in turn, so one without a client of this
+/// machine's doesn't stop the rest.
+///
+/// One command per host, not per session: the claims all fall due together (the
+/// first input after a host's panes reattached), and one ssh each over the commands
+/// master ran past sshd's `MaxSessions`. The host refused the excess with `Session
+/// open refused by peer`, and those panes' clients kept sitting out the size, so
+/// tmux went on drawing their windows at an old client's size.
+pub fn claim_window_sizes_command(sessions: &[crate::tmux::SessionTarget], tag: &str) -> String {
     let option = sh_quote(&tmux_client_option(tag));
-    format!(
-        "{}; {}; c=$({SELECTED_TMUX} show-options -qv -t {pane} {option}) \
-         && [ -n \"$c\" ] \
-         && {SELECTED_TMUX} list-clients -t {target} -F '#{{client_name}}' \
-         | grep -qxF -- \"$c\" \
-         && {SELECTED_TMUX} refresh-client -t \"$c\" -f '!ignore-size' ';' \
-         set-option -q -t {pane} {option} \"$c\"",
-        tmux_path_prelude(),
-        select_session_socket(session)
-    )
+    let mut cmd = tmux_path_prelude();
+    for session in sessions {
+        let pane = sh_quote(&format!("={}:", session.name));
+        let target = sh_quote(&format!("={}", session.name));
+        cmd.push_str(&format!(
+            "; {}; c=$({SELECTED_TMUX} show-options -qv -t {pane} {option}) \
+             && [ -n \"$c\" ] \
+             && {SELECTED_TMUX} list-clients -t {target} -F '#{{client_name}}' \
+             | grep -qxF -- \"$c\" \
+             && {SELECTED_TMUX} refresh-client -t \"$c\" -f '!ignore-size' ';' \
+             set-option -q -t {pane} {option} \"$c\"",
+            select_session_socket(session)
+        ));
+    }
+    cmd
 }
 
 /// A remote *program* — run through the user's login+interactive shell.
@@ -2381,6 +2397,32 @@ mod tests {
             "tmux \"$@\" refresh-client -t \"$c\" -f '!ignore-size' ';' \
              set-option -q -t '=muxel_app_1:' @muxel_client_ab12 \"$c\""
         ));
+    }
+
+    /// A host's claims go out as one command, so a burst can't run past sshd's
+    /// `MaxSessions`; each session is claimed on its own server, and one with
+    /// nothing to claim doesn't stop the next.
+    #[test]
+    fn a_hosts_claims_share_one_command_and_each_runs_on_its_own() {
+        let first: crate::tmux::SessionTarget = "muxel_app_1".into();
+        let second = crate::tmux::SessionTarget::new("muxel_app_2", Some(Socket::Private));
+        let cmd = claim_window_sizes_command(&[first.clone(), second.clone()], "ab12");
+        assert_eq!(cmd.matches(&tmux_path_prelude()).count(), 1);
+        let (one, two) = cmd
+            .split_once(&format!("; {}; ", select_session_socket(&second)))
+            .expect("the second claim chooses its own server");
+        assert_eq!(one, claim_window_size_command(&first, "ab12"));
+        assert_eq!(
+            format!(
+                "{}; {}; {two}",
+                tmux_path_prelude(),
+                select_session_socket(&second)
+            ),
+            claim_window_size_command(&second, "ab12")
+        );
+        assert_eq!(cmd.matches("refresh-client").count(), 2);
+        // Separated by `;`, not `&&`: an unclaimable first session can't skip the second.
+        assert!(!one.ends_with("&&") && !two.starts_with("&&"));
     }
 
     /// Both attach paths clear the server id before creating a session. Existing
