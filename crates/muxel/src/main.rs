@@ -21,6 +21,7 @@ mod i18n;
 mod integrations;
 mod libraries;
 mod new_window;
+mod pane_scope;
 mod power;
 #[cfg(target_os = "windows")]
 mod present_pump;
@@ -294,6 +295,8 @@ fn main() {
         }
     };
     install_panic_reporter();
+    // Linux: find out now whether panes can run in systemd scopes of their own.
+    pane_scope::warm();
     // gpui reports real render failures (swap-chain present, scene-too-large
     // draw errors, GPU device loss) through `log` and swallows the Result;
     // without a logger they vanish silently. Errors/warnings go to stderr.

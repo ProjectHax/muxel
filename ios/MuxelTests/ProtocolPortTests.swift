@@ -164,6 +164,19 @@ final class ProtocolPortTests: XCTestCase {
         }
     }
 
+    // Mirrors pane_scope.rs `a_remote_program_runs_in_a_scope_when_the_host_can_make_one`.
+    func testRemoteProgramRunsInAScopeWhenTheHostCanMakeOne() {
+        let program = "\"${SHELL:-/bin/sh}\" -ilc 'exec claude'"
+        XCTAssertEqual(
+            TmuxCommands.remoteExec(program),
+            "if command -v systemd-run >/dev/null 2>&1 && "
+                + "systemd-run --user --scope --quiet --collect -p OOMPolicy=continue true </dev/null >/dev/null 2>&1; "
+                + "then exec systemd-run --user --scope --quiet --collect -p OOMPolicy=continue "
+                + "'--description=muxel pane' -- \(program); fi; exec \(program)")
+        let cmd = TmuxCommands.launchAgent(session: "s", cwd: "/w", program: "claude", args: [])
+        XCTAssertTrue(cmd.contains("OOMPolicy=continue"))
+    }
+
     // iOS must launch the agent through a login+interactive shell so it's on the
     // user's PATH (a no-PTY SSH exec has a bare PATH → the agent exits instantly).
     func testLaunchAgentWrapsInLoginShell() {

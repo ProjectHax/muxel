@@ -21,6 +21,7 @@ pub mod memory;
 pub mod muse;
 pub mod outage;
 mod pane;
+pub mod pane_scope;
 pub mod path_paste;
 pub mod placement;
 pub mod readaloud;
@@ -2923,9 +2924,11 @@ pub struct Settings {
     /// Turn the accomplishment log on for every project created from now on.
     #[serde(default)]
     pub new_project_accomplishments: bool,
-    /// Most memory, in GB, each process a local pane starts may commit
-    /// (Windows only; 0 = no limit). A process that asks for more is refused,
-    /// which usually stops it.
+    /// The memory limit for local panes, in GB (0 = no limit). On Windows it
+    /// is how much each process a pane starts may commit: a process that asks
+    /// for more is refused, which usually stops it. On Linux it is how much the
+    /// pane's processes may use together (a systemd scope's `MemoryMax`): when
+    /// they reach it, the kernel kills the largest. Elsewhere it does nothing.
     #[serde(default = "default_pane_memory_limit_gb")]
     pub pane_memory_limit_gb: u32,
 }
@@ -2946,7 +2949,7 @@ fn default_pane_memory_limit_gb() -> u32 {
 }
 
 impl Settings {
-    /// The per-process limit for new local panes, in bytes; `None` when off.
+    /// The memory limit for new local panes, in bytes; `None` when off.
     pub fn pane_memory_limit_bytes(&self) -> Option<u64> {
         (self.pane_memory_limit_gb > 0).then(|| u64::from(self.pane_memory_limit_gb) << 30)
     }

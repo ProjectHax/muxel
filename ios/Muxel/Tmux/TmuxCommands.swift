@@ -404,9 +404,22 @@ enum TmuxCommands {
             let inner = "exec " + Shell.command([program] + args)
             cmd += " -- sh -c " + Shell.quote(
                 "tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\" 2>/dev/null; "
-                    + "exec \"${SHELL:-/bin/sh}\" -ilc \(Shell.quote(inner))")
+                    + remoteExec("\"${SHELL:-/bin/sh}\" -ilc \(Shell.quote(inner))"))
         }
         return cmd
+    }
+
+    /// Runs `command` (one simple command, as shell words) in a systemd scope of its
+    /// own with `OOMPolicy=continue` where the host can make one, so a process the
+    /// kernel kills there for memory takes nothing else in the pane with it — the
+    /// tmux server's `tmux-spawn-….scope` otherwise holds the agent and everything it
+    /// started, and systemd stops all of it. Elsewhere (macOS, no user manager) a trial
+    /// run of `true` fails and `command` runs as before. Port of
+    /// `pane_scope::remote_exec` (muxel-core); the string must match it exactly.
+    static func remoteExec(_ command: String) -> String {
+        let scope = "systemd-run --user --scope --quiet --collect -p OOMPolicy=continue"
+        return "if command -v systemd-run >/dev/null 2>&1 && \(scope) true </dev/null >/dev/null 2>&1; "
+            + "then exec \(scope) '--description=muxel pane' -- \(command); fi; exec \(command)"
     }
 
     /// Creates a session's missing folder, which tmux would otherwise replace with the
@@ -450,7 +463,7 @@ enum TmuxCommands {
             let inner = "exec " + Shell.command([program] + args)
             cmd += " -- sh -c " + Shell.quote(
                 "tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\" 2>/dev/null; "
-                    + "exec \"${SHELL:-/bin/sh}\" -ilc \(Shell.quote(inner))")
+                    + remoteExec("\"${SHELL:-/bin/sh}\" -ilc \(Shell.quote(inner))"))
         }
         return cmd
     }

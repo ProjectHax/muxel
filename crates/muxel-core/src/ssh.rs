@@ -984,7 +984,10 @@ fn remote_command(spec: &SshSpec) -> String {
             // This shell command runs only on creation, not on `-A` reattach.
             crate::tmux::control_pane_program(
                 "sh",
-                &["-c".into(), login_shell_command(p, spec.args)],
+                &[
+                    "-c".into(),
+                    crate::pane_scope::remote_exec(&login_shell_command(p, spec.args)),
+                ],
             )
             .iter()
             .map(|arg| sh_quote(arg))
@@ -1068,14 +1071,19 @@ fn remote_command(spec: &SshSpec) -> String {
             let cwd = sh_quote(cwd);
             cmd.push_str(&format!("mkdir -p -- {cwd} && cd {cwd} && "));
         }
-        cmd.push_str("exec ");
-        match spec.program {
+        let program = match spec.program {
             // Same PATH problem without tmux: ssh runs this via a *non-interactive*
             // shell, which reads no profile.
-            Some(p) => cmd.push_str(&login_shell_command(p, spec.args)),
-            // The remote login shell (expanded by the remote shell — left unquoted).
-            None => cmd.push_str("${SHELL:-/bin/sh} -l"),
-        }
+            Some(p) => login_shell_command(p, spec.args),
+            // The remote login shell (expanded by `sh` there — left unquoted).
+            None => "\"${SHELL:-/bin/sh}\" -l".to_string(),
+        };
+        // In a scope of its own where the host can make one: panes multiplexed
+        // over one SSH connection share its login session's scope, which systemd
+        // would otherwise stop whole when one process runs out of memory. Run by
+        // `sh` because the remote login shell may not be a POSIX one.
+        cmd.push_str("exec sh -c ");
+        cmd.push_str(&sh_quote(&crate::pane_scope::remote_exec(&program)));
         cmd
     }
 }
@@ -1286,7 +1294,10 @@ mod tests {
         });
         assert_eq!(
             cmd,
-            "mkdir -p -- /srv/app && cd /srv/app && exec ${SHELL:-/bin/sh} -l"
+            format!(
+                "mkdir -p -- /srv/app && cd /srv/app && exec sh -c {}",
+                sh_quote(&crate::pane_scope::remote_exec("\"${SHELL:-/bin/sh}\" -l"))
+            )
         );
     }
 
@@ -1610,8 +1621,12 @@ mod tests {
         assert_eq!(v[v.len() - 2], "--");
         assert_eq!(
             v.last().unwrap(),
-            "mkdir -p -- /srv/app && cd /srv/app && \
-             exec \"${SHELL:-/bin/sh}\" -ilc 'exec claude --model opus'"
+            &format!(
+                "mkdir -p -- /srv/app && cd /srv/app && exec sh -c {}",
+                sh_quote(&crate::pane_scope::remote_exec(
+                    "\"${SHELL:-/bin/sh}\" -ilc 'exec claude --model opus'"
+                ))
+            )
         );
     }
 
@@ -1631,7 +1646,10 @@ mod tests {
         };
         assert_eq!(
             ssh_args(&spec).last().unwrap(),
-            "mkdir -p -- /srv/app && cd /srv/app && exec ${SHELL:-/bin/sh} -l"
+            &format!(
+                "mkdir -p -- /srv/app && cd /srv/app && exec sh -c {}",
+                sh_quote(&crate::pane_scope::remote_exec("\"${SHELL:-/bin/sh}\" -l"))
+            )
         );
     }
 
@@ -1664,9 +1682,12 @@ mod tests {
                  exec tmux \"$@\" -u set -g mouse on ';' {profile_cleanup}set-environment -g -u MUXEL_INSTANCE_ID ';' \
                  new-session -A -s muxel-abc123 -c /srv/app \
                  -- sh -c 'tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\" 2>/dev/null; exec \"$@\"' \
-                 muxel-agent sh -c '\"${{SHELL:-/bin/sh}}\" -ilc '\\''exec claude'\\'''",
+                 muxel-agent sh -c {agent}",
                 tmux_path_prelude(),
-                profile_cleanup = test_profile_cleanup()
+                profile_cleanup = test_profile_cleanup(),
+                agent = sh_quote(&crate::pane_scope::remote_exec(
+                    "\"${SHELL:-/bin/sh}\" -ilc 'exec claude'"
+                ))
             )
         );
     }
@@ -2213,9 +2234,10 @@ mod tests {
             tmux_client_tag: None,
         };
         let cmd = ssh_args(&spec).last().unwrap().clone();
-        // The last ` -- `: the first is the `set -- -L mxl` choosing the server.
+        // The command after new-session's ` -- `: the one before it is the
+        // `set -- -L mxl` choosing the server.
         let (_, after) = cmd
-            .rsplit_once(" -- ")
+            .split_once(" -c /srv/app -- ")
             .expect("a command follows the separator");
         assert!(
             after.starts_with("sh -c ")
@@ -2337,7 +2359,10 @@ mod tests {
         let tagged = ssh_args(&spec(Some("ab12"))).last().unwrap().clone();
         let program = crate::tmux::control_pane_program(
             "sh",
-            &["-c".into(), login_shell_command("claude", &[])],
+            &[
+                "-c".into(),
+                crate::pane_scope::remote_exec(&login_shell_command("claude", &[])),
+            ],
         )
         .iter()
         .map(|arg| sh_quote(arg))
@@ -2481,8 +2506,12 @@ mod tests {
         };
         assert_eq!(
             ssh_args(&spec).last().unwrap(),
-            "mkdir -p -- '/srv/my app' && cd '/srv/my app' && \
-             exec \"${SHELL:-/bin/sh}\" -ilc 'exec bash'"
+            &format!(
+                "mkdir -p -- '/srv/my app' && cd '/srv/my app' && exec sh -c {}",
+                sh_quote(&crate::pane_scope::remote_exec(
+                    "\"${SHELL:-/bin/sh}\" -ilc 'exec bash'"
+                ))
+            )
         );
     }
 

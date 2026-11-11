@@ -6248,6 +6248,11 @@ pub struct MuxelApp {
     /// Workspaces another muxel window had open when the selector last looked,
     /// marked "in use" there. A snapshot: entering one still checks its lock.
     workspaces_in_use: HashSet<Uuid>,
+    /// Linux: what each pane's systemd scopes last said about running out of
+    /// memory, so each new kill is reported once (see `check_pane_memory_kills`).
+    pane_oom_seen: HashMap<Uuid, muxel_core::pane_scope::OomCounts>,
+    /// When the pane scopes were last checked for kills.
+    pane_oom_checked_at: Option<Instant>,
     /// "New workspace" name editor used in the selector.
     workspace_name_input: Entity<InputState>,
     /// Settings modal size (resizable via the bottom-right corner).
@@ -8537,6 +8542,8 @@ impl MuxelApp {
             workspace_lock: None,
             workspace_busy: None,
             workspaces_in_use: HashSet::new(),
+            pane_oom_seen: HashMap::new(),
+            pane_oom_checked_at: None,
             workspace_name_input,
             settings_size: size(px(780.0), px(620.0)),
             settings_pane_w: px(560.0),
@@ -9466,7 +9473,9 @@ impl MuxelApp {
             )
         }) {
             create_missing_cwd(&spec)?;
-            return Ok(spec.with_memory_limit(self.settings.pane_memory_limit_bytes()));
+            return Ok(spec
+                .with_memory_limit(self.settings.pane_memory_limit_bytes())
+                .with_launch_prefix(self.pane_scope_prefix(instance_id)));
         }
         // Resume-capable agents (e.g. Claude): give the pane a stable session id and
         // resolve the --session-id / --resume flag *before* anything borrows the
@@ -9648,11 +9657,27 @@ impl MuxelApp {
                             ))
                         },
                     );
+                    // Linux: the program tmux starts runs in a scope of its own,
+                    // so a process killed for memory there doesn't stop the
+                    // agent with it (see `muxel_core::pane_scope`).
+                    let scope = self.pane_scope_prefix(instance_id);
+                    let (scoped_program, scoped_args) = if scope.is_empty() {
+                        (resolved.program.clone(), resolved.args.clone())
+                    } else {
+                        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+                        let (program, args) = muxel_core::pane_scope::wrap_tmux_program(
+                            &scope,
+                            resolved.program.as_deref(),
+                            &resolved.args,
+                            &shell,
+                        );
+                        (Some(program), args)
+                    };
                     let launch = crate::session_binding::tmux_pane_args(
                         socket.clone(),
                         &session.name,
-                        resolved.program.as_deref(),
-                        &resolved.args,
+                        scoped_program.as_deref(),
+                        &scoped_args,
                         instance_id,
                         integrations::tmux_session_env_supported(),
                         root.as_deref(),
@@ -9696,7 +9721,8 @@ impl MuxelApp {
                     match resolved.program.clone() {
                         Some(program) => CommandSpec::program(program, resolved.args.clone()),
                         None => CommandSpec::shell(),
-                    },
+                    }
+                    .with_launch_prefix(self.pane_scope_prefix(instance_id)),
                     Vec::new(),
                 ),
             };
@@ -9797,6 +9823,13 @@ impl MuxelApp {
                 // tmux client, that's the client, not the remote or server side.
                 .with_memory_limit(self.settings.pane_memory_limit_bytes()),
         ))
+    }
+
+    /// Linux: the argv that starts a local pane's program in a systemd scope of
+    /// its own, with the pane memory limit; empty where that isn't available.
+    fn pane_scope_prefix(&self, instance_id: Uuid) -> Vec<String> {
+        crate::pane_scope::prefix(instance_id, self.settings.pane_memory_limit_bytes())
+            .unwrap_or_default()
     }
 
     /// Preparation refusals never reach TerminalLaunch's fallback-shell path.
@@ -14457,6 +14490,9 @@ impl MuxelApp {
     /// prompt), so it's precise — no guessing from idle time.
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.expire_closes(Instant::now(), cx);
+        if self.check_pane_memory_kills() {
+            cx.notify();
+        }
         // Remember the grid each pane settled at, so a restart respawns its program
         // already at the right size instead of resizing it after its first paint —
         // which a re-attached tmux session shows as visibly wrong spacing until the
@@ -15591,6 +15627,65 @@ impl MuxelApp {
             title: title.to_string(),
             subtitle: format!("{} · {}", kind.label(), project),
         });
+    }
+
+    /// Linux: report processes the kernel killed for memory in a pane's scope,
+    /// every few seconds. The pane's agent keeps running (the scope's
+    /// `OOMPolicy=continue`), so without this the kill would go unexplained.
+    /// Counts a scope had before this muxel first saw it aren't reported.
+    /// Returns whether anything was added to the feed.
+    fn check_pane_memory_kills(&mut self) -> bool {
+        const EVERY: Duration = Duration::from_secs(5);
+        if self
+            .pane_oom_checked_at
+            .is_some_and(|at| at.elapsed() < EVERY)
+        {
+            return false;
+        }
+        self.pane_oom_checked_at = Some(Instant::now());
+        let mut reported = false;
+        for (iid, now) in crate::pane_scope::oom_counts() {
+            let Some(before) = self.pane_oom_seen.insert(iid, now) else {
+                continue;
+            };
+            let killed = now.killed.saturating_sub(before.killed);
+            if killed == 0 {
+                continue;
+            }
+            let limit_reached = now.limit_reached > before.limit_reached;
+            let inst = self.workspace.instance(iid);
+            let title = inst
+                .map(|i| i.display_name().to_string())
+                .unwrap_or_else(|| t("A closed pane").to_string());
+            let project = inst
+                .and_then(|i| self.workspace.project(i.project_id))
+                .map(|p| p.name.clone())
+                .unwrap_or_default();
+            let limit = self.settings.pane_memory_limit_gb.to_string();
+            let body = if limit_reached {
+                tf(
+                    "The pane's processes reached its {limit} GB memory limit, so Linux stopped the largest one. The rest of the pane kept running. Settings → Behavior sets the limit.",
+                    &[("limit", &limit)],
+                )
+            } else {
+                t("The computer ran out of memory, so Linux stopped a process in this pane. The rest of the pane kept running.").to_string()
+            };
+            muxel_store::append_event_log(&format!(
+                "memory-limit: \"{title}\" [{project}] killed={killed} cause={}",
+                if limit_reached {
+                    "pane-limit"
+                } else {
+                    "out-of-memory"
+                }
+            ));
+            self.add_event(
+                NotifKind::Error,
+                tf("{title}: a process ran out of memory", &[("title", &title)]),
+                body,
+            );
+            reported = true;
+        }
+        reported
     }
 
     /// Tell the user a process in pane `title` reached the pane's memory limit:
@@ -30736,15 +30831,32 @@ impl MuxelApp {
                 move |s| s.pane_memory_limit_gb = gb,
             ));
         }
+        // Windows limits each process (a job object); Linux limits the pane's
+        // processes together (a cgroup), which is all a cgroup can do.
+        let (label, description) = if cfg!(windows) {
+            (
+                t("Memory limit for each process in a pane"),
+                t(
+                    "Limits how much memory each process a local pane starts can commit. A process that asks for more is refused, which usually stops it, so one runaway doesn't take the computer down in the common case; it can't help when less memory is free than the limit. The 16 GB default fits typical developer tools; large Java heaps, optimized links and local model runners can need more. Applies to panes started after a change. Windows reports a process that reaches the limit on a best-effort basis. Programs launched with their own breakaway flag, and processes a tmux server or remote host runs, aren't covered.",
+                ),
+            )
+        } else {
+            (
+                t("Memory limit for each pane"),
+                t(
+                    "Limits how much memory a local pane's processes can use together, plus up to a quarter of that in swap. When they reach it, Linux stops the largest of them and the rest of the pane, its agent included, keeps running; the notifications feed says so. Each local pane runs in a systemd scope of its own, so even with the limit off, a process stopped because the computer ran out of memory takes nothing else with it. The 16 GB default fits typical developer tools; large builds, links and local model runners can need more. Applies to panes started after a change. Needs a systemd user session. Panes on a remote host get a scope of their own there, but no limit.",
+                ),
+            )
+        };
         v_flex()
             .gap_1()
-            .child(self.settings_label(&t("Memory limit for each process in a pane"), cx))
+            .child(self.settings_label(&label, cx))
             .child(row)
             .child(
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(t("Limits how much memory each process a local pane starts can commit. A process that asks for more is refused, which usually stops it, so one runaway doesn't take the computer down in the common case; it can't help when less memory is free than the limit. The 16 GB default fits typical developer tools; large Java heaps, optimized links and local model runners can need more. Applies to panes started after a change. Windows reports a process that reaches the limit on a best-effort basis. Programs launched with their own breakaway flag, and processes a tmux server or remote host runs, aren't covered.")),
+                    .child(description),
             )
             .into_any_element()
     }
@@ -34254,7 +34366,10 @@ impl MuxelApp {
                 ),
             )
             // Job objects are Windows-only; elsewhere the setting does nothing.
-            .children(cfg!(windows).then(|| self.render_pane_memory_limit(cx)))
+            .children(
+                cfg!(any(windows, target_os = "linux"))
+                    .then(|| self.render_pane_memory_limit(cx)),
+            )
             .child(
                 self.check_row(
                     Checkbox::new("b-dev-console")

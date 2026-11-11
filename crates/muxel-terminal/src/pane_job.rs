@@ -37,12 +37,12 @@
 //! a remote host runs, WSL's Linux processes, and processes Windows starts on a
 //! program's behalf (COM servers, services) are outside it.
 //!
-//! Unix has no equivalent here. The closest per-process control is
-//! `setrlimit(RLIMIT_AS)` in the child before exec, which limits address space
-//! rather than commit and breaks programs that reserve large ranges up front
-//! (V8, Go, sanitizers). On Linux, a cgroup v2 `memory.max` per pane (for
-//! example through `systemd-run --user --scope`) limits the whole group, and
-//! the kernel's OOM killer then picks the victim inside it.
+//! Unix has no per-process equivalent. The closest is `setrlimit(RLIMIT_AS)`
+//! in the child before exec, which limits address space rather than commit and
+//! breaks programs that reserve large ranges up front (V8, Go, sanitizers). On
+//! Linux, muxel instead runs each local pane in a systemd scope whose cgroup
+//! `memory.max` limits the pane's processes together, and the kernel's OOM
+//! killer picks the victim inside it (`muxel_core::pane_scope`).
 
 use std::time::{Duration, Instant};
 

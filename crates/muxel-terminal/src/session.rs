@@ -734,6 +734,12 @@ pub struct CommandSpec {
     /// Most memory, in bytes, each process in the pane's local tree may
     /// commit (Windows; see [`crate::pane_job`]). `None` = no limit.
     pub memory_limit: Option<u64>,
+    /// Argv that starts the program on Unix, put in front of it once the program
+    /// has been found: Linux's `systemd-run --user --scope … --` (see
+    /// `muxel_core::pane_scope`), which execs it in a scope of its own. The pane
+    /// still records the program itself as what it launched. Left off when the
+    /// program can't be found, so that failure reads as it always has.
+    pub launch_prefix: Vec<String>,
 }
 
 impl CommandSpec {
@@ -766,6 +772,7 @@ impl CommandSpec {
             binding: LaunchBinding::Unknown,
             launch_resumed: false,
             memory_limit: None,
+            launch_prefix: Vec::new(),
         }
     }
 
@@ -794,6 +801,7 @@ impl CommandSpec {
             binding: LaunchBinding::Unknown,
             launch_resumed: false,
             memory_limit: None,
+            launch_prefix: Vec::new(),
         }
     }
 
@@ -879,6 +887,12 @@ impl CommandSpec {
 
     pub fn with_memory_limit(mut self, bytes: Option<u64>) -> Self {
         self.memory_limit = bytes;
+        self
+    }
+
+    /// See [`Self::launch_prefix`]. Empty runs the program directly.
+    pub fn with_launch_prefix(mut self, prefix: Vec<String>) -> Self {
+        self.launch_prefix = prefix;
         self
     }
 }
@@ -1634,6 +1648,15 @@ impl TerminalSession {
             .as_command()
             .ok()
             .and_then(|command| std::fs::canonicalize(command.get_program()).ok());
+        // Only a program that was found gets started through the prefix; the
+        // prefix execs it, so the PID and the executable it ends up running are
+        // the program's own.
+        #[cfg(unix)]
+        if !spec.launch_prefix.is_empty() && expected_executable.is_some() {
+            let argv = builder.get_argv_mut();
+            let prefix = spec.launch_prefix.iter().map(std::ffi::OsString::from);
+            argv.splice(0..0, prefix);
+        }
         // The job is created before the child so the child starts inside it.
         #[cfg(windows)]
         let pane_job = spec
