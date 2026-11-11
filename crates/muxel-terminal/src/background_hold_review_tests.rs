@@ -101,18 +101,26 @@ struct Probe {
     start: Instant,
 }
 
-impl Probe {
-    fn new() -> Self {
-        #[cfg(windows)]
-        let command = CommandSpec::program(
+/// A child that only waits for input, so the test alone writes the screen.
+fn inert_command() -> CommandSpec {
+    if cfg!(windows) {
+        CommandSpec::program(
             "cmd.exe",
             vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
-        );
-        #[cfg(unix)]
-        let command = CommandSpec::program("/bin/cat", vec![]);
-        let (session, receiver) =
-            TerminalSession::spawn(command.with_binding(LaunchBinding::Known(None)), 100, 24)
-                .expect("spawn inert review fixture");
+        )
+    } else {
+        CommandSpec::program("/bin/cat", vec![])
+    }
+}
+
+impl Probe {
+    fn new() -> Self {
+        let (session, receiver) = TerminalSession::spawn(
+            inert_command().with_binding(LaunchBinding::Known(None)),
+            100,
+            24,
+        )
+        .expect("spawn inert review fixture");
         Self {
             session,
             _receiver: receiver,
@@ -517,7 +525,6 @@ fn pr136_shared_hidden_footer_releases_once_in_the_runtime() {
 /// Working→Idle edge, which latches Done, and the pane flashes Done/Working.
 #[test]
 fn every_claude_spinner_frame_reads_working_without_a_title() {
-    use crate::session::CommandSpec;
     let rule = "─".repeat(100);
     let screen = |row: &str| {
         format!(
@@ -525,7 +532,7 @@ fn every_claude_spinner_frame_reads_working_without_a_title() {
         )
     };
     let (session, _receiver) =
-        TerminalSession::spawn(CommandSpec::program("/bin/cat", vec![]), 100, 24).unwrap();
+        TerminalSession::spawn(inert_command(), 100, 24).expect("spawn inert fixture");
     let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
     let working = vec!["esc to interrupt".to_string()];
     let start = Instant::now();
