@@ -1309,6 +1309,9 @@ pub struct Workspace {
     /// Persisted git-diff panel width in pixels (None = default).
     #[serde(default)]
     pub gitdiff_panel_width: Option<f32>,
+    /// Whether the sidebar's NOTIFICATIONS section is collapsed to its header.
+    #[serde(default)]
+    pub notifications_collapsed: bool,
     /// Named git worktrees, referenced by instances via `Instance.worktree_id`.
     #[serde(default)]
     pub worktrees: Vec<Worktree>,
@@ -1317,6 +1320,26 @@ pub struct Workspace {
     /// monitor leaves the project in the main window (pin kept).
     #[serde(default)]
     pub project_windows: std::collections::HashMap<Uuid, ProjectWindow>,
+}
+
+#[cfg(test)]
+mod workspace_notifications_tests {
+    use super::Workspace;
+
+    #[test]
+    fn notifications_collapsed_defaults_off_and_round_trips() {
+        let old: Workspace =
+            serde_json::from_str(r#"{"projects":[],"active_project":null,"instances":[]}"#)
+                .unwrap();
+        assert!(!old.notifications_collapsed);
+
+        let ws = Workspace {
+            notifications_collapsed: true,
+            ..Workspace::default()
+        };
+        let back: Workspace = serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
+        assert!(back.notifications_collapsed);
+    }
 }
 
 /// Where a project's dedicated window lives: which monitor (stable UUID) and
