@@ -180,6 +180,14 @@ thread_local! {
     static LAUNCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Commands this thread has run through [`ProfiledOutput`] so far. gpui's test
+/// executor runs background tasks on the test's own thread, so an app test
+/// sees its panes' git here too.
+#[cfg(test)]
+pub(crate) fn git_launches() -> usize {
+    LAUNCHES.with(std::cell::Cell::get)
+}
+
 impl ProfiledOutput for Command {
     fn profiled_output(&mut self) -> std::io::Result<std::process::Output> {
         #[cfg(test)]
@@ -1781,6 +1789,14 @@ pub fn remove_worktree(repo: &Path, worktree_path: &Path) {
 /// bloat the editor buffer.
 const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
 
+/// The first line of `git_diff`'s text, shown before the diff has run.
+pub fn git_diff_placeholder(dir: &Path) -> String {
+    tf(
+        "# Changes in {dir}\n",
+        &[("dir", &dir.display().to_string())],
+    )
+}
+
 /// Working-tree changes for `dir`: tracked changes vs HEAD, scoped to the folder.
 /// Returns display-ready unified-diff text, or a short human message when there's
 /// nothing to show or `dir` isn't a git repo. Untracked/new files are not shown
@@ -1808,10 +1824,7 @@ pub fn git_diff(dir: &Path) -> String {
 
     // A header so it's always obvious which folder the diff is reading from, and
     // a heads-up when that folder is only a subdirectory of a larger repo.
-    let mut header = tf(
-        "# Changes in {dir}\n",
-        &[("dir", &dir.display().to_string())],
-    );
+    let mut header = git_diff_placeholder(dir);
     let is_subdir = matches!(
         (dir.canonicalize(), Path::new(&toplevel).canonicalize()),
         (Ok(d), Ok(t)) if d != t

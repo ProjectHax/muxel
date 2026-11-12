@@ -1517,7 +1517,10 @@ feature is added or changed, update the matching entry here in the same change**
 - **Git diff pane** — a simpler read-only pane showing the working-tree diff for a
   directory. From a pane's diff button it opens as a tab beside that pane; from
   the project menu or a worktree's **View changes** it joins the nearest diff
-  tab, if there is one.
+  tab, if there is one. While it's on screen, docked or popped out, it refreshes
+  every 1.5 s and keeps your scroll position. A pane hidden behind another tab,
+  another view or a maximized pane runs no git, and refreshes as soon as it's
+  shown. The ↻ button, reopening and popping out never wait on git.
 - **Command palette / global search** — quick navigation and search across the
   workspace.
 - **Find in project** — search within the active project.

@@ -243,16 +243,17 @@ impl EditorView {
         }
     }
 
-    /// Create a read-only git-diff view of `dir`, syntax-highlighted via the
-    /// "diff" grammar (green additions / red deletions / `@@` hunks). The buffer
-    /// is never saved; `refresh_diff` re-runs `git diff`.
+    /// Create a read-only git-diff view of `dir` showing `content`,
+    /// syntax-highlighted via the "diff" grammar (green additions / red
+    /// deletions / `@@` hunks). The buffer is never saved. `git diff` runs off
+    /// the UI thread and arrives through `set_diff_content`.
     pub fn diff(
         dir: PathBuf,
+        content: String,
         config: EditorConfig,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let content = crate::integrations::git_diff(&dir);
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .code_editor("diff")
@@ -369,27 +370,13 @@ impl EditorView {
         self.diff_dir.as_deref()
     }
 
-    /// Re-run `git diff` for a diff pane and replace the shown text (synchronous;
-    /// used by the manual refresh button and pop-out/restore).
-    pub fn refresh_diff(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(dir) = self.diff_dir.clone() else {
-            return;
-        };
-        let content = crate::integrations::git_diff(&dir);
-        self.apply_diff_text(content, window, cx);
-    }
-
-    /// Replace a diff pane's text with already-computed `content` (used by the
-    /// periodic background refresh so `git diff` doesn't run on the UI thread).
+    /// Replace a diff pane's text with background-computed `content`, keeping
+    /// the user's scroll position. Does nothing when the text is unchanged (so an
+    /// idle diff never jumps) or when this isn't a diff pane.
     pub fn set_diff_content(&self, content: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.diff_dir.is_some() {
-            self.apply_diff_text(content, window, cx);
+        if self.diff_dir.is_none() {
+            return;
         }
-    }
-
-    /// Swap in new diff text while keeping the user's scroll position. Does
-    /// nothing when the text is unchanged (so an idle diff never jumps).
-    fn apply_diff_text(&self, content: String, window: &mut Window, cx: &mut Context<Self>) {
         self.input.update(cx, |s, cx| {
             if &*s.value() == content.as_str() {
                 return;
@@ -710,8 +697,18 @@ impl Focusable for EditorView {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times each editor view has rendered, for tests that need a
+    /// pane to have been drawn or not.
+    pub(crate) static TEST_RENDERS: std::cell::RefCell<std::collections::HashMap<gpui::EntityId, usize>> =
+        Default::default();
+}
+
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        TEST_RENDERS.with(|renders| *renders.borrow_mut().entry(cx.entity_id()).or_default() += 1);
         let notice = self
             .external_change
             .as_ref()

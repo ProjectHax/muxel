@@ -385,6 +385,38 @@ impl PaneNode {
         }
     }
 
+    /// The tab each tab group shows, in reading order, as rendering picks it: a
+    /// group holding `focused` shows it, any other its own active tab. With
+    /// `maximized` set, only the group holding it is on screen.
+    pub fn shown_tabs(&self, focused: Option<Uuid>, maximized: Option<Uuid>) -> Vec<Uuid> {
+        fn walk(node: &PaneNode, focused: Option<Uuid>, out: &mut Vec<Uuid>) {
+            match node {
+                PaneNode::Leaf(ld) => {
+                    // An emptied leaf is pruned in the same mutation and can't be
+                    // deserialized, but this runs every frame: never index one.
+                    if ld.tabs.is_empty() {
+                        return;
+                    }
+                    out.push(match focused {
+                        Some(f) if ld.tabs.contains(&f) => f,
+                        _ => ld.tabs[ld.active.min(ld.tabs.len() - 1)],
+                    });
+                }
+                PaneNode::Split { children, .. } => {
+                    for child in children {
+                        walk(child, focused, out);
+                    }
+                }
+            }
+        }
+        let root = maximized
+            .and_then(|m| self.leaf_containing(m))
+            .unwrap_or(self);
+        let mut out = Vec::new();
+        walk(root, focused, &mut out);
+        out
+    }
+
     /// All instance ids in this subtree, in reading order (every tab of every
     /// leaf). Drives terminal spawning and the FocusNext/Prev cycle.
     pub fn collect_instances(&self) -> Vec<Uuid> {
@@ -1473,6 +1505,30 @@ mod tests {
         assert_eq!(root.leaf_containing(b), root.leaf_containing(a));
         assert_eq!(tabs_of(c), Some(vec![c]));
         assert_eq!(tabs_of(Uuid::new_v4()), None);
+    }
+
+    #[test]
+    fn shown_tabs_follow_focus_active_tabs_and_the_maximize() {
+        // Left group [a, b] showing b; right group [c].
+        let (a, b, c) = (id(), id(), id());
+        let root = PaneNode::Split {
+            direction: SplitDirection::Horizontal,
+            sizes: vec![0.5, 0.5],
+            children: vec![tabs_leaf(vec![a, b], 1), PaneNode::leaf(c)],
+        };
+        assert_eq!(root.shown_tabs(None, None), vec![b, c]);
+        // Focusing a background tab shows it; focus elsewhere changes nothing here.
+        assert_eq!(root.shown_tabs(Some(a), None), vec![a, c]);
+        assert_eq!(root.shown_tabs(Some(c), None), vec![b, c]);
+        assert_eq!(root.shown_tabs(Some(id()), None), vec![b, c]);
+        // A maximize shows only its group, whichever of its tabs it names.
+        assert_eq!(root.shown_tabs(None, Some(a)), vec![b]);
+        assert_eq!(root.shown_tabs(Some(a), Some(b)), vec![a]);
+        assert_eq!(root.shown_tabs(Some(a), Some(c)), vec![c]);
+        // A maximize naming a pane that isn't here leaves the whole layout shown.
+        assert_eq!(root.shown_tabs(None, Some(id())), vec![b, c]);
+        // An out-of-range active index shows the last tab, as rendering does.
+        assert_eq!(tabs_leaf(vec![a, b], 7).shown_tabs(None, None), vec![b]);
     }
 
     fn id() -> Uuid {
