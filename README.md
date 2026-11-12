@@ -2,6 +2,11 @@
   <img src="docs/banner.png" alt="muxel — a native multi-agent terminal multiplexer, built on GPUI" width="820">
 </p>
 
+<p align="center">
+  <a href="https://discord.gg/SyzGSDamea"><img src="https://img.shields.io/badge/Discord-join%20the%20chat-5865F2?logo=discord&logoColor=white" alt="Join the muxel Discord"></a>
+  <a href="https://x.com/muxelsh"><img src="https://img.shields.io/badge/follow-%40muxelsh-000000?logo=x&logoColor=white" alt="Follow @muxelsh on X"></a>
+</p>
+
 A native, GPU-accelerated **multi-agent terminal multiplexer** for running many
 AI coding agents (Claude, opencode, Amp, …) and shells side by side — built in
 Rust on [GPUI](https://github.com/zed-industries/zed) (Zed's UI framework).
