@@ -538,8 +538,11 @@ feature is added or changed, update the matching entry here in the same change**
   shows **blocked** while the report says Working. A finished Codex turn also
   reaches **done** when its submitted Working turn reports Idle; protocol `error`
   uses the existing **done** badge with its error source retained. A Working
-  report before any prompt in the launch, such as Codex's while it resumes a
-  session, keeps a restored **done**. Clear, provider switch, shell prompt,
+  report before any prompt while the launch starts up, such as Codex's while it
+  resumes a session, keeps a restored **done**. Past the startup wait, a Working
+  report is a turn even when muxel typed nothing, so a turn started by another
+  session's message, a scheduled wakeup or a remote prompt shows **working**
+  and counts as work. Clear, provider switch, shell prompt,
   process exit, or relaunch returns an unfinished pane to its existing fallback
   detection. Both local and remote tmux panes continue using that fallback
   because tmux does not forward OSC 7501 reports. Once Claude has reported in a

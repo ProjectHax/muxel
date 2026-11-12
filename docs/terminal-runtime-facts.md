@@ -167,7 +167,10 @@ status reports.
 A root that isn't Working settles the provider for completion readiness, like
 an Idle title; a Working root alone does not, since Codex reports Working while
 it boots a resumed session. The app keeps a durable Done through a report's
-Working until a turn is submitted in the launch.
+Working until a turn is submitted in the launch, for the restore guard's
+startup window (30 seconds plus the preset's startup delay). Past that window
+a report's Working is a turn: a cross-session message, a scheduled wakeup or a
+remote prompt starts one without input through the PTY.
 
 Claude suppresses its OSC title glyph after a successful capability probe.
 Once any root report has arrived in a launch, the terminal accepts this
