@@ -69,6 +69,8 @@ mod codex_capture_tests;
 #[cfg(all(test, windows))]
 mod conpty_test_support;
 mod control_api;
+#[cfg(test)]
+mod diff_refresh_tests;
 #[cfg(all(test, windows))]
 mod first_prompt_size_tests;
 #[cfg(all(test, windows))]
@@ -6202,8 +6204,10 @@ pub struct MuxelApp {
     _status_timer: Task<()>,
     /// Periodically checks scheduled Loops (fire when due + post-run cleanup).
     _loop_timer: Task<()>,
-    /// Periodically re-runs `git diff` for open diff panes (off the UI thread).
+    /// Periodically re-runs `git diff` for the diff panes on screen (off the UI
+    /// thread).
     _diff_timer: Task<()>,
+    diff_refresh: DiffRefresh,
     /// Polls open local text files and reads changed content off the UI thread.
     _resource_timer: Task<()>,
     /// Debounce handle for persisting the window geometry on resize/move.
@@ -6508,6 +6512,19 @@ impl PaneView {
     }
 }
 
+/// Diff-pane refresh bookkeeping. Only panes on screen run `git diff`, and a
+/// pane coming into view refreshes at once.
+#[derive(Default)]
+struct DiffRefresh {
+    /// Diff views on screen at the last frame. A view missing here is new to the
+    /// screen, so a pop-out or re-dock (which rebuilds the view) counts as shown.
+    shown: HashSet<EntityId>,
+    /// The newest refresh requested per pane while one is in flight. A result
+    /// that lands after a newer request was made is dropped, never shown.
+    latest: HashMap<Uuid, u64>,
+    next: u64,
+}
+
 /// Cloneable editor state, captured so an editor pane can be rebuilt in another
 /// window (pop-out) — gpui-component binds text-input focus to the creating
 /// window, so the view is re-created rather than moved.
@@ -6542,7 +6559,8 @@ impl EditorSnapshot {
     }
     fn build(self, config: EditorConfig, window: &mut Window, cx: &mut App) -> Entity<EditorView> {
         if let Some(dir) = self.diff_dir {
-            return cx.new(|cx| EditorView::diff(dir, config, window, cx));
+            // Keep the text it had; it refreshes once it's on screen.
+            return cx.new(|cx| EditorView::diff(dir, self.text, config, window, cx));
         }
         cx.new(|cx| {
             EditorView::from_state(
@@ -6937,6 +6955,10 @@ impl Render for WorkspaceWindow {
             let focus = self.focus_handle.clone();
             let shown = self.shown.clone();
             app.update(cx, |app, cx| {
+                // Here as well as in the main window's render: a minimized main
+                // window draws nothing, and a diff pane this window shows
+                // still refreshes as it comes into view.
+                app.sync_diff_visibility(cx);
                 app.render_secondary_content(pid, &focus, &shown, window, cx)
             })
         } else {
@@ -8006,37 +8028,21 @@ impl MuxelApp {
             }
         });
 
-        // Keep open diff panes current as agents change files. `git diff` runs on
-        // a background thread; results are applied (scroll-preserving) on the UI
-        // thread. Idle when no diff panes are open.
-        let diff_timer = cx.spawn_in(window, async move |view: WeakEntity<Self>, cx| {
+        // Keep the diff panes on screen current as agents change files. A hidden
+        // pane runs no git; it refreshes when it comes into view (see
+        // `sync_diff_visibility`). Idle when no diff pane is shown.
+        let diff_timer = cx.spawn(async move |view: WeakEntity<Self>, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(1500))
                     .await;
-                let Ok(jobs) = view.update(cx, |this, cx| this.diff_refresh_jobs(cx)) else {
+                let Ok(refresh) = view.update(cx, |this, cx| {
+                    let jobs = this.diff_refresh_jobs(cx);
+                    this.refresh_diffs(jobs, cx)
+                }) else {
                     break; // view dropped
                 };
-                if jobs.is_empty() {
-                    continue;
-                }
-                let results = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let _git = ui_profile::git_caller("diff-pane");
-                        jobs.into_iter()
-                            .map(|(iid, dir)| (iid, crate::integrations::git_diff(&dir)))
-                            .collect::<Vec<(Uuid, String)>>()
-                    })
-                    .await;
-                if view
-                    .update_in(cx, |this, window, cx| {
-                        this.apply_diff_refreshes(results, window, cx)
-                    })
-                    .is_err()
-                {
-                    break;
-                }
+                refresh.await;
             }
         });
 
@@ -8663,6 +8669,7 @@ impl MuxelApp {
             _status_timer: status_timer,
             _loop_timer: loop_timer,
             _diff_timer: diff_timer,
+            diff_refresh: DiffRefresh::default(),
             _resource_timer: resource_timer,
             bounds_save_task: None,
             show_terms,
@@ -12183,15 +12190,17 @@ impl MuxelApp {
             }
             InstanceKind::Diff => {
                 if !self.editors.contains_key(&iid) {
-                    // `editor_path` holds the directory to diff; re-run it so a
-                    // restored diff pane reflects the current working tree.
+                    // `editor_path` holds the directory to diff. The diff runs
+                    // when the pane is first on screen, so a restored pane
+                    // reflects the current working tree.
                     if let Some(dir) = self
                         .workspace
                         .instance(iid)
                         .and_then(|i| i.editor_path.clone())
                     {
                         let config = self.editor_config();
-                        let ed = cx.new(|cx| EditorView::diff(dir, config, window, cx));
+                        let text = crate::integrations::git_diff_placeholder(&dir);
+                        let ed = cx.new(|cx| EditorView::diff(dir, text, config, window, cx));
                         self.editors.insert(iid, ed);
                     }
                 }
@@ -16911,74 +16920,43 @@ impl MuxelApp {
             || cx.has_active_drag()
     }
 
-    /// Browser instances whose pane content is actually on screen: the shown tab
-    /// of each leaf in the active project (respecting maximize + dashboard).
+    /// Whether the main window draws none of its panes: a hotbar view, the
+    /// workspace selector or the terms screen takes their place.
+    fn main_panes_covered(&self) -> bool {
+        self.main_view_replaced() || self.show_workspace_selector || self.show_terms
+    }
+
+    /// The instances whose pane content is on screen in a pane layout: the shown
+    /// tab of each tab group in the main window's active project (unless
+    /// [`Self::main_panes_covered`]) and in each secondary (per-monitor)
+    /// window's project, respecting maximize as render does. Pop-outs aren't
+    /// included.
+    fn shown_layout_tabs(&self) -> Vec<Uuid> {
+        let main = self
+            .workspace
+            .active()
+            .filter(|_| !self.main_panes_covered());
+        main.into_iter()
+            .chain(
+                self.secondary_windows
+                    .iter()
+                    .filter_map(|sec| self.workspace.project(sec.pid)),
+            )
+            .filter_map(|project| project.layout.as_ref())
+            .flat_map(|layout| layout.shown_tabs(self.active_instance, self.maximized))
+            .collect()
+    }
+
+    /// Browser instances whose pane content is actually on screen: those among
+    /// [`Self::shown_layout_tabs`], in the main window and in secondary windows
+    /// alike. None while a hotbar view replaces the main window's panes.
     fn visible_browser_ids(&self) -> Vec<Uuid> {
         if self.browsers.is_empty() || self.main_view_replaced() {
             return Vec::new();
         }
-        let Some(project) = self.workspace.active() else {
-            return Vec::new();
-        };
-        fn walk(
-            node: &PaneNode,
-            active_instance: Option<Uuid>,
-            browsers: &HashMap<Uuid, Entity<crate::browser::BrowserView>>,
-            out: &mut Vec<Uuid>,
-        ) {
-            match node {
-                PaneNode::Leaf(ld) => {
-                    // Mirror render_pane: a pane holding the focused instance
-                    // shows it; others show their own saved active tab.
-                    //
-                    // Also mirror its empty-leaf guard. `pane.rs` prunes an
-                    // emptied leaf in the same mutation and `LeafData` refuses to
-                    // deserialize `"tabs": []`, so this should be unreachable —
-                    // but this walk runs every frame, so an index panic here
-                    // would take the whole UI down.
-                    if ld.tabs.is_empty() {
-                        return;
-                    }
-                    let leaf_active = ld.active.min(ld.tabs.len().saturating_sub(1));
-                    let iid = match active_instance {
-                        Some(a) if ld.tabs.contains(&a) => a,
-                        _ => ld.tabs[leaf_active],
-                    };
-                    if browsers.contains_key(&iid) {
-                        out.push(iid);
-                    }
-                }
-                PaneNode::Split { children, .. } => {
-                    for child in children {
-                        walk(child, active_instance, browsers, out);
-                    }
-                }
-            }
-        }
-        let mut out = Vec::new();
-        if let Some(layout) = &project.layout {
-            // A maximized pane's window shows only its tab group, as render does.
-            let root = self
-                .maximized
-                .and_then(|m| layout.leaf_containing(m))
-                .unwrap_or(layout);
-            walk(root, self.active_instance, &self.browsers, &mut out);
-        }
-        // Projects shown in secondary (per-monitor) windows render there.
-        for sec in &self.secondary_windows {
-            if let Some(layout) = self
-                .workspace
-                .project(sec.pid)
-                .and_then(|p| p.layout.as_ref())
-            {
-                let root = self
-                    .maximized
-                    .and_then(|m| layout.leaf_containing(m))
-                    .unwrap_or(layout);
-                walk(root, self.active_instance, &self.browsers, &mut out);
-            }
-        }
-        out
+        let mut shown = self.shown_layout_tabs();
+        shown.retain(|iid| self.browsers.contains_key(iid));
+        shown
     }
 
     /// Show/hide the native browser webviews to match what's actually visible
@@ -17165,14 +17143,14 @@ impl MuxelApp {
             return;
         }
         // Reuse an already-open diff pane for the same directory: refresh + focus.
-        if let Some(iid) = self.editors.iter().find_map(|(iid, ed)| {
-            let ed = ed.read(cx);
-            (ed.diff_dir() == Some(dir.as_path())).then_some(*iid)
+        if let Some((iid, ed)) = self.editors.iter().find_map(|(iid, ed)| {
+            (ed.read(cx).diff_dir() == Some(dir.as_path())).then(|| (*iid, ed.clone()))
         }) {
-            if let Some(ed) = self.editors.get(&iid).cloned() {
-                ed.update(cx, |e, cx| e.refresh_diff(window, cx));
-            }
             self.focus_resource(iid, OpenFocus::Focus, window, cx);
+            // Focus puts it on screen; mark it so this frame doesn't refresh it
+            // a second time.
+            self.diff_refresh.shown.insert(ed.entity_id());
+            self.refresh_diffs(vec![(iid, dir)], cx).detach();
             return;
         }
 
@@ -17181,8 +17159,10 @@ impl MuxelApp {
         if !self.place_resource_instance(pid, instance, origin, None) {
             return;
         }
+        // The diff itself runs off the UI thread once the pane is on screen.
         let config = self.editor_config();
-        let ed = cx.new(|cx| EditorView::diff(dir, config, window, cx));
+        let text = crate::integrations::git_diff_placeholder(&dir);
+        let ed = cx.new(|cx| EditorView::diff(dir, text, config, window, cx));
         self.editors.insert(iid, ed);
         self.focus_resource(iid, OpenFocus::Focus, window, cx);
         self.persist();
@@ -17361,18 +17341,24 @@ impl MuxelApp {
         placed
     }
 
-    fn open_editor_resources(&self) -> Vec<(Uuid, Entity<EditorView>)> {
+    /// Every editor view, docked or popped out.
+    fn editor_views(&self) -> impl Iterator<Item = (Uuid, &Entity<EditorView>)> {
         self.editors
             .iter()
-            .map(|(iid, editor)| (*iid, editor.clone()))
+            .map(|(iid, editor)| (*iid, editor))
             .chain(
                 self.popouts
                     .iter()
                     .filter_map(|(iid, popout)| match &popout.view {
-                        PaneView::Editor(editor) => Some((*iid, editor.clone())),
+                        PaneView::Editor(editor) => Some((*iid, editor)),
                         _ => None,
                     }),
             )
+    }
+
+    fn open_editor_resources(&self) -> Vec<(Uuid, Entity<EditorView>)> {
+        self.editor_views()
+            .map(|(iid, editor)| (iid, editor.clone()))
             .collect()
     }
 
@@ -17454,33 +17440,117 @@ impl MuxelApp {
         }
     }
 
-    /// Re-run `git diff` for an open diff pane.
-    fn refresh_diff_pane(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ed) = self.editors.get(&iid).cloned() {
-            ed.update(cx, |e, cx| e.refresh_diff(window, cx));
+    /// The refresh button: re-run `git diff` for a docked diff pane, off the UI
+    /// thread.
+    fn refresh_diff_pane(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+        let dir = self
+            .editors
+            .get(&iid)
+            .and_then(|ed| ed.read(cx).diff_dir().map(Path::to_path_buf));
+        if let Some(dir) = dir {
+            self.refresh_diffs(vec![(iid, dir)], cx).detach();
         }
     }
 
-    /// (instance id, directory) for every open diff pane — the work list for the
-    /// background refresh timer.
+    /// Every diff pane on screen: docked panes in a shown tab, and every
+    /// popped-out one.
+    fn shown_diff_panes(&self, cx: &App) -> Vec<(Uuid, Entity<EditorView>)> {
+        // Runs every frame: collect only the diff panes, and walk the layout
+        // only when there are some.
+        let mut diffs: Vec<_> = self
+            .editor_views()
+            .filter(|(_, ed)| ed.read(cx).is_diff())
+            .map(|(iid, ed)| (iid, ed.clone()))
+            .collect();
+        if diffs.is_empty() {
+            return diffs;
+        }
+        let shown: HashSet<Uuid> = self.shown_layout_tabs().into_iter().collect();
+        diffs.retain(|(iid, _)| shown.contains(iid) || self.popouts.contains_key(iid));
+        diffs
+    }
+
+    /// (instance id, directory) for every diff pane on screen — the work list for
+    /// the background refresh timer. A hidden pane runs no git.
     fn diff_refresh_jobs(&self, cx: &App) -> Vec<(Uuid, PathBuf)> {
-        self.editors
-            .iter()
-            .filter_map(|(iid, ed)| ed.read(cx).diff_dir().map(|d| (*iid, d.to_path_buf())))
+        self.shown_diff_panes(cx)
+            .into_iter()
+            .filter_map(|(iid, ed)| ed.read(cx).diff_dir().map(|d| (iid, d.to_path_buf())))
             .collect()
     }
 
-    /// Apply background-computed diff text to each pane, keeping scroll position.
-    fn apply_diff_refreshes(
-        &mut self,
-        results: Vec<(Uuid, String)>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        for (iid, content) in results {
-            if let Some(ed) = self.editors.get(&iid).cloned() {
-                ed.update(cx, |e, cx| e.set_diff_content(content, window, cx));
+    /// Run each frame: refresh every diff pane that has just come on screen, so a
+    /// pane that was hidden while files changed is current once it's shown.
+    fn sync_diff_visibility(&mut self, cx: &mut Context<Self>) {
+        let panes = self.shown_diff_panes(cx);
+        if panes.is_empty() && self.diff_refresh.shown.is_empty() {
+            return;
+        }
+        let mut shown = HashSet::with_capacity(panes.len());
+        let mut fresh = Vec::new();
+        for (iid, ed) in panes {
+            if !self.diff_refresh.shown.contains(&ed.entity_id())
+                && let Some(dir) = ed.read(cx).diff_dir()
+            {
+                fresh.push((iid, dir.to_path_buf()));
             }
+            shown.insert(ed.entity_id());
+        }
+        self.diff_refresh.shown = shown;
+        self.refresh_diffs(fresh, cx).detach();
+    }
+
+    /// Run `git diff` for `jobs` on a background thread, then show each result in
+    /// its pane, in whichever window holds it. The task ends once they're shown.
+    fn refresh_diffs(&mut self, jobs: Vec<(Uuid, PathBuf)>, cx: &mut Context<Self>) -> Task<()> {
+        if jobs.is_empty() {
+            return Task::ready(());
+        }
+        let refresh = &mut self.diff_refresh;
+        let jobs: Vec<_> = jobs
+            .into_iter()
+            .map(|(iid, dir)| {
+                refresh.next += 1;
+                refresh.latest.insert(iid, refresh.next);
+                (iid, refresh.next, dir)
+            })
+            .collect();
+        cx.spawn(async move |view: WeakEntity<Self>, cx| {
+            let results = cx
+                .background_executor()
+                .spawn(async move {
+                    let _git = ui_profile::git_caller("diff-pane");
+                    jobs.into_iter()
+                        .map(|(iid, seq, dir)| (iid, seq, crate::integrations::git_diff(&dir)))
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let _ = view.update(cx, |this, cx| this.apply_diff_refreshes(results, cx));
+        })
+    }
+
+    /// Show background-computed diff text in each pane, keeping scroll position.
+    /// A result overtaken by a newer request for the same pane is dropped.
+    fn apply_diff_refreshes(&mut self, results: Vec<(Uuid, u64, String)>, cx: &mut Context<Self>) {
+        let editors: HashMap<_, _> = self.open_editor_resources().into_iter().collect();
+        for (iid, seq, content) in results {
+            if self.diff_refresh.latest.get(&iid) != Some(&seq) {
+                continue;
+            }
+            self.diff_refresh.latest.remove(&iid);
+            let (Some(editor), Some(handle)) = (
+                editors.get(&iid).cloned(),
+                self.editor_secondary_window(iid).or(self.main_window),
+            ) else {
+                continue;
+            };
+            // Runs from a task, never inside a window update, so updating the
+            // pane's own window can't nest.
+            let _ = handle.update(cx, move |_root, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.set_diff_content(content, window, cx)
+                });
+            });
         }
     }
 
@@ -22079,21 +22149,18 @@ impl MuxelApp {
     }
 
     /// Rebuild any editors awaiting re-dock into the main window. Called from
-    /// `render`, which holds the main window.
-    fn drain_editor_redocks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Editors whose project moved back to this window: rebuild the view only
-        // (the instance never left its layout).
-        if !self.pending_editor_rebuild.is_empty() {
-            let config = self.editor_config();
-            for (iid, snap) in std::mem::take(&mut self.pending_editor_rebuild) {
-                let ed = snap.build(config.clone(), window, cx);
-                self.editors.insert(iid, ed);
-            }
-        }
-        if self.pending_editor_redock.is_empty() {
-            return;
+    /// `render`, which holds the main window. Returns whether it built any.
+    fn drain_editor_redocks(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.pending_editor_rebuild.is_empty() && self.pending_editor_redock.is_empty() {
+            return false;
         }
         let config = self.editor_config();
+        // Editors whose project moved back to this window: rebuild the view only
+        // (the instance never left its layout).
+        for (iid, snap) in std::mem::take(&mut self.pending_editor_rebuild) {
+            let ed = snap.build(config.clone(), window, cx);
+            self.editors.insert(iid, ed);
+        }
         for (iid, snap, redock) in std::mem::take(&mut self.pending_editor_redock) {
             let ed = snap.build(config.clone(), window, cx);
             self.editors.insert(iid, ed);
@@ -22101,6 +22168,7 @@ impl MuxelApp {
                 self.redock_into_layout(iid, pid, redock, cx);
             }
         }
+        true
     }
 
     /// Rebuild any browsers awaiting re-dock into the main window. Called from
@@ -25999,8 +26067,8 @@ impl MuxelApp {
                             .xsmall()
                             .label("↻")
                             .tooltip(t("Refresh diff"))
-                            .on_click(cx.listener(move |this, _e, window, cx| {
-                                this.refresh_diff_pane(iid, window, cx)
+                            .on_click(cx.listener(move |this, _e, _window, cx| {
+                                this.refresh_diff_pane(iid, cx)
                             }))
                     }))
                     // Image/markdown editors get a rendered/raw toggle.
@@ -36256,6 +36324,8 @@ impl Render for MuxelApp {
         // Native browser webviews draw above all gpui content in their bounds —
         // keep them shown/hidden in lockstep with what this frame displays.
         self.sync_browser_visibility(cx);
+        // A diff pane coming into view refreshes at once (hidden ones run no git).
+        self.sync_diff_visibility(cx);
         // Cache the settings pane width so deep helpers can size wrapping labels
         // absolutely (their multi-line height is otherwise mis-measured).
         if self.show_settings {
@@ -36305,8 +36375,14 @@ impl Render for MuxelApp {
         }
         // Rebuild any editors/browsers awaiting re-dock (needs the main window).
         let prep = ui_profile::region_scope(ui_profile::Region::Prep);
-        self.drain_editor_redocks(window, cx);
+        let rebuilt_editors = self.drain_editor_redocks(window, cx);
         self.drain_browser_redocks(window, cx);
+        // The check above ran before these editors existed, and their notify
+        // while drawing brings no next frame. Without a second look, a diff
+        // docked back shows its old text until the timer.
+        if rebuilt_editors {
+            self.sync_diff_visibility(cx);
+        }
         drop(prep);
 
         // The title bar shows the active *workspace* name (next to "muxel"), not
