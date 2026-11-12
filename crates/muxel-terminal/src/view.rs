@@ -302,6 +302,10 @@ struct RuntimeStatusState {
     /// provider binding change, unlike `completion_revision`: the held-close
     /// checkpoint spans that change.
     launch_completion_revision: u64,
+    /// The current Working spell began after this launch's first submitted
+    /// turn was recorded. A spell already running at that submission (an
+    /// agent still starting up) doesn't count until it leaves Working.
+    working_after_submission: bool,
     provider_settled: bool,
     completion_ready: bool,
     semantic_title_status: Option<AgentStatus>,
@@ -348,6 +352,7 @@ impl RuntimeStatusState {
             done_latch: false,
             completion_armed: false,
             launch_completion_revision: 0,
+            working_after_submission: false,
             provider_settled: false,
             completion_ready: false,
             semantic_title_status: None,
@@ -956,6 +961,11 @@ impl RuntimeStatusState {
         if public_changed {
             self.snapshot_seq = self.snapshot_seq.wrapping_add(1);
         }
+        self.working_after_submission = match (self.status, status) {
+            (_, s) if s != AgentStatus::Working => false,
+            (AgentStatus::Working, _) => self.working_after_submission,
+            _ => session.first_submission_at().is_some(),
+        };
         self.status = status;
         self.background = background;
         self.reason = reason;
@@ -4249,6 +4259,13 @@ impl TerminalView {
         self.runtime
             .background
             .filter(|_| self.runtime.binding_rev == self.session.binding_revision())
+    }
+
+    /// Whether the terminal is Working in a spell that began after this
+    /// launch's first submitted turn. Working already present when that turn
+    /// went in, such as an agent still starting up, is not that turn.
+    pub fn working_after_submission(&self) -> bool {
+        self.runtime.status == AgentStatus::Working && self.runtime.working_after_submission
     }
 
     /// Fresh completion edges observed in this PTY launch. Cached reads do
