@@ -1760,8 +1760,8 @@ mod binding_regressions {
 #[cfg(all(test, windows))]
 mod grok_regressions {
     use super::super::{
-        AgentStatus, GrokActiveSession, GrokRegistryRead, LoopCleanup, LoopRun, MuxelApp,
-        PostRunAction, conpty_test_support::ChildHandle, grok_switch_interval,
+        AgentStatus, GrokActiveSession, GrokRegistryRead, LoopCleanup, LoopLaunch, LoopRun,
+        MuxelApp, PostRunAction, conpty_test_support::ChildHandle, grok_switch_interval,
         popout_lifecycle_tests::with_app,
     };
     use super::{DiscoveryBatch, DiscoveryCandidate, SessionCandidate};
@@ -2246,7 +2246,7 @@ mod grok_regressions {
                     };
                     let mut run = LoopRun {
                         loop_id: Uuid::new_v4(),
-                        launch: Some(session.id),
+                        launch: LoopLaunch::Installed(session.id),
                         seen_working: true,
                         started: Instant::now(),
                         post_run: PostRunAction::Exit,
@@ -2286,6 +2286,7 @@ mod grok_regressions {
                             cached_done,
                             session.binding_revision(),
                             session.first_submission_binding(),
+                            true,
                             Duration::ZERO
                         ),
                         LoopCleanup::Abandon,

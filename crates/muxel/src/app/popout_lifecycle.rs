@@ -1,18 +1,25 @@
 //! Window ownership must not change a live terminal's background lifecycle.
 
-use super::{LoopCleanup, LoopRun, PostRunAction, terminal_view_in};
+use super::{LoopCleanup, LoopLaunch, LoopRun, PostRunAction, terminal_view_in};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// `launching(pane, token)` says whether the deferred launch holding `token`
+/// is still the pane's pending launch. A run waiting on one keeps waiting
+/// while it is, up to the loop runtime cap.
 pub(super) fn loop_heartbeat<'a, T, P>(
     runs: &mut HashMap<Uuid, LoopRun>,
     docked: &'a HashMap<Uuid, T>,
     popouts: &'a HashMap<Uuid, P>,
     terminal: impl Fn(&'a P) -> Option<&'a T>,
+    launching: impl Fn(Uuid, u64) -> bool,
     cleanup: impl Fn(&T, &mut LoopRun) -> LoopCleanup,
 ) -> Vec<Uuid> {
     let mut close = Vec::new();
     runs.retain(|iid, run| {
+        if let LoopLaunch::Deferred(token) = run.launch {
+            return LoopRun::keeps_waiting(launching(*iid, token), run.started.elapsed());
+        }
         let Some(view) = terminal_view_in(*iid, docked, popouts, &terminal) else {
             return false;
         };
@@ -33,7 +40,7 @@ pub(super) fn loop_heartbeat<'a, T, P>(
 #[cfg(test)]
 mod tests {
     use super::loop_heartbeat;
-    use crate::app::{AgentStatus, LoopRun, PostRunAction};
+    use crate::app::{AgentStatus, LoopLaunch, LoopRun, PostRunAction};
     use std::cell::Cell;
     use std::collections::HashMap;
     use std::rc::Rc;
@@ -69,7 +76,7 @@ mod tests {
             pane,
             LoopRun {
                 loop_id,
-                launch: Some(launch),
+                launch: LoopLaunch::Installed(launch),
                 seen_working: false,
                 started: Instant::now(),
                 post_run: PostRunAction::Exit,
@@ -81,8 +88,9 @@ mod tests {
                 docked,
                 popouts,
                 Option::as_ref,
+                |_, _| false,
                 |view: &Rc<Cell<TerminalRuntimeSnapshot>>, run| {
-                    run.cleanup(view.get(), 1, Some(1), Duration::ZERO)
+                    run.cleanup(view.get(), 1, Some(1), true, Duration::ZERO)
                 },
             )
         };
