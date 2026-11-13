@@ -57,6 +57,10 @@ pub struct EditorView {
     is_markdown: bool,
     /// Show the rendered view (image / markdown) vs the raw text editor.
     show_rendered: bool,
+    /// The rendered view's focus. The text input isn't drawn while the
+    /// rendered view shows, and GPUI sends the keys of a focused handle that
+    /// isn't drawn to the window root, past every binding in the pane.
+    view_focus: FocusHandle,
     /// "Copy as rich text" just succeeded: the header shows a check briefly.
     rich_copied: bool,
     /// Counts copies, so an earlier copy's timer can't clear a later one's check.
@@ -235,6 +239,7 @@ impl EditorView {
             is_image,
             is_markdown,
             show_rendered: is_markdown || is_image,
+            view_focus: cx.focus_handle(),
             rich_copied: false,
             rich_copy_count: 0,
             rich_copy_converting: false,
@@ -273,6 +278,7 @@ impl EditorView {
             is_image: false,
             is_markdown: false,
             show_rendered: false,
+            view_focus: cx.focus_handle(),
             rich_copied: false,
             rich_copy_count: 0,
             rich_copy_converting: false,
@@ -307,10 +313,15 @@ impl EditorView {
         self.show_rendered
     }
 
-    /// Toggle between the rendered view (image/markdown) and the raw text editor.
-    pub fn toggle_rendered(&mut self, cx: &mut Context<Self>) {
+    /// Toggle between the rendered view (image/markdown) and the raw text
+    /// editor. Focus held in the view going away moves to the one shown.
+    pub fn toggle_rendered(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_renderable() {
+            let focused = self.focus_handle(cx).contains_focused(window, cx);
             self.show_rendered = !self.show_rendered;
+            if focused {
+                window.focus(&self.focus_handle(cx), cx);
+            }
             cx.notify();
         }
     }
@@ -692,8 +703,14 @@ impl EditorView {
 }
 
 impl Focusable for EditorView {
+    /// The handle of the view that's drawn: the rendered view's while it
+    /// shows, otherwise the text input's.
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.input.read(cx).focus_handle(cx)
+        if self.show_rendered && self.is_renderable() {
+            self.view_focus.clone()
+        } else {
+            self.input.read(cx).focus_handle(cx)
+        }
     }
 }
 
@@ -720,6 +737,7 @@ impl Render for EditorView {
         {
             div()
                 .id("img-view")
+                .track_focus(&self.view_focus)
                 .size_full()
                 .overflow_scroll()
                 .flex()
@@ -735,6 +753,8 @@ impl Render for EditorView {
             let src = self.input.read(cx).value().to_string();
             div()
                 .id("md-view")
+                .debug_selector(|| "md-view".into())
+                .track_focus(&self.view_focus)
                 .size_full()
                 .bg(cx.theme().background)
                 .child(markdown(src).selectable(true).scrollable(true).p_4())
