@@ -171,6 +171,10 @@ grok
 <generated session title> - grok
 ```
 
+Grok 1.0.77 keeps those items and that order but animates the title with the
+ASCII frames `|`, `/`, `-` and `\` (`/ - Thinking - grok`), the frames its
+on-screen spinner row already used; both frame sets are the busy bit.
+
 Treat a complete leading spinner/activity prefix as Working, a complete leading
 `⚠ Action Required`/spinner/activity prefix as Blocked, and the stable title
 without that prefix as Idle. Strip only those leading protocol fields and trailing

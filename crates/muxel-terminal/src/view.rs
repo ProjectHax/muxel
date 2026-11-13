@@ -1896,8 +1896,15 @@ fn live_background_counts<'a>(
     None
 }
 
+/// Grok's title spinner frame. Releases up to 1.0.70 animate it in braille;
+/// 1.0.77 uses the ASCII frames its on-screen spinner row already drew. Only a
+/// Grok pane's title ending in `grok` is read this way, so a shell's `| - …`
+/// title stays a title.
 fn is_grok_spinner(part: &str) -> bool {
-    matches!(part, "⠋" | "⠙" | "⠹" | "⠸" | "⠼" | "⠴" | "⠦" | "⠧")
+    matches!(
+        part,
+        "⠋" | "⠙" | "⠹" | "⠸" | "⠼" | "⠴" | "⠦" | "⠧" | "|" | "/" | "-" | "\\"
+    )
 }
 
 fn combine_title_status(
@@ -6615,6 +6622,73 @@ mod tests {
             title_status(
                 TitleProvider::Grok,
                 Some("Custom title with no provider state"),
+                Some(Duration::ZERO)
+            ),
+            None
+        );
+    }
+
+    /// Titles Grok 1.0.77 sent through muxel's PTY over one turn that ran a
+    /// 15-ping shell command. That release animates the title with ASCII frames.
+    #[test]
+    fn grok_ascii_spinner_titles_are_working_and_never_name_the_pane() {
+        let name = "Ping localhost fifteen times command";
+        for working in [
+            "/ - Waiting for response… - grok",
+            "\\ - Running user_prompt_submit hook… - grok",
+            "/ - Thinking - grok",
+            "- - Responding - grok",
+            "| - Writing command… - grok",
+            "- - Running pre_tool_use hook… - grok",
+            "| - Ping localhost fifteen times and wait… - grok",
+            "\\ - Ping localhost fifteen times and wait… - Ping localhost fifteen times command - grok",
+            "/ - Running stop hook… - Ping localhost fifteen times command - grok",
+            "| - Responding - Ping localhost fifteen times command - grok",
+        ] {
+            assert_eq!(
+                title_status(TitleProvider::Grok, Some(working), Some(Duration::ZERO)),
+                Some(AgentStatus::Working),
+                "{working:?}"
+            );
+            let named = clean_agent_title("grok", working);
+            assert!(
+                named.is_none() || named.as_deref() == Some(name),
+                "{working:?} named the pane {named:?}"
+            );
+        }
+        // Before the first turn, and once it ends.
+        for (idle, named) in [
+            ("grok", None),
+            ("Ping localhost fifteen times command - grok", Some(name)),
+        ] {
+            assert_eq!(
+                title_status(TitleProvider::Grok, Some(idle), Some(Duration::ZERO)),
+                Some(AgentStatus::Idle),
+                "{idle:?}"
+            );
+            assert_eq!(clean_agent_title("grok", idle).as_deref(), named);
+        }
+        // Grok's default item order puts action-required before the spinner.
+        assert_eq!(
+            title_status(
+                TitleProvider::Grok,
+                Some("⚠ Action Required - | - Preparing question… - Topic - grok"),
+                Some(Duration::ZERO)
+            ),
+            Some(AgentStatus::Blocked)
+        );
+        // Without Grok's sentinel, or outside a Grok pane, the frames are text.
+        for foreign in ["| - Thinking", "/ - make test", "- - npm run build"] {
+            assert_eq!(
+                title_status(TitleProvider::Grok, Some(foreign), Some(Duration::ZERO)),
+                None,
+                "{foreign:?}"
+            );
+        }
+        assert_eq!(
+            title_status(
+                TitleProvider::Other,
+                Some("| - Thinking - grok"),
                 Some(Duration::ZERO)
             ),
             None
@@ -11430,6 +11504,30 @@ mod provider_switch_tests {
             let (status, _) = self.sample(session);
             (status, self.runtime.prev_raw, self.runtime.completion_armed)
         }
+    }
+
+    /// A Grok 1.0.77 turn, titled as that release titled one through muxel's
+    /// PTY: Working while it works and Done once only the session name is left,
+    /// so ctl sees the prompt it sent start and finish.
+    #[test]
+    fn a_grok_turn_titled_with_ascii_frames_works_until_it_is_done() {
+        let (session, _receiver) = fixture();
+        let mut viewer = Viewer::new(TitleProvider::Grok);
+        session.process_output(b"\x1b]0;grok\x07");
+        assert_eq!(viewer.sample(&session).0, AgentStatus::Idle);
+        session.mark_turn_submitted();
+        for title in [
+            "| - Waiting for response… - grok",
+            "/ - Thinking - grok",
+            "\\ - Ping localhost fifteen times and wait… - Ping localhost fifteen times command - grok",
+            "- - Running stop hook… - Ping localhost fifteen times command - grok",
+        ] {
+            session.process_output(format!("\x1b]0;{title}\x07").as_bytes());
+            assert_eq!(viewer.sample(&session).0, AgentStatus::Working, "{title:?}");
+        }
+        session.process_output("\x1b]0;Ping localhost fifteen times command - grok\x07".as_bytes());
+        assert_eq!(viewer.sample(&session), (AgentStatus::Done, true));
+        session.kill();
     }
 
     #[test]
