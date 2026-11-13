@@ -931,6 +931,15 @@ fn activity_state(status: AgentStatus) -> AgentActivityState {
 
 const RESTORE_ACTIVITY_MAX_WAIT_MS: u64 = 30_000;
 
+/// Whether a launch `elapsed` old is still inside the time its CLI may take
+/// to boot: the restore wait plus the preset's configured startup delay.
+fn within_startup_window(elapsed: Option<Duration>, startup_delay_ms: u32) -> bool {
+    let budget = Duration::from_millis(
+        RESTORE_ACTIVITY_MAX_WAIT_MS.saturating_add(u64::from(startup_delay_ms)),
+    );
+    elapsed.is_some_and(|elapsed| elapsed < budget)
+}
+
 fn restore_activity_guard_active(
     pending: bool,
     submitted_turn: bool,
@@ -938,13 +947,10 @@ fn restore_activity_guard_active(
     elapsed: Option<Duration>,
     startup_delay_ms: u32,
 ) -> bool {
-    let budget = Duration::from_millis(
-        RESTORE_ACTIVITY_MAX_WAIT_MS.saturating_add(u64::from(startup_delay_ms)),
-    );
     pending
         && !submitted_turn
         && !completion_ready
-        && elapsed.is_some_and(|elapsed| elapsed < budget)
+        && within_startup_window(elapsed, startup_delay_ms)
 }
 
 /// A restored terminal may emit a synthetic Working cycle while its CLI boots.
@@ -1044,10 +1050,11 @@ fn attend_agent_activity(
 #[cfg(test)]
 mod restored_activity_tests {
     use super::{
-        AgentActivityState, AgentPreset, AgentStatus, Instance, activity_needs_observation,
-        attend_agent_activity, attention_rank, done_is_read, is_restored_transition,
-        persisted_status, restore_activity_guard_active, restored_activity_sample,
-        unprompted_report_working,
+        AgentActivityState, AgentPreset, AgentStatus, Instance, SeenStatus, StatusBinding,
+        StatusSample, activity_needs_observation, apply_status_sample, attend_agent_activity,
+        attention_rank, done_is_read, is_restored_transition, persisted_status,
+        restore_activity_guard_active, restored_activity_sample, unprompted_report_working,
+        within_startup_window,
     };
     use std::time::Duration;
     use uuid::Uuid;
@@ -1192,23 +1199,122 @@ mod restored_activity_tests {
         // Ready title that ends the restore guard.
         let guarded = restore_activity_guard_active(true, false, true, Some(Duration::ZERO), 0);
         assert!(!guarded);
-        let held = guarded || unprompted_report_working(&runtime, false);
+        let starting = within_startup_window(Some(Duration::ZERO), 0);
+        let held = guarded || unprompted_report_working(&runtime, false, starting);
         assert_eq!(
             persisted_status(AgentStatus::Working, Some(&done), held),
             AgentStatus::Done
         );
         // A submitted turn makes the report real work.
-        let held = unprompted_report_working(&runtime, true);
+        let held = unprompted_report_working(&runtime, true, starting);
         assert_eq!(
             persisted_status(AgentStatus::Working, Some(&done), held),
             AgentStatus::Working
         );
         // Visible evidence and other reported states keep their own rules.
         runtime.reason = TerminalStatusReason::ProviderTitle;
-        assert!(!unprompted_report_working(&runtime, false));
+        assert!(!unprompted_report_working(&runtime, false, starting));
         runtime.reason = TerminalStatusReason::ProgramStatus(None);
         runtime.status = AgentStatus::Blocked;
-        assert!(!unprompted_report_working(&runtime, false));
+        assert!(!unprompted_report_working(&runtime, false, starting));
+    }
+
+    /// One status tick for a pane nothing has typed a turn into, `elapsed`
+    /// into its launch: the shown status as the tick computes it, applied to
+    /// the record and durable activity.
+    fn tick_without_submission(
+        instance: &mut Instance,
+        record: &mut Option<SeenStatus>,
+        runtime: muxel_terminal::TerminalRuntimeSnapshot,
+        elapsed: Duration,
+        now: i64,
+    ) -> AgentStatus {
+        let elapsed = Some(elapsed);
+        let restoring =
+            restore_activity_guard_active(true, false, runtime.completion_ready, elapsed, 0);
+        let unprompted =
+            unprompted_report_working(&runtime, false, within_startup_window(elapsed, 0));
+        let shown = persisted_status(runtime.status, Some(instance), restoring || unprompted);
+        let (preserve, _) = restored_activity_sample(restoring, false, runtime.status);
+        apply_status_sample(
+            record,
+            Some(&mut instance.activity),
+            StatusSample::from_runtime(runtime, runtime.binding_rev, shown, false, preserve),
+            now,
+        );
+        shown
+    }
+
+    #[test]
+    fn a_provider_reported_turn_without_a_muxel_submission_records_work() {
+        use muxel_core::control::status_since;
+        use muxel_terminal::{
+            TerminalRuntimeSnapshot, TerminalStatusCoverage, TerminalStatusReason,
+        };
+        let launch = Uuid::new_v4();
+        let report = |status, completion_revision| TerminalRuntimeSnapshot {
+            background: None,
+            status,
+            attributable: true,
+            reason: TerminalStatusReason::ProgramStatus(None),
+            coverage: TerminalStatusCoverage::ProgramStatus,
+            launch_id: launch,
+            binding_rev: 0,
+            snapshot_seq: 1,
+            input_rev: 0,
+            draft_latched: false,
+            completion_ready: true,
+            completion_revision,
+        };
+        let settled = || {
+            Some(SeenStatus {
+                status: AgentStatus::Done,
+                binding: StatusBinding { launch, rev: 0 },
+                coverage: TerminalStatusCoverage::ProgramStatus,
+                completion_revision: 1,
+                held: false,
+            })
+        };
+
+        // A builder finished a turn and sat idle. An hour into the launch, a
+        // message from another session starts its next turn, and nothing was
+        // typed into the pane.
+        let mut instance = attended_completion();
+        let mut record = settled();
+        let an_hour = Duration::from_secs(3_600);
+        let shown = tick_without_submission(
+            &mut instance,
+            &mut record,
+            report(AgentStatus::Working, 1),
+            an_hour,
+            1_000,
+        );
+        assert_eq!(shown, AgentStatus::Working);
+        assert_eq!(instance.activity.work_started_at, Some(1_000));
+        assert_eq!(status_since(&instance.activity), Some(1_000));
+        let shown = tick_without_submission(
+            &mut instance,
+            &mut record,
+            report(AgentStatus::Done, 2),
+            an_hour,
+            2_000,
+        );
+        assert_eq!(shown, AgentStatus::Done);
+        assert_eq!(instance.activity.completed_at, Some(2_000));
+        assert_eq!(status_since(&instance.activity), Some(2_000));
+
+        // The same report while the launch boots is startup noise.
+        let mut booting = attended_completion();
+        let mut record = settled();
+        let shown = tick_without_submission(
+            &mut booting,
+            &mut record,
+            report(AgentStatus::Working, 1),
+            Duration::from_secs(2),
+            1_000,
+        );
+        assert_eq!(shown, AgentStatus::Done);
+        assert_eq!(booting.activity.work_started_at, Some(100));
     }
 
     #[test]
@@ -1443,15 +1549,20 @@ fn persisted_status(
     }
 }
 
-/// Whether the provider's own report is all that says Working: no turn has
-/// been submitted in this launch. Codex reports Working while it boots a
-/// resumed session, before any prompt and after its first Ready title. Like
-/// startup noise during restore, that cannot replace a durable Done.
+/// Whether the provider's own report is all that says Working while the
+/// launch boots (`starting`, see [`within_startup_window`]) and no turn has
+/// been submitted in it. Codex reports Working while it boots a resumed
+/// session, before any prompt and after its first Ready title. Like startup
+/// noise during restore, that cannot replace a durable Done. Past the startup
+/// window a report's Working is a turn, though muxel typed nothing: a message
+/// from another session, a scheduled wakeup or a remote prompt starts one.
 fn unprompted_report_working(
     runtime: &muxel_terminal::TerminalRuntimeSnapshot,
     submitted_turn: bool,
+    starting: bool,
 ) -> bool {
-    runtime.status == AgentStatus::Working
+    starting
+        && runtime.status == AgentStatus::Working
         && matches!(
             runtime.reason,
             muxel_terminal::TerminalStatusReason::ProgramStatus(_)
@@ -1460,14 +1571,17 @@ fn unprompted_report_working(
 }
 
 /// What a terminal pane shows: its live status, with durable Done kept while
-/// it restores (`restoring`) and through a report's Working before any turn.
+/// it restores (`restoring`) and through a report's Working before any turn
+/// while it boots (`starting`).
 fn shown_terminal_status(
     view: &TerminalView,
     instance: Option<&Instance>,
     restoring: bool,
+    starting: bool,
 ) -> AgentStatus {
     let runtime = view.runtime_snapshot();
-    let unprompted = unprompted_report_working(&runtime, view.session().has_submitted_turn());
+    let unprompted =
+        unprompted_report_working(&runtime, view.session().has_submitted_turn(), starting);
     persisted_status(runtime.status, instance, restoring || unprompted)
 }
 
@@ -23942,17 +24056,16 @@ impl MuxelApp {
         terminal_view_in(iid, &self.terminals, &self.popouts, PopOut::terminal_view)
     }
 
-    fn terminal_activity_sample(
-        &self,
-        iid: Uuid,
-        terminal: &TerminalView,
-    ) -> TerminalActivitySample {
-        let runtime = terminal.runtime_snapshot();
-        let binding_rev = terminal.session().binding_revision();
-        let raw_status = runtime.status;
-        let submitted_turn = terminal.session().has_submitted_turn();
-        let instance = self.workspace.instance(iid);
-        let startup_delay_ms = instance
+    /// How long ago `iid`'s current launch started.
+    fn launch_elapsed(&self, iid: Uuid) -> Option<Duration> {
+        self.terminal_launches
+            .get(&iid)
+            .map(|&(at, _)| at.elapsed())
+    }
+
+    /// The configured startup delay of `instance`'s preset.
+    fn startup_delay_ms(&self, instance: Option<&Instance>) -> u32 {
+        instance
             .and_then(|instance| {
                 instance
                     .preset_id
@@ -23963,17 +24076,36 @@ impl MuxelApp {
                             .find(|preset| preset.name == instance.preset)
                     })
             })
-            .map_or(0, |preset| preset.startup_delay_ms);
+            .map_or(0, |preset| preset.startup_delay_ms)
+    }
+
+    /// Whether `iid`'s current launch is still booting its CLI.
+    fn in_startup_window(&self, iid: Uuid) -> bool {
+        within_startup_window(
+            self.launch_elapsed(iid),
+            self.startup_delay_ms(self.workspace.instance(iid)),
+        )
+    }
+
+    fn terminal_activity_sample(
+        &self,
+        iid: Uuid,
+        terminal: &TerminalView,
+    ) -> TerminalActivitySample {
+        let runtime = terminal.runtime_snapshot();
+        let binding_rev = terminal.session().binding_revision();
+        let raw_status = runtime.status;
+        let submitted_turn = terminal.session().has_submitted_turn();
+        let instance = self.workspace.instance(iid);
         let restoring = restore_activity_guard_active(
             self.restoring_activity.contains(&iid),
             submitted_turn,
             terminal.completion_ready(),
-            self.terminal_launches
-                .get(&iid)
-                .map(|&(at, _)| at.elapsed()),
-            startup_delay_ms,
+            self.launch_elapsed(iid),
+            self.startup_delay_ms(instance),
         );
-        let unprompted = unprompted_report_working(&runtime, submitted_turn);
+        let unprompted =
+            unprompted_report_working(&runtime, submitted_turn, self.in_startup_window(iid));
         TerminalActivitySample {
             status: persisted_status(raw_status, instance, restoring || unprompted),
             raw_status,
@@ -27485,7 +27617,12 @@ impl MuxelApp {
                     .unwrap_or_default();
                 let program = inst.and_then(|i| i.program.clone());
                 let status = self.terminals.get(&iid).map(|v| {
-                    shown_terminal_status(v.read(cx), inst, self.restoring_activity.contains(&iid))
+                    shown_terminal_status(
+                        v.read(cx),
+                        inst,
+                        self.restoring_activity.contains(&iid),
+                        self.in_startup_window(iid),
+                    )
                 });
                 let color = status
                     .map(|s| pane_status_hsla(s, inst.map(|i| &i.activity), cx))
@@ -29061,6 +29198,7 @@ impl MuxelApp {
                                 view,
                                 inst,
                                 self.restoring_activity.contains(&iid),
+                                self.in_startup_window(iid),
                             ),
                         )
                     } else if let Some(ed) = self.editors.get(&iid) {
