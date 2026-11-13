@@ -84,7 +84,7 @@ fn copy_as_rich_text_is_offered_for_rendered_markdown_only() {
                 .add_project(Project::new("rich-copy", project.clone()));
             let markdown = open(app, pid, &project.join("notes.md"), window, cx);
             assert!(offers_copy(app, cx), "rendered Markdown");
-            app.editors[&markdown].update(cx, |editor, cx| editor.toggle_rendered(cx));
+            app.editors[&markdown].update(cx, |editor, cx| editor.toggle_rendered(window, cx));
             assert!(!offers_copy(app, cx), "Markdown in Raw view");
 
             open(app, pid, &project.join("notes.txt"), window, cx);
