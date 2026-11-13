@@ -5,6 +5,83 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.3.7] — 2026-11-13
+
+### Added
+- **Open a second muxel window with New Window** — two muxel windows could
+  already run side by side, but on macOS there was no way to start the second
+  one: launching the app again only brought the running copy forward. **New
+  Window** (`Ctrl+Shift+N`, `Cmd+N` and the File and Dock menus on macOS, the
+  command palette, or the workspace selector) now starts another muxel that
+  opens on the workspace selector, or straight into the workspace you pick with
+  the selector's new-window button. The windows share one workspace list: a
+  workspace made in one shows up in the others, one open elsewhere is marked in
+  use and can't be deleted, and `muxel ctl` run in a pane reaches the window
+  that holds that pane.
+- **Choose whether new agents open as tabs or panes** — since 0.3.6 the
+  toolbar's agent button and `Ctrl+Alt+1–9` add a new agent as a tab in the
+  focused pane. If you liked each agent in a pane of its own, Settings →
+  Behavior → **New agents open** now offers **In a new pane**, which opens it to
+  the right of the focused pane. The default stays **In a new tab**.
+- **The notifications section folds away** — every new notification added a row
+  above PROJECTS, so the project list kept shifting down while agents ran.
+  Clicking the NOTIFICATIONS header now collapses the section to one line with
+  the count and the clear-all button; notifications keep arriving and are there
+  when you expand it, and the choice is saved with the workspace. Thanks to
+  [@ithielnor](https://github.com/ithielnor) ([#142](https://github.com/ProjectHax/muxel/pull/142)).
+- **One runaway process no longer takes a whole pane down, on Linux** — when the
+  kernel killed a process for using too much memory, systemd stopped everything
+  that shared its group, so one runaway test binary took down its agent, its
+  tmux session and sometimes the desktop session muxel was started from. Each
+  local pane now runs in a systemd scope of its own, so a killed process takes
+  nothing else with it, and the notifications feed says which pane it was. The
+  pane memory limit from 0.3.6, which was Windows-only, now applies on Linux too:
+  a pane's processes can use 16 GB together by default before Linux stops the
+  largest one. If you run large builds, links or local models in a pane, raise
+  it or turn it off in Settings → Behavior. Panes on a remote Linux host also get
+  a scope of their own there, without a limit. This needs a systemd user session;
+  without one, panes start as before.
+
+### Changed
+- **Diff panes refresh only while you can see them** — every open diff pane ran
+  `git diff` every second and a half, even behind another tab, and the refresh
+  button, reopening a diff and restoring diff panes at startup all ran git while
+  the window waited. A diff pane now refreshes only while it's on screen, and as
+  soon as it comes into view, so a hidden one is current once you look at it.
+  Every refresh runs in the background, and a popped-out diff pane now refreshes
+  on its own, which it never did. On Windows a hidden diff pane went from about
+  210 process starts a minute to none. Thanks to
+  [@railapex](https://github.com/railapex) ([#143](https://github.com/ProjectHax/muxel/pull/143)).
+
+### Fixed
+- **A scheduled loop on the Claude preset keeps track of its run** — a loop
+  lost its run as soon as it fired, because Claude's pane starts a moment after
+  the loop records it. A loop set to close its pane when done never closed it,
+  the runtime limit never applied, and the next fire could open a second copy
+  beside the first. The run now follows its pane through that start, closes it
+  once the turn finishes, even a short turn that ends between two of the loop's
+  checks, and skips a fire while the last one is still running. Claude loops are
+  now bound by the 30-minute runtime limit like every other loop, so a turn
+  still going at 30 minutes is stopped. Thanks to
+  [@railapex](https://github.com/railapex) ([#144](https://github.com/ProjectHax/muxel/pull/144)).
+- **A turn you didn't type shows as working** — when a Claude, Codex, Grok or
+  Muse turn started without muxel typing it, such as a message from another
+  session, a scheduled wakeup or a prompt sent from Remote Control, the pane and
+  sidebar kept showing done or idle for the whole turn, and its time wasn't
+  counted. Such a turn now shows **working** and counts as work like any other.
+  Thanks to [@railapex](https://github.com/railapex) ([#145](https://github.com/ProjectHax/muxel/pull/145)).
+- **Remote panes keep their full size after a reconnect** — after many remote
+  tmux panes on one host reconnected at once, some showed only the top or bottom
+  of their agent and stayed that way. Each pane opened its own ssh session to
+  reclaim its window size, the host refused the ones past its session limit, and
+  a refused pane never tried again. A host's panes now reclaim their sizes in one
+  ssh call, and one that can't reach its host retries.
+- **Remote Claude panes no longer flicker between working and done** — a
+  Claude turn on a remote host is read from its spinner row, and muxel
+  recognised only one of the glyphs that row cycles through. Most reads saw the
+  turn end, so the pane flashed between working and done for the whole turn.
+  Every frame of the spinner now reads as working.
+
 ## [0.3.6] — 2026-11-10
 
 ### Added
