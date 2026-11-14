@@ -865,8 +865,10 @@ feature is added or changed, update the matching entry here in the same change**
   that fired it.
 - **Sound alerts** (Settings → Sounds) — a chime when an agent finishes, and a
   different one when it's blocked waiting on you, in a pane you aren't looking at
-  (even while muxel is focused, so another pane's agent can call you over). Agents
-  only — a shell finishing a command never chimes. The built-in sounds are
+  (even while muxel is focused, so another pane's agent can call you over). Set
+  **Chime for** to **Every pane** and the done chime also rings when the agent in
+  the pane you're watching finishes, once per turn; the blocked chime stays
+  background-only. Agents only — a shell finishing a command never chimes. The built-in sounds are
   synthesized by muxel (a rising two-note chime for done, a double knock for
   blocked); either can be replaced with your own WAV, AIFF, MP3, OGG, FLAC or M4A
   file (Play to preview, cut to 10 s; a file that won't play falls back to the

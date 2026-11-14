@@ -10,6 +10,10 @@
 //! - **Once per pane until you look** — after a pane rings for Done (or for
 //!   Blocked), it doesn't ring for that again until you've focused it, or
 //!   [`PANE_COOLDOWN`] has passed.
+//! - **Unless you want the pane you're watching too** — with the done chime set
+//!   to always, [`AlertGate::attended_ringing`] keeps a watched pane's pending
+//!   alert of that kind, so its Done rings like a background pane's. The
+//!   cooldown then restarts each tick you look, so every turn rings once.
 //! - **One at a time** — alerts due together play as one chime (Blocked wins),
 //!   and chimes are at least [`MIN_GAP`] apart; an alert held back by the gap
 //!   plays after it rather than being lost.
@@ -97,6 +101,20 @@ impl AlertGate {
         self.rung.retain(|(rang, _), _| *rang != pane);
     }
 
+    /// The user is looking at `pane` but wants its `keep` alert to ring anyway
+    /// (the done chime set to always). Like [`Self::attended`], except a
+    /// pending `keep` alert stays to settle and ring.
+    pub fn attended_ringing(&mut self, pane: Uuid, keep: AlertSound) {
+        if self
+            .pending
+            .get(&pane)
+            .is_some_and(|(sound, _)| *sound != keep)
+        {
+            self.pending.remove(&pane);
+        }
+        self.rung.retain(|(rang, _), _| *rang != pane);
+    }
+
     /// The chime to play now, if any. `current` is each agent pane's present
     /// alert state (`None` while it works, or once it's gone); an alert whose
     /// pane has moved on is dropped.
@@ -156,6 +174,9 @@ mod tests {
         gate: AlertGate,
         states: HashMap<Uuid, Option<AlertSound>>,
         now: Instant,
+        /// The pane the user is looking at, and the alert they want from it
+        /// anyway (the done chime set to always).
+        watching: Option<(Uuid, Option<AlertSound>)>,
     }
 
     impl Sim {
@@ -164,12 +185,19 @@ mod tests {
                 gate: AlertGate::default(),
                 states: HashMap::new(),
                 now: Instant::now(),
+                watching: None,
             }
         }
 
         /// Advance one tick with `pane` in `state`; returns what chimed.
         fn tick(&mut self, changes: &[(Uuid, Option<AlertSound>)]) -> Option<AlertSound> {
             self.now += TICK;
+            // The status tick attends the watched pane before arming it.
+            match self.watching {
+                Some((pane, None)) => self.gate.attended(pane),
+                Some((pane, Some(keep))) => self.gate.attended_ringing(pane, keep),
+                None => {}
+            }
             for &(pane, state) in changes {
                 let before = self.states.insert(pane, state).flatten();
                 if let Some(sound) = state
@@ -273,6 +301,46 @@ mod tests {
         let mut sim = Sim::new();
         sim.tick(&[(pane, Some(Blocked))]);
         sim.states.remove(&pane);
+        assert!(sim.idle(5).is_empty());
+    }
+
+    #[test]
+    fn the_pane_you_are_watching_never_rings() {
+        let pane = Uuid::new_v4();
+        let mut sim = Sim::new();
+        sim.watching = Some((pane, None));
+        sim.tick(&[(pane, Some(Done))]);
+        assert!(sim.idle(5).is_empty());
+        sim.tick(&[(pane, Some(Blocked))]);
+        assert!(sim.idle(5).is_empty());
+    }
+
+    #[test]
+    fn with_the_done_chime_always_the_watched_pane_rings_for_every_turn() {
+        let pane = Uuid::new_v4();
+        let mut sim = Sim::new();
+        sim.watching = Some((pane, Some(Done)));
+        assert_eq!(sim.tick(&[(pane, Some(Done))]), None, "not settled yet");
+        assert_eq!(sim.tick(&[]), Some(Done));
+        assert!(sim.idle(10).is_empty(), "one turn rings once");
+        // The next turn, well inside the cooldown, rings again.
+        sim.tick(&[(pane, None)]);
+        sim.idle(20);
+        sim.tick(&[(pane, Some(Done))]);
+        assert_eq!(sim.tick(&[]), Some(Done));
+        // A Done that flickers back to work still never rings.
+        sim.tick(&[(pane, None)]);
+        sim.tick(&[(pane, Some(Done))]);
+        assert_eq!(sim.tick(&[(pane, None)]), None);
+        assert!(sim.idle(5).is_empty());
+    }
+
+    #[test]
+    fn with_the_done_chime_always_the_watched_pane_still_never_rings_blocked() {
+        let pane = Uuid::new_v4();
+        let mut sim = Sim::new();
+        sim.watching = Some((pane, Some(Done)));
+        sim.tick(&[(pane, Some(Blocked))]);
         assert!(sim.idle(5).is_empty());
     }
 

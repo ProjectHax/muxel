@@ -15221,7 +15221,13 @@ impl MuxelApp {
                 .filter(|sound| agent && sound.enabled(&self.settings));
             if agent {
                 if attended {
-                    self.alert_gate.attended(iid);
+                    // Set to always, the pane you're looking at rings for
+                    // Done too; Blocked there never does.
+                    if self.settings.done_chime_always() {
+                        self.alert_gate.attended_ringing(iid, AlertSound::Done);
+                    } else {
+                        self.alert_gate.attended(iid);
+                    }
                 }
                 if let Some(sound) = chime {
                     self.alert_gate.arm(iid, sound, alert_now);

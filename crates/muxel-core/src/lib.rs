@@ -2291,6 +2291,17 @@ pub const NEW_AGENT_TAB: &str = "tab";
 /// [`Settings::new_agent_placement`]: a new agent gets a pane of its own.
 pub const NEW_AGENT_PANE: &str = "pane";
 
+fn default_sound_done_when() -> String {
+    DONE_CHIME_BACKGROUND.to_string()
+}
+
+/// [`Settings::sound_done_when`]: the done chime rings only for a pane you
+/// aren't looking at.
+pub const DONE_CHIME_BACKGROUND: &str = "background";
+/// [`Settings::sound_done_when`]: the done chime also rings for the pane you're
+/// looking at.
+pub const DONE_CHIME_ALWAYS: &str = "always";
+
 /// A user keybinding override: an action name bound to a keystroke string.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KeyBindingCfg {
@@ -2896,6 +2907,11 @@ pub struct Settings {
     /// Chime when an agent finishes a turn in a pane you aren't watching.
     #[serde(default = "default_true")]
     pub sound_on_done: bool,
+    /// Which panes the done chime rings for: [`DONE_CHIME_BACKGROUND`] (only
+    /// one you aren't looking at) or [`DONE_CHIME_ALWAYS`] (the one you're
+    /// looking at too). Anything else reads as background.
+    #[serde(default = "default_sound_done_when")]
+    pub sound_done_when: String,
     /// Chime when an agent is blocked waiting on you.
     #[serde(default = "default_true")]
     pub sound_on_blocked: bool,
@@ -2981,6 +2997,12 @@ impl Settings {
     /// focused pane (see [`Settings::new_agent_placement`]).
     pub fn new_agents_open_as_panes(&self) -> bool {
         self.new_agent_placement == NEW_AGENT_PANE
+    }
+
+    /// Whether the done chime also rings for the pane you're looking at (see
+    /// [`Settings::sound_done_when`]).
+    pub fn done_chime_always(&self) -> bool {
+        self.sound_done_when == DONE_CHIME_ALWAYS
     }
 }
 
@@ -3296,6 +3318,7 @@ impl Default for Settings {
             read_aloud_tables: false,
             read_aloud_max_chars: 0,
             sound_on_done: true,
+            sound_done_when: default_sound_done_when(),
             sound_on_blocked: true,
             sound_done_file: None,
             sound_blocked_file: None,
@@ -4004,6 +4027,33 @@ mod settings_tests {
         let s: Settings = serde_json::from_value(v).unwrap();
         assert!(s.confirm_close_terminal);
         assert!(!s.confirm_close_editor && !s.confirm_close_diff);
+    }
+
+    #[test]
+    fn the_done_chime_is_for_background_panes_unless_set_to_always() {
+        assert!(!Settings::default().done_chime_always());
+        // A config from before the setting existed keeps chiming only for
+        // panes you aren't looking at.
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("sound_done_when");
+        let s: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(s.sound_done_when, DONE_CHIME_BACKGROUND);
+        let always = Settings {
+            sound_done_when: DONE_CHIME_ALWAYS.to_string(),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&always).unwrap();
+        assert!(
+            serde_json::from_str::<Settings>(&json)
+                .unwrap()
+                .done_chime_always()
+        );
+        // A value this version doesn't know reads as the default.
+        let odd = Settings {
+            sound_done_when: "never".to_string(),
+            ..Settings::default()
+        };
+        assert!(!odd.done_chime_always());
     }
 
     #[test]

@@ -150,6 +150,34 @@ impl MuxelApp {
                 |s, on| s.sound_on_done = on,
             ))
             .child(self.alert_sound_row(AlertSound::Done, cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .mr_1()
+                            .child(t("Chime for")),
+                    )
+                    .child(self.done_chime_when_btn(
+                        muxel_core::DONE_CHIME_BACKGROUND,
+                        &t("Background panes only"),
+                        settings.sound_on_done,
+                        cx,
+                    ))
+                    .child(self.done_chime_when_btn(
+                        muxel_core::DONE_CHIME_ALWAYS,
+                        &t("Every pane"),
+                        settings.sound_on_done,
+                        cx,
+                    )),
+            )
+            .child(note(t(
+                "Background panes are any pane but the one you're focused on while muxel is the active window. Every pane also chimes when the agent you're watching finishes.",
+            )))
             .child(self.setting_check(
                 "snd-blocked",
                 settings.sound_on_blocked,
@@ -201,6 +229,32 @@ impl MuxelApp {
                 "Your own sound can be WAV, AIFF, MP3, OGG, FLAC or M4A. Anything longer than 10 seconds is cut short.",
             )))
             .into_any_element()
+    }
+
+    /// Settings → Sounds: one choice of which panes the done chime rings for.
+    fn done_chime_when_btn(
+        &self,
+        value: &'static str,
+        label: &str,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        let selected = if value == muxel_core::DONE_CHIME_ALWAYS {
+            self.settings.done_chime_always()
+        } else {
+            !self.settings.done_chime_always()
+        };
+        Button::new(SharedString::from(format!("snd-done-when-{value}")))
+            .ghost()
+            .small()
+            .selected(selected)
+            .disabled(!enabled)
+            .label(label.to_string())
+            .on_click(cx.listener(move |this, _e, _w, cx| {
+                this.settings.sound_done_when = value.to_string();
+                this.persist_settings();
+                cx.notify();
+            }))
     }
 
     /// One alert's sound: what plays, with Play / Choose / Use built-in.
