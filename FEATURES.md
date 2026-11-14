@@ -739,9 +739,11 @@ feature is added or changed, update the matching entry here in the same change**
   delay), and at the 30-second cap if it never does, for any agent.
   A `ctl new --prompt` task is stricter: it waits for Claude's editable
   composer and bracketed-paste mode, Codex's live editor (under its model
-  status line, `? for shortcuts` or context-left footer; a status line whose
-  model name has no digit and no `gpt-`/`codex-` prefix isn't recognised
-  without one of the other two) and Ready title, or
+  status line, `? for shortcuts` or context-left footer; the status line may
+  open with a model id or with a display name and its effort, `Daybreak Blue
+  low`, and may end with Codex's `← for agents` hint; a display name with no
+  digit and no effort after it isn't recognised without one of the other two)
+  and Ready title, or
   Grok's semantic idle state after its configured startup delay. In a tmux
   pane, which forwards no program titles unless tmux's own `set-titles` is on,
   muxel reads the provider's title through tmux (`#{pane_title}`) while that
