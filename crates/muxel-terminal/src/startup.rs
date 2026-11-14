@@ -846,39 +846,63 @@ impl Screen {
     }
 }
 
+/// Codex's reasoning efforts, which its status line prints after the model;
+/// `default` shows while a fresh session hasn't settled on one.
+const CODEX_EFFORTS: &[&str] = &["default", "minimal", "low", "medium", "high", "xhigh"];
+
+/// The hint Codex 0.167 adds to the end of its status line while the box is
+/// empty.
+const CODEX_AGENTS_HINT: &str = "← for agents";
+
 /// A row Codex draws below its live editor: its own shortcut hint or context
 /// meter (`? for shortcuts … 98% context left`), or a passive status line that
 /// opens with a model id (`gpt-5.4 high fast · scratch`, `o4-mini · …`, a custom
-/// provider's `llama3.1:8b · …`). A model name with no digit and no `gpt-` or
-/// `codex-` prefix is not recognised without one of the other two footers.
+/// provider's `llama3.1:8b · …`) or with a model's display name and its
+/// reasoning effort (`Daybreak Blue low · …`, `GPT-6.1-Sol high · …`). A
+/// display name with no digit and no effort after it is not recognised without
+/// one of the other two footers.
 /// Menus separate key hints with ` · ` as well (`enter continue · esc quit`),
 /// so a status line must open with a model-like token and no later segment may
-/// read as a key hint. A segment that merely is such a word (a project folder
-/// named `continue`) is not one.
+/// read as a key hint, except Codex's own trailing `← for agents`. A segment
+/// that merely is such a word (a project folder named `continue`) is not one.
 fn codex_footer(row: &str) -> bool {
     let row = row.trim();
     if row.starts_with("? for shortcuts") || row.contains("% context left") {
         return true;
     }
-    let mut segments = row.split(" · ");
-    let Some(id) = segments
-        .next()
-        .and_then(|model| model.split_whitespace().next())
-    else {
+    let segments: Vec<&str> = row.split(" · ").collect();
+    let Some((head, rest)) = segments.split_first() else {
         return false;
+    };
+    let words: Vec<&str> = head.split_whitespace().collect();
+    let Some(&id) = words.first() else {
+        return false;
+    };
+    let token = |word: &str| {
+        word.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && word
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._:/@+-".contains(&b))
     };
     let openai = ["gpt-", "codex-"].iter().any(|prefix| {
         id.get(..prefix.len())
             .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
     });
-    let model_like = id.len() >= 2
-        && id.starts_with(|c: char| c.is_ascii_alphanumeric())
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._:/@+-".contains(&b))
-        && (openai || id.bytes().any(|b| b.is_ascii_digit()));
-    let mut rest = segments.peekable();
-    model_like && rest.peek().is_some() && !rest.any(key_hint)
+    let model_like =
+        id.len() >= 2 && token(id) && (openai || id.bytes().any(|b| b.is_ascii_digit()));
+    // `Daybreak Blue low`, `GPT-6.1-Sol high fast`: a name of up to four
+    // words, then an effort, then perhaps `fast`.
+    let words = words.strip_suffix(&["fast"]).unwrap_or(&words[..]);
+    let named = words.split_last().is_some_and(|(effort, name)| {
+        CODEX_EFFORTS.contains(effort)
+            && (1..=4).contains(&name.len())
+            && name.iter().copied().all(token)
+    });
+    let hinted = match rest.split_last() {
+        Some((last, before)) if last.trim() == CODEX_AGENTS_HINT => before,
+        _ => rest,
+    };
+    (model_like || named) && !rest.is_empty() && !hinted.iter().copied().any(key_hint)
 }
 
 /// `enter to confirm`, `esc quit`, `press enter …`, `ctrl+t transcript`,
@@ -1370,9 +1394,81 @@ mod tests {
         assert!(sample.codex_ctl_origin().is_none(), "nonuniform grid");
     }
 
+    /// Every empty Codex box in recorded Codex sessions, cut from their
+    /// screens: 0.164.0 on a display-name model, and 0.167.2 on the default
+    /// model and on that display name, whose status line ends with
+    /// `← for agents` while the box is empty. The paths stand in for the
+    /// recorded ones at the same length, so 0.164.0's status line still cuts
+    /// its path where Codex did.
+    #[test]
+    fn every_recorded_empty_codex_box_is_found_and_reads_empty() {
+        let welcome = "
+  >_ OpenAI Codex (v0.167.2)
+     C:\\work\\demo-app
+
+  To get started, describe a task or try one of these commands:
+
+  /init - create an AGENTS.md file with instructions for Codex
+  /status - show current session configuration
+  /permissions - choose what Codex is allowed to do
+  /model - choose what model and reasoning effort to use
+  /review - review any changes and find issues
+
+
+";
+        let recorded = [
+            (
+                "
+  >_ OpenAI Codex (v0.164.0)
+     C:\\work\\example-workspace\\nested\\demo-project-000000000000000002\\project
+
+  Tip: Use the desktop app. Install it from https://chatgpt.com/codex?app-landing-page=true and run codex app.
+
+
+› Ask Codex to do anything
+
+  Daybreak Blue low · C:\\work\\example-workspace\\nested\\demo-project-000000000000000002\\proj…  ⚠ 2 warnings · f2 to view
+"
+                .to_string(),
+                7,
+            ),
+            (
+                format!(
+                    "{welcome}› Ask Codex to do anything\n\n  GPT-6.1-Sol low · Context 100% left · C:\\work\\demo-app · ← for agents\n"
+                ),
+                13,
+            ),
+            (
+                format!(
+                    "{welcome}› Ask Codex to do anything\n\n  Daybreak Blue low · Context 100% left · C:\\work\\demo-app · ← for agents\n"
+                ),
+                13,
+            ),
+        ];
+        for (text, row) in recorded {
+            let empty = screen(&text, row, 2);
+            assert!(empty.codex_composer_context(true).is_some(), "{text}");
+            assert!(empty.codex_composer_context(false).is_none(), "{text}");
+        }
+        // The same tour with a draft: the hint is gone.
+        let draft = screen(
+            &format!(
+                "{welcome}› fix the login bug\n\n  Daybreak Blue low · Context 100% left · C:\\work\\demo-app\n"
+            ),
+            13,
+            19,
+        );
+        assert!(draft.codex_draft_matches("fix the login bug"));
+    }
+
     #[test]
     fn codex_editor_accepts_non_gpt_models_and_the_shortcut_footer_but_no_menu() {
         for footer in [
+            "  Daybreak Blue low · scratch",
+            "  Daybreak Blue xhigh fast · scratch",
+            "  Daybreak Blue default · Context 100% left · C:\\work\\app",
+            "  GPT-6.1-Sol high · Context 100% left · C:\\src\\scratch · scratch · main",
+            "  GPT-6.1-Sol low · Context 100% left · C:\\work\\app · ← for agents",
             "  o4-mini medium · scratch · Context 0% used",
             "  o3 · scratch",
             "  llama3.1:8b · ~/src/webapp",
@@ -1419,6 +1515,10 @@ mod tests {
             "  ⚠ 1 · f2",
             "  scratch · Context 0% used",
             "  sonnet · scratch",
+            "  Daybreak Blue · scratch",
+            "  Thinking high · esc to interrupt",
+            "  gpt-5.4 · ← back",
+            "  ← for agents",
             "  Press enter to confirm or esc to cancel",
         ] {
             let menu = screen(
