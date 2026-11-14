@@ -811,22 +811,16 @@ impl Screen {
             row.chars().count() >= 8 && row.chars().all(|ch| ch == '─' || ch == '━')
         };
         let (top, bottom) = if empty.is_some() {
-            let top = rows[..cursor].iter().rposition(|row| rule(row))?;
             let bottom = rows[cursor + 1..]
                 .iter()
                 .position(|row| rule(row))
                 .map(|offset| cursor + 1 + offset)?;
+            let top = claude_box_top(&rows, bottom).filter(|&top| top < cursor)?;
             (top, bottom)
         } else {
             // A repaint can leave the cursor anywhere, so take the final box.
-            // Its edges are the same full-width rule. Draft rows are drawn
-            // under the prompt, two columns in, so a rule typed into a draft
-            // never matches an edge and can't cut the box short.
             let bottom = rows.iter().rposition(|row| rule(row))?;
-            let edge = rows[bottom].trim_end();
-            let top = rows[..bottom]
-                .iter()
-                .rposition(|row| row.trim_end() == edge)?;
+            let top = claude_box_top(&rows, bottom)?;
             (top, bottom)
         };
         // The final framed region belongs to the composer, not an earlier turn.
@@ -839,11 +833,45 @@ impl Screen {
         if !after.starts_with(char::is_whitespace) {
             return None;
         }
+        // Rows under the prompt row are the draft's own, drawn two columns in.
+        // Anything at the edge's column means the two rules frame something
+        // else, such as a transcript above a permission form that has no box.
+        let indent = rows[bottom]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .count();
+        if !rows[top + 2..bottom]
+            .iter()
+            .all(|row| row.chars().take(indent + 2).all(char::is_whitespace))
+        {
+            return None;
+        }
         let cursor_at_start = cursor == top + 1 && self.cursor_column == prefix + 2;
         empty
             .is_none_or(|empty| cursor_at_start == empty)
             .then_some(top + 1..bottom)
     }
+}
+
+/// The top edge of Claude's input box whose bottom edge is `rows[bottom]`: the
+/// nearest row above it that starts with a rule at the edge's column. Claude
+/// can draw its usage notice into the right end of the top rule and then erase
+/// it with EL, so the top rule may be cut short, or carry text that ends at
+/// the edge's last column. Nearest keeps the match inside the box. Draft rows
+/// start two columns in, so a rule typed into a draft is never taken for it.
+fn claude_box_top(rows: &[&str], bottom: usize) -> Option<usize> {
+    let rule = |ch: char| ch == '─' || ch == '━';
+    let edge = rows[bottom].trim_end();
+    let indent = edge.chars().take_while(|ch| ch.is_whitespace()).count();
+    let top = rows[..bottom].iter().rposition(|row| {
+        row.chars().take_while(|ch| ch.is_whitespace()).count() == indent
+            && row.chars().nth(indent).is_some_and(rule)
+    })?;
+    let row = rows[top].trim_end();
+    let run = row.chars().skip(indent).take_while(|&ch| rule(ch)).count();
+    let (end, width) = (indent + run, edge.chars().count());
+    let whole = row.chars().count();
+    (run >= 8 && end <= width && (whole == end || whole == width)).then_some(top)
 }
 
 /// A row Codex draws below its live editor: its own shortcut hint or context
@@ -1555,6 +1583,36 @@ mod tests {
         );
         // Neither status nor a hidden cursor grants startup input.
         assert!(!draft.claude_composer(false));
+    }
+    #[test]
+    fn box_under_a_usage_notice_or_its_cut_rule_is_still_found() {
+        // Claude 2.1.323 at 297 columns, from a recording: the usage notice
+        // drawn into the right end of the box's top rule, then the rule as EL
+        // left it when the notice went.
+        let bottom = "─".repeat(297);
+        let notice = format!(
+            "{}You've used 89% of your weekly limit · resets Nov 17, 1pm (America/Chicago)──",
+            "─".repeat(220)
+        );
+        assert_eq!(notice.chars().count(), 297);
+        for top in [notice, "─".repeat(220)] {
+            let footer = "  [>_>] · ▱▱▱▱▱▱▱▱▱▱ 450k · haiku med";
+            let text = format!(
+                "Claude Code v2.1.323\n\n{top}\n❯ reply with the word violet\n{bottom}\n\n{footer}"
+            );
+            let mut box_ = screen(&text, 3, 28);
+            assert!(box_.claude_composer(false), "{top}");
+            assert!(box_.claude_draft_matches("reply with the word violet"));
+            box_.cursor_row = 6;
+            box_.cursor_column = 0;
+            box_.cursor_visible = false;
+            assert_eq!(
+                box_.claude_status_context(),
+                Some(format!(
+                    "Claude Code v2.1.323\n\n{top}\n{bottom}\n\n{footer}"
+                ))
+            );
+        }
     }
     #[test]
     fn trust_choice_quoted_transcript_and_wrong_terminal_modes_are_not_ready() {

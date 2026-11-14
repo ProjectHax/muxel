@@ -8801,6 +8801,30 @@ mod provider_switch_tests {
         }
 
         #[test]
+        fn permission_form_under_a_shorter_transcript_rule_frames_no_box() {
+            use crate::startup::Screen;
+            // Claude 2.1.322's file permission form, from a recording, has
+            // one rule above it and none below. A shorter rule higher up sits
+            // right above a `❯ ` prompt in the transcript; the two rules must
+            // not be read as Claude's box around the transcript.
+            let text = format!(
+                "Claude Code v2.1.322\n{}\n❯ Create note.txt containing hi.\n\n● Write(note.txt)\n\n{}\n Create file\n note.txt\n{dash}\n  1 hi\n{dash}\n Do you want to create note.txt?\n ❯ 1. Yes\n   2. Yes, and switch to accept edits (auto-approve file edits and common file commands) for this session (shift+tab)\n   3. No\n\n Esc to cancel · Tab to amend",
+                "─".repeat(40),
+                "─".repeat(60),
+                dash = "╌".repeat(60),
+            );
+            let screen = Screen {
+                text: text.clone(),
+                cursor_row: 13,
+                cursor_column: 1,
+                cursor_visible: true,
+                bracketed_paste: true,
+            };
+            assert_eq!(screen.claude_status_context(), None);
+            assert_eq!(claude_sample(&text, 13, 1), AgentStatus::Blocked);
+        }
+
+        #[test]
         fn hidden_composer_cannot_supply_status_or_authorize_input() {
             use crate::startup::Screen;
             use crate::view::{provider_screen_status, status_screen_context};
