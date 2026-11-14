@@ -1,19 +1,29 @@
-//! Diff panes run `git diff` only while on screen. Draws real frames with no
-//! PTY. Each window is a gpui-component `Root`, as muxel opens it, since an
-//! editor needs one to paint; on macOS that `Root` asks gpui's test window for
-//! an NSView it can't give, so these run on Windows and Linux.
+//! Diff panes run `git diff` only while on screen, and a watched one only
+//! when its files change. Draws real frames with no PTY. Each window is a
+//! gpui-component `Root`, as muxel opens it, since an editor needs one to
+//! paint; on macOS that `Root` asks gpui's test window for an NSView it can't
+//! give, so these run on Windows and Linux.
 use super::{MuxelApp, Project, ResourceOrigin, SecondaryWindow, WorkspaceWindow};
 use crate::editor::TEST_RENDERS;
+use crate::file_watch::FileWatch;
+use crate::file_watch::test_backend::TestBackend;
 use crate::integrations::git_launches;
 use crate::test_support::TestRepo;
 use crate::theme;
 use gpui::{AnyWindowHandle, AppContext, Context, Entity, TestAppContext, Window, WindowHandle};
 use gpui_component::Root;
+use muxel_core::diff_schedule::{BACKSTOP, MIN_GAP, POLL};
+use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode};
+use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// Longer than one tick of the diff timer.
+/// Longer than the poll of a pane without a watch.
 const DIFF_TICK: Duration = Duration::from_millis(1600);
+/// Past a watched pane's quiet period and its gap after the last refresh,
+/// short of the poll: only a watch's wake refreshes the pane within it.
+const SOON: Duration = MIN_GAP.saturating_add(Duration::from_millis(100));
+const _: () = assert!(SOON.as_millis() < POLL.as_millis());
 
 struct Fixture {
     pid: Uuid,
@@ -79,6 +89,9 @@ fn with_app(run: impl FnOnce(&mut TestAppContext, &Main, &Fixture)) {
         // The diff timer stays live; the others would add unrelated work.
         app._status_timer = gpui::Task::ready(());
         app._update_timer = gpui::Task::ready(());
+        // No watcher, so panes poll while visible, unless a test hands
+        // the app one (`watch_with`).
+        app.file_watch = Some(None);
         // Past first run: the terms and workspace screens draw no panes.
         app.show_terms = false;
         app.show_workspace_selector = false;
@@ -165,7 +178,11 @@ fn launches_while<R>(run: impl FnOnce() -> R) -> usize {
 }
 
 fn tick(cx: &mut TestAppContext) {
-    cx.executor().advance_clock(DIFF_TICK);
+    wait(cx, DIFF_TICK);
+}
+
+fn wait(cx: &mut TestAppContext, time: Duration) {
+    cx.executor().advance_clock(time);
     cx.run_until_parked();
 }
 
@@ -194,6 +211,230 @@ fn secondary_window(cx: &mut TestAppContext, main: &Main, pid: Uuid) -> WindowHa
     secondary
 }
 
+/// Give the app a watcher whose events the test plays.
+fn watch_with(cx: &mut TestAppContext, main: &Main) -> TestBackend {
+    let backend = TestBackend::default();
+    let (watch, signal) = FileWatch::start_with(|handler| backend.build(handler)).unwrap();
+    main.update(cx, |app, _, cx| app.follow_file_watch(watch, signal, cx));
+    backend
+}
+
+fn watched(cx: &mut TestAppContext, main: &Main, iid: Uuid) -> bool {
+    main.update(cx, |app, _, _| app.diff_panes.sources[&iid].watch.is_some())
+}
+
+/// A's diff pane, watched through a test backend, past its first refresh
+/// and the check after the watch began, so nothing is due but the backstop.
+fn watched_diff(cx: &mut TestAppContext, main: &Main, fx: &Fixture) -> (TestBackend, Uuid) {
+    let backend = watch_with(cx, main);
+    let iid = open_diff(cx, main, fx, &fx.a);
+    assert!(watched(cx, main, iid), "the pane watches its repository");
+    wait(cx, 2 * MIN_GAP);
+    (backend, iid)
+}
+
+fn send(backend: &TestBackend, kind: notify::EventKind, paths: &[PathBuf]) {
+    let mut event = notify::Event::new(kind);
+    for path in paths {
+        event = event.add_path(path.clone());
+    }
+    backend.send(Ok(event));
+}
+
+fn modified(backend: &TestBackend, path: PathBuf) {
+    send(
+        backend,
+        notify::EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+        &[path],
+    );
+}
+
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn a_tracked_edit_refreshes_a_visible_diff_without_a_tick() {
+    with_app(|cx, main, fx| {
+        let (backend, iid) = watched_diff(cx, main, fx);
+        add_line(&fx.a);
+        modified(&backend, fx.a.path().join("notes.txt"));
+        wait(cx, SOON);
+        assert!(diff_text(cx, main, iid).contains("+second"));
+    });
+}
+
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn writes_under_an_untracked_directory_start_no_git() {
+    with_app(|cx, main, fx| {
+        let (backend, iid) = watched_diff(cx, main, fx);
+        // The tracked edit goes unreported, so only a refresh started by
+        // the other writes, or a poll, would show it.
+        add_line(&fx.a);
+        let root = fx.a.path();
+        send(
+            &backend,
+            notify::EventKind::Create(CreateKind::File),
+            &[root.join("target/debug/out.o"), root.join("scratch.txt")],
+        );
+        modified(&backend, root.join("target"));
+        modified(&backend, root.to_path_buf());
+        wait(cx, 3 * POLL);
+        assert!(!diff_text(cx, main, iid).contains("+second"), "no git ran");
+        // The pane is live: its tracked file's event refreshes it.
+        modified(&backend, root.join("notes.txt"));
+        wait(cx, SOON);
+        assert!(diff_text(cx, main, iid).contains("+second"));
+    });
+}
+
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn a_commit_on_the_branch_refreshes_the_diff() {
+    with_app(|cx, main, fx| {
+        let (backend, iid) = watched_diff(cx, main, fx);
+        add_line(&fx.a);
+        modified(&backend, fx.a.path().join("notes.txt"));
+        wait(cx, SOON);
+        assert!(diff_text(cx, main, iid).contains("+second"));
+        fx.a.commit(&[], "second");
+        // Only the branch's ref is reported moving, as git renames it into
+        // place.
+        let heads = fx.a.path().join(".git").join("refs").join("heads");
+        send(
+            &backend,
+            notify::EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            &[heads.join("main.lock"), heads.join("main")],
+        );
+        wait(cx, SOON);
+        assert!(!diff_text(cx, main, iid).contains("+second"));
+    });
+}
+
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn a_lost_diff_watch_puts_the_pane_back_on_its_poll() {
+    with_app(|cx, main, fx| {
+        let (backend, iid) = watched_diff(cx, main, fx);
+        send(
+            &backend,
+            notify::EventKind::Remove(RemoveKind::Folder),
+            &[fx.a.path().to_path_buf()],
+        );
+        cx.run_until_parked();
+        assert!(!watched(cx, main, iid));
+        add_line(&fx.a);
+        tick(cx);
+        assert!(diff_text(cx, main, iid).contains("+second"));
+    });
+}
+
+/// `git add` of a new file whose index event the watcher lost: the file is
+/// now tracked, but the pane's plan still lists the old files.
+fn add_unreported(repo: &TestRepo) -> PathBuf {
+    let added = repo.path().join("added.txt");
+    std::fs::write(&added, "one\n").unwrap();
+    repo.git(&["add", "added.txt"]);
+    added
+}
+
+/// After the plan caught up, an edit to the newly tracked file wakes the
+/// pane by itself.
+fn edit_wakes(
+    cx: &mut TestAppContext,
+    main: &Main,
+    backend: &TestBackend,
+    iid: Uuid,
+    added: PathBuf,
+) {
+    std::fs::write(&added, "one\nmore\n").unwrap();
+    modified(backend, added);
+    wait(cx, SOON);
+    assert!(
+        diff_text(cx, main, iid).contains("+more"),
+        "the newly tracked file's edit refreshed the pane"
+    );
+}
+
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn a_watcher_overflow_re_plans_the_diff() {
+    with_app(|cx, main, fx| {
+        let (backend, iid) = watched_diff(cx, main, fx);
+        let added = add_unreported(&fx.a);
+        backend.send(Ok(
+            notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan)
+        ));
+        wait(cx, SOON);
+        assert!(
+            diff_text(cx, main, iid).contains("+one"),
+            "the rescan refreshed"
+        );
+        edit_wakes(cx, main, &backend, iid, added);
+    });
+}
+
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn the_backstop_re_plans_after_a_lost_index_event() {
+    with_app(|cx, main, fx| {
+        let (backend, iid) = watched_diff(cx, main, fx);
+        let added = add_unreported(&fx.a);
+        wait(cx, BACKSTOP);
+        assert!(
+            diff_text(cx, main, iid).contains("+one"),
+            "the backstop refreshed"
+        );
+        edit_wakes(cx, main, &backend, iid, added);
+    });
+}
+
+/// An edit inside a submodule changes the diff (`-dirty`) without touching a
+/// file the plan tracks, so a repository with one polls instead of watching.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn a_repository_with_a_submodule_polls() {
+    with_app(|cx, main, fx| {
+        fx.a.git(&[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &fx.b.path().to_string_lossy(),
+            "sub",
+        ]);
+        fx.a.commit(&[], "add sub");
+        let backend = watch_with(cx, main);
+        let iid = open_diff(cx, main, fx, &fx.a);
+        assert!(!watched(cx, main, iid), "the pane polls");
+        let inside = fx.a.path().join("sub").join("notes.txt");
+        std::fs::write(&inside, "first\nsecond\n").unwrap();
+        modified(&backend, inside);
+        tick(cx);
+        assert!(diff_text(cx, main, iid).contains("-dirty"));
+    });
+}
+
 #[test]
 #[cfg_attr(
     target_os = "macos",
@@ -204,8 +445,11 @@ fn a_hidden_diff_pane_starts_no_git_until_it_is_shown() {
         let (a, b) = hidden_and_shown(cx, main, fx);
         add_line(&fx.a);
         add_line(&fx.b);
-        // One pane's refresh, as B now stands.
-        let one = launches_while(|| crate::integrations::git_diff(fx.b.path()));
+        // One pane's poll, as B now stands: its top level is already known.
+        let toplevel = crate::integrations::diff_plan(fx.b.path())
+            .expect("a work tree")
+            .toplevel;
+        let one = launches_while(|| crate::integrations::git_diff(fx.b.path(), Some(&toplevel)));
         assert!(one > 0);
         let ticked = launches_while(|| tick(cx));
         assert_eq!(ticked, one, "only the shown pane ran git");

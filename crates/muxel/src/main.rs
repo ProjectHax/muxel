@@ -9,13 +9,13 @@
 
 mod accomplishments_view;
 mod app;
-mod binding_watch;
 mod browser;
 #[cfg(target_os = "linux")]
 mod browser_helper;
 mod browser_storage;
 mod control;
 mod editor;
+mod file_watch;
 mod filetree;
 mod i18n;
 mod integrations;

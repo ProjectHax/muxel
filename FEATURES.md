@@ -1536,9 +1536,18 @@ feature is added or changed, update the matching entry here in the same change**
   directory. From a pane's diff button it opens as a tab beside that pane; from
   the project menu or a worktree's **View changes** it joins the nearest diff
   tab, if there is one. While it's on screen, docked or popped out, it refreshes
-  every 1.5 s and keeps your scroll position. A pane hidden behind another tab,
-  another view or a maximized pane runs no git, and refreshes as soon as it's
-  shown. The ↻ button, reopening and popping out never wait on git.
+  when a tracked file under its folder changes or HEAD's branch moves, once the
+  writes have been quiet for 0.3 s (at most 2 s into a steady stream, and at
+  most once a second), and keeps your scroll position. New untracked files and
+  build output don't wake it, and it re-checks every 30 s anyway, re-reading
+  which files are tracked if HEAD or the index changed unreported. Where the
+  folder can't be watched (a checkout with more than 4096 tracked folders on
+  Linux, a repository with submodules, or git pointed elsewhere by `GIT_DIR`),
+  it refreshes every 1.5 s instead. A pane hidden behind another tab, another
+  view or a maximized pane runs no git, and refreshes as soon as it's shown if
+  it may be stale. The ↻ button, reopening and popping out never wait on git.
+  On Windows, while the pane is open the folders above its folder can't be
+  renamed.
 - **Command palette / global search** — quick navigation and search across the
   workspace.
 - **Find in project** — search within the active project.

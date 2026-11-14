@@ -71,6 +71,7 @@ mod codex_capture_tests;
 #[cfg(all(test, windows))]
 mod conpty_test_support;
 mod control_api;
+mod diff_panes;
 #[cfg(test)]
 mod diff_refresh_tests;
 #[cfg(all(test, windows))]
@@ -109,6 +110,7 @@ mod transcript_read_tests;
 use claude_launch::TerminalPreparation;
 mod tmux_install_modal;
 mod upkeep;
+mod watching;
 
 use popout_lifecycle::loop_heartbeat;
 use recoverable_close::{ClientCount, CloseDeparture, CloseGroup, HeldClose};
@@ -6257,9 +6259,19 @@ pub struct MuxelApp {
     close_layout_poll: bool,
     /// Coalescing/backoff and stale-result guards for background provider scans.
     session_discoveries: muxel_core::session_discovery::SessionDiscoveries,
-    /// The Claude hook directory's watcher, started for the first Claude pane
-    /// discovery looks up. `Some(None)`: it failed, and Claude panes poll.
-    claude_binding_watch: Option<Option<crate::binding_watch::ClaudeBindingWatch>>,
+    /// The app's one file watcher, started by the first registration.
+    /// `Some(None)`: it couldn't start or it failed, and every watched target
+    /// polls for the rest of the run.
+    file_watch: Option<Option<crate::file_watch::FileWatch>>,
+    /// What each live registration with `file_watch` wakes.
+    watch_targets: HashMap<muxel_core::file_watch::WatchId, watching::WatchTarget>,
+    /// Providers whose watch was tried: its registration, or `None` when the
+    /// provider polls for the rest of the run. Claude's is tried for the first
+    /// Claude pane discovery looks up.
+    provider_watches: HashMap<
+        muxel_core::session_discovery::SessionProvider,
+        Option<muxel_core::file_watch::WatchId>,
+    >,
     /// Accepted Grok identity and observation time belong to one pane launch.
     /// Keep live identity even when a workspace write is rolled back.
     #[cfg(windows)]
@@ -6510,10 +6522,8 @@ pub struct MuxelApp {
     _status_timer: Task<()>,
     /// Periodically checks scheduled Loops (fire when due + post-run cleanup).
     _loop_timer: Task<()>,
-    /// Periodically re-runs `git diff` for the diff panes on screen (off the UI
-    /// thread).
-    _diff_timer: Task<()>,
-    diff_refresh: DiffRefresh,
+    /// When each diff pane on screen re-runs `git diff` (off the UI thread).
+    diff_panes: diff_panes::DiffPanes,
     /// Polls open local text files and reads changed content off the UI thread.
     _resource_timer: Task<()>,
     /// Debounce handle for persisting the window geometry on resize/move.
@@ -6816,19 +6826,6 @@ impl PaneView {
             PaneView::Browser(v) => v.read(cx).focus_handle(cx),
         }
     }
-}
-
-/// Diff-pane refresh bookkeeping. Only panes on screen run `git diff`, and a
-/// pane coming into view refreshes at once.
-#[derive(Default)]
-struct DiffRefresh {
-    /// Diff views on screen at the last frame. A view missing here is new to the
-    /// screen, so a pop-out or re-dock (which rebuilds the view) counts as shown.
-    shown: HashSet<EntityId>,
-    /// The newest refresh requested per pane while one is in flight. A result
-    /// that lands after a newer request was made is dropped, never shown.
-    latest: HashMap<Uuid, u64>,
-    next: u64,
 }
 
 /// Cloneable editor state, captured so an editor pane can be rebuilt in another
@@ -8334,24 +8331,6 @@ impl MuxelApp {
             }
         });
 
-        // Keep the diff panes on screen current as agents change files. A hidden
-        // pane runs no git; it refreshes when it comes into view (see
-        // `sync_diff_visibility`). Idle when no diff pane is shown.
-        let diff_timer = cx.spawn(async move |view: WeakEntity<Self>, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(1500))
-                    .await;
-                let Ok(refresh) = view.update(cx, |this, cx| {
-                    let jobs = this.diff_refresh_jobs(cx);
-                    this.refresh_diffs(jobs, cx)
-                }) else {
-                    break; // view dropped
-                };
-                refresh.await;
-            }
-        });
-
         // Poll metadata for open local text files off the UI thread. Content is
         // read only when a file's revision changes.
         let resource_timer = cx.spawn_in(window, async move |view: WeakEntity<Self>, cx| {
@@ -8790,7 +8769,9 @@ impl MuxelApp {
             layout_reads: HashMap::new(),
             close_layout_poll: false,
             session_discoveries: Default::default(),
-            claude_binding_watch: None,
+            file_watch: None,
+            watch_targets: HashMap::new(),
+            provider_watches: HashMap::new(),
             #[cfg(windows)]
             grok_observations: HashMap::new(),
             claude_hook_seen: HashMap::new(),
@@ -8974,8 +8955,7 @@ impl MuxelApp {
             settings,
             _status_timer: status_timer,
             _loop_timer: loop_timer,
-            _diff_timer: diff_timer,
-            diff_refresh: DiffRefresh::default(),
+            diff_panes: diff_panes::DiffPanes::default(),
             _resource_timer: resource_timer,
             bounds_save_task: None,
             show_terms,
@@ -17510,14 +17490,13 @@ impl MuxelApp {
             return;
         }
         // Reuse an already-open diff pane for the same directory: refresh + focus.
-        if let Some((iid, ed)) = self.editors.iter().find_map(|(iid, ed)| {
-            (ed.read(cx).diff_dir() == Some(dir.as_path())).then(|| (*iid, ed.clone()))
-        }) {
+        if let Some(iid) = self
+            .editors
+            .iter()
+            .find_map(|(iid, ed)| (ed.read(cx).diff_dir() == Some(dir.as_path())).then_some(*iid))
+        {
             self.focus_resource(iid, OpenFocus::Focus, window, cx);
-            // Focus puts it on screen; mark it so this frame doesn't refresh it
-            // a second time.
-            self.diff_refresh.shown.insert(ed.entity_id());
-            self.refresh_diffs(vec![(iid, dir)], cx).detach();
+            self.request_diff(iid, cx);
             return;
         }
 
@@ -17803,120 +17782,6 @@ impl MuxelApp {
         } else {
             editor.update(cx, |editor, cx| {
                 editor.apply_disk_change(change, main_window, cx);
-            });
-        }
-    }
-
-    /// The refresh button: re-run `git diff` for a docked diff pane, off the UI
-    /// thread.
-    fn refresh_diff_pane(&mut self, iid: Uuid, cx: &mut Context<Self>) {
-        let dir = self
-            .editors
-            .get(&iid)
-            .and_then(|ed| ed.read(cx).diff_dir().map(Path::to_path_buf));
-        if let Some(dir) = dir {
-            self.refresh_diffs(vec![(iid, dir)], cx).detach();
-        }
-    }
-
-    /// Every diff pane on screen: docked panes in a shown tab, and every
-    /// popped-out one.
-    fn shown_diff_panes(&self, cx: &App) -> Vec<(Uuid, Entity<EditorView>)> {
-        // Runs every frame: collect only the diff panes, and walk the layout
-        // only when there are some.
-        let mut diffs: Vec<_> = self
-            .editor_views()
-            .filter(|(_, ed)| ed.read(cx).is_diff())
-            .map(|(iid, ed)| (iid, ed.clone()))
-            .collect();
-        if diffs.is_empty() {
-            return diffs;
-        }
-        let shown: HashSet<Uuid> = self.shown_layout_tabs().into_iter().collect();
-        diffs.retain(|(iid, _)| shown.contains(iid) || self.popouts.contains_key(iid));
-        diffs
-    }
-
-    /// (instance id, directory) for every diff pane on screen — the work list for
-    /// the background refresh timer. A hidden pane runs no git.
-    fn diff_refresh_jobs(&self, cx: &App) -> Vec<(Uuid, PathBuf)> {
-        self.shown_diff_panes(cx)
-            .into_iter()
-            .filter_map(|(iid, ed)| ed.read(cx).diff_dir().map(|d| (iid, d.to_path_buf())))
-            .collect()
-    }
-
-    /// Run each frame: refresh every diff pane that has just come on screen, so a
-    /// pane that was hidden while files changed is current once it's shown.
-    fn sync_diff_visibility(&mut self, cx: &mut Context<Self>) {
-        let panes = self.shown_diff_panes(cx);
-        if panes.is_empty() && self.diff_refresh.shown.is_empty() {
-            return;
-        }
-        let mut shown = HashSet::with_capacity(panes.len());
-        let mut fresh = Vec::new();
-        for (iid, ed) in panes {
-            if !self.diff_refresh.shown.contains(&ed.entity_id())
-                && let Some(dir) = ed.read(cx).diff_dir()
-            {
-                fresh.push((iid, dir.to_path_buf()));
-            }
-            shown.insert(ed.entity_id());
-        }
-        self.diff_refresh.shown = shown;
-        self.refresh_diffs(fresh, cx).detach();
-    }
-
-    /// Run `git diff` for `jobs` on a background thread, then show each result in
-    /// its pane, in whichever window holds it. The task ends once they're shown.
-    fn refresh_diffs(&mut self, jobs: Vec<(Uuid, PathBuf)>, cx: &mut Context<Self>) -> Task<()> {
-        if jobs.is_empty() {
-            return Task::ready(());
-        }
-        let refresh = &mut self.diff_refresh;
-        let jobs: Vec<_> = jobs
-            .into_iter()
-            .map(|(iid, dir)| {
-                refresh.next += 1;
-                refresh.latest.insert(iid, refresh.next);
-                (iid, refresh.next, dir)
-            })
-            .collect();
-        cx.spawn(async move |view: WeakEntity<Self>, cx| {
-            let results = cx
-                .background_executor()
-                .spawn(async move {
-                    let _git = ui_profile::git_caller("diff-pane");
-                    jobs.into_iter()
-                        .map(|(iid, seq, dir)| (iid, seq, crate::integrations::git_diff(&dir)))
-                        .collect::<Vec<_>>()
-                })
-                .await;
-            let _ = view.update(cx, |this, cx| this.apply_diff_refreshes(results, cx));
-        })
-    }
-
-    /// Show background-computed diff text in each pane, keeping scroll position.
-    /// A result overtaken by a newer request for the same pane is dropped.
-    fn apply_diff_refreshes(&mut self, results: Vec<(Uuid, u64, String)>, cx: &mut Context<Self>) {
-        let editors: HashMap<_, _> = self.open_editor_resources().into_iter().collect();
-        for (iid, seq, content) in results {
-            if self.diff_refresh.latest.get(&iid) != Some(&seq) {
-                continue;
-            }
-            self.diff_refresh.latest.remove(&iid);
-            let (Some(editor), Some(handle)) = (
-                editors.get(&iid).cloned(),
-                self.editor_secondary_window(iid).or(self.main_window),
-            ) else {
-                continue;
-            };
-            // Runs from a task, never inside a window update, so updating the
-            // pane's own window can't nest.
-            let _ = handle.update(cx, move |_root, window, cx| {
-                editor.update(cx, |editor, cx| {
-                    editor.set_diff_content(content, window, cx)
-                });
             });
         }
     }
@@ -26453,7 +26318,7 @@ impl MuxelApp {
                             .label("↻")
                             .tooltip(t("Refresh diff"))
                             .on_click(cx.listener(move |this, _e, _window, cx| {
-                                this.refresh_diff_pane(iid, cx)
+                                this.request_diff(iid, cx)
                             }))
                     }))
                     // Image/markdown editors get a rendered/raw toggle.

@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// `std::process::Command` for `program`, with the console window suppressed on
 /// Windows. muxel is a GUI app, so spawning a console child (git, ssh, gh, …)
@@ -1797,11 +1797,189 @@ pub fn git_diff_placeholder(dir: &Path) -> String {
     )
 }
 
+/// What a diff pane's watch needs to know about `dir`'s repository. Resolved by
+/// [`diff_plan`] when the pane is first refreshed, and again after HEAD or the
+/// index changes.
+#[derive(Debug, Clone)]
+pub struct DiffPlan {
+    /// `git rev-parse --show-toplevel`, as git prints it.
+    pub toplevel: String,
+    /// Files tracked under `dir`, relative to it.
+    pub tracked: Vec<PathBuf>,
+    /// HEAD and the index.
+    pub state: Vec<PathBuf>,
+    /// HEAD's target: the current branch's loose ref, `packed-refs`, and
+    /// reftable's `tables.list` (a linked worktree's own too).
+    pub refs: Vec<PathBuf>,
+    /// Whether those files settle what `git diff HEAD` reads, by the same
+    /// rules as [`GitRefStamp`]: no variable from [`GIT_DISCOVERY_ENV`] set,
+    /// and a HEAD [`settled_head`] accepts. Nor is a repository with a
+    /// submodule settled: an edit inside one changes the diff (`-dirty`)
+    /// without touching a tracked file. An unsettled repository isn't
+    /// watched; its pane polls while visible.
+    pub settled: bool,
+    /// HEAD and the index as they stood before the tracked files were
+    /// listed. When they differ at a later refresh, the event that should
+    /// have re-planned was lost, and the plan is resolved again.
+    pub inputs: PlanInputs,
+}
+
+/// The size and modification time of each file a plan was read from (or
+/// `None` where it was missing), compared at each refresh to catch a change
+/// whose event the watcher lost, without running git.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanInputs(Vec<(PathBuf, Option<(u64, SystemTime)>)>);
+
+impl PlanInputs {
+    pub fn read(files: &[PathBuf]) -> Self {
+        Self(
+            files
+                .iter()
+                .map(|file| {
+                    let stamp = std::fs::metadata(file)
+                        .ok()
+                        .and_then(|meta| Some((meta.len(), meta.modified().ok()?)));
+                    (file.clone(), stamp)
+                })
+                .collect(),
+        )
+    }
+
+    /// Whether every file still stands as it did when read.
+    pub fn current(&self) -> bool {
+        let files: Vec<PathBuf> = self.0.iter().map(|(file, _)| file.clone()).collect();
+        Self::read(&files) == *self
+    }
+}
+
+/// `path` with `.` and `..` resolved without touching the disk, so it compares
+/// equal to the paths a watcher reports.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            part => out.push(part),
+        }
+    }
+    out
+}
+
+/// A path git printed with `-z`. Elsewhere than Unix a name that isn't UTF-8
+/// is skipped: the watch then misses its edits, which the backstop refresh
+/// still shows.
+fn git_path(bytes: &[u8]) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(PathBuf::from(OsStr::from_bytes(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        std::str::from_utf8(bytes).ok().map(PathBuf::from)
+    }
+}
+
+/// Resolve [`DiffPlan`] for `dir` with two git commands, `rev-parse` and
+/// `ls-files`. `None` where `dir` isn't in a work tree git will read.
+pub fn diff_plan(dir: &Path) -> Option<DiffPlan> {
+    let git = |args: &[&str]| {
+        git_read_command()
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .profiled_output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| out.stdout)
+    };
+    let dirs = String::from_utf8(git(&[
+        "rev-parse",
+        "--show-toplevel",
+        "--absolute-git-dir",
+    ])?)
+    .ok()?;
+    let mut lines = dirs.lines();
+    let toplevel = lines.next()?.to_string();
+    let git_dir = lexical(Path::new(lines.next()?));
+    // As [`git_ref_stamp`] finds it, from the `commondir` file.
+    let common = lexical(&common_git_dir(&git_dir));
+    let state = vec![git_dir.join("HEAD"), git_dir.join("index")];
+    // Before listing: a change after this makes the plan stale, never the
+    // other way round.
+    let inputs = PlanInputs::read(&state);
+    let (tracked, submodules) = tracked_files(&git(&["ls-files", "-z", "-s", "--", "."])?);
+    let head = (!GIT_DISCOVERY_ENV
+        .iter()
+        .any(|key| std::env::var_os(key).is_some()))
+    .then(|| settled_head(&git_dir, &common))
+    .flatten();
+    let mut refs = vec![
+        common.join("packed-refs"),
+        common.join("reftable").join("tables.list"),
+    ];
+    if git_dir != common {
+        refs.push(git_dir.join("reftable").join("tables.list"));
+    }
+    // The branch HEAD names, where its loose ref would be.
+    if let Some(refname) = head
+        .as_deref()
+        .and_then(|head| std::str::from_utf8(head).ok())
+        .and_then(|head| head.trim_end().strip_prefix("ref:"))
+        .map(str::trim)
+        .filter(|refname| is_valid_ref_name(refname))
+    {
+        let per_worktree = !refname.starts_with("refs/")
+            || ["refs/bisect/", "refs/worktree/", "refs/rewritten/"]
+                .iter()
+                .any(|prefix| refname.starts_with(prefix));
+        refs.push(if per_worktree { &git_dir } else { &common }.join(refname));
+    }
+    Some(DiffPlan {
+        toplevel,
+        tracked,
+        state,
+        refs,
+        settled: head.is_some() && !submodules,
+        inputs,
+    })
+}
+
+/// The paths in `git ls-files -z -s` output (`<mode> <object> <stage>\t<path>`),
+/// once each though a conflict lists a path per stage, and whether any is a
+/// submodule (mode 160000).
+fn tracked_files(listing: &[u8]) -> (Vec<PathBuf>, bool) {
+    let mut submodules = false;
+    let mut tracked: Vec<PathBuf> = listing
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| {
+            let tab = entry.iter().position(|byte| *byte == b'\t')?;
+            submodules |= entry.starts_with(b"160000 ");
+            git_path(&entry[tab + 1..])
+        })
+        .collect();
+    tracked.dedup();
+    (tracked, submodules)
+}
+
+/// What a diff pane shows for a folder git won't read, or that's gone.
+pub fn not_a_git_repo(dir: &Path) -> String {
+    tf(
+        "# {dir}\n\nNot a git repository.\n",
+        &[("dir", &dir.display().to_string())],
+    )
+}
+
 /// Working-tree changes for `dir`: tracked changes vs HEAD, scoped to the folder.
 /// Returns display-ready unified-diff text, or a short human message when there's
 /// nothing to show or `dir` isn't a git repo. Untracked/new files are not shown
 /// (we can't tell agent-created files from pre-existing ones without a baseline).
-pub fn git_diff(dir: &Path) -> String {
+/// With the repository's `toplevel` already known (from a [`DiffPlan`]) it runs
+/// one git command instead of two.
+pub fn git_diff(dir: &Path, toplevel: Option<&str>) -> String {
     let git = |args: &[&str]| {
         git_read_command()
             .arg("-C")
@@ -1812,14 +1990,12 @@ pub fn git_diff(dir: &Path) -> String {
     };
 
     // Resolve the repo root (also our "is this a git repo?" check, in one call).
-    let toplevel = match git(&["rev-parse", "--show-toplevel"]) {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => {
-            return tf(
-                "# {dir}\n\nNot a git repository.\n",
-                &[("dir", &dir.display().to_string())],
-            );
-        }
+    let toplevel = match toplevel {
+        Some(toplevel) => toplevel.to_string(),
+        None => match git(&["rev-parse", "--show-toplevel"]) {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            _ => return not_a_git_repo(dir),
+        },
     };
 
     // A header so it's always obvious which folder the diff is reading from, and
@@ -6227,7 +6403,17 @@ mod tests {
         std::fs::write(repo.join("sub/insub.txt"), "a\nSUBCHANGED\n").unwrap();
         std::fs::write(repo.join("untracked_new.txt"), "nope\n").unwrap();
 
-        let diff = git_diff(&repo);
+        let diff = git_diff(&repo, None);
+        // A watched pane's refresh, which knows the top level, shows the same.
+        for dir in [repo.clone(), repo.join("sub")] {
+            let plan = diff_plan(&dir).expect("a work tree");
+            assert_eq!(
+                git_diff(&dir, Some(&plan.toplevel)),
+                git_diff(&dir, None),
+                "{}",
+                dir.display()
+            );
+        }
         // The header names the exact folder being diffed.
         assert!(
             diff.contains(&repo.display().to_string()),
@@ -6246,7 +6432,7 @@ mod tests {
 
         // Diffing the subfolder is scoped to it: flags the parent repo, shows the
         // subfolder's change, and does NOT include the parent's tracked.txt change.
-        let sub_diff = git_diff(&repo.join("sub"));
+        let sub_diff = git_diff(&repo.join("sub"), None);
         assert!(
             sub_diff.contains("subfolder of git repo"),
             "subfolder note shown:\n{sub_diff}"
@@ -6265,9 +6451,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&plain);
         std::fs::create_dir_all(&plain).unwrap();
         assert!(
-            git_diff(&plain).contains("Not a git repository."),
+            git_diff(&plain, None).contains("Not a git repository."),
             "non-repo message"
         );
+        assert!(diff_plan(&plain).is_none(), "nothing to watch");
 
         let _ = std::fs::remove_dir_all(&plain);
         let _ = std::fs::remove_dir_all(&repo);
