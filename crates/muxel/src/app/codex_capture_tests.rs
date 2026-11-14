@@ -8,27 +8,113 @@ use crate::theme;
 use gpui::{TestAppContext, WindowHandle};
 use muxel_core::{AgentPreset, CodexResumePath, CodexSession, Instance, Project, RemoteRef};
 use muxel_terminal::{CommandSpec, TerminalLaunch};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 use uuid::Uuid;
 
+/// The test's storage root, removed on drop. A root that won't go fails the
+/// test, and the panic names the path that refused, so one sighting is enough
+/// to trace what held it.
 struct TempRoot(PathBuf);
 
 impl Drop for TempRoot {
     fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.0).unwrap();
+        let Err(error) = std::fs::remove_dir_all(&self.0) else {
+            return;
+        };
+        let left = left_under(&self.0);
+        let refused = match remove_naming_refusal(&self.0) {
+            Err(refusal) => format!("first path that refused: {refusal}"),
+            Ok(()) => "nothing refused a second pass; the holder let go in between".to_string(),
+        };
+        let report = format!(
+            "could not remove test root {}: {error}\n{refused}\nleft under it: {left:?}",
+            self.0.display()
+        );
+        if std::thread::panicking() {
+            // A second panic would abort and hide the test's own failure.
+            eprintln!("{report}");
+        } else {
+            panic!("{report}");
+        }
     }
+}
+
+/// Every path under `root`, relative to it, sorted.
+fn left_under(root: &Path) -> Vec<String> {
+    let mut left = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            left.push(
+                path.strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string(),
+            );
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                dirs.push(path);
+            }
+        }
+    }
+    left.sort();
+    left
+}
+
+/// Remove `path`, deepest first, stopping at the first path that refuses.
+/// `remove_dir_all` stops there too but doesn't say where.
+fn remove_naming_refusal(path: &Path) -> Result<(), String> {
+    let refused = |what: &str, error: std::io::Error| format!("{what} {}: {error}", path.display());
+    let meta = std::fs::symlink_metadata(path).map_err(|e| refused("could not read", e))?;
+    if !meta.is_dir() {
+        return std::fs::remove_file(path).map_err(|e| refused("could not remove file", e));
+    }
+    let entries = std::fs::read_dir(path).map_err(|e| refused("could not list", e))?;
+    for entry in entries {
+        remove_naming_refusal(&entry.map_err(|e| refused("could not list", e))?.path())?;
+    }
+    std::fs::remove_dir(path).map_err(|e| refused("could not remove folder", e))
+}
+
+#[test]
+fn a_root_that_will_not_go_names_the_path_that_refused() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    let root = std::env::temp_dir().join(format!("muxel-codex-capture-held-{}", Uuid::new_v4()));
+    let held = root.join("data").join("held.lock");
+    std::fs::create_dir_all(held.parent().unwrap()).unwrap();
+    std::fs::write(&held, b"").unwrap();
+    // No sharing at all, so nothing can delete it while this handle lives.
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&held)
+        .unwrap();
+    let panic = std::panic::catch_unwind(|| drop(TempRoot(root.clone()))).unwrap_err();
+    drop(handle);
+    std::fs::remove_dir_all(&root).unwrap();
+    let report = panic.downcast_ref::<String>().unwrap();
+    assert!(
+        report.contains(&format!("could not remove file {}", held.display())),
+        "{report}"
+    );
+    assert!(
+        report.contains(r#"left under it: ["data", "data\\held.lock"]"#),
+        "{report}"
+    );
 }
 
 pub(super) fn with_app(run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelApp>)) {
     let root = std::env::temp_dir().join(format!("muxel-codex-capture-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
-    let _temp = TempRoot(root.clone());
+    // Declared first, dropped last: the lease is held until the root is gone,
+    // so the next app test can't start while it is still being removed.
     let _storage = muxel_store::test_support::set_root(root.clone());
+    let _temp = TempRoot(root.clone());
     assert_eq!(muxel_store::data_dir(), Some(root.join("data")));
     assert_eq!(muxel_store::config_dir(), Some(root.join("config")));
     let mut cx = TestAppContext::single();

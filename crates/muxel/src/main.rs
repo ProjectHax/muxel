@@ -28,6 +28,7 @@ mod present_pump;
 mod remote_paste;
 mod secrets;
 mod session_binding;
+mod settings_model;
 mod settings_view;
 mod sound;
 mod split;

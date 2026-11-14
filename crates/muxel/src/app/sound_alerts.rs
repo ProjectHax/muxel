@@ -1,8 +1,9 @@
 //! Sound alerts in the app: ringing the chime the status tick's `AlertGate`
-//! lets through, and Settings → Sounds (on/off per alert, the user's own sound
+//! lets through, and Settings → Notifications (on/off per alert, the user's own sound
 //! files, volume). Decoding and playback live in `crate::sound`; when to ring
 //! lives in `muxel_core::sound_alert`.
 
+use super::settings_kit::{Block, Click, Form, Group, Row, Seg};
 use super::*;
 use crate::sound::{self, Clip};
 use muxel_core::sound_alert::{DEFAULT_VOLUME, volume_gain};
@@ -29,7 +30,7 @@ impl MuxelApp {
         stop
     }
 
-    /// Settings → Sounds "Play". A custom file is decoded first so one that
+    /// Settings → Notifications "Play". A custom file is decoded first so one that
     /// won't play says why here; a real alert would quietly use the built-in.
     fn preview_alert(&mut self, sound: AlertSound, cx: &mut Context<Self>) {
         match sound.file(&self.settings).map(Path::to_path_buf) {
@@ -130,135 +131,146 @@ impl MuxelApp {
         cx.notify();
     }
 
-    pub(super) fn render_settings_sounds(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// Settings → Notifications: desktop notifications, then the chimes.
+    pub(super) fn notification_blocks(&self, form: &Form, cx: &mut Context<Self>) -> Vec<Block> {
         let settings = &self.settings;
-        let muted = cx.theme().muted_foreground;
-        let note = |text: SharedString| div().text_xs().text_color(muted).child(text);
         let volume = i32::from(settings.sound_volume);
-
-        v_flex()
-            .gap_3()
-            .max_w(px(560.0))
-            .child(note(t(
-                "muxel chimes when an agent finishes, or needs you, in a pane you aren't looking at. Only agents ring — never shells.",
-            )))
-            .child(self.setting_check(
-                "snd-done",
-                settings.sound_on_done,
-                &t("Chime when an agent finishes"),
-                cx,
-                |s, on| s.sound_on_done = on,
-            ))
-            .child(self.alert_sound_row(AlertSound::Done, cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .mr_1()
-                            .child(t("Chime for")),
-                    )
-                    .child(self.done_chime_when_btn(
-                        muxel_core::DONE_CHIME_BACKGROUND,
-                        &t("Background panes only"),
-                        settings.sound_on_done,
-                        cx,
-                    ))
-                    .child(self.done_chime_when_btn(
-                        muxel_core::DONE_CHIME_ALWAYS,
-                        &t("Every pane"),
-                        settings.sound_on_done,
-                        cx,
-                    )),
+        let always = settings.done_chime_always();
+        let when_seg = |value: &'static str, label: SharedString, selected: bool| {
+            Seg::new(
+                label,
+                selected,
+                cx.listener(move |this, _e, _w, cx| {
+                    this.settings.sound_done_when = value.to_string();
+                    this.persist_settings();
+                    cx.notify();
+                }),
             )
-            .child(note(t(
-                "Background panes are any pane but the one you're focused on while muxel is the active window. Every pane also chimes when the agent you're watching finishes.",
-            )))
-            .child(self.setting_check(
-                "snd-blocked",
-                settings.sound_on_blocked,
-                &t("Chime when an agent needs your input"),
-                cx,
-                |s, on| s.sound_on_blocked = on,
-            ))
-            .child(self.alert_sound_row(AlertSound::Blocked, cx))
-            .child(self.settings_label(&t("Volume"), cx))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("snd-vol-dec")
-                            .ghost()
-                            .label("−")
-                            .disabled(volume == 0)
-                            .on_click(cx.listener(move |this, _e, _w, cx| {
-                                this.set_alert_volume(volume - 10, cx)
-                            })),
-                    )
-                    .child(div().w(rems(4.0)).text_center().child(format!("{volume}%")))
-                    .child(
-                        Button::new("snd-vol-inc")
-                            .ghost()
-                            .label("+")
-                            .disabled(volume == 100)
-                            .on_click(cx.listener(move |this, _e, _w, cx| {
-                                this.set_alert_volume(volume + 10, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("snd-vol-reset")
-                            .ghost()
-                            .small()
-                            .label(t("Default"))
-                            .disabled(settings.sound_volume == DEFAULT_VOLUME)
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.set_alert_volume(i32::from(DEFAULT_VOLUME), cx)
-                            })),
-                    ),
-            )
-            .child(note(t(
-                "A pane chimes once, then stays quiet for that alert until you've looked at it (or five minutes pass), so an agent going back and forth between working and done doesn't keep ringing. Alerts that land together play as one chime.",
-            )))
-            .child(note(t(
-                "Your own sound can be WAV, AIFF, MP3, OGG, FLAC or M4A. Anything longer than 10 seconds is cut short.",
-            )))
-            .into_any_element()
-    }
-
-    /// Settings → Sounds: one choice of which panes the done chime rings for.
-    fn done_chime_when_btn(
-        &self,
-        value: &'static str,
-        label: &str,
-        enabled: bool,
-        cx: &mut Context<Self>,
-    ) -> Button {
-        let selected = if value == muxel_core::DONE_CHIME_ALWAYS {
-            self.settings.done_chime_always()
-        } else {
-            !self.settings.done_chime_always()
+            .disabled(!settings.sound_on_done)
         };
-        Button::new(SharedString::from(format!("snd-done-when-{value}")))
-            .ghost()
-            .small()
-            .selected(selected)
-            .disabled(!enabled)
-            .label(label.to_string())
-            .on_click(cx.listener(move |this, _e, _w, cx| {
-                this.settings.sound_done_when = value.to_string();
-                this.persist_settings();
-                cx.notify();
-            }))
+        let done_when = form.segmented(
+            "snd-done-when",
+            vec![
+                when_seg(
+                    muxel_core::DONE_CHIME_BACKGROUND,
+                    t("Background panes"),
+                    !always,
+                ),
+                when_seg(muxel_core::DONE_CHIME_ALWAYS, t("Every pane"), always),
+            ],
+        );
+        let step = |percent: i32| -> Click {
+            Box::new(cx.listener(move |this, _e, _w, cx| this.set_alert_volume(percent, cx)))
+        };
+        let volume_control = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                Button::new("snd-vol-reset")
+                    .ghost()
+                    .small()
+                    .label(t("Default"))
+                    .disabled(settings.sound_volume == DEFAULT_VOLUME)
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        this.set_alert_volume(i32::from(DEFAULT_VOLUME), cx)
+                    })),
+            )
+            .child(form.stepper(
+                "snd-vol",
+                format!("{volume}%"),
+                (volume > 0).then(|| step(volume - 10)),
+                (volume < 100).then(|| step(volume + 10)),
+            ));
+
+        vec![
+            Block::Group(Group::new(
+                t("Desktop"),
+                vec![
+                    Row::narrow(
+                        t("Desktop notifications"),
+                        form.switch(
+                            "b-notif",
+                            self.notifications_enabled,
+                            true,
+                            cx.listener(|this, on: &bool, _w, cx| {
+                                this.notifications_enabled = *on;
+                                this.persist_settings();
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .desc(t("When an agent finishes a turn or needs your attention.")),
+                    Row::new(
+                        t("Check that they arrive"),
+                        Button::new("test-notif")
+                            .outline()
+                            .small()
+                            .icon(IconName::Bell)
+                            .label(t("Send a test notification"))
+                            .on_click(cx.listener(|_this, _e, _w, _cx| {
+                                notify(
+                                    t("muxel test notification").to_string(),
+                                    t("If you can see this, notifications are working.")
+                                        .to_string(),
+                                    None,
+                                );
+                            })),
+                    )
+                    .desc(t("Your desktop decides whether muxel's notifications are shown.")),
+                ],
+            )),
+            Block::Group(Group::new(
+                t("Chimes"),
+                vec![
+                    Row::narrow(
+                        t("Chime when an agent finishes"),
+                        self.setting_switch(form, "snd-done", settings.sound_on_done, cx, |s, on| {
+                            s.sound_on_done = on
+                        }),
+                    )
+                    .desc(t("Only agents ring, never shells."))
+                    .keywords("sound alert"),
+                    Row::stacked(
+                        t("Finish sound"),
+                        self.alert_sound_control(AlertSound::Done, form, cx),
+                    ),
+                    Row::new(t("Chime for"), done_when).desc(t(
+                        "Background panes are any pane but the one you're focused on while muxel is the active window. Every pane also chimes when the agent you're watching finishes.",
+                    )),
+                    Row::narrow(
+                        t("Chime when an agent needs your input"),
+                        self.setting_switch(
+                            form,
+                            "snd-blocked",
+                            settings.sound_on_blocked,
+                            cx,
+                            |s, on| s.sound_on_blocked = on,
+                        ),
+                    )
+                    .keywords("sound alert blocked"),
+                    Row::stacked(
+                        t("Input sound"),
+                        self.alert_sound_control(AlertSound::Blocked, form, cx),
+                    ),
+                    Row::new(t("Volume"), volume_control).desc(t(
+                        "A pane chimes once, then stays quiet for that alert until you've looked at it (or five minutes pass), so an agent going back and forth between working and waiting doesn't ring over and over.",
+                    )),
+                ],
+            )),
+            Block::Note(t(
+                "Your own sound can be WAV, AIFF, MP3, OGG, FLAC or M4A. Anything longer than 10 seconds is cut short.",
+            )),
+        ]
     }
 
     /// One alert's sound: what plays, with Play / Choose / Use built-in.
-    fn alert_sound_row(&self, sound: AlertSound, cx: &mut Context<Self>) -> impl IntoElement {
+    fn alert_sound_control(
+        &self,
+        sound: AlertSound,
+        form: &Form,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let id = match sound {
             AlertSound::Done => "done",
             AlertSound::Blocked => "blocked",
@@ -274,19 +286,18 @@ impl MuxelApp {
             .as_ref()
             .filter(|(s, _)| *s == sound)
             .map(|(_, e)| e.clone());
-        let muted = cx.theme().muted_foreground;
-        let danger = cx.theme().danger;
+        let pal = form.pal;
         v_flex()
-            .pl(px(28.0))
             .gap_1()
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_2()
                     .child(
                         Button::new(SharedString::from(format!("snd-{id}-play")))
-                            .ghost()
+                            .outline()
                             .small()
                             .icon(Icon::empty().path("icons/volume-2.svg"))
                             .tooltip(t("Play"))
@@ -294,7 +305,13 @@ impl MuxelApp {
                                 cx.listener(move |this, _e, _w, cx| this.preview_alert(sound, cx)),
                             ),
                     )
-                    .child(div().max_w(px(240.0)).truncate().text_sm().child(name))
+                    .child(
+                        div()
+                            .max_w(form.rem * 15.0)
+                            .truncate()
+                            .text_sm()
+                            .child(name),
+                    )
                     .child(
                         Button::new(SharedString::from(format!("snd-{id}-choose")))
                             .ghost()
@@ -318,10 +335,11 @@ impl MuxelApp {
             .children(missing.then(|| {
                 div()
                     .text_xs()
-                    .text_color(muted)
+                    .text_color(pal.dim)
                     .child(t("File not found — the built-in chime plays instead."))
             }))
-            .children(error.map(|e| div().text_xs().text_color(danger).child(e)))
+            .children(error.map(|e| div().text_xs().text_color(pal.danger).child(e)))
+            .into_any_element()
     }
 }
 

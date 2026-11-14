@@ -342,7 +342,7 @@ pub fn transcribe_local(
     _language: &str,
 ) -> Result<String> {
     bail!(
-        "local transcription isn't available on Windows on ARM — pick a Provider in Settings → Speech"
+        "local transcription isn't available on Windows on ARM — pick a Provider in Settings → Dictation"
     )
 }
 

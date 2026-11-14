@@ -432,7 +432,7 @@ where
 /// so the reply needs no audio decoder.
 fn synth_provider(text: &str, cfg: &VoiceConfig) -> Result<Vec<f32>> {
     if cfg.api_key.is_empty() {
-        bail!("set a provider API key in Settings → Speech");
+        bail!("set a provider API key in Settings → Dictation");
     }
     let body = muxel_core::tts::build_speech_request(
         &cfg.provider_model,

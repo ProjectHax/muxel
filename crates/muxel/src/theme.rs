@@ -2,6 +2,7 @@
 //! switch themes/mode at runtime, and derive a terminal color palette from the
 //! active gpui-component theme.
 
+use crate::settings_model::{Rgb, ThemeInputs};
 use gpui::{Action, App, Global, Hsla, Rgba, SharedString, px};
 use gpui_component::{ActiveTheme, Theme, ThemeRegistry};
 use muxel_terminal::TerminalPalette;
@@ -150,5 +151,202 @@ pub fn palette_from_theme(cx: &App) -> TerminalPalette {
             hsla_to_u32(t.cyan_light),       // 14 bright cyan
             hsla_to_u32(t.foreground),       // 15 bright white
         ],
+    }
+}
+
+/// One swatch per registered theme, in the order the picker lists them. Each
+/// is resolved the way applying it would, so a theme that leaves a colour out
+/// shows the same fallback here as it would in use.
+pub fn theme_swatches(cx: &App) -> Vec<crate::settings_view::ThemeSwatch> {
+    ThemeRegistry::global(cx)
+        .sorted_themes()
+        .into_iter()
+        .map(|config| {
+            let mut theme = cx.theme().clone();
+            theme.apply_config(config);
+            crate::settings_view::ThemeSwatch {
+                name: config.name.clone(),
+                background: theme.background,
+                border: theme.border,
+                bars: [theme.foreground, theme.blue, theme.green, theme.yellow],
+            }
+        })
+        .collect()
+}
+
+/// A theme colour as opaque sRGB, composited over `backdrop` when translucent.
+fn rgb_over(color: Hsla, backdrop: Rgb) -> Rgb {
+    let rgba: Rgba = color.into();
+    let a = rgba.a.clamp(0.0, 1.0);
+    [
+        backdrop[0] + (rgba.r.clamp(0.0, 1.0) - backdrop[0]) * a,
+        backdrop[1] + (rgba.g.clamp(0.0, 1.0) - backdrop[1]) * a,
+        backdrop[2] + (rgba.b.clamp(0.0, 1.0) - backdrop[2]) * a,
+    ]
+}
+
+/// An opaque sRGB colour as the `Hsla` gpui paints with.
+pub fn hsla(rgb: Rgb) -> Hsla {
+    Rgba {
+        r: rgb[0],
+        g: rgb[1],
+        b: rgb[2],
+        a: 1.0,
+    }
+    .into()
+}
+
+/// The colours of `theme` that the Settings window derives its palette from.
+pub fn settings_theme_inputs(theme: &Theme) -> ThemeInputs {
+    // A translucent background has nothing behind it but the window.
+    let background = rgb_over(theme.background, [0.0; 3]);
+    let over = |color: Hsla| rgb_over(color, background);
+    let sidebar = over(theme.sidebar);
+    ThemeInputs {
+        background,
+        foreground: over(theme.foreground),
+        muted_foreground: over(theme.muted_foreground),
+        border: over(theme.border),
+        sidebar,
+        sidebar_accent: rgb_over(theme.sidebar_accent, sidebar),
+        sidebar_accent_foreground: rgb_over(theme.sidebar_accent_foreground, sidebar),
+        primary: over(theme.primary),
+        warning: over(theme.warning),
+        danger: over(theme.danger),
+        success: over(theme.success),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ThemeAssets, settings_theme_inputs};
+    use crate::settings_model::{
+        CONTROL_CONTRAST, DIM_CONTRAST, HIGHLIGHT_CONTRAST, contrast, palette,
+    };
+    use gpui_component::{Theme, ThemeColor, ThemeConfig, ThemeSet};
+    use std::rc::Rc;
+
+    /// Every bundled theme, plus gpui-component's two built-in defaults, resolved
+    /// the way the running app resolves them.
+    fn resolved_themes() -> Vec<(String, Theme)> {
+        let mut configs: Vec<ThemeConfig> = Vec::new();
+        for file in ThemeAssets::iter() {
+            let embedded = ThemeAssets::get(&file).expect("embedded theme");
+            let text = std::str::from_utf8(&embedded.data).expect("utf-8 theme");
+            let set: ThemeSet =
+                serde_json::from_str(text).unwrap_or_else(|e| panic!("{file} does not parse: {e}"));
+            configs.extend(set.themes);
+        }
+        let mut themes: Vec<(String, Theme)> = vec![
+            (
+                "Default Light".to_string(),
+                Theme::from(&*ThemeColor::light()),
+            ),
+            (
+                "Default Dark".to_string(),
+                Theme::from(&*ThemeColor::dark()),
+            ),
+        ];
+        for config in configs {
+            let mut theme = Theme::from(&*ThemeColor::dark());
+            let name = config.name.to_string();
+            theme.apply_config(&Rc::new(config));
+            themes.push((name, theme));
+        }
+        themes
+    }
+
+    /// The Settings window has to stay usable in every theme muxel ships, not
+    /// only the default: text and secondary text legible on every surface it
+    /// sits on, controls visible against their cards, and a switch that is on
+    /// distinguishable from one that is off.
+    #[test]
+    fn settings_palette_is_legible_in_every_bundled_theme() {
+        let themes = resolved_themes();
+        assert!(themes.len() > 30, "only {} themes resolved", themes.len());
+        let mut failures: Vec<String> = Vec::new();
+        for (name, theme) in &themes {
+            let inputs = settings_theme_inputs(theme);
+            let p = palette(&inputs);
+            let mut check = |what: &str, ratio: f32, min: f32| {
+                if ratio + 0.005 < min {
+                    failures.push(format!("{name}: {what} is {ratio:.2}, needs {min:.2}"));
+                }
+            };
+            for (surface_name, surface) in [
+                ("background", p.background),
+                ("card", p.card),
+                ("nav", p.nav),
+                ("track", p.track),
+            ] {
+                // Secondary text reads wherever primary text can; a theme whose
+                // own text is fainter than that sets the ceiling for both.
+                let ceiling = contrast(p.text, surface).min(DIM_CONTRAST);
+                check(
+                    &format!("secondary text on {surface_name}"),
+                    contrast(p.dim, surface),
+                    ceiling,
+                );
+                check(
+                    &format!("text on {surface_name}"),
+                    contrast(p.text, surface),
+                    CONTROL_CONTRAST,
+                );
+            }
+            check(
+                "selected section text",
+                contrast(p.nav_selected_text, p.nav_selected),
+                DIM_CONTRAST,
+            );
+            check(
+                "selected section against the list",
+                contrast(p.nav_selected, p.nav),
+                1.1,
+            );
+            check(
+                "switch on against its card",
+                contrast(p.accent, p.card),
+                CONTROL_CONTRAST,
+            );
+            check(
+                "thumb on a switch that is on",
+                contrast(p.on_accent, p.accent),
+                CONTROL_CONTRAST,
+            );
+            check(
+                "thumb on a switch that is off",
+                contrast(p.switch_off_thumb, p.switch_off),
+                CONTROL_CONTRAST,
+            );
+            check(
+                "chosen segment against its track",
+                contrast(p.track_selected, p.track),
+                1.15,
+            );
+            check(
+                "chosen segment text",
+                contrast(p.text, p.track_selected),
+                CONTROL_CONTRAST,
+            );
+            check("card border", contrast(p.card_border, p.background), 1.2);
+            check(
+                "search highlight text",
+                contrast(p.text, p.highlight),
+                contrast(p.text, p.card).min(HIGHLIGHT_CONTRAST),
+            );
+            for (status_name, status) in [
+                ("warning", p.warning),
+                ("danger", p.danger),
+                ("success", p.success),
+            ] {
+                let ceiling = contrast(p.text, p.card).min(DIM_CONTRAST);
+                check(
+                    &format!("{status_name} text"),
+                    contrast(status, p.card),
+                    ceiling,
+                );
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
     }
 }

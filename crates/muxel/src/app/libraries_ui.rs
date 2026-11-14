@@ -4,6 +4,7 @@
 //! Git runs on its own threads (`crate::libraries::run_job`), never on the UI
 //! thread or the gpui executor; results come back over a channel.
 
+use super::settings_kit::{Form, Group, ListItem, Row, add_button, delete_button, title_button};
 use super::*;
 use crate::libraries::{
     LibraryListMarker, add_error_text, agent_pick_hint_text, branch_text, copy_error_text,
@@ -776,110 +777,104 @@ impl MuxelApp {
 // ---------------------------------------------------------------------------
 
 impl MuxelApp {
-    pub(super) fn render_settings_libraries(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut list = v_flex().w(rems(10.0)).flex_none().gap_1();
-        for config in &self.library_hub.configs {
-            let id = config.id;
-            let selected = self.settings_ui.selected_library == Some(id);
-            let fg = if selected {
-                cx.theme().sidebar_accent_foreground
-            } else {
-                cx.theme().foreground
-            };
-            let mut row = div()
-                .id(SharedString::from(format!("library-row-{id}")))
-                .flex()
-                .items_center()
-                .gap_2()
-                .w_full()
-                .px_2()
-                .py_1()
-                .rounded(cx.theme().radius)
-                .cursor_pointer()
-                .text_color(fg)
-                .on_click(cx.listener(move |this, _e, window, cx| {
-                    this.open_library_details(id, window, cx)
-                }))
-                .child(Icon::new(IconName::BookOpen).small())
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_sm()
-                        .child(display_name(config)),
-                );
-            let marker =
-                library_list_marker(self.library_hub.actions(id), self.library_hub.runtime(id));
-            if let Some(marker) = marker {
-                let shape = match marker {
-                    LibraryListMarker::Busy => div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("…"),
-                    LibraryListMarker::Error => {
-                        div().size(px(7.0)).rounded_full().bg(cx.theme().danger)
-                    }
-                };
-                let tip = SharedString::from(library_list_marker_tooltip(marker));
-                row = row.child(
+    pub(super) fn render_settings_libraries(
+        &self,
+        form: &Form,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pal = form.pal;
+        let items = self
+            .library_hub
+            .configs
+            .iter()
+            .map(|config| {
+                let id = config.id;
+                let selected = self.settings_ui.selected_library == Some(id);
+                let fg = form.item_fg(selected, false);
+                let marker =
+                    library_list_marker(self.library_hub.actions(id), self.library_hub.runtime(id));
+                let trailing = marker.map(|marker| {
+                    let shape = match marker {
+                        LibraryListMarker::Busy => div()
+                            .text_sm()
+                            .text_color(if selected { fg } else { pal.dim })
+                            .child("…"),
+                        LibraryListMarker::Error => {
+                            div().size(px(7.0)).rounded_full().bg(pal.danger)
+                        }
+                    };
+                    let tip = SharedString::from(library_list_marker_tooltip(marker));
                     div()
                         .id(SharedString::from(format!("library-marker-{id}")))
                         .flex_none()
                         .child(shape)
                         .tooltip(move |window, cx| {
                             gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
-                        }),
-                );
-            }
-            if selected {
-                row = row.bg(cx.theme().sidebar_accent);
-            } else {
-                row = row.hover(|s| s.bg(cx.theme().accent));
-            }
-            list = list.child(row);
-        }
-        list = list.child(
-            Button::new("add-library")
-                .ghost()
-                .icon(IconName::Plus)
-                .label(t("Add library"))
-                .on_click(cx.listener(|this, _e, _w, cx| this.show_library_add_form(cx))),
-        );
-
+                        })
+                        .into_any_element()
+                });
+                ListItem {
+                    id: SharedString::from(format!("library-row-{id}")),
+                    icon: Some(
+                        Icon::new(IconName::BookOpen)
+                            .small()
+                            .text_color(fg)
+                            .into_any_element(),
+                    ),
+                    label: display_name(config).into(),
+                    sub: None,
+                    trailing,
+                    selected,
+                    dim: false,
+                    on_click: Box::new(cx.listener(move |this, _e, window, cx| {
+                        this.open_library_details(id, window, cx)
+                    })),
+                }
+            })
+            .collect();
+        let detail = form.detail();
         let details = match self.settings_ui.selected_library {
             Some(id) if self.library_hub.config(id).is_some() => {
-                self.render_library_details(id, cx)
+                self.render_library_details(id, &detail, cx)
             }
-            _ => self.render_library_add_form(cx),
+            _ => self.render_library_add_form(&detail, cx),
         };
-
-        div()
-            .flex()
-            .flex_row()
-            .gap_4()
-            .child(list)
-            .child(div().flex_1().min_w_0().child(details))
-            .into_any_element()
+        form.master_detail(
+            items,
+            Some(
+                add_button("add-library", t("Add library"))
+                    .on_click(cx.listener(|this, _e, _w, cx| this.show_library_add_form(cx))),
+            ),
+            None,
+            details,
+        )
+        .into_any_element()
     }
 
-    fn render_library_add_form(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_library_add_form(&self, form: &Form, cx: &mut Context<Self>) -> AnyElement {
         let ui = &self.settings_ui;
         v_flex()
-            .gap_2()
-            .max_w(px(560.0))
-            .child(self.settings_label(&t("Repository URL"), cx))
-            .child(Self::wide_input(Input::new(&ui.lib_url)))
-            .child(self.settings_label(&t("Branch"), cx))
-            .child(Self::wide_input(Input::new(&ui.lib_branch)))
-            .child(self.settings_label(&t("Display name"), cx))
-            .child(Self::wide_input(Input::new(&ui.lib_name)))
+            .w(form.w)
+            .gap(form.rem)
+            .child(form.editor_title(None, t("Add a library"), Vec::new()))
+            .child(form.group(
+                Group::new(
+                    "",
+                    vec![
+                        Row::new(t("Repository URL"), form.input(&ui.lib_url)),
+                        Row::new(t("Branch"), form.input(&ui.lib_branch)),
+                        Row::new(t("Display name"), form.input(&ui.lib_name)),
+                    ],
+                ),
+                &[],
+            ))
             .children(
                 ui.lib_add_error
                     .clone()
-                    .map(|msg| div().text_sm().text_color(cx.theme().danger).child(msg)),
+                    .map(|msg| form.status(msg, form.pal.danger)),
             )
             .child(
-                div().flex().gap_2().pt_2().child(
+                div().w(form.w).flex().justify_end().child(
                     Button::new("save-library")
                         .primary()
                         .label(t("Add library"))
@@ -890,10 +885,11 @@ impl MuxelApp {
     }
 
     /// Only the display name is editable; actions are disabled while busy or held.
-    fn render_library_details(&self, id: Uuid, cx: &mut Context<Self>) -> AnyElement {
+    fn render_library_details(&self, id: Uuid, form: &Form, cx: &mut Context<Self>) -> AnyElement {
         let Some(config) = self.library_hub.config(id) else {
             return div().into_any_element();
         };
+        let pal = form.pal;
         let actions = self.library_hub.actions(id);
         let status = library_row_status(
             config,
@@ -901,100 +897,83 @@ impl MuxelApp {
             actions,
             &chrono::Local,
         );
-        let muted = cx.theme().muted_foreground;
-        let danger = cx.theme().danger;
-        let warning = cx.theme().warning;
-        let value = |text: String| div().text_sm().min_w_0().child(text);
-        v_flex()
-            .gap_2()
-            .max_w(px(560.0))
-            .child(self.settings_label(&t("Display name"), cx))
+        let value = |text: String| {
+            div()
+                .w(form.control_w())
+                .text_sm()
+                .text_color(pal.dim)
+                .child(text)
+        };
+        let rename_w = form.control_w() - form.rem * 6.5;
+        let rename = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(form.input_w(
+                &self.settings_ui.lib_rename,
+                if rename_w < px(90.0) {
+                    px(90.0)
+                } else {
+                    rename_w
+                },
+            ))
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Input::new(&self.settings_ui.lib_rename)),
-                    )
-                    .child(
-                        Button::new("rename-library")
-                            .ghost()
-                            .label(t("Save name"))
-                            .on_click(
-                                cx.listener(move |this, _e, _w, cx| this.rename_library(id, cx)),
-                            ),
-                    ),
-            )
-            .child(self.settings_label(&t("Repository URL"), cx))
-            .child(value(config.url.clone()))
-            .child(self.settings_label(&t("Branch"), cx))
-            .child(value(branch_text(&config.branch)))
-            .child(self.settings_label(&t("Last successful pull"), cx))
-            .child(value(status.last_pull))
-            .children(
-                status
-                    .busy
-                    .map(|busy| div().text_sm().text_color(muted).child(busy)),
-            )
+                Button::new("rename-library")
+                    .outline()
+                    .small()
+                    .label(t("Save name"))
+                    .on_click(cx.listener(move |this, _e, _w, cx| this.rename_library(id, cx))),
+            );
+        let mut rows = vec![
+            Row::new(t("Display name"), rename),
+            Row::new(t("Repository URL"), value(config.url.clone())),
+            Row::new(t("Branch"), value(branch_text(&config.branch))),
+            Row::new(t("Last successful pull"), value(status.last_pull)),
+        ];
+        if let Some(counts) = status.counts {
+            rows.push(Row::new(t("Contents"), value(counts)));
+        }
+        let title_actions = vec![
+            Button::new("pull-library")
+                .primary()
+                .small()
+                .label(t("Pull now"))
+                .disabled(!actions.pull_now)
+                .on_click(cx.listener(move |this, _e, _w, cx| this.pull_library_now(id, cx)))
+                .into_any_element(),
+            title_button("resync-library", t("Re-sync"))
+                .tooltip(t("Re-sync from repository"))
+                .disabled(!actions.resync)
+                .on_click(cx.listener(move |this, _e, _w, cx| this.request_library_resync(id, cx)))
+                .into_any_element(),
+            delete_button("remove-library", t("Remove"))
+                .disabled(!actions.remove)
+                .on_click(cx.listener(move |this, _e, _w, cx| this.remove_library(id, cx)))
+                .into_any_element(),
+        ];
+        v_flex()
+            .w(form.w)
+            .gap(form.rem)
+            .child(form.editor_title(None, display_name(config), title_actions))
+            .children(status.busy.map(|busy| form.status(busy, pal.dim)))
             .children(
                 status
                     .errors
                     .into_iter()
-                    .map(|e| div().text_sm().text_color(danger).child(e)),
+                    .map(|error| form.status(error, pal.danger)),
             )
-            .children(status.counts.map(value))
-            .children(
-                status
-                    .discarded
-                    .map(|d| div().text_sm().text_color(warning).child(d)),
-            )
-            .children(
-                status
-                    .warnings
-                    .map(|w| div().text_sm().text_color(muted).child(w)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .pt_2()
-                    .child(
-                        Button::new("pull-library")
-                            .primary()
-                            .label(t("Pull now"))
-                            .disabled(!actions.pull_now)
-                            .on_click(
-                                cx.listener(move |this, _e, _w, cx| this.pull_library_now(id, cx)),
-                            ),
-                    )
-                    .child(
-                        Button::new("resync-library")
-                            .ghost()
-                            .label(t("Re-sync from repository"))
-                            .disabled(!actions.resync)
-                            .on_click(cx.listener(move |this, _e, _w, cx| {
-                                this.request_library_resync(id, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("remove-library")
-                            .ghost()
-                            .label(t("Remove"))
-                            .disabled(!actions.remove)
-                            .on_click(
-                                cx.listener(move |this, _e, _w, cx| this.remove_library(id, cx)),
-                            ),
-                    ),
-            )
+            .child(form.group(Group::new("", rows), &[]))
+            .children(status.discarded.map(|d| form.status(d, pal.warning)))
+            .children(status.warnings.map(|w| form.status(w, pal.dim)))
             .into_any_element()
     }
 
-    fn open_library_details(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_library_details(
+        &mut self,
+        id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(name) = self.library_hub.config(id).map(|c| c.name.clone()) else {
             return;
         };

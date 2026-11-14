@@ -14,7 +14,7 @@
 //!
 //! - `OOMPolicy=continue`: a process killed for memory takes nothing else in
 //!   the pane with it.
-//! - `MemoryMax` from Settings → Behavior's pane memory limit (16 GB by
+//! - `MemoryMax` from Settings → General's pane memory limit (16 GB by
 //!   default), for the pane's processes together, so a runaway is killed
 //!   inside its pane before the computer runs out. Swap is capped at a quarter
 //!   of the limit, so a runaway can't push the rest of the machine into swap

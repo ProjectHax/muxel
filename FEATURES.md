@@ -99,8 +99,8 @@ feature is added or changed, update the matching entry here in the same change**
   active pane.
 - **New agents open as tabs** — the toolbar's agent button and `Ctrl+Alt+1–9`
   add the new agent as a tab in the focused pane, so starting an agent never adds
-  a column. Settings → Behavior → **New agents open** switches them to **In a new
-  pane** instead, which opens each one in a pane of its own to the right of the
+  a column. Settings → General → **Open in** switches them to **New pane**
+  instead, which opens each one in a pane of its own to the right of the
   focused pane. An empty project gets its first pane either way. New Tab, New
   Pane, Split Right/Down, the split buttons and dragging a tab to an edge keep
   doing what they say, whatever the setting. In a per-monitor project window,
@@ -396,7 +396,7 @@ feature is added or changed, update the matching entry here in the same change**
   toggle, or hold `Ctrl+Shift+H` to push-to-talk) records the microphone and
   types the transcript into the **focused** agent's prompt, left unsubmitted so
   you can review before pressing Enter (or enable auto-submit). Two engines,
-  chosen in Settings → Speech: **Local** runs whisper.cpp entirely on your
+  chosen in Settings → Dictation: **Local** runs whisper.cpp entirely on your
   machine (the model downloads once on first use), or a **Provider** — any
   OpenAI-compatible `/audio/transcriptions` endpoint (OpenAI, Groq, a self-hosted
   server) via a base URL + model + API key stored in the OS keychain. Provider
@@ -408,7 +408,7 @@ feature is added or changed, update the matching entry here in the same change**
   microphone privacy screen. (Local whisper isn't
   available on Windows-on-ARM — whisper.cpp can't build there — so use a Provider;
   every other platform has both.)
-- **Spoken wake command** — an opt-in toggle in Settings → Speech: say the wake
+- **Spoken wake command** — an opt-in toggle in Settings → Dictation: say the wake
   phrase (default *"wake up daddy's home"*) into the mic and muxel walks every
   agent pane of every project in turn, relaunching each one whose process isn't
   running, then lands back on the pane you started from. Nothing is drawn over the
@@ -444,13 +444,13 @@ feature is added or changed, update the matching entry here in the same change**
   pause) badge that pauses or resumes it without switching to it. `Ctrl+Shift+R`
   reads / pauses / resumes the focused pane, `Ctrl+Alt+R` starts it over, and
   `Ctrl+Alt+S` stops whatever is speaking; all three are in the `Ctrl+P` palette.
-- **Read Aloud settings** — Settings → Read Aloud: show or hide the read-aloud buttons;
+- **Read Aloud settings** — Settings → Read aloud: show or hide the read-aloud buttons;
   final message vs. whole turn; **auto-read** when the focused pane's agent (or any
   agent) finishes, queued one reply at a time (shells are never auto-read); say the
   agent's name first; a length limit (about 30 s / 1 min / 3 min) that stops at the
   end of a sentence; say "link" instead of spelling out URLs; say only a path's file
   name; read tables row by row or skip them; and the voice itself (below).
-- **The voice** — Settings → Read Aloud picks the synthesizer, in the same three
+- **The voice** — Settings → Read aloud picks the synthesizer, in the same three
   flavours as dictation:
   - **System** (default) — the voice the OS already ships (`say` on macOS, SAPI on
     Windows, `spd-say`/`espeak` on Linux). No model, no key, no network, works on a
@@ -554,7 +554,9 @@ feature is added or changed, update the matching entry here in the same change**
   bright green; once you focus its pane, its sidebar and dashboard icons dim and
   its sidebar pill turns to a green outline, so unread finishes stand out. Screen checks, markers included, skip
   Claude's input box, so a typed or pasted draft doesn't set a Claude pane's
-  status, while permission forms and hints outside the box still do. A draft can
+  status, while permission forms and hints outside the box still do. The box is
+  still found when Claude draws its usage notice into the box's top rule, and
+  after the notice leaves that rule cut short. A draft can
   still count, as before, where muxel can't pick out the box whole: a rule drawn
   below it, a draft line that lands on the box's edge, or bash mode's `!` prompt.
   Grok's unanswered question card reports **blocked** in a pane without a tmux
@@ -630,7 +632,7 @@ feature is added or changed, update the matching entry here in the same change**
   the first phase and just stops, waiting, with the todo list still half-unchecked.
   Each agent pane has an **Auto** toggle in its header: while it's on, muxel watches
   the pane and, whenever the agent goes idle with work still to do, types `continue`
-  and presses Enter for you. The message is yours to change in Settings → Behavior
+  and presses Enter for you. The message is yours to change in Settings → General
   → Auto-continue message (kept to one line; blank restores `continue`), and
   right-clicking a pane's **Auto** button gives that one pane its own, in a popup
   pre-filled with what it types now. A pane's message stays with it, across
@@ -855,7 +857,7 @@ feature is added or changed, update the matching entry here in the same change**
   add more browser presets with their own homepages — in **Settings → Agents**
   (default `duckduckgo.com`; a bare domain gets `https://`). On macOS/Windows it's
   an embedded pane in the layout; on Linux it opens in a separate browser window.
-- **Optional** — Settings → Behavior → "Open ctrl+clicked links in the built-in
+- **Optional** — Settings → General → "Open links in the built-in
   browser" (default on); off routes every link to the system browser.
 
 ## Notifications
@@ -865,7 +867,7 @@ feature is added or changed, update the matching entry here in the same change**
   focused — no toast pops over the app you're already looking at (the in-app feed
   still records it). Clicking the notification raises muxel and jumps to the pane
   that fired it.
-- **Sound alerts** (Settings → Sounds) — a chime when an agent finishes, and a
+- **Sound alerts** (Settings → Notifications) — a chime when an agent finishes, and a
   different one when it's blocked waiting on you, in a pane you aren't looking at
   (even while muxel is focused, so another pane's agent can call you over). Set
   **Chime for** to **Every pane** and the done chime also rings when the agent in
@@ -890,7 +892,7 @@ feature is added or changed, update the matching entry here in the same change**
   many notifications it holds, so incoming notifications stop pushing PROJECTS
   down; the choice is remembered per workspace.
 - **Controls** — an enable/disable toggle and a "send test notification" button.
-- **System tray** (Settings → Behavior → "Minimize to the system tray on close") —
+- **System tray** (Settings → General → "Minimize to the system tray on close") —
   closing the window iconifies muxel to a tray icon instead of quitting. The tray
   menu lists every agent with its live status and the most recent notifications;
   clicking one restores muxel and focuses that project + pane, and "Quit" exits for
@@ -898,7 +900,7 @@ feature is added or changed, update the matching entry here in the same change**
   KDE, the AppIndicator extension on GNOME); Windows/macOS use the notification-area
   / status-bar item. (Stock GPUI can only iconify, so the window still appears in the
   taskbar; restoring from the tray is best-effort on Wayland — the dash always works.)
-- **Developer console** (Settings → Behavior → "Developer console", toggled with F12) —
+- **Developer console** (Settings → General → "Developer console", toggled with F12) —
   an opt-in popped-out window logging errors as they happen. A failed agent launch
   shows the program it tried, the working directory, and the OS error/code; git, save,
   and SSH errors land here too. Timestamped, newest first, selectable/copyable, with a
@@ -1303,7 +1305,7 @@ feature is added or changed, update the matching entry here in the same change**
   outside muxel's control, so a program is not guaranteed those five seconds.
 - **Per-process memory limit (Windows)** — each local pane's process tree runs in
   its own job object, and every process in it can commit at most 16 GB by default
-  (Settings → Behavior: Off, 8, 16, 32 or 64 GB; a change applies to panes started
+  (Settings → General: Off, 8, 16, 32 or 64 GB; a change applies to panes started
   after it). A process that asks for more is refused, which usually stops it, so
   a single runaway doesn't take the machine down in the common case. It's no
   guarantee: when less memory is free than the limit, or several large
@@ -1318,7 +1320,7 @@ feature is added or changed, update the matching entry here in the same change**
   remote host or tmux server runs, aren't covered. If Windows can't apply the
   limit, the pane starts without one and the reason is logged.
 - **Per-pane memory limit (Linux)** — each local pane runs in a systemd scope of
-  its own, and the same Settings → Behavior choice (16 GB by default) limits how
+  its own, and the same Settings → General choice (16 GB by default) limits how
   much memory the pane's processes use together, plus up to a quarter of that in
   swap. When they reach it, Linux stops the largest of them and the rest of the
   pane, its agent included, keeps running. Even with the limit off, a process
@@ -1334,7 +1336,7 @@ feature is added or changed, update the matching entry here in the same change**
   its tmux session with it; the limit and the feed report apply only to local
   panes.
 - **Selection & clipboard** — mouse text selection and copy/paste (`⌘C`/`⌘V` on
-  macOS, `Ctrl+Shift+C`/`Ctrl+Shift+V` elsewhere). A global Settings → Behavior
+  macOS, `Ctrl+Shift+C`/`Ctrl+Shift+V` elsewhere). A global Settings → General
   choice picks the mouse copy/paste style: **right-click copy/paste** (default —
   right-click copies the selection, or pastes when nothing is selected), a
   **right-click Copy/Paste menu**, or **copy on select** (selecting copies
@@ -1702,7 +1704,7 @@ feature is added or changed, update the matching entry here in the same change**
   markers, heavy dirs pruned) and lists the found roots; clicking one fills in the
   directory and name so you can open it without typing the path. Mirrors the iOS
   companion app's host scan.
-- **SSH host library** — Settings → Remotes manages saved hosts with the common
+- **SSH host library** — Settings → Hosts manages saved hosts with the common
   options: hostname/alias, port, user, auth (ssh-agent, key file, or password),
   ProxyJump, agent forwarding, host-key policy, keepalive, compression (for slow
   or high-latency links), and extra `-o` options. Two safe defaults are applied
@@ -1766,7 +1768,7 @@ feature is added or changed, update the matching entry here in the same change**
   it out from under you if you're using that session from another machine. Working
   lid-down on an external display reconnects as usual. Works on macOS, Windows, and
   Linux with systemd-logind or elogind. (Tune or disable the probe per host in
-  Settings → Remotes → Keepalive; blank uses a 20s default, `0` turns it off.)
+  Settings → Hosts → Keepalive; blank uses a 20s default, `0` turns it off.)
 - **Reconnecting never resizes someone else's session** — a remote tmux pane joining
   a session another client is already attached to stays out of the window size
   (tmux 3.2+'s `ignore-size`), so a laptop reconnecting on a desk, asleep or
@@ -1894,24 +1896,59 @@ feature is added or changed, update the matching entry here in the same change**
 
 ## Settings & theming
 
-- **Settings modal** — sections for Appearance, Editor, Behavior, Sounds, Speech,
-  Read Aloud, Agents, Runners, Snippets, Loops, Remotes, Identities, Projects, and
-  Keybindings.
-- **Themes** — ~22 bundled themes with a switcher (Catppuccin, Gruvbox, Tokyo
-  Night, Solarized, Ayu, Everforest, and more).
+- **Settings window** — sixteen sections in five labelled groups, each with an
+  icon and (for the list sections) a count: *Application* (Appearance, General,
+  Editor, Keybindings), *Alerts and voice* (Notifications, Dictation, Read
+  aloud), *Agents and automation* (Agents, Runners, Snippets, Loops, Libraries,
+  Outside control), *Remote* (Hosts, Identities) and *Workspace* (Projects).
+  Every section is built from the same rows: a setting's name and one line about
+  it on the left, its control on the right (a switch, a segmented control, a
+  menu, a stepper or a field), grouped under headings.
+- **Search settings** — the field above the section list finds a setting by its
+  name, description or group, a shortcut by its action or keys, and a saved
+  agent, runner, snippet, loop, host, identity or project by name. Matching
+  settings are shown with their controls, so they can be changed from the
+  results; the section list shows how many matched in each section.
+- **Changes apply as you make them** — a switch, choice or number takes effect
+  and is saved at once; a text field applies when you leave it or press Enter
+  (and on closing the window). **Revert changes** puts settings, agent presets
+  and the theme back to how they were when the window opened, and stays open;
+  **Done**, the close button, a click outside the dialog and the Settings
+  shortcut all keep the changes. List items (an agent, runner, snippet, loop,
+  host, identity or project) are still saved explicitly: while one is open the
+  footer names it and offers **Discard changes** and **Save**.
+- **Floating Settings window** — the button beside Close moves Settings out of
+  the main window into an OS window of its own, which can sit outside muxel, on
+  another monitor, or beside the panes a change affects; the main window stays
+  usable behind it. The same button docks it back as a dialog. The choice is
+  remembered, so Settings opens the same way next time. Docked, the dialog
+  still drags by its header and resizes from its corner.
+- **Themes** — 39 themes (37 bundled sets such as Catppuccin, Gruvbox, Tokyo
+  Night, Solarized, Ayu and Everforest, plus the two defaults), picked from
+  swatches that show each theme's own colours, above a preview pane drawn in the
+  current theme, terminal font and pane border. Settings derives its own colours
+  from the active theme and corrects any that would be hard to read (secondary
+  text, borders, the selected section, switches), which a test checks for every
+  theme.
 - **Sizing** — whole-app zoom plus independent UI, terminal, and code/diff font
   sizes.
-- **Keybindings** — configurable shortcuts with a rebind UI, a cheat-sheet overlay
-  (`Ctrl+Shift+/`), `Alt+1–9` to jump to a pane's Nth tab, `Ctrl+1–9` to switch to
-  the Nth project, `Ctrl+Alt+1–9` to open the Nth agent preset as a tab in the
-  focused pane, `Ctrl+Shift+G` to toggle the "new agents get a git worktree"
+- **Keybindings** — every shortcut listed by what it does, grouped, with its
+  keys drawn as key caps. Click one and press the new keys to rebind it (Esc
+  cancels); the old keys stop working at once. A shortcut that differs from its
+  default says so and has a reset button, **Reset all** restores every default,
+  and two actions bound to the same keys where both apply are flagged. The
+  `Alt+1–9` (jump to a pane's Nth tab), `Ctrl+1–9` (switch to the Nth project)
+  and `Ctrl+Alt+1–9` (open the Nth agent preset as a tab in the focused pane)
+  ranges each show as one row and take their modifiers from any number chord. A
+  filter narrows the list by action or key. Also: a cheat-sheet overlay
+  (`Ctrl+Shift+/`), `Ctrl+Shift+G` to toggle the "new agents get a git worktree"
   switch, `Ctrl+Shift+A` to focus the next agent needing attention (blocked, then
   done), and `Cmd+Q` (`Ctrl+Q` elsewhere) to quit from any focus.
 - **Behavior** — immediate-save appearance, confirm destructive actions, quit
   confirmation, "Ask before closing a busy terminal" (on by default; see
   Recoverable terminal close), and auto-close a pane when its process exits
   **cleanly** (an abnormal exit always leaves a tombstone pane instead).
-- **Local tmux by default** — "New agents run in a tmux session" defaults **on**
+- **Local tmux by default** — General → "Run in a tmux session" defaults **on**
   whenever `tmux` is installed, so local panes survive a muxel restart and reattach
   (matching remote panes); the toggle greys out and has no effect when tmux isn't
   found. tmux is unix-only, so this never applies on Windows.

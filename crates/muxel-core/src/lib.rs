@@ -2776,6 +2776,10 @@ pub struct Settings {
     /// Enable the developer console (a popped-out error log toggled with F12).
     #[serde(default)]
     pub dev_console_enabled: bool,
+    /// Settings opens in a window of its own, which can sit outside the main
+    /// window, rather than as a dialog over it.
+    #[serde(default)]
+    pub settings_floating: bool,
     /// Keybinding overrides.
     #[serde(default)]
     pub keybindings: Vec<KeyBindingCfg>,
@@ -3280,6 +3284,7 @@ impl Default for Settings {
             diff_split_view: false,
             minimize_to_tray: false,
             dev_console_enabled: false,
+            settings_floating: false,
             keybindings: Vec::new(),
             runners: Runner::defaults(),
             snippets: Snippet::defaults(),

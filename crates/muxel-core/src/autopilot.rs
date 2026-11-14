@@ -14,7 +14,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 /// What gets typed (then Enter) when the agent is nudged, unless the user has set
-/// their own in Settings → Behavior ([`crate::Settings::auto_continue_message`]).
+/// their own in Settings → General ([`crate::Settings::auto_continue_message`]).
 pub const AUTO_CONTINUE_MESSAGE: &str = "continue";
 
 /// The auto-continue message to save for what the user typed into the setting.

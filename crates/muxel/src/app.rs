@@ -79,6 +79,8 @@ mod first_prompt_size_tests;
 mod hidden_paint_tests;
 mod hotbar;
 mod libraries_ui;
+#[cfg(all(test, not(target_os = "macos")))]
+mod markdown_copy_tests;
 mod pane_grid;
 #[cfg(all(test, windows))]
 mod paste_submission_tests;
@@ -102,6 +104,11 @@ mod restart_guard;
 #[cfg(all(test, windows))]
 mod rich_copy_tests;
 mod session_discovery;
+mod settings_keys;
+mod settings_kit;
+mod settings_lists;
+mod settings_pages;
+mod settings_shell;
 mod sound_alerts;
 mod strip_button;
 #[cfg(test)]
@@ -4051,6 +4058,53 @@ pub fn install_keybindings(settings: &muxel_core::Settings, cx: &mut App) {
     cx.bind_keys(bindings);
 }
 
+/// Every rebindable action as `settings` binds it: its keystroke (the user's
+/// override, else the default) and the key context it applies in.
+fn bound_actions(settings: &muxel_core::Settings) -> Vec<crate::settings_model::Bound> {
+    let passthrough: Vec<&str> = settings
+        .terminal_passthrough_keys
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    settings_view::DEFAULT_KEYBINDINGS
+        .iter()
+        .map(|(name, default, context)| {
+            let keystroke = settings
+                .keybindings
+                .iter()
+                .find(|k| k.action == *name)
+                .map(|k| k.keystroke.as_str())
+                .unwrap_or(default);
+            crate::settings_model::Bound {
+                action: name.to_string(),
+                keystroke: keystroke.to_string(),
+                context: resolve_binding_context(name, keystroke, *context, &passthrough)
+                    .map(str::to_string),
+            }
+        })
+        .collect()
+}
+
+/// Rebind after the keybindings changed from `prev` to `next`. gpui only ever
+/// adds bindings, so a keystroke an action moved away from is unbound first
+/// (a `NoAction` binding suppresses the ones before it); otherwise the old
+/// shortcut would keep firing until the next launch. The fresh bindings go on
+/// after, so they are unaffected.
+pub fn rebind_keys(prev: &muxel_core::Settings, next: &muxel_core::Settings, cx: &mut App) {
+    let stale = crate::settings_model::stale_bindings(&bound_actions(prev), &bound_actions(next));
+    let unbind: Vec<KeyBinding> = stale
+        .iter()
+        .filter(|binding| {
+            let mut chords = binding.keystroke.split_whitespace().peekable();
+            chords.peek().is_some() && chords.all(|chord| Keystroke::parse(chord).is_ok())
+        })
+        .map(|binding| KeyBinding::new(&binding.keystroke, NoAction, binding.context.as_deref()))
+        .collect();
+    cx.bind_keys(unbind);
+    install_keybindings(next, cx);
+}
+
 /// Pick the gpui key context for a binding.
 ///
 /// - Explicit context from the table wins (e.g. `Terminal`-only search).
@@ -5601,6 +5655,17 @@ fn selected_copy_text(text: String) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// Ctrl+C / Ctrl+Insert outside a terminal: the window's text selection, or
+/// else whatever the focused input has selected.
+fn copy_selection(window: &mut Window, cx: &mut App) {
+    use gpui_component::WindowExt as _;
+    if let Some(text) = selected_copy_text(window.selected_text(cx)) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    } else {
+        window.dispatch_action(Box::new(gpui_component::input::Copy), cx);
+    }
+}
+
 #[cfg(test)]
 mod copy_selection_tests {
     use super::selected_copy_text;
@@ -5709,8 +5774,10 @@ enum WorktreeChoice {
     None,
 }
 
-/// Live state captured when the settings modal opens, so Cancel can revert.
+/// Live state captured when the settings modal opens, so Revert can restore it.
 struct SettingsSnapshot {
+    /// [`MuxelApp::settings_fingerprint`] of everything below.
+    fingerprint: String,
     settings: muxel_core::Settings,
     presets: Vec<AgentPreset>,
     theme: String,
@@ -6211,7 +6278,7 @@ pub struct MuxelApp {
     alert_gate: AlertGate,
     /// Raised to cut off the chime still playing when the next one starts.
     alert_playback: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// Settings → Sounds: why the last file tried for an alert won't play.
+    /// Settings → Notifications: why the last file tried for an alert won't play.
     alert_sound_error: Option<(AlertSound, String)>,
     /// What the status probes last saw; moved into each `refresh_status` job.
     status_polls: StatusPolls,
@@ -6571,6 +6638,25 @@ pub struct MuxelApp {
     /// render). Lets deep helpers (`check_row`) size wrapping labels absolutely so
     /// their multi-line height is measured correctly. See [`settings_content_w`].
     settings_pane_w: Pixels,
+    /// The window's rem while Settings is open, so its sizes follow the
+    /// interface font size and zoom.
+    settings_rem: Pixels,
+    /// Something differs from when Settings opened, so Revert has work to do.
+    settings_dirty: bool,
+    /// Intercepts key presses while a Keybindings row is recording.
+    key_recorder: Option<Subscription>,
+    /// Settings' own window, while it floats outside the main one.
+    settings_window: Option<WindowHandle<gpui_component::Root>>,
+    /// That window is the one the user is in, so a confirmation asked for from
+    /// Settings shows there rather than on the main window.
+    settings_window_active: bool,
+    /// The window Settings' text fields were made in. A field only gets focus
+    /// and blur events in its own window, so they are remade when Settings
+    /// moves between the main window and its own.
+    settings_ui_window: Option<WindowId>,
+    /// Settings' fields applying on Enter/blur and its search re-rendering;
+    /// replaced whenever the fields are remade.
+    settings_input_subs: Vec<Subscription>,
     /// The main window's render count; see [`terminal_pane_element`].
     shown: DisplayEpoch,
     /// Settings card offset from centre, set by dragging its title bar.
@@ -7701,6 +7787,9 @@ impl Render for PopoutView {
             .on_action(cx.listener(|_, a: &muxel_terminal::OpenLink, _w, cx| {
                 MuxelApp::open_popout_link(&a.url, a.pane, OpenFocus::Focus, cx);
             }))
+            // The copy chords are bound for every window, so a popped-out
+            // editor needs their handler too.
+            .on_action(|_: &CopySelection, window, cx| copy_selection(window, cx))
             .on_action(
                 cx.listener(|_, a: &muxel_terminal::OpenLinkBackground, _w, cx| {
                     MuxelApp::open_popout_link(&a.url, a.pane, OpenFocus::Background, cx);
@@ -8437,11 +8526,16 @@ impl MuxelApp {
             if this.bounds_save_task.is_some() {
                 return;
             }
+            // This window by its handle, not `update_in`: that runs in whichever
+            // window rendered the app last, and with Settings floating (or a
+            // project window, or a popout) that is often not this one, whose
+            // bounds would then be saved as the main window's.
+            let main = window.window_handle();
             this.bounds_save_task = Some(cx.spawn_in(window, async move |this, cx| {
                 cx.background_executor()
                     .timer(Duration::from_millis(250))
                     .await;
-                let _ = this.update_in(cx, |this, window, _cx| {
+                Self::update_in_window(&this, main, cx, |this, window, _cx| {
                     this.save_window_geom(window);
                     this.bounds_save_task = None;
                 });
@@ -8492,6 +8586,8 @@ impl MuxelApp {
             .unwrap_or(0);
         let available_programs = installed_programs(&presets);
         let settings_ui = SettingsUi::new(window, cx);
+        let settings_input_subs =
+            settings_shell::settings_input_subscriptions(&settings_ui, window, cx);
         let rename_input = cx.new(|cx| InputState::new(window, cx));
         let dispose_commit_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(t("Commit message (default: worktree name)"))
@@ -8625,7 +8721,7 @@ impl MuxelApp {
 
         let auto_message_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder(t("blank = the default from Settings → Behavior"))
+                .placeholder(t("blank = the default from Settings → General"))
         });
         cx.subscribe_in(
             &auto_message_input,
@@ -8857,8 +8953,15 @@ impl MuxelApp {
             pane_oom_seen: HashMap::new(),
             pane_oom_checked_at: None,
             workspace_name_input,
-            settings_size: size(px(780.0), px(620.0)),
+            settings_size: size(px(960.0), px(680.0)),
             settings_pane_w: px(560.0),
+            settings_rem: px(16.0),
+            settings_dirty: false,
+            key_recorder: None,
+            settings_window: None,
+            settings_window_active: false,
+            settings_ui_window: Some(window.window_handle().window_id()),
+            settings_input_subs,
             shown: DisplayEpoch::default(),
             settings_offset: point(px(0.0), px(0.0)),
             settings_resize: None,
@@ -9040,6 +9143,14 @@ impl MuxelApp {
                             gpui::AnyWindowHandle::from(h).window_id() == window_id
                         }) {
                             this.dev_console_window = None;
+                        }
+                        // Settings' own window closed from its title bar or
+                        // the OS: that closes Settings.
+                        if this.settings_window.is_some_and(|h| {
+                            gpui::AnyWindowHandle::from(h).window_id() == window_id
+                        }) {
+                            this.settings_window = None;
+                            this.close_settings(cx);
                         }
                         if this.accomplishments_window.is_some_and(|h| {
                             gpui::AnyWindowHandle::from(h).window_id() == window_id
@@ -13034,7 +13145,7 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// From the "New remote project" dialog: jump to Settings → Remotes with a
+    /// From the "New remote project" dialog: jump to Settings → Hosts with a
     /// fresh host editor open, so a host can be added without hunting for it.
     fn open_add_remote_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_remote_project_modal(cx);
@@ -13405,8 +13516,13 @@ impl MuxelApp {
             let handle = view.read(cx).focus_handle(cx);
             window.focus(&handle, cx);
         } else if let Some(ed) = self.editors.get(&iid) {
+            // A press in the pane may have focused something inside the editor
+            // already, as a double-click in rendered Markdown focuses its text.
+            // Copy goes where that focus is, so leave it there.
             let handle = ed.read(cx).focus_handle(cx);
-            window.focus(&handle, cx);
+            if !handle.contains_focused(window, cx) {
+                window.focus(&handle, cx);
+            }
         } else if let Some(bv) = self.browsers.get(&iid) {
             let handle = bv.read(cx).focus_handle(cx);
             window.focus(&handle, cx);
@@ -13946,6 +14062,7 @@ impl MuxelApp {
                 self.report_save_error(SaveTarget::Settings, format!("{e:#}"));
             }
         }
+        self.refresh_settings_dirty();
     }
 
     /// Save after a library event the user did not trigger: only the library
@@ -15568,7 +15685,7 @@ impl MuxelApp {
     /// stealing focus, since this fires while the user is doing something else.
     ///
     /// Typed as literal keystrokes (not a bracketed paste): it's a short one-line
-    /// command (Settings → Behavior), and typing it is exactly what the user would
+    /// command (Settings → General), and typing it is exactly what the user would
     /// do, with no paste-mode markers for an agent's input box to mishandle.
     fn send_continue(&self, iid: Uuid, cx: &App) {
         if self.is_closing(iid) {
@@ -15586,7 +15703,7 @@ impl MuxelApp {
     }
 
     /// What auto-continue types into pane `iid`: the pane's own message if it has
-    /// one, else the default from Settings → Behavior. Normalized here too, not only
+    /// one, else the default from Settings → General. Normalized here too, not only
     /// when saved: a hand-edited settings or workspace file could hold a line break,
     /// which would press Enter mid-message.
     fn continue_message_for(&self, iid: Uuid) -> String {
@@ -15675,7 +15792,7 @@ impl MuxelApp {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(t("Typed, then Enter, when Auto resumes this pane. Kept until the pane is closed; blank uses the default from Settings → Behavior.")),
+                            .child(t("Typed, then Enter, when Auto resumes this pane. Kept until the pane is closed; blank uses the default from Settings → General.")),
                     )
                     .child(Input::new(&self.auto_message_input))
                     .child(
@@ -16040,7 +16157,7 @@ impl MuxelApp {
             let limit = self.settings.pane_memory_limit_gb.to_string();
             let body = if limit_reached {
                 tf(
-                    "The pane's processes reached its {limit} GB memory limit, so Linux stopped the largest one. The rest of the pane kept running. Settings → Behavior sets the limit.",
+                    "The pane's processes reached its {limit} GB memory limit, so Linux stopped the largest one. The rest of the pane kept running. Settings → General sets the limit.",
                     &[("limit", &limit)],
                 )
             } else {
@@ -16091,21 +16208,21 @@ impl MuxelApp {
         let (body, status) = match hit.status {
             muxel_terminal::HitStatus::Stopped => (
                 tf(
-                    "{program} (PID {pid}) reached this pane's {limit} GB memory limit and stopped. Settings → Behavior sets the limit.",
+                    "{program} (PID {pid}) reached this pane's {limit} GB memory limit and stopped. Settings → General sets the limit.",
                     &args,
                 ),
                 "stopped",
             ),
             muxel_terminal::HitStatus::Running => (
                 tf(
-                    "{program} (PID {pid}) reached this pane's {limit} GB memory limit. Windows refused the memory it asked for; it is still running. Settings → Behavior sets the limit.",
+                    "{program} (PID {pid}) reached this pane's {limit} GB memory limit. Windows refused the memory it asked for; it is still running. Settings → General sets the limit.",
                     &args,
                 ),
                 "running",
             ),
             muxel_terminal::HitStatus::Unknown => (
                 tf(
-                    "{program} (PID {pid}) reached this pane's {limit} GB memory limit. Windows refused the memory it asked for; muxel couldn't check whether it stopped. Settings → Behavior sets the limit.",
+                    "{program} (PID {pid}) reached this pane's {limit} GB memory limit. Windows refused the memory it asked for; muxel couldn't check whether it stopped. Settings → General sets the limit.",
                     &args,
                 ),
                 "unknown",
@@ -16374,7 +16491,7 @@ impl MuxelApp {
         );
     }
 
-    /// Settings → Behavior → "New agents open": a tab in the focused pane, or a
+    /// Settings → General → "New agents open": a tab in the focused pane, or a
     /// pane of their own to its right. An empty project gets its first pane
     /// either way.
     fn new_agent_placement(&self) -> PlacementMode {
@@ -17257,7 +17374,8 @@ impl MuxelApp {
     /// float above ALL gpui content, so they must hide beneath these.
     /// NOTE: every new modal/palette/menu flag MUST be added here (see CLAUDE.md).
     fn any_overlay_open(&self, cx: &App) -> bool {
-        self.show_settings
+        // Floating in its own window, Settings covers nothing here.
+        (self.show_settings && !self.settings.settings_floating)
             || !self.control_approvals.is_empty()
             || self.show_search_palette
             || self.show_find_panel
@@ -22186,14 +22304,7 @@ impl MuxelApp {
             // A ctrl+clicked terminal link opens beside the pane it was clicked
             // in: URLs in the built-in browser when enabled, files in an editor.
             .on_action(cx.listener(Self::on_open_link))
-            .on_action(cx.listener(|_this, _: &CopySelection, window, cx| {
-                use gpui_component::WindowExt as _;
-                if let Some(text) = selected_copy_text(window.selected_text(cx)) {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                } else {
-                    window.dispatch_action(Box::new(gpui_component::input::Copy), cx);
-                }
-            }))
+            .on_action(|_: &CopySelection, window, cx| copy_selection(window, cx))
             .on_action(cx.listener(Self::on_open_link_background))
     }
 
@@ -23876,7 +23987,7 @@ impl MuxelApp {
                         }
                         muxel_core::SttEngine::Provider => {
                             if api_key.is_empty() {
-                                anyhow::bail!("set a provider API key in Settings → Speech");
+                                anyhow::bail!("set a provider API key in Settings → Dictation");
                             }
                             let wav = muxel_core::stt::encode_wav_16k_mono(&audio);
                             crate::stt::transcribe_provider(
@@ -26472,9 +26583,9 @@ impl MuxelApp {
                                     } else {
                                         t("Show rendered markdown")
                                     })
-                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                    .on_click(cx.listener(move |this, _e, window, cx| {
                                         if let Some(ed) = this.editors.get(&iid).cloned() {
-                                            ed.update(cx, |e, cx| e.toggle_rendered(cx));
+                                            ed.update(cx, |e, cx| e.toggle_rendered(window, cx));
                                         }
                                     }))
                             }),
@@ -30138,11 +30249,6 @@ impl MuxelApp {
             .child(text.to_string())
     }
 
-    fn set_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
-        self.settings_ui.section = section;
-        cx.notify();
-    }
-
     /// Open Settings → Runners with runner `idx` selected for editing.
     fn open_runner_settings(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.runners_menu = None;
@@ -30164,28 +30270,44 @@ impl MuxelApp {
     }
 
     fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_settings = !self.show_settings;
         if self.show_settings {
-            // Size the modal for the current UI scale (font size × zoom) so the
-            // content isn't cramped when scaled up. The corner-drag can override.
-            let scale = (self.settings.ui_font_size * self.settings.zoom / 16.0).clamp(1.0, 2.5);
-            self.settings_size = size(px(780.0 * scale), px(620.0 * scale));
-            self.settings_offset = point(px(0.0), px(0.0));
-            self.settings_snapshot = Some(SettingsSnapshot {
-                settings: self.settings.clone(),
-                presets: self.presets.clone(),
-                theme: self.theme.clone(),
-                theme_mode: self.theme_mode.clone(),
-                use_tmux: self.use_tmux,
-                use_worktree: self.use_worktree,
-                notifications: self.notifications_enabled,
-            });
-            self.load_appearance_inputs(window, cx);
-            self.load_behavior_inputs(window, cx);
-            self.load_speech_inputs(window, cx);
-            self.load_read_aloud_inputs(window, cx);
-            self.load_system_voices(cx);
-            self.load_keybinding_inputs(window, cx);
+            // Closing with the shortcut or the toolbar keeps changes, like Done.
+            self.dismiss_settings(window, cx);
+            return;
+        }
+        self.show_settings = true;
+        // Size the modal for the current UI scale (font size × zoom) so the
+        // content isn't cramped when scaled up. The corner-drag can override.
+        let scale = (self.settings.ui_font_size * self.settings.zoom / 16.0).clamp(1.0, 2.5);
+        self.settings_size = size(px(960.0 * scale), px(680.0 * scale));
+        self.settings_offset = point(px(0.0), px(0.0));
+        self.settings_snapshot = Some(SettingsSnapshot {
+            fingerprint: self.settings_fingerprint(),
+            settings: self.settings.clone(),
+            presets: self.presets.clone(),
+            theme: self.theme.clone(),
+            theme_mode: self.theme_mode.clone(),
+            use_tmux: self.use_tmux,
+            use_worktree: self.use_worktree,
+            notifications: self.notifications_enabled,
+        });
+        self.settings_dirty = false;
+        self.settings_ui.theme_swatches = theme::theme_swatches(cx);
+        self.settings_ui.themes_expanded = false;
+        for input in [
+            self.settings_ui.search.clone(),
+            self.settings_ui.kb_filter.clone(),
+        ] {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
+        self.load_settings_inputs(window, cx);
+        // Asked once per opening, not each time the fields are (re)loaded: the
+        // OS keychain can take a moment to answer.
+        self.settings_ui.stt_has_key = crate::secrets::has_stt_api_key();
+        self.load_system_voices(cx);
+        if self.settings.settings_floating {
+            self.float_settings(cx);
         }
         cx.notify();
     }
@@ -30193,37 +30315,11 @@ impl MuxelApp {
     fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.show_settings = false;
         self.settings_snapshot = None;
+        self.settings_dirty = false;
+        self.settings_window_active = false;
+        self.stop_key_recording(cx);
+        self.close_settings_window(cx);
         cx.notify();
-    }
-
-    /// Keep all edits (they applied live + persisted) and dismiss.
-    fn save_settings(&mut self, cx: &mut Context<Self>) {
-        self.persist_settings();
-        self.close_settings(cx);
-    }
-
-    /// Revert settings to the snapshot taken when the modal opened, then dismiss.
-    fn cancel_settings(&mut self, cx: &mut Context<Self>) {
-        if let Some(snap) = self.settings_snapshot.take() {
-            self.settings = snap.settings;
-            self.presets = snap.presets;
-            self.theme = snap.theme;
-            self.theme_mode = snap.theme_mode;
-            self.use_tmux = snap.use_tmux;
-            self.use_worktree = snap.use_worktree;
-            self.notifications_enabled = snap.notifications;
-            // Re-apply the live visual state that editing may have changed.
-            let zoom = self.settings.zoom;
-            let ui_font = self.settings.ui_font_size;
-            theme::apply_initial_theme(&self.theme.clone(), cx);
-            theme::set_ui_font_size(ui_font, cx);
-            theme::set_ui_scale(zoom, cx);
-            self.refresh_terminal_config(cx);
-            self.refresh_terminal_palettes(cx);
-            self.apply_keybindings(cx);
-            self.persist_settings();
-        }
-        self.close_settings(cx);
     }
 
     fn load_appearance_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -30307,7 +30403,7 @@ impl MuxelApp {
 
     // ===== Speech-to-text settings handlers =====
 
-    /// Seed the Speech section's text inputs from the current settings + keychain.
+    /// Seed the Dictation section's text inputs from the current settings.
     fn load_speech_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let url = self.settings.stt_provider_url.clone();
         self.settings_ui
@@ -30328,7 +30424,6 @@ impl MuxelApp {
         self.settings_ui
             .stt_api_key
             .update(cx, |s, cx| s.set_value("", window, cx));
-        self.settings_ui.stt_has_key = crate::secrets::has_stt_api_key();
     }
 
     /// Read the wake-phrase input and persist it. A phrase of only punctuation
@@ -30433,206 +30528,6 @@ impl MuxelApp {
         cx.notify();
     }
 
-    fn stt_engine_btn(
-        &self,
-        value: muxel_core::SttEngine,
-        label: &str,
-        cx: &mut Context<Self>,
-    ) -> Button {
-        let id = SharedString::from(format!("stt-engine-{label}"));
-        Button::new(id)
-            .ghost()
-            .selected(self.settings.stt_engine == value)
-            .label(label.to_string())
-            .on_click(cx.listener(move |this, _e, _w, cx| this.set_stt_engine(value, cx)))
-    }
-
-    fn render_settings_speech(&self, cx: &mut Context<Self>) -> AnyElement {
-        let is_local = self.settings.stt_engine == muxel_core::SttEngine::Local;
-        let models = ["tiny", "base", "small", "medium"];
-        let current_model = self.settings.stt_model.clone();
-        let mut model_row = div().flex().flex_wrap().gap_1();
-        for m in models {
-            let selected = current_model == m;
-            model_row = model_row.child(
-                Button::new(SharedString::from(format!("stt-model-{m}")))
-                    .ghost()
-                    .selected(selected)
-                    .label(m)
-                    .on_click(cx.listener(move |this, _e, _w, cx| this.set_stt_model(m, cx))),
-            );
-        }
-
-        let mut col = v_flex()
-            .gap_3()
-            .max_w(px(560.0))
-            .child(self.settings_label(&t("Dictation engine"), cx))
-            .child(
-                div()
-                    .flex()
-                    .gap_1()
-                    .child(self.stt_engine_btn(muxel_core::SttEngine::Local, &t("Local"), cx))
-                    .child(self.stt_engine_btn(
-                        muxel_core::SttEngine::Provider,
-                        &t("Provider"),
-                        cx,
-                    )),
-            );
-
-        if is_local {
-            col = col
-                .child(self.settings_label(
-                    &t("Local model (whisper.cpp) — downloaded on first use"),
-                    cx,
-                ))
-                .child(model_row);
-        } else {
-            col = col
-                .child(self.settings_label(&t("Provider base URL (OpenAI-compatible)"), cx))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .child(Input::new(&self.settings_ui.stt_provider_url)),
-                        )
-                        .child(
-                            Button::new("stt-apply-provider")
-                                .primary()
-                                .label(t("Apply"))
-                                .on_click(
-                                    cx.listener(|this, _e, _w, cx| this.apply_stt_provider(cx)),
-                                ),
-                        ),
-                )
-                .child(self.settings_label(&t("Provider model"), cx))
-                .child(Self::wide_input(Input::new(
-                    &self.settings_ui.stt_provider_model,
-                )))
-                .child(self.settings_label(
-                    &if self.settings_ui.stt_has_key {
-                        t("API key — a key is stored; type a new one to replace it")
-                    } else {
-                        t("API key — stored in the OS keychain")
-                    },
-                    cx,
-                ))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .child(Input::new(&self.settings_ui.stt_api_key)),
-                        )
-                        .child(
-                            Button::new("stt-save-key")
-                                .primary()
-                                .label(t("Save"))
-                                .on_click(cx.listener(|this, _e, window, cx| {
-                                    this.save_stt_api_key(window, cx)
-                                })),
-                        )
-                        .children(self.settings_ui.stt_has_key.then(|| {
-                            Button::new("stt-clear-key")
-                                .ghost()
-                                .label(t("Remove"))
-                                .on_click(
-                                    cx.listener(|this, _e, _w, cx| this.clear_stt_api_key(cx)),
-                                )
-                        })),
-                );
-        }
-
-        col.child(self.settings_label(
-            &t("Spoken language (BCP-47, e.g. en) — blank auto-detects"),
-            cx,
-        ))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(v_flex().flex_1().child(Input::new(&self.settings_ui.stt_language)))
-                .child(
-                    Button::new("stt-apply-lang")
-                        .primary()
-                        .label(t("Apply"))
-                        .on_click(cx.listener(|this, _e, _w, cx| this.apply_stt_provider(cx))),
-                ),
-        )
-        .child(
-            self.check_row(
-                Checkbox::new("stt-autosubmit")
-                    .checked(self.settings.stt_autosubmit)
-                    .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                        this.settings.stt_autosubmit = *c;
-                        this.persist_settings();
-                        cx.notify();
-                    })),
-                &t("Press Enter automatically after inserting the transcript"),
-            ),
-        )
-        .child(
-            self.check_row(
-                Checkbox::new("stt-wake-command")
-                    .checked(self.settings.stt_wake_command)
-                    .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                        this.settings.stt_wake_command = *c;
-                        this.persist_settings();
-                        cx.notify();
-                    })),
-                &t("Dictating the wake phrase sweeps every pane and relaunches the ones that aren't running"),
-            ),
-        )
-        .children(self.settings.stt_wake_command.then(|| {
-            v_flex()
-                .gap_3()
-                .child(self.settings_label(&t("Wake phrase"), cx))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .child(Input::new(&self.settings_ui.stt_wake_phrase)),
-                        )
-                        .child(
-                            Button::new("stt-apply-wake-phrase")
-                                .primary()
-                                .label(t("Apply"))
-                                .on_click(cx.listener(|this, _e, window, cx| {
-                                    this.apply_stt_wake_phrase(window, cx)
-                                })),
-                        ),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(t(
-                            "Matched on whole words, ignoring case and punctuation. The transcript that triggers it is not typed into the pane.",
-                        )),
-                )
-        }))
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(t(
-                    "Provider mode uploads your recorded audio to the endpoint above. Local mode runs entirely on this machine.",
-                )),
-        )
-        .into_any_element()
-    }
-
     // ===== Read-aloud settings =====
 
     /// Seed the Read Aloud section's text inputs from the current settings.
@@ -30725,426 +30620,6 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// One choice in a row of mutually exclusive setting buttons: `pick` applies
-    /// it to the settings, which are then saved.
-    fn option_btn(
-        &self,
-        id: impl Into<ElementId>,
-        label: SharedString,
-        selected: bool,
-        cx: &mut Context<Self>,
-        pick: impl Fn(&mut muxel_core::Settings) + 'static,
-    ) -> Button {
-        Button::new(id)
-            .ghost()
-            .selected(selected)
-            .label(label)
-            .on_click(cx.listener(move |this, _e, _w, cx| {
-                pick(&mut this.settings);
-                this.persist_settings();
-                cx.notify();
-            }))
-    }
-
-    /// A settings checkbox bound to one boolean setting.
-    fn setting_check(
-        &self,
-        id: &'static str,
-        checked: bool,
-        label: &str,
-        cx: &mut Context<Self>,
-        set: impl Fn(&mut muxel_core::Settings, bool) + 'static,
-    ) -> impl IntoElement {
-        self.check_row(
-            Checkbox::new(id).checked(checked).on_click(cx.listener(
-                move |this, c: &bool, _w, cx| {
-                    set(&mut this.settings, *c);
-                    this.persist_settings();
-                    cx.notify();
-                },
-            )),
-            label,
-        )
-    }
-
-    fn render_settings_read_aloud(&self, cx: &mut Context<Self>) -> AnyElement {
-        use muxel_core::{ReadAloudAuto, ReadAloudScope, TtsEngine};
-        let settings = &self.settings;
-        let muted = cx.theme().muted_foreground;
-        let note = |text: SharedString| div().text_xs().text_color(muted).child(text);
-
-        // A shortcut as the user has it bound.
-        let chord = |action: &str| {
-            settings
-                .keybindings
-                .iter()
-                .find(|k| k.action == action)
-                .map(|k| k.keystroke.clone())
-                .or_else(|| {
-                    settings_view::DEFAULT_KEYBINDINGS
-                        .iter()
-                        .find(|(name, _, _)| *name == action)
-                        .map(|(_, default, _)| default.to_string())
-                })
-                .map(|ks| prettify_keys(&ks))
-                .unwrap_or_default()
-        };
-
-        let scope = settings.read_aloud_scope;
-        let auto = settings.read_aloud_auto;
-        let max = settings.read_aloud_max_chars;
-        let engine = settings.tts_engine;
-
-        let mut col = v_flex()
-            .gap_3()
-            .max_w(px(560.0))
-            .child(note(
-                tf(
-                    "Press {keys}, or a speaker (in the toolbar for the focused pane, or on any pane), to hear the agent's last reply. Press it again to pause, and again to resume — each pane keeps its own place, picking up at the start of the sentence it paused in. {restart} starts over; {stop} stops.",
-                    &[
-                        ("keys", &chord("ReadAloud")),
-                        ("restart", &chord("ReadAloudRestart")),
-                        ("stop", &chord("ReadAloudStop")),
-                    ],
-                )
-                .into(),
-            ))
-            .child(self.setting_check(
-                "ra-button",
-                settings.read_aloud_button,
-                &t("Show read-aloud buttons in the toolbar and on each pane"),
-                cx,
-                |s, on| s.read_aloud_button = on,
-            ))
-            // --- What is read ---
-            .child(self.settings_label(&t("What to read"), cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_1()
-                    .child(self.option_btn(
-                        "ra-scope-final",
-                        t("Final message"),
-                        scope == ReadAloudScope::FinalMessage,
-                        cx,
-                        |s| s.read_aloud_scope = ReadAloudScope::FinalMessage,
-                    ))
-                    .child(self.option_btn(
-                        "ra-scope-turn",
-                        t("Whole last turn"),
-                        scope == ReadAloudScope::WholeTurn,
-                        cx,
-                        |s| s.read_aloud_scope = ReadAloudScope::WholeTurn,
-                    )),
-            )
-            .child(note(t(
-                "The final message is what the agent wrote after its last tool call — usually its summary. Code, diffs, commands and tool output are never read, only the agent's own words.",
-            )))
-            .child(self.settings_label(&t("Read automatically when an agent finishes"), cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_1()
-                    .child(self.option_btn(
-                        "ra-auto-off",
-                        t("Off"),
-                        auto == ReadAloudAuto::Off,
-                        cx,
-                        |s| s.read_aloud_auto = ReadAloudAuto::Off,
-                    ))
-                    .child(self.option_btn(
-                        "ra-auto-focused",
-                        t("Focused pane"),
-                        auto == ReadAloudAuto::Focused,
-                        cx,
-                        |s| s.read_aloud_auto = ReadAloudAuto::Focused,
-                    ))
-                    .child(self.option_btn(
-                        "ra-auto-all",
-                        t("Any agent"),
-                        auto == ReadAloudAuto::All,
-                        cx,
-                        |s| s.read_aloud_auto = ReadAloudAuto::All,
-                    )),
-            )
-            .child(self.setting_check(
-                "ra-announce",
-                settings.read_aloud_announce,
-                &t("Say the agent's name before its reply"),
-                cx,
-                |s, on| s.read_aloud_announce = on,
-            ))
-            .child(self.settings_label(&t("Length limit"), cx));
-
-        let mut limits = div().flex().flex_wrap().gap_1();
-        for (chars, label) in [
-            (0, t("No limit")),
-            (500, t("About 30 s")),
-            (1000, t("About 1 min")),
-            (3000, t("About 3 min")),
-        ] {
-            limits = limits.child(self.option_btn(
-                SharedString::from(format!("ra-max-{chars}")),
-                label,
-                max == chars,
-                cx,
-                move |s| s.read_aloud_max_chars = chars,
-            ));
-        }
-        col =
-            col.child(limits)
-                .child(note(t(
-                    "A long reply stops at the end of a sentence once the limit is reached.",
-                )))
-                // --- How it's cleaned up ---
-                .child(self.settings_label(&t("Clean-up"), cx))
-                .child(self.setting_check(
-                    "ra-urls",
-                    settings.read_aloud_skip_urls,
-                    &t("Say \u{201c}link\u{201d} instead of reading web addresses"),
-                    cx,
-                    |s, on| s.read_aloud_skip_urls = on,
-                ))
-                .child(self.setting_check(
-                    "ra-paths",
-                    settings.read_aloud_short_paths,
-                    &t("Say only the file name of a path (src/app.rs:120 \u{2192} app.rs)"),
-                    cx,
-                    |s, on| s.read_aloud_short_paths = on,
-                ))
-                .child(self.setting_check(
-                    "ra-tables",
-                    settings.read_aloud_tables,
-                    &t("Read tables row by row (off skips them)"),
-                    cx,
-                    |s, on| s.read_aloud_tables = on,
-                ))
-                // --- The voice ---
-                .child(self.settings_label(&t("Voice"), cx))
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap_1()
-                        .child(self.option_btn(
-                            "ra-engine-system",
-                            t("System"),
-                            engine == TtsEngine::System,
-                            cx,
-                            |s| s.tts_engine = TtsEngine::System,
-                        ))
-                        .children(
-                            (crate::tts::local_voice_supported() || engine == TtsEngine::Local)
-                                .then(|| {
-                                    self.option_btn(
-                                        "ra-engine-local",
-                                        t("Local (Kokoro)"),
-                                        engine == TtsEngine::Local,
-                                        cx,
-                                        |s| s.tts_engine = TtsEngine::Local,
-                                    )
-                                }),
-                        )
-                        .child(self.option_btn(
-                            "ra-engine-provider",
-                            t("Provider"),
-                            engine == TtsEngine::Provider,
-                            cx,
-                            |s| s.tts_engine = TtsEngine::Provider,
-                        )),
-                );
-
-        col = match engine {
-            TtsEngine::System => {
-                let listed = self
-                    .settings_ui
-                    .tts_system_voices
-                    .as_ref()
-                    .filter(|voices| !voices.is_empty());
-                match listed {
-                    Some(voices) => {
-                        let current = if settings.tts_system_voice.is_empty() {
-                            t("OS default voice")
-                        } else {
-                            SharedString::from(settings.tts_system_voice.clone())
-                        };
-                        let choices: Vec<(String, String)> = muxel_core::tts::voices_for_language(
-                            voices,
-                            &crate::i18n::current_language(),
-                        )
-                        .into_iter()
-                        .cloned()
-                        .collect();
-                        col.child(self.settings_label(&t("System voice"), cx)).child(
-                            DropdownButton::new("ra-system-voice")
-                                .button(
-                                    Button::new("ra-system-voice-btn")
-                                        .ghost()
-                                        .icon(Icon::empty().path("icons/volume-2.svg"))
-                                        .label(current),
-                                )
-                                .dropdown_menu(move |mut menu, _window, _cx| {
-                                    menu = menu.menu(
-                                        t("OS default voice"),
-                                        Box::new(SetSystemVoice(String::new())),
-                                    );
-                                    for (name, locale) in &choices {
-                                        menu = menu.menu(
-                                            format!("{name} ({locale})"),
-                                            Box::new(SetSystemVoice(name.clone())),
-                                        );
-                                    }
-                                    menu.scrollable(true)
-                                }),
-                        )
-                    }
-                    None => col
-                        .child(self.settings_label(
-                            &t("System voice name (blank = the OS default voice)"),
-                            cx,
-                        ))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    v_flex()
-                                        .flex_1()
-                                        .child(Input::new(&self.settings_ui.tts_system_voice)),
-                                )
-                                .child(
-                                    Button::new("ra-apply-system-voice")
-                                        .primary()
-                                        .label(t("Apply"))
-                                        .on_click(cx.listener(|this, _e, _w, cx| {
-                                            this.apply_tts_system_voice(cx)
-                                        })),
-                                ),
-                        ),
-                }
-            }
-            TtsEngine::Local => {
-                let mut voices = div().flex().flex_wrap().gap_1();
-                for voice in muxel_core::tts::KOKORO_VOICES {
-                    voices = voices.child(self.option_btn(
-                        SharedString::from(format!("ra-kokoro-{voice}")),
-                        SharedString::from(*voice),
-                        settings.tts_local_voice == *voice,
-                        cx,
-                        move |s| s.tts_local_voice = voice.to_string(),
-                    ));
-                }
-                col.child(self.settings_label(&t("Kokoro voice"), cx))
-                    .child(voices)
-                    .child(note(t(
-                        "Runs offline on this machine. The model (about 90 MB) downloads the first time it speaks. Speaks at its own pace.",
-                    )))
-            }
-            TtsEngine::Provider => col
-                .child(self.settings_label(&t("Provider voice (alloy, echo, nova, onyx, shimmer, …)"), cx))
-                .child(Self::wide_input(Input::new(&self.settings_ui.tts_provider_voice)))
-                .child(self.settings_label(&t("Provider model"), cx))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .child(Input::new(&self.settings_ui.tts_provider_model)),
-                        )
-                        .child(
-                            Button::new("ra-apply-provider")
-                                .primary()
-                                .label(t("Apply"))
-                                .on_click(
-                                    cx.listener(|this, _e, _w, cx| this.apply_tts_provider(cx)),
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(note(t(
-                            "Uses the provider URL and API key from Speech. The reply's text is sent to that endpoint.",
-                        )))
-                        .child(
-                            Button::new("ra-open-speech")
-                                .ghost()
-                                .xsmall()
-                                .label(t("Speech settings"))
-                                .on_click(cx.listener(|this, _e, _w, cx| {
-                                    this.set_section(SettingsSection::Speech, cx)
-                                })),
-                        ),
-                ),
-        };
-
-        let rate_note = if engine == TtsEngine::Local {
-            t("Speaking rate (System and Provider voices)")
-        } else {
-            t("Speaking rate")
-        };
-        col.child(self.settings_label(&rate_note, cx))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("ra-rate-dec").ghost().label("−").on_click(
-                            cx.listener(|this, _e, _w, cx| this.adjust_tts_rate(-0.1, cx)),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .w(rems(4.0))
-                            .text_center()
-                            .child(format!("{:.1}×", settings.tts_rate)),
-                    )
-                    .child(
-                        Button::new("ra-rate-inc").ghost().label("+").on_click(
-                            cx.listener(|this, _e, _w, cx| this.adjust_tts_rate(0.1, cx)),
-                        ),
-                    )
-                    .child(
-                        Button::new("ra-rate-reset")
-                            .ghost()
-                            .small()
-                            .label(t("Normal"))
-                            .disabled((settings.tts_rate - 1.0).abs() < 0.05)
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.settings.tts_rate = 1.0;
-                                this.persist_settings();
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                div().child(
-                    Button::new("ra-test-voice")
-                        .ghost()
-                        .small()
-                        .icon(Icon::empty().path("icons/volume-2.svg"))
-                        .label(t("Test voice"))
-                        .tooltip(t("Hear a sample with these settings"))
-                        .on_click(cx.listener(|this, _e, _w, cx| {
-                            this.say_read_aloud_notice(
-                                t("This is how muxel reads an agent's reply aloud."),
-                                cx,
-                            )
-                        })),
-                ),
-            )
-            .into_any_element()
-    }
-
     // ===== Editor settings handlers =====
 
     fn apply_editor_font_family(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -31174,179 +30649,12 @@ impl MuxelApp {
         cx.notify();
     }
 
-    fn render_settings_editor(&self, cx: &mut Context<Self>) -> AnyElement {
-        v_flex()
-            .gap_3()
-            .max_w(px(520.0))
-            .child(self.settings_label(
-                &t("Code & diff font size — code editor and git-diff panes"),
-                cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(Button::new("ed-font-dec").ghost().label("−").on_click(
-                        cx.listener(|this, _e, w, cx| this.adjust_editor_font(-1.0, w, cx)),
-                    ))
-                    .child(
-                        div()
-                            .w(rems(4.0))
-                            .text_center()
-                            .child(format!("{}", self.settings.editor_font_size.round() as i32)),
-                    )
-                    .child(Button::new("ed-font-inc").ghost().label("+").on_click(
-                        cx.listener(|this, _e, w, cx| this.adjust_editor_font(1.0, w, cx)),
-                    )),
-            )
-            .child(self.settings_label(&t("Editor font family (blank = theme monospace)"), cx))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .child(Input::new(&self.settings_ui.editor_font_family)),
-                    )
-                    .child(
-                        Button::new("apply-ed-font")
-                            .primary()
-                            .label(t("Apply"))
-                            .on_click(
-                                cx.listener(|this, _e, w, cx| this.apply_editor_font_family(w, cx)),
-                            ),
-                    ),
-            )
-            .child(
-                self.settings_label(&t("Tab width (spaces) — applies to newly opened files"), cx),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("ed-tab-dec").ghost().label("−").on_click(
-                            cx.listener(|this, _e, w, cx| this.adjust_editor_tab(-1, w, cx)),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .w(rems(4.0))
-                            .text_center()
-                            .child(format!("{}", self.settings.editor_tab_size)),
-                    )
-                    .child(
-                        Button::new("ed-tab-inc").ghost().label("+").on_click(
-                            cx.listener(|this, _e, w, cx| this.adjust_editor_tab(1, w, cx)),
-                        ),
-                    ),
-            )
-            .child(
-                self.check_row(
-                    Checkbox::new("ed-wrap")
-                        .checked(self.settings.editor_soft_wrap)
-                        .on_click(cx.listener(|this, c: &bool, w, cx| {
-                            this.settings.editor_soft_wrap = *c;
-                            this.persist_settings();
-                            this.apply_editor_config(w, cx);
-                            cx.notify();
-                        })),
-                    &t("Soft wrap long lines"),
-                ),
-            )
-            .child(
-                self.check_row(
-                    Checkbox::new("ed-lines")
-                        .checked(self.settings.editor_line_numbers)
-                        .on_click(cx.listener(|this, c: &bool, w, cx| {
-                            this.settings.editor_line_numbers = *c;
-                            this.persist_settings();
-                            this.apply_editor_config(w, cx);
-                            cx.notify();
-                        })),
-                    &t("Show line numbers"),
-                ),
-            )
-            .child(
-                self.check_row(
-                    Checkbox::new("ed-guides")
-                        .checked(self.settings.editor_indent_guides)
-                        .on_click(cx.listener(|this, c: &bool, w, cx| {
-                            this.settings.editor_indent_guides = *c;
-                            this.persist_settings();
-                            this.apply_editor_config(w, cx);
-                            cx.notify();
-                        })),
-                    &t("Show indent guides"),
-                ),
-            )
-            .into_any_element()
-    }
-
     /// Adjust the terminal font size (independent of the UI zoom) and save.
     fn adjust_terminal_font(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.settings.font_size = (self.settings.font_size + delta).clamp(6.0, 72.0);
         self.refresh_terminal_config(cx);
         self.persist_settings();
         cx.notify();
-    }
-
-    /// Settings → Behavior: the per-process memory limit for local panes.
-    fn render_pane_memory_limit(&self, cx: &mut Context<Self>) -> AnyElement {
-        let current = self.settings.pane_memory_limit_gb;
-        let mut choices = vec![0, 8, 16, 32, 64];
-        // A hand-edited value still shows as the selected choice.
-        if !choices.contains(&current) {
-            choices.push(current);
-            choices.sort_unstable();
-        }
-        let mut row = div().flex().flex_wrap().gap_1();
-        for gb in choices {
-            let label = if gb == 0 {
-                t("Off")
-            } else {
-                tf("{gb} GB", &[("gb", &gb.to_string())]).into()
-            };
-            row = row.child(self.option_btn(
-                SharedString::from(format!("b-mem-{gb}")),
-                label,
-                current == gb,
-                cx,
-                move |s| s.pane_memory_limit_gb = gb,
-            ));
-        }
-        // Windows limits each process (a job object); Linux limits the pane's
-        // processes together (a cgroup), which is all a cgroup can do.
-        let (label, description) = if cfg!(windows) {
-            (
-                t("Memory limit for each process in a pane"),
-                t(
-                    "Limits how much memory each process a local pane starts can commit. A process that asks for more is refused, which usually stops it, so one runaway doesn't take the computer down in the common case; it can't help when less memory is free than the limit. The 16 GB default fits typical developer tools; large Java heaps, optimized links and local model runners can need more. Applies to panes started after a change. Windows reports a process that reaches the limit on a best-effort basis. Programs launched with their own breakaway flag, and processes a tmux server or remote host runs, aren't covered.",
-                ),
-            )
-        } else {
-            (
-                t("Memory limit for each pane"),
-                t(
-                    "Limits how much memory a local pane's processes can use together, plus up to a quarter of that in swap. When they reach it, Linux stops the largest of them and the rest of the pane, its agent included, keeps running; the notifications feed says so. Each local pane runs in a systemd scope of its own, so even with the limit off, a process stopped because the computer ran out of memory takes nothing else with it. The 16 GB default fits typical developer tools; large builds, links and local model runners can need more. Applies to panes started after a change. Needs a systemd user session. Panes on a remote host get a scope of their own there, but no limit.",
-                ),
-            )
-        };
-        v_flex()
-            .gap_1()
-            .child(self.settings_label(&label, cx))
-            .child(row)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(description),
-            )
-            .into_any_element()
     }
 
     fn set_close_on_exit(&mut self, on: bool, cx: &mut Context<Self>) {
@@ -31359,15 +30667,6 @@ impl MuxelApp {
         self.settings.pane_border = value.to_string();
         self.persist_settings();
         cx.notify();
-    }
-
-    fn pane_border_btn(&self, value: &'static str, label: &str, cx: &mut Context<Self>) -> Button {
-        Button::new(SharedString::from(format!("pb-{value}")))
-            .ghost()
-            .small()
-            .selected(self.settings.pane_border == value)
-            .label(label.to_string())
-            .on_click(cx.listener(move |this, _e, _w, cx| this.set_pane_border(value, cx)))
     }
 
     fn set_terminal_mouse(&mut self, value: &str, cx: &mut Context<Self>) {
@@ -31385,43 +30684,6 @@ impl MuxelApp {
             self.settings.diff_split_view = split;
             self.persist_settings();
         }
-    }
-
-    fn new_agent_placement_btn(
-        &self,
-        value: &'static str,
-        label: &str,
-        cx: &mut Context<Self>,
-    ) -> Button {
-        let selected = if value == muxel_core::NEW_AGENT_PANE {
-            self.settings.new_agents_open_as_panes()
-        } else {
-            !self.settings.new_agents_open_as_panes()
-        };
-        Button::new(SharedString::from(format!("nap-{value}")))
-            .ghost()
-            .small()
-            .selected(selected)
-            .label(label.to_string())
-            .on_click(cx.listener(move |this, _e, _w, cx| {
-                this.settings.new_agent_placement = value.to_string();
-                this.persist_settings();
-                cx.notify();
-            }))
-    }
-
-    fn terminal_mouse_btn(
-        &self,
-        value: &'static str,
-        label: &str,
-        cx: &mut Context<Self>,
-    ) -> Button {
-        Button::new(SharedString::from(format!("tm-{value}")))
-            .ghost()
-            .small()
-            .selected(self.settings.terminal_mouse == value)
-            .label(label.to_string())
-            .on_click(cx.listener(move |this, _e, _w, cx| this.set_terminal_mouse(value, cx)))
     }
 
     fn set_global_default_preset(&mut self, id: Uuid, cx: &mut Context<Self>) {
@@ -32512,55 +31774,6 @@ impl MuxelApp {
     fn adjust_ui_font(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.settings.ui_font_size = (self.settings.ui_font_size + delta).clamp(10.0, 28.0);
         theme::set_ui_font_size(self.settings.ui_font_size, cx);
-        self.persist_settings();
-        cx.notify();
-    }
-
-    fn load_keybinding_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let overrides: std::collections::HashMap<String, String> = self
-            .settings
-            .keybindings
-            .iter()
-            .map(|k| (k.action.clone(), k.keystroke.clone()))
-            .collect();
-        for (name, input) in &self.settings_ui.keybinds {
-            let ks = overrides.get(name).cloned().unwrap_or_else(|| {
-                settings_view::DEFAULT_KEYBINDINGS
-                    .iter()
-                    .find(|(n, _, _)| n == name)
-                    .map(|(_, d, _)| d.to_string())
-                    .unwrap_or_default()
-            });
-            input.update(cx, |s, cx| s.set_value(ks, window, cx));
-        }
-        let pass = self.settings.terminal_passthrough_keys.join(", ");
-        self.settings_ui
-            .passthrough_keys
-            .update(cx, |s, cx| s.set_value(pass, window, cx));
-    }
-
-    fn apply_keybindings(&mut self, cx: &mut Context<Self>) {
-        let mut cfgs = Vec::new();
-        for (name, input) in &self.settings_ui.keybinds {
-            let ks = input.read(cx).value().trim().to_string();
-            if !ks.is_empty() {
-                cfgs.push(muxel_core::KeyBindingCfg {
-                    action: name.clone(),
-                    keystroke: ks,
-                });
-            }
-        }
-        self.settings.keybindings = cfgs;
-        // Terminal pass-through chords (comma/space/newline separated).
-        let pass = self.settings_ui.passthrough_keys.read(cx).value().clone();
-        self.settings.terminal_passthrough_keys = pass
-            .split([',', ' ', '\n'])
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect();
-        let snapshot = self.settings.clone();
-        install_keybindings(&snapshot, cx);
         self.persist_settings();
         cx.notify();
     }
@@ -34303,2330 +33516,6 @@ impl MuxelApp {
             )
             .into_any_element()
     }
-
-    /// The settings page as a centered modal card over a dimmed backdrop.
-    fn render_settings_modal(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let editing_agent = (self.settings_ui.selected_preset.is_some()
-            && self.settings_ui.section == SettingsSection::Agents)
-            || (self.settings_ui.selected_runner.is_some()
-                && self.settings_ui.section == SettingsSection::Runners)
-            || (self.settings_ui.selected_snippet.is_some()
-                && self.settings_ui.section == SettingsSection::Snippets);
-        modal_backdrop()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _ev, _w, cx| this.close_settings(cx)),
-            )
-            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
-                if let Some((start, base)) = this.settings_resize {
-                    let w = (f32::from(base.width) + f32::from(ev.position.x - start.x)).max(420.0);
-                    let h =
-                        (f32::from(base.height) + f32::from(ev.position.y - start.y)).max(320.0);
-                    this.settings_size = size(px(w), px(h));
-                    cx.notify();
-                } else if let Some((start, base)) = this.settings_move {
-                    this.settings_offset = point(
-                        base.x + (ev.position.x - start.x),
-                        base.y + (ev.position.y - start.y),
-                    );
-                    cx.notify();
-                }
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _ev, _w, _cx| {
-                    this.settings_resize = None;
-                    this.settings_move = None;
-                }),
-            )
-            .child(
-                div()
-                    .w(self.settings_size.width)
-                    .h(self.settings_size.height)
-                    .relative()
-                    // Shift from the centred position by the drag offset.
-                    .left(self.settings_offset.x)
-                    .top(self.settings_offset.y)
-                    .max_w(relative(0.95))
-                    .max_h(relative(0.9))
-                    .flex()
-                    .flex_col()
-                    .bg(cx.theme().background)
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .rounded(cx.theme().radius_lg)
-                    .shadow_lg()
-                    .overflow_hidden()
-                    // Clicks inside the card must not reach the backdrop.
-                    .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .px_4()
-                            .py_2()
-                            .bg(cx.theme().title_bar)
-                            // Drag the title bar to move the modal around.
-                            .cursor(CursorStyle::OpenHand)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
-                                    cx.stop_propagation();
-                                    this.settings_move = Some((ev.position, this.settings_offset));
-                                }),
-                            )
-                            .child(div().font_semibold().child(t("Settings")))
-                            .child(div().flex_1())
-                            .child(
-                                // Pressing Close must not begin a title-bar drag.
-                                div()
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation()
-                                    })
-                                    .child(
-                                        Button::new("close-settings")
-                                            .ghost()
-                                            .icon(IconName::Close)
-                                            .tooltip(t("Close"))
-                                            .on_click(cx.listener(|this, _ev, _w, cx| {
-                                                this.close_settings(cx)
-                                            })),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .child(self.render_settings(window, cx)),
-                    )
-                    .children((!editing_agent).then(|| {
-                        div()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .gap_2()
-                            .px_4()
-                            .py_2()
-                            .border_t_1()
-                            .border_color(cx.theme().border)
-                            .child(
-                                Button::new("settings-cancel")
-                                    .ghost()
-                                    .label(t("Cancel"))
-                                    .on_click(
-                                        cx.listener(|this, _e, _w, cx| this.cancel_settings(cx)),
-                                    ),
-                            )
-                            .child(
-                                Button::new("settings-save")
-                                    .primary()
-                                    .label(t("Save"))
-                                    .on_click(
-                                        cx.listener(|this, _e, _w, cx| this.save_settings(cx)),
-                                    ),
-                            )
-                    }))
-                    .child(
-                        // Bottom-right corner: drag to resize the modal.
-                        div()
-                            .absolute()
-                            .bottom_0()
-                            .right_0()
-                            .size(px(18.0))
-                            .cursor(CursorStyle::ResizeUpLeftDownRight)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
-                                    cx.stop_propagation();
-                                    this.settings_resize = Some((ev.position, this.settings_size));
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .bottom(px(3.0))
-                                    .right(px(3.0))
-                                    .size(px(9.0))
-                                    .border_b_2()
-                                    .border_r_2()
-                                    .border_color(cx.theme().muted_foreground),
-                            ),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    /// Definite inner width of the settings content pane. The modal card is
-    /// `w(settings_size).max_w(relative(0.95))`, so its real width is clamped to
-    /// 95% of the window — using `settings_size` alone is why inputs were only right
-    /// at one window size. Subtract the nav (rems 10) and a scrollbar margin. This
-    /// is the width content must be sized against absolutely, since the
-    /// `overflow_y_scroll` pane gives children no definite width of their own.
-    fn settings_content_w(&self, window: &mut Window) -> Pixels {
-        let cap = window.viewport_size().width * 0.95;
-        let modal_w = if self.settings_size.width < cap {
-            self.settings_size.width
-        } else {
-            cap
-        };
-        let raw = modal_w - window.rem_size() * 10.0 - px(20.0);
-        if raw < px(320.0) { px(320.0) } else { raw }
-    }
-
-    fn render_settings(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let current = self.settings_ui.section;
-        let nav_item = |label: SharedString, section: SettingsSection| {
-            Button::new(label.clone())
-                .ghost()
-                .selected(section == current)
-                .label(label)
-        };
-        let sections = [
-            (t("Appearance"), SettingsSection::Appearance),
-            (t("Editor"), SettingsSection::Editor),
-            (t("Behavior"), SettingsSection::Behavior),
-            (t("Sounds"), SettingsSection::Sounds),
-            (t("Speech"), SettingsSection::Speech),
-            (t("Read Aloud"), SettingsSection::ReadAloud),
-            (t("Agents"), SettingsSection::Agents),
-            (t("Outside control"), SettingsSection::OutsideControl),
-            (t("Runners"), SettingsSection::Runners),
-            (t("Snippets"), SettingsSection::Snippets),
-            (t("Loops"), SettingsSection::Loops),
-            (t("Libraries"), SettingsSection::Libraries),
-            (t("Remotes"), SettingsSection::Remotes),
-            (t("Identities"), SettingsSection::Identities),
-            (t("Projects"), SettingsSection::Projects),
-            (t("Keybindings"), SettingsSection::Keybindings),
-        ];
-        let mut nav_items = v_flex().p_2().gap_1();
-        for (label, section) in sections {
-            nav_items = nav_items.child(
-                nav_item(label, section)
-                    .on_click(cx.listener(move |this, _e, _w, cx| this.set_section(section, cx))),
-            );
-        }
-        // The section list scrolls on its own so its last entries never paint
-        // over Cancel/Save when the modal is short.
-        let nav = div()
-            .id("settings-nav")
-            .w(rems(10.0))
-            .flex_none()
-            .h_full()
-            .min_h_0()
-            .overflow_y_scroll()
-            .bg(cx.theme().sidebar)
-            .child(nav_items);
-
-        let content_w = self.settings_content_w(window);
-        let content = match current {
-            SettingsSection::Appearance => self.render_settings_appearance(cx),
-            SettingsSection::Editor => self.render_settings_editor(cx),
-            SettingsSection::Behavior => self.render_settings_behavior(cx),
-            SettingsSection::Sounds => self.render_settings_sounds(cx),
-            SettingsSection::Speech => self.render_settings_speech(cx),
-            SettingsSection::ReadAloud => self.render_settings_read_aloud(cx),
-            SettingsSection::Agents => self.render_settings_agents(cx),
-            SettingsSection::OutsideControl => self.render_settings_outside_control(cx),
-            SettingsSection::Runners => self.render_settings_runners(cx),
-            SettingsSection::Snippets => self.render_settings_snippets(cx),
-            SettingsSection::Loops => self.render_settings_loops(cx),
-            SettingsSection::Libraries => self.render_settings_libraries(cx),
-            SettingsSection::Remotes => self.render_settings_remotes(cx),
-            SettingsSection::Identities => self.render_settings_identities(cx),
-            SettingsSection::Projects => self.render_settings_projects(cx),
-            SettingsSection::Keybindings => self.render_settings_keybindings(content_w, cx),
-        };
-
-        div()
-            .size_full()
-            .flex()
-            .flex_row()
-            .child(nav)
-            .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_w_0()
-                    .min_h_0()
-                    .child(
-                        div()
-                            .id("settings-content")
-                            .size_full()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.settings_scroll)
-                            // The scroll container itself doesn't give children a
-                            // definite width (percentage widths collapse), so put
-                            // the content in an absolute-width inner block.
-                            .child(div().w(content_w).p_4().child(content)),
-                    )
-                    .child(
-                        div().absolute().inset_0().child(
-                            Scrollbar::new(&self.settings_scroll)
-                                .id("settings-sb")
-                                .axis(ScrollbarAxis::Vertical),
-                        ),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_settings_appearance(&self, cx: &mut Context<Self>) -> AnyElement {
-        let current_theme = cx.theme().theme_name().clone();
-        v_flex()
-            .gap_3()
-            .max_w(px(520.0))
-            .child(self.settings_label(&t("Theme"), cx))
-            .child(
-                DropdownButton::new("settings-theme")
-                    .button(
-                        Button::new("settings-theme-btn")
-                            .ghost()
-                            .icon(IconName::Palette)
-                            .label(current_theme),
-                    )
-                    .dropdown_menu(move |mut menu, _window, cx| {
-                        for name in theme::theme_names(cx) {
-                            menu =
-                                menu.menu(name.clone(), Box::new(crate::theme::SwitchTheme(name)));
-                        }
-                        menu.scrollable(true)
-                    }),
-            )
-            .child(self.settings_label(&t("Language"), cx))
-            .child(
-                DropdownButton::new("settings-language")
-                    .button(
-                        Button::new("settings-language-btn")
-                            .ghost()
-                            .label(crate::i18n::display_name(&crate::i18n::current_language())),
-                    )
-                    .dropdown_menu(move |mut menu, _window, _cx| {
-                        for entry in crate::i18n::available_languages() {
-                            menu = menu.menu(
-                                SharedString::from(entry.1),
-                                Box::new(crate::i18n::SetLanguage(entry.0.to_string())),
-                            );
-                        }
-                        menu.scrollable(true)
-                    }),
-            )
-            .child(self.settings_label(
-                &t("Interface font size — all UI text except the terminal"),
-                cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("ui-font-dec").ghost().label("−").on_click(
-                            cx.listener(|this, _e, _w, cx| this.adjust_ui_font(-1.0, cx)),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .w(rems(4.0))
-                            .text_center()
-                            .child(format!("{}", self.settings.ui_font_size.round() as i32)),
-                    )
-                    .child(
-                        Button::new("ui-font-inc")
-                            .ghost()
-                            .label("+")
-                            .on_click(cx.listener(|this, _e, _w, cx| this.adjust_ui_font(1.0, cx))),
-                    ),
-            )
-            .child(self.settings_label(&t("UI zoom — scales the whole app"), cx))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("ui-zoom-dec")
-                            .ghost()
-                            .label("−")
-                            .on_click(cx.listener(|this, _e, _w, cx| this.adjust_zoom(-0.1, cx))),
-                    )
-                    .child(
-                        div()
-                            .w(rems(4.0))
-                            .text_center()
-                            .child(format!("{}%", (self.settings.zoom * 100.0).round() as i32)),
-                    )
-                    .child(
-                        Button::new("ui-zoom-inc")
-                            .ghost()
-                            .label("+")
-                            .on_click(cx.listener(|this, _e, _w, cx| this.adjust_zoom(0.1, cx))),
-                    ),
-            )
-            .child(self.settings_label(&t("Terminal font size — independent of UI zoom"), cx))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(Button::new("term-font-dec").ghost().label("−").on_click(
-                        cx.listener(|this, _e, _w, cx| this.adjust_terminal_font(-1.0, cx)),
-                    ))
-                    .child(
-                        div()
-                            .w(rems(4.0))
-                            .text_center()
-                            .child(format!("{}", self.settings.font_size.round() as i32)),
-                    )
-                    .child(Button::new("term-font-inc").ghost().label("+").on_click(
-                        cx.listener(|this, _e, _w, cx| this.adjust_terminal_font(1.0, cx)),
-                    )),
-            )
-            .child(self.settings_label(&t("Terminal font family (blank = built-in default)"), cx))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .child(Input::new(&self.settings_ui.font_family)),
-                    )
-                    .child(
-                        Button::new("apply-font-family")
-                            .primary()
-                            .label(t("Apply"))
-                            .on_click(cx.listener(|this, _e, _w, cx| this.apply_font_family(cx))),
-                    ),
-            )
-            .child(self.settings_label(&t("Pane border"), cx))
-            .child(
-                div()
-                    .flex()
-                    .gap_1()
-                    .child(self.pane_border_btn("off", &t("Off"), cx))
-                    .child(self.pane_border_btn("subtle", &t("Subtle"), cx))
-                    .child(self.pane_border_btn("bold", &t("Bold"), cx)),
-            )
-            .into_any_element()
-    }
-
-    /// A checkbox + label row. The label is rendered separately because
-    /// gpui-component's `Checkbox` label uses line-height 1.0, which clips
-    /// descenders (g/p/y).
-    /// Wrap a gpui-component `Input` so it fills the full width of a column form.
-    /// The input ignores flex-grow on itself, so the proven pattern (mirroring the
-    /// SSH Port/User fields) is a growing `v_flex().flex_1()` wrapper inside a flex
-    /// row — the wrapper takes the width and the input fills it.
-    fn wide_input(inp: Input) -> impl IntoElement {
-        div().flex().child(v_flex().flex_1().child(inp))
-    }
-
-    fn check_row(&self, checkbox: Checkbox, label: &str) -> impl IntoElement {
-        // The label needs a DEFINITE width — with `flex_1` its width is resolved
-        // only in the layout pass, so a multi-line (wrapped) label's height is
-        // mis-measured and the next row overlaps it. Use the editor-safe width
-        // (pane minus the list column, capped at the form max) so one absolute
-        // value fits both full-width sections and the narrower list+editor panes.
-        let label_w = {
-            let editor = self.settings_pane_w - px(208.0); // p_4 + list (rems 10) + gap
-            let cap = px(560.0);
-            let base = if editor < cap { editor } else { cap };
-            let w = base - px(28.0); // checkbox + gap
-            if w < px(180.0) { px(180.0) } else { w }
-        };
-        div()
-            .flex()
-            // `items_start` so the box aligns with the first line when the label wraps.
-            .items_start()
-            .gap_2()
-            .py_0p5()
-            .child(checkbox)
-            .child(div().w(label_w).text_sm().child(label.to_string()))
-    }
-
-    fn render_settings_behavior(&self, cx: &mut Context<Self>) -> AnyElement {
-        let global_default = self
-            .presets
-            .iter()
-            .find(|p| p.id.to_string() == self.settings.default_preset)
-            .map(|p| p.id);
-        let mut preset_row = div().flex().flex_wrap().gap_1();
-        for p in &self.presets {
-            let id = p.id;
-            preset_row = preset_row.child(
-                Button::new(SharedString::from(format!("bdef-{id}")))
-                    .ghost()
-                    .selected(Some(id) == global_default)
-                    .label(p.name.clone())
-                    .on_click(
-                        cx.listener(move |this, _e, _w, cx| this.set_global_default_preset(id, cx)),
-                    ),
-            );
-        }
-        v_flex()
-            .gap_3()
-            .max_w(px(520.0))
-            .child(
-                self.check_row(
-                    Checkbox::new("b-notif")
-                        .checked(self.notifications_enabled)
-                        .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                            this.notifications_enabled = *c;
-                            this.persist_settings();
-                            cx.notify();
-                        })),
-                    &t("Desktop notifications"),
-                ),
-            )
-            .child(
-                self.check_row(
-                    Checkbox::new("b-browser")
-                        .checked(self.settings.browser_enabled)
-                        .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                            this.settings.browser_enabled = *c;
-                            this.persist_settings();
-                            // Windows only: the embedded webview needs a
-                            // compositor flag set before gpui starts (see
-                            // main.rs), so a mid-session change takes full
-                            // effect on the next launch.
-                            #[cfg(target_os = "windows")]
-                            this.add_event(
-                                NotifKind::Success,
-                                t("Browser"),
-                                t("Restart muxel to fully apply the browser change.").to_string(),
-                            );
-                            cx.notify();
-                        })),
-                    &t("Open ctrl+clicked links in the built-in browser (off = system browser)"),
-                ),
-            )
-            .child(
-                self.check_row(
-                    Checkbox::new("b-minimize-tray")
-                        .checked(self.settings.minimize_to_tray)
-                        .on_click(
-                            cx.listener(|this, c: &bool, _w, cx| this.set_minimize_to_tray(*c, cx)),
-                        ),
-                    &t("Minimize to the system tray on close"),
-                ),
-            )
-            .child(
-                div().pl(rems(1.75)).child(
-                    Button::new("test-notif")
-                        .ghost()
-                        .small()
-                        .icon(IconName::Bell)
-                        .label(t("Send a test notification"))
-                        .tooltip(t("Check that your desktop shows muxel notifications"))
-                        .on_click(cx.listener(|_this, _e, _w, _cx| {
-                            notify(
-                                t("muxel test notification").to_string(),
-                                t("If you can see this, notifications are working.").to_string(),
-                                None,
-                            );
-                        })),
-                ),
-            )
-            .child(
-                self.check_row(
-                    Checkbox::new("b-close")
-                        .checked(self.settings.close_on_exit)
-                        .on_click(
-                            cx.listener(|this, c: &bool, _w, cx| this.set_close_on_exit(*c, cx)),
-                        ),
-                    &t("Close a pane when its process exits cleanly (a crash leaves the pane open)"),
-                ),
-            )
-            .child(
-                self.check_row(
-                    Checkbox::new("b-confirm-close-term")
-                        .checked(self.settings.confirm_close_terminal)
-                        .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                            this.settings.confirm_close_terminal = *c;
-                            this.persist_settings();
-                            cx.notify();
-                        })),
-                    &t("Ask before closing a busy terminal"),
-                ),
-            )
-            // Job objects are Windows-only; elsewhere the setting does nothing.
-            .children(
-                cfg!(any(windows, target_os = "linux"))
-                    .then(|| self.render_pane_memory_limit(cx)),
-            )
-            .child(
-                self.check_row(
-                    Checkbox::new("b-dev-console")
-                        .checked(self.settings.dev_console_enabled)
-                        .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                            this.settings.dev_console_enabled = *c;
-                            this.persist_settings();
-                            cx.notify();
-                        })),
-                    &t("Developer console (toggle with F12)"),
-                ),
-            )
-            .child(self.settings_label(&t("Terminal copy & paste"), cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_1()
-                    .child(self.terminal_mouse_btn("copy_paste", &t("Right-click copy/paste"), cx))
-                    .child(self.terminal_mouse_btn("menu", &t("Right-click menu"), cx))
-                    .child(self.terminal_mouse_btn("copy_on_select", &t("Copy on select"), cx)),
-            )
-            .child(self.settings_label(&t("New agents open"), cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_1()
-                    .child(self.new_agent_placement_btn(
-                        muxel_core::NEW_AGENT_TAB,
-                        &t("In a new tab"),
-                        cx,
-                    ))
-                    .child(self.new_agent_placement_btn(
-                        muxel_core::NEW_AGENT_PANE,
-                        &t("In a new pane"),
-                        cx,
-                    )),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t(
-                        "For the toolbar's agent button and Ctrl+Alt+1–9. A new tab joins the focused pane; a new pane opens to its right.",
-                    )),
-            )
-            .child(
-                self.check_row(
-                    Checkbox::new("b-tmux")
-                        // Effectively off (and greyed) when tmux isn't installed,
-                        // even though the preference stays saved.
-                        .checked(self.use_tmux && self.tmux_available)
-                        .disabled(!self.tmux_available)
-                        .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                            this.use_tmux = *c;
-                            this.persist_settings();
-                            cx.notify();
-                        })),
-                    &if self.tmux_available {
-                        t("New agents run in a tmux session")
-                    } else {
-                        t("New agents run in a tmux session (tmux not installed)")
-                    },
-                ),
-            )
-            .children(
-                (!self.tmux_available && cfg!(any(target_os = "linux", target_os = "macos")))
-                    .then(|| {
-                        div().pl(px(24.0)).child(
-                            Button::new("b-tmux-install")
-                                .small()
-                                .label(t("Install tmux…"))
-                                .on_click(cx.listener(|this, _e, window, cx| {
-                                    this.open_tmux_install(window, cx)
-                                })),
-                        )
-                    }),
-            )
-            .child(
-                self.check_row(
-                    Checkbox::new("b-worktree")
-                        .checked(self.use_worktree)
-                        .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                            this.use_worktree = *c;
-                            this.persist_settings();
-                            cx.notify();
-                        })),
-                    &t("New agents use a git worktree"),
-                ),
-            )
-            .child(self.settings_label(&t("Default preset for new agents"), cx))
-            .child(div().flex().child(preset_row.flex_1()))
-            .child(self.settings_label(&t("Auto-continue message"), cx))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .child(Input::new(&self.settings_ui.auto_continue_message)),
-                    )
-                    .child(
-                        Button::new("b-auto-continue-apply")
-                            .primary()
-                            .label(t("Apply"))
-                            .on_click(cx.listener(|this, _e, window, cx| {
-                                this.apply_auto_continue_message(window, cx)
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t("What a pane's Auto toggle types, then presses Enter, to resume an agent that stalls with work left. Blank restores “continue”. Right-click a pane's Auto button to give that pane its own.")),
-            )
-            .into_any_element()
-    }
-
-    fn render_settings_agents(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut list = v_flex().w(rems(10.0)).flex_none().gap_1();
-        for (idx, p) in self.presets.iter().enumerate() {
-            let selected = self.settings_ui.selected_preset == Some(idx);
-            // Flag agents whose binary isn't installed (hidden from new-agent menus).
-            let not_installed = !self.agent_runnable(p);
-            let fg = if selected {
-                cx.theme().sidebar_accent_foreground
-            } else {
-                cx.theme().foreground
-            };
-            let icon = preset_icon(p, px(15.0), fg);
-            let mut row =
-                div()
-                    .id(SharedString::from(format!("preset-item-{idx}")))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .rounded(cx.theme().radius)
-                    .cursor_pointer()
-                    .text_color(fg)
-                    .on_click(cx.listener(move |this, _e, window, cx| {
-                        this.open_preset_editor(idx, window, cx)
-                    }))
-                    .child(icon)
-                    .child(div().flex_1().text_sm().child(p.name.clone()))
-                    .children(not_installed.then(|| {
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(t("not installed"))
-                    }));
-            if selected {
-                row = row.bg(cx.theme().sidebar_accent);
-            } else {
-                row = row.hover(|s| s.bg(cx.theme().accent));
-            }
-            list = list.child(row);
-        }
-        list = list.child(
-            Button::new("add-preset")
-                .ghost()
-                .icon(IconName::Plus)
-                .label(t("Add preset"))
-                .on_click(cx.listener(|this, _e, window, cx| this.add_preset(window, cx))),
-        );
-
-        let editor = match self.settings_ui.selected_preset {
-            Some(idx) if idx < self.presets.len() => self.render_preset_editor(idx, cx),
-            _ => div()
-                .p_4()
-                .text_color(cx.theme().muted_foreground)
-                .child(t("Select a preset to edit, or add one."))
-                .into_any_element(),
-        };
-
-        div()
-            .flex()
-            .flex_row()
-            .gap_4()
-            .child(list)
-            .child(div().flex_1().min_w_0().child(editor))
-            .into_any_element()
-    }
-
-    fn render_settings_snippets(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut list = v_flex().w(rems(10.0)).flex_none().gap_1();
-        for (idx, s) in self.snippets.iter().enumerate() {
-            let selected = self.settings_ui.selected_snippet == Some(idx);
-            let fg = if selected {
-                cx.theme().sidebar_accent_foreground
-            } else {
-                cx.theme().foreground
-            };
-            let mut row = div()
-                .id(SharedString::from(format!("snippet-row-{idx}")))
-                .flex()
-                .items_center()
-                .gap_2()
-                .w_full()
-                .px_2()
-                .py_1()
-                .rounded(cx.theme().radius)
-                .cursor_pointer()
-                .text_color(fg)
-                .on_click(cx.listener(move |this, _e, window, cx| {
-                    this.open_snippet_editor(idx, window, cx)
-                }))
-                .child(Icon::new(IconName::SquareTerminal).small())
-                .child(div().flex_1().min_w_0().text_sm().child(s.name.clone()))
-                .children(s.submit.then(|| {
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("↵")
-                }));
-            if selected {
-                row = row.bg(cx.theme().sidebar_accent);
-            } else {
-                row = row.hover(|s| s.bg(cx.theme().accent));
-            }
-            list = list.child(row);
-        }
-        list = list.child(
-            Button::new("add-snippet")
-                .ghost()
-                .icon(IconName::Plus)
-                .label(t("Add snippet"))
-                .on_click(cx.listener(|this, _e, window, cx| this.add_snippet(window, cx))),
-        );
-
-        let editor = match self.settings_ui.selected_snippet {
-            Some(idx) if idx < self.snippets.len() => self.render_snippet_editor(idx, cx),
-            _ => div()
-                .p_4()
-                .text_color(cx.theme().muted_foreground)
-                .child(t("Select a snippet to edit, or add one."))
-                .into_any_element(),
-        };
-
-        div()
-            .flex()
-            .flex_row()
-            .gap_4()
-            .child(list)
-            .child(div().flex_1().min_w_0().child(editor))
-            .into_any_element()
-    }
-
-    fn render_snippet_editor(&self, idx: usize, cx: &mut Context<Self>) -> AnyElement {
-        let ui = &self.settings_ui;
-        v_flex()
-            .gap_2()
-            .max_w(px(560.0))
-            .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&ui.sn_name)))
-            .child(self.settings_label(&t("Text — typed into the focused pane"), cx))
-            .child(Self::wide_input(Input::new(&ui.sn_text).h(px(120.0))))
-            .child(self.check_row(
-                Checkbox::new("sn-submit").checked(ui.sn_submit).on_click(
-                    cx.listener(|this, _c: &bool, _w, cx| this.toggle_snippet_submit(cx)),
-                ),
-                &t("Press Enter after typing (run it)"),
-            ))
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .pt_2()
-                    .child(
-                        Button::new("save-snippet")
-                            .primary()
-                            .label(t("Save"))
-                            .on_click(cx.listener(|this, _e, _w, cx| this.save_snippet(cx))),
-                    )
-                    .child(
-                        Button::new("del-snippet")
-                            .ghost()
-                            .label(t("Delete"))
-                            .on_click(cx.listener(move |this, _e, _w, cx| {
-                                let name = this
-                                    .snippets
-                                    .get(idx)
-                                    .map(|s| s.name.clone())
-                                    .unwrap_or_default();
-                                this.request_confirm(
-                                    t("Delete snippet?"),
-                                    tf("The “{name}” snippet will be deleted.", &[("name", &name)]),
-                                    t("Delete"),
-                                    ConfirmAction::DeleteSnippet(idx),
-                                    cx,
-                                )
-                            })),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_settings_runners(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut list = v_flex().w(rems(10.0)).flex_none().gap_1();
-        for (idx, r) in self.runners.iter().enumerate() {
-            let selected = self.settings_ui.selected_runner == Some(idx);
-            let program = r
-                .preset_id
-                .and_then(|id| self.presets.iter().find(|p| p.id == id))
-                .and_then(|p| p.program.clone());
-            let fg = if selected {
-                cx.theme().sidebar_accent_foreground
-            } else {
-                cx.theme().foreground
-            };
-            let mut row =
-                div()
-                    .id(SharedString::from(format!("runner-row-{idx}")))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .rounded(cx.theme().radius)
-                    .cursor_pointer()
-                    .text_color(fg)
-                    .on_click(cx.listener(move |this, _e, window, cx| {
-                        this.open_runner_editor(idx, window, cx)
-                    }))
-                    .child(agent_icon(program.as_deref(), px(15.0), fg))
-                    .child(div().text_sm().child(r.name.clone()));
-            if selected {
-                row = row.bg(cx.theme().sidebar_accent);
-            } else {
-                row = row.hover(|s| s.bg(cx.theme().accent));
-            }
-            list = list.child(row);
-        }
-        list = list.child(
-            Button::new("add-runner")
-                .ghost()
-                .icon(IconName::Plus)
-                .label(t("Add runner"))
-                .on_click(cx.listener(|this, _e, window, cx| this.add_runner(window, cx))),
-        );
-
-        let editor = match self.settings_ui.selected_runner {
-            Some(idx) if idx < self.runners.len() => self.render_runner_editor(idx, cx),
-            _ => div()
-                .p_4()
-                .text_color(cx.theme().muted_foreground)
-                .child(t("Select a runner to edit, or add one."))
-                .into_any_element(),
-        };
-
-        div()
-            .flex()
-            .flex_row()
-            .gap_4()
-            .child(list)
-            .child(div().flex_1().min_w_0().child(editor))
-            .into_any_element()
-    }
-
-    fn render_runner_editor(&self, idx: usize, cx: &mut Context<Self>) -> AnyElement {
-        let ui = &self.settings_ui;
-        let selected_preset = ui.r_preset_id;
-        // Agent picker: "Current/default" + one button per preset.
-        let mut agent_row = div().flex().flex_wrap().gap_1();
-        agent_row = agent_row.child(
-            Button::new("runner-agent-default")
-                .ghost()
-                .selected(selected_preset.is_none())
-                .label(t("Current/default"))
-                .on_click(cx.listener(|this, _e, _w, cx| this.set_runner_preset(None, cx))),
-        );
-        for p in &self.presets {
-            let id = p.id;
-            agent_row = agent_row.child(
-                Button::new(SharedString::from(format!("runner-agent-{}", id.simple())))
-                    .ghost()
-                    .selected(selected_preset == Some(id))
-                    .icon(agent_icon_obj(p.program.as_deref()))
-                    .label(p.name.clone())
-                    .on_click(
-                        cx.listener(move |this, _e, _w, cx| this.set_runner_preset(Some(id), cx)),
-                    ),
-            );
-        }
-
-        v_flex()
-            .gap_2()
-            .max_w(px(560.0))
-            .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&ui.r_name)))
-            .child(self.settings_label(&t("Agent"), cx))
-            .child(div().flex().child(agent_row.flex_1()))
-            .child(self.settings_label(&t("Auto mode — Shift+Tab presses at startup"), cx))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("runner-presses-dec")
-                            .ghost()
-                            .label("−")
-                            .on_click(
-                                cx.listener(|this, _e, _w, cx| this.adjust_runner_presses(-1, cx)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .w(rems(2.0))
-                            .text_center()
-                            .child(format!("{}", ui.r_presses)),
-                    )
-                    .child(
-                        Button::new("runner-presses-inc")
-                            .ghost()
-                            .label("+")
-                            .on_click(
-                                cx.listener(|this, _e, _w, cx| this.adjust_runner_presses(1, cx)),
-                            ),
-                    ),
-            )
-            .child(self.settings_label(
-                &t("Prompt — {{input}} is replaced with run-time details"),
-                cx,
-            ))
-            .child(Self::wide_input(Input::new(&ui.r_prompt).h(px(120.0))))
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .pt_2()
-                    .child(
-                        Button::new("save-runner")
-                            .primary()
-                            .label(t("Save"))
-                            .on_click(cx.listener(|this, _e, _w, cx| this.save_runner(cx))),
-                    )
-                    .child(
-                        Button::new("del-runner")
-                            .ghost()
-                            .label(t("Delete"))
-                            .on_click(cx.listener(move |this, _e, _w, cx| {
-                                let name = this
-                                    .runners
-                                    .get(idx)
-                                    .map(|r| r.name.clone())
-                                    .unwrap_or_default();
-                                this.request_confirm(
-                                    t("Delete runner?"),
-                                    tf("The “{name}” runner will be deleted.", &[("name", &name)]),
-                                    t("Delete"),
-                                    ConfirmAction::DeleteRunner(idx),
-                                    cx,
-                                )
-                            })),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_settings_loops(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut list = v_flex().w(rems(12.0)).flex_none().gap_1();
-        for (idx, l) in self.loops.iter().enumerate() {
-            let selected = self.settings_ui.selected_loop == Some(idx);
-            let program = l
-                .preset_id
-                .and_then(|id| self.presets.iter().find(|p| p.id == id))
-                .and_then(|p| p.program.clone());
-            let base_fg = if l.enabled {
-                cx.theme().foreground
-            } else {
-                cx.theme().muted_foreground
-            };
-            let fg = if selected {
-                cx.theme().sidebar_accent_foreground
-            } else {
-                base_fg
-            };
-            let sched = loop_schedule_summary(&l.schedule);
-            let mut row = div()
-                .id(SharedString::from(format!("loop-row-{idx}")))
-                .flex()
-                .items_center()
-                .gap_2()
-                .w_full()
-                .px_2()
-                .py_1()
-                .rounded(cx.theme().radius)
-                .cursor_pointer()
-                .text_color(fg)
-                .on_click(
-                    cx.listener(move |this, _e, window, cx| this.open_loop_editor(idx, window, cx)),
-                )
-                .child(agent_icon(program.as_deref(), px(15.0), fg))
-                .child(
-                    v_flex()
-                        .min_w_0()
-                        .child(div().text_sm().child(l.name.clone()))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(sched),
-                        ),
-                );
-            if selected {
-                row = row.bg(cx.theme().sidebar_accent);
-            } else {
-                row = row.hover(|s| s.bg(cx.theme().accent));
-            }
-            list = list.child(row);
-        }
-        list = list.child(
-            Button::new("add-loop")
-                .ghost()
-                .icon(IconName::Plus)
-                .label(t("Add loop"))
-                .on_click(cx.listener(|this, _e, window, cx| this.add_loop(window, cx))),
-        );
-
-        let editor = match self.settings_ui.selected_loop {
-            Some(idx) if idx < self.loops.len() => self.render_loop_editor(idx, cx),
-            _ => div()
-                .p_4()
-                .text_color(cx.theme().muted_foreground)
-                .child(t("Select a loop to edit, or add one."))
-                .into_any_element(),
-        };
-
-        div()
-            .flex()
-            .flex_row()
-            .gap_4()
-            .child(list)
-            .child(div().flex_1().min_w_0().child(editor))
-            .into_any_element()
-    }
-
-    fn render_loop_editor(&self, idx: usize, cx: &mut Context<Self>) -> AnyElement {
-        let ui = &self.settings_ui;
-        let kind = ui.l_sched_kind;
-
-        // Agent picker. No "Current" here, unlike runners: a loop fires unattended,
-        // so it runs the agent it names, not whatever the toolbar has selected then.
-        let mut agent_row = div().flex().flex_wrap().gap_1();
-        for p in &self.presets {
-            let id = p.id;
-            agent_row = agent_row.child(
-                Button::new(SharedString::from(format!("loop-agent-{}", id.simple())))
-                    .ghost()
-                    .selected(ui.l_preset_id == Some(id))
-                    .icon(agent_icon_obj(p.program.as_deref()))
-                    .label(p.name.clone())
-                    .on_click(cx.listener(move |this, _e, _w, cx| this.set_loop_preset(id, cx))),
-            );
-        }
-
-        // Project picker.
-        let mut project_row = div().flex().flex_wrap().gap_1();
-        for p in &self.workspace.projects {
-            let pidp = p.id;
-            project_row = project_row.child(
-                Button::new(SharedString::from(format!("loop-proj-{}", pidp.simple())))
-                    .ghost()
-                    .selected(ui.l_project_id == Some(pidp))
-                    .label(p.name.clone())
-                    .on_click(cx.listener(move |this, _e, _w, cx| this.set_loop_project(pidp, cx))),
-            );
-        }
-
-        // Schedule kind toggle.
-        let mut sched_row = div().flex().flex_wrap().gap_1();
-        for (k, label) in [
-            (0u8, t("Every minutes")),
-            (1, t("Every hours")),
-            (2, t("Daily at")),
-        ] {
-            sched_row = sched_row.child(
-                Button::new(SharedString::from(format!("loop-sched-{k}")))
-                    .ghost()
-                    .selected(kind == k)
-                    .label(label)
-                    .on_click(cx.listener(move |this, _e, _w, cx| this.set_loop_sched_kind(k, cx))),
-            );
-        }
-        let value_row = if kind == 2 {
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(div().w(px(56.0)).child(Input::new(&ui.l_hour)))
-                .child(div().child(":"))
-                .child(div().w(px(56.0)).child(Input::new(&ui.l_minute)))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(t("local 24h time")),
-                )
-        } else {
-            let unit = if kind == 0 { "minutes" } else { "hours" };
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(div().w(px(80.0)).child(Input::new(&ui.l_interval)))
-                .child(div().text_sm().child(unit))
-        };
-
-        v_flex()
-            .gap_2()
-            .max_w(px(560.0))
-            .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&ui.l_name)))
-            .child(self.settings_label(&t("Agent"), cx))
-            .child(div().flex().child(agent_row.flex_1()))
-            .child(self.settings_label(&t("Project"), cx))
-            .child(div().flex().child(project_row.flex_1()))
-            .child(self.settings_label(&t("Schedule"), cx))
-            .child(div().flex().child(sched_row.flex_1()))
-            .child(value_row)
-            .child(self.settings_label(&t("Auto mode — Shift+Tab presses at startup"), cx))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("loop-presses-dec").ghost().label("−").on_click(
-                            cx.listener(|this, _e, _w, cx| this.adjust_loop_presses(-1, cx)),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .w(rems(2.0))
-                            .text_center()
-                            .child(format!("{}", ui.l_presses)),
-                    )
-                    .child(
-                        Button::new("loop-presses-inc").ghost().label("+").on_click(
-                            cx.listener(|this, _e, _w, cx| this.adjust_loop_presses(1, cx)),
-                        ),
-                    ),
-            )
-            .child(self.settings_label(&t("Prompt"), cx))
-            .child(Self::wide_input(Input::new(&ui.l_prompt).h(px(120.0))))
-            .child(
-                self.check_row(
-                    Checkbox::new("loop-exit")
-                        .checked(ui.l_exit)
-                        .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                            this.settings_ui.l_exit = *c;
-                            cx.notify();
-                        })),
-                    &t("Exit the agent after each run (close the pane once it finishes)"),
-                ),
-            )
-            .child(
-                self.check_row(
-                    Checkbox::new("loop-enabled")
-                        .checked(ui.l_enabled)
-                        .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                            this.settings_ui.l_enabled = *c;
-                            cx.notify();
-                        })),
-                    &t("Enabled"),
-                ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .pt_2()
-                    .child(
-                        Button::new("loop-run-now")
-                            .label(t("Run now"))
-                            .icon(IconName::Play)
-                            .on_click(cx.listener(move |this, _e, window, cx| {
-                                this.run_loop_now(idx, window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("save-loop")
-                            .primary()
-                            .label(t("Save"))
-                            .on_click(cx.listener(|this, _e, _w, cx| this.save_loop(cx))),
-                    )
-                    .child(Button::new("del-loop").ghost().label(t("Delete")).on_click(
-                        cx.listener(move |this, _e, _w, cx| {
-                            let name = this
-                                .loops
-                                .get(idx)
-                                .map(|l| l.name.clone())
-                                .unwrap_or_default();
-                            this.request_confirm(
-                                t("Delete loop?"),
-                                tf("The “{name}” loop will be deleted.", &[("name", &name)]),
-                                t("Delete"),
-                                ConfirmAction::DeleteLoop(idx),
-                                cx,
-                            )
-                        }),
-                    )),
-            )
-            .into_any_element()
-    }
-
-    fn render_settings_remotes(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut list = v_flex().w(rems(10.0)).flex_none().gap_1();
-        for (idx, h) in self.remotes.iter().enumerate() {
-            let selected = self.settings_ui.selected_remote == Some(idx);
-            let fg = if selected {
-                cx.theme().sidebar_accent_foreground
-            } else {
-                cx.theme().foreground
-            };
-            let label = if h.name.is_empty() {
-                "(unnamed)".to_string()
-            } else {
-                h.name.clone()
-            };
-            let mut row =
-                div()
-                    .id(SharedString::from(format!("remote-row-{idx}")))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .rounded(cx.theme().radius)
-                    .cursor_pointer()
-                    .text_color(fg)
-                    .on_click(cx.listener(move |this, _e, window, cx| {
-                        this.open_remote_editor(idx, window, cx)
-                    }))
-                    .child(Icon::new(IconName::Network).small())
-                    .child(div().text_sm().child(label));
-            if selected {
-                row = row.bg(cx.theme().sidebar_accent);
-            } else {
-                row = row.hover(|s| s.bg(cx.theme().accent));
-            }
-            list = list.child(row);
-        }
-        list = list.child(
-            Button::new("add-remote")
-                .ghost()
-                .icon(IconName::Plus)
-                .label(t("Add host"))
-                .on_click(cx.listener(|this, _e, window, cx| this.add_remote(window, cx))),
-        );
-
-        let editor = match self.settings_ui.selected_remote {
-            Some(idx) if idx < self.remotes.len() => self.render_remote_editor(idx, cx),
-            _ => div()
-                .p_4()
-                .text_color(cx.theme().muted_foreground)
-                .child(t("Select a host to edit, or add one. Hosts are used when creating remote projects."))
-                .into_any_element(),
-        };
-
-        div()
-            .flex()
-            .flex_row()
-            .gap_4()
-            .child(list)
-            .child(div().flex_1().min_w_0().child(editor))
-            .into_any_element()
-    }
-
-    fn render_remote_editor(&self, idx: usize, cx: &mut Context<Self>) -> AnyElement {
-        let ui = &self.settings_ui;
-        let auth = ui.s_auth;
-        let auth_btn = |label: &'static str, val: SshAuth, id: &'static str| {
-            Button::new(id)
-                .ghost()
-                .selected(auth == val)
-                .label(label)
-                .on_click(cx.listener(move |this, _e, _w, cx| this.set_remote_auth(val, cx)))
-        };
-
-        // Credentials: inline, or drawn from a shared login identity.
-        let cred_picker = {
-            let mut row = div().flex().flex_wrap().gap_1().child(
-                Button::new("cred-inline")
-                    .ghost()
-                    .selected(ui.s_identity_id.is_none())
-                    .label(t("Inline"))
-                    .on_click(cx.listener(|this, _e, _w, cx| {
-                        this.settings_ui.s_identity_id = None;
-                        cx.notify();
-                    })),
-            );
-            for id in &self.identities {
-                let iid = id.id;
-                row = row.child(
-                    Button::new(SharedString::from(format!("cred-{}", iid.simple())))
-                        .ghost()
-                        .selected(ui.s_identity_id == Some(iid))
-                        .icon(IconName::CircleUser)
-                        .label(id.name.clone())
-                        .on_click(cx.listener(move |this, _e, _w, cx| {
-                            this.settings_ui.s_identity_id = Some(iid);
-                            cx.notify();
-                        })),
-                );
-            }
-            row
-        };
-
-        let mut form = v_flex()
-            .gap_2()
-            .w_full()
-            .max_w(px(560.0))
-            .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&ui.s_name)))
-            .child(self.settings_label(&t("Host (or ~/.ssh/config alias)"), cx))
-            .child(Self::wide_input(Input::new(&ui.s_host)))
-            .child(self.settings_label(&t("Credentials"), cx))
-            .child(cred_picker)
-            .child(self.settings_label(&t("Port"), cx))
-            .child(Input::new(&ui.s_port));
-
-        if ui.s_identity_id.is_none() {
-            // Inline credentials: user + auth + key/password on the host itself.
-            form = form
-                .child(self.settings_label(&t("User"), cx))
-                .child(Self::wide_input(Input::new(&ui.s_user)))
-                .child(self.settings_label(&t("Authentication"), cx))
-                .child(
-                    div()
-                        .flex()
-                        .gap_1()
-                        .child(auth_btn("ssh-agent", SshAuth::Agent, "remote-auth-agent"))
-                        .child(auth_btn("Key file", SshAuth::Key, "remote-auth-key"))
-                        .child(auth_btn("Password", SshAuth::Password, "remote-auth-pw")),
-                );
-            if auth == SshAuth::Key {
-                form = form
-                    .child(self.settings_label(&t("Identity file"), cx))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .items_center()
-                            .child(v_flex().flex_1().child(Input::new(&ui.s_identity)))
-                            .child(
-                                Button::new("remote-browse-key")
-                                    .ghost()
-                                    .icon(IconName::Folder)
-                                    .label(t("Browse"))
-                                    .on_click(cx.listener(|this, _e, window, cx| {
-                                        this.browse_identity_file(window, cx)
-                                    })),
-                            ),
-                    );
-            } else if auth == SshAuth::Password {
-                let hint = if ui.s_has_password {
-                    t("A password is saved in the OS keychain. Type a new one to replace it.")
-                } else {
-                    t("Stored securely in the OS keychain — never in muxel's config.")
-                };
-                form = form
-                    .child(self.settings_label(&t("Password"), cx))
-                    .child(Self::wide_input(Input::new(&ui.s_password)))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(hint),
-                    );
-                // Password auth feeds the secret to ssh via `sshpass`. Warn if it's
-                // unavailable (Windows has no sshpass — use a key or ssh-agent there).
-                if !self.sshpass_available {
-                    let warn = if cfg!(target_os = "windows") {
-                        "Password auth needs `sshpass`, which isn't available on Windows. \
-                         Use a key file or ssh-agent instead."
-                    } else {
-                        "`sshpass` not found on PATH — install it for password auth, or use \
-                         a key file / ssh-agent. (Windows can't use password auth.)"
-                    };
-                    form = form.child(div().text_xs().text_color(cx.theme().warning).child(warn));
-                }
-            }
-        } else {
-            // Credentials come from a shared identity — show which, or warn if it's gone.
-            match self
-                .identities
-                .iter()
-                .find(|i| Some(i.id) == ui.s_identity_id)
-                .map(|i| i.name.clone())
-            {
-                Some(name) => {
-                    form = form.child(div().text_xs().text_color(cx.theme().muted_foreground).child(
-                        tf(
-                            "User, authentication & key/password come from the “{name}” identity.",
-                            &[("name", &name)],
-                        ),
-                    ));
-                }
-                None => {
-                    form = form.child(div().text_xs().text_color(cx.theme().warning).child(t(
-                        "The selected identity no longer exists — this host falls back to \
-                         ssh-agent until you pick another or switch to Inline.",
-                    )));
-                }
-            }
-        }
-
-        let forward = ui.s_forward_agent;
-        let compression = ui.s_compression;
-        let use_tmux = ui.s_use_tmux;
-        let remote_os = ui.s_remote_os;
-        let win_shell = ui.s_windows_shell;
-        let os_btn = |label: &'static str, val: RemoteOs, id: &'static str| {
-            Button::new(id)
-                .ghost()
-                .selected(remote_os == val)
-                .label(label)
-                .on_click(cx.listener(move |this, _e, _w, cx| {
-                    this.settings_ui.s_remote_os = val;
-                    cx.notify();
-                }))
-        };
-        let shell_btn = |label: &'static str, val: WindowsShell, id: &'static str| {
-            Button::new(id)
-                .ghost()
-                .selected(win_shell == val)
-                .label(label)
-                .on_click(cx.listener(move |this, _e, _w, cx| {
-                    this.settings_ui.s_windows_shell = val;
-                    cx.notify();
-                }))
-        };
-        form = form
-            .child(self.settings_label(&t("Remote operating system"), cx))
-            .child(
-                div()
-                    .flex()
-                    .gap_1()
-                    .child(os_btn(
-                        "Unix (Linux/macOS)",
-                        RemoteOs::Unix,
-                        "remote-os-unix",
-                    ))
-                    .child(os_btn("Windows", RemoteOs::Windows, "remote-os-windows")),
-            )
-            .child(self.settings_label(&t("Jump host (ProxyJump, optional)"), cx))
-            .child(Self::wide_input(Input::new(&ui.s_jump)))
-            .child(
-                self.check_row(
-                    Checkbox::new("remote-forward-agent")
-                        .checked(forward)
-                        .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                            this.settings_ui.s_forward_agent = *c;
-                            cx.notify();
-                        })),
-                    &t("Forward the ssh-agent (-A)"),
-                ),
-            )
-            .child(
-                self.check_row(
-                    Checkbox::new("remote-compression")
-                        .checked(compression)
-                        .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                            this.settings_ui.s_compression = *c;
-                            cx.notify();
-                        })),
-                    &t("Enable compression (-C) — helps on slow or high-latency links"),
-                ),
-            );
-
-        // Persistence and the pane shell are the two places the families really
-        // differ, so the form asks a different question for each.
-        if remote_os == RemoteOs::Windows {
-            form = form
-                .child(self.settings_label(&t("Pane shell"), cx))
-                .child(
-                    div()
-                        .flex()
-                        .gap_1()
-                        .child(shell_btn(
-                            "PowerShell",
-                            WindowsShell::PowerShell,
-                            "win-shell-ps",
-                        ))
-                        .child(shell_btn("pwsh 7+", WindowsShell::Pwsh, "win-shell-pwsh"))
-                        .child(shell_btn("cmd.exe", WindowsShell::Cmd, "win-shell-cmd")),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(t(
-                            "Windows has no tmux, so a pane here lasts as long as its SSH \
-                     connection. On reconnect muxel relaunches the pane and the agent \
-                     resumes its saved conversation.",
-                        )),
-                );
-        } else {
-            form = form.child(
-                self.check_row(
-                    Checkbox::new("remote-tmux")
-                        .checked(use_tmux)
-                        .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                            this.settings_ui.s_use_tmux = *c;
-                            cx.notify();
-                        })),
-                    &t("Run remote panes in a persistent tmux session (survives disconnects)"),
-                ),
-            );
-        }
-
-        form = form
-            .child(self.settings_label(&t("StrictHostKeyChecking (blank = accept-new)"), cx))
-            .child(Self::wide_input(Input::new(&ui.s_strict)))
-            .child(self.settings_label(
-                &t("Keepalive — ServerAliveInterval secs (blank = 20s default; 0 disables)"),
-                cx,
-            ))
-            .child(Self::wide_input(Input::new(&ui.s_keepalive)))
-            .child(self.settings_label(&t("Extra ssh -o options (one per line)"), cx))
-            .child(Self::wide_input(Input::new(&ui.s_extra).h(px(60.0))));
-
-        // Inline Test-connection result, above the buttons.
-        form.children(match &self.settings_ui.s_test {
-            RemoteTestState::Idle => None,
-            RemoteTestState::Testing => Some(
-                div()
-                    .pt_1()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t("Connecting…"))
-                    .into_any_element(),
-            ),
-            RemoteTestState::Ok(msg) => Some(
-                div()
-                    .pt_1()
-                    .text_xs()
-                    .text_color(cx.theme().success)
-                    .child(format!("✓ {msg}"))
-                    .into_any_element(),
-            ),
-            RemoteTestState::Failed(msg) => Some(
-                div()
-                    .pt_1()
-                    .min_w_0()
-                    .text_xs()
-                    .text_color(cx.theme().danger)
-                    .child(format!("✗ {msg}"))
-                    .into_any_element(),
-            ),
-        })
-        .child(
-            div()
-                .flex()
-                .gap_2()
-                .pt_2()
-                .child(
-                    Button::new("test-remote")
-                        .ghost()
-                        .icon(IconName::Network)
-                        .label(t("Test connection"))
-                        .on_click(cx.listener(move |this, _e, window, cx| {
-                            this.save_remote(window, cx);
-                            this.test_remote_connection(idx, window, cx);
-                        })),
-                )
-                .child(
-                    Button::new("save-remote")
-                        .primary()
-                        .label(t("Save"))
-                        .on_click(cx.listener(|this, _e, window, cx| this.save_remote(window, cx))),
-                )
-                .child(
-                    Button::new("del-remote")
-                        .ghost()
-                        .label(t("Delete"))
-                        .on_click(cx.listener(move |this, _e, _w, cx| {
-                            let name = this
-                                .remotes
-                                .get(idx)
-                                .map(|h| h.name.clone())
-                                .unwrap_or_default();
-                            this.request_confirm(
-                                t("Delete host?"),
-                                tf(
-                                    "The “{name}” SSH host and its saved password will be removed.",
-                                    &[("name", &name)],
-                                ),
-                                t("Delete"),
-                                ConfirmAction::DeleteRemote(idx),
-                                cx,
-                            )
-                        })),
-                ),
-        )
-        .into_any_element()
-    }
-
-    fn render_settings_identities(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut list = v_flex().w(rems(10.0)).flex_none().gap_1();
-        for (idx, id) in self.identities.iter().enumerate() {
-            let selected = self.settings_ui.selected_identity == Some(idx);
-            let fg = if selected {
-                cx.theme().sidebar_accent_foreground
-            } else {
-                cx.theme().foreground
-            };
-            let label = if id.name.is_empty() {
-                "(unnamed)".to_string()
-            } else {
-                id.name.clone()
-            };
-            let mut row = div()
-                .id(SharedString::from(format!("identity-row-{idx}")))
-                .flex()
-                .items_center()
-                .gap_2()
-                .w_full()
-                .px_2()
-                .py_1()
-                .rounded(cx.theme().radius)
-                .cursor_pointer()
-                .text_color(fg)
-                .on_click(cx.listener(move |this, _e, window, cx| {
-                    this.open_identity_editor(idx, window, cx)
-                }))
-                .child(Icon::new(IconName::CircleUser).small())
-                .child(div().text_sm().child(label));
-            if selected {
-                row = row.bg(cx.theme().sidebar_accent);
-            } else {
-                row = row.hover(|s| s.bg(cx.theme().accent));
-            }
-            list = list.child(row);
-        }
-        list = list.child(
-            Button::new("add-identity")
-                .ghost()
-                .icon(IconName::Plus)
-                .label(t("Add identity"))
-                .on_click(cx.listener(|this, _e, window, cx| this.add_identity(window, cx))),
-        );
-
-        let editor = match self.settings_ui.selected_identity {
-            Some(idx) if idx < self.identities.len() => self.render_identity_editor(idx, cx),
-            _ => div()
-                .p_4()
-                .text_color(cx.theme().muted_foreground)
-                .child(t(
-                    "Select an identity to edit, or add one. An identity is a reusable login \
-                     (user + auth + key/password) that multiple hosts can share.",
-                ))
-                .into_any_element(),
-        };
-
-        div()
-            .flex()
-            .flex_row()
-            .gap_4()
-            .child(list)
-            .child(div().flex_1().min_w_0().child(editor))
-            .into_any_element()
-    }
-
-    fn render_identity_editor(&self, idx: usize, cx: &mut Context<Self>) -> AnyElement {
-        let ui = &self.settings_ui;
-        let auth = ui.id_auth;
-        let auth_btn = |label: &'static str, val: SshAuth, id: &'static str| {
-            Button::new(id)
-                .ghost()
-                .selected(auth == val)
-                .label(label)
-                .on_click(cx.listener(move |this, _e, _w, cx| this.set_identity_auth(val, cx)))
-        };
-
-        let mut form = v_flex()
-            .gap_2()
-            .w_full()
-            .max_w(px(560.0))
-            .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&ui.id_name)))
-            .child(self.settings_label(&t("User"), cx))
-            .child(Self::wide_input(Input::new(&ui.id_user)))
-            .child(self.settings_label(&t("Authentication"), cx))
-            .child(
-                div()
-                    .flex()
-                    .gap_1()
-                    .child(auth_btn("ssh-agent", SshAuth::Agent, "id-auth-agent"))
-                    .child(auth_btn("Key file", SshAuth::Key, "id-auth-key"))
-                    .child(auth_btn("Password", SshAuth::Password, "id-auth-pw")),
-            );
-
-        if auth == SshAuth::Key {
-            form = form
-                .child(self.settings_label(&t("Identity file"), cx))
-                .child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .items_center()
-                        .child(v_flex().flex_1().child(Input::new(&ui.id_identity)))
-                        .child(
-                            Button::new("id-browse-key")
-                                .ghost()
-                                .icon(IconName::Folder)
-                                .label(t("Browse"))
-                                .on_click(cx.listener(|this, _e, window, cx| {
-                                    this.browse_identity_key_file(window, cx)
-                                })),
-                        ),
-                );
-        } else if auth == SshAuth::Password {
-            let hint = if ui.id_has_password {
-                t("A password is saved in the OS keychain. Type a new one to replace it.")
-            } else {
-                t("Stored securely in the OS keychain — never in muxel's config.")
-            };
-            form = form
-                .child(self.settings_label(&t("Password"), cx))
-                .child(Self::wide_input(Input::new(&ui.id_password)))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(hint),
-                );
-        }
-
-        form.child(
-            div()
-                .flex()
-                .gap_2()
-                .pt_2()
-                .child(
-                    Button::new("save-identity")
-                        .primary()
-                        .label(t("Save"))
-                        .on_click(
-                            cx.listener(|this, _e, window, cx| this.save_identity(window, cx)),
-                        ),
-                )
-                .child(
-                    Button::new("del-identity")
-                        .ghost()
-                        .label(t("Delete"))
-                        .on_click(cx.listener(move |this, _e, _w, cx| {
-                            let name = this
-                                .identities
-                                .get(idx)
-                                .map(|i| i.name.clone())
-                                .unwrap_or_default();
-                            this.request_confirm(
-                                t("Delete identity?"),
-                                tf(
-                                    "The “{name}” login identity and its saved password will be \
-                                     removed; hosts using it fall back to inline credentials.",
-                                    &[("name", &name)],
-                                ),
-                                t("Delete"),
-                                ConfirmAction::DeleteIdentity(idx),
-                                cx,
-                            )
-                        })),
-                ),
-        )
-        .into_any_element()
-    }
-
-    fn render_preset_editor(&self, idx: usize, cx: &mut Context<Self>) -> AnyElement {
-        let ui = &self.settings_ui;
-        let inj = ui.p_injection.clone();
-        let is_flag = matches!(inj, InjectionMode::CliFlag { .. });
-        let is_muse = muxel_core::muse::is_program(Some(ui.p_program.read(cx).value().as_ref()));
-        v_flex()
-            .gap_2()
-            .max_w(px(560.0))
-            .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&ui.p_name)))
-            .child(self.settings_label(&t("Type"), cx))
-            .child(
-                div()
-                    .flex()
-                    .gap_1()
-                    .child(
-                        Button::new("pk-terminal")
-                            .ghost()
-                            .selected(ui.p_kind == muxel_core::PresetKind::Terminal)
-                            .label(t("Agent"))
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.settings_ui.p_kind = muxel_core::PresetKind::Terminal;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("pk-browser")
-                            .ghost()
-                            .selected(ui.p_kind == muxel_core::PresetKind::Browser)
-                            .label(t("Browser"))
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.settings_ui.p_kind = muxel_core::PresetKind::Browser;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .children((ui.p_kind == muxel_core::PresetKind::Browser).then(|| {
-                v_flex()
-                    .gap_2()
-                    .child(self.settings_label(&t("Homepage URL"), cx))
-                    .child(Self::wide_input(Input::new(&ui.p_url)))
-            }))
-            .children((ui.p_kind == muxel_core::PresetKind::Terminal).then(|| {
-                v_flex()
-                    .gap_2()
-                    .child(self.settings_label(&t("Program (blank = default shell)"), cx))
-                    .child(Self::wide_input(Input::new(&ui.p_program)))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_3()
-                            .child(
-                                v_flex()
-                                    .flex_1()
-                                    .gap_1()
-                                    .child(self.settings_label(&t("Model"), cx))
-                                    .child(Input::new(&ui.p_model)),
-                            )
-                            .child(
-                                v_flex()
-                                    .flex_1()
-                                    .gap_1()
-                                    .child(self.settings_label(&t("Model flag"), cx))
-                                    .child(Input::new(&ui.p_model_flag)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_3()
-                            .child(
-                                v_flex()
-                                    .flex_1()
-                                    .gap_1()
-                                    .child(self.settings_label(&t("Effort"), cx))
-                                    .child(Input::new(&ui.p_effort)),
-                            )
-                            .child(
-                                v_flex()
-                                    .flex_1()
-                                    .gap_1()
-                                    .child(self.settings_label(&t("Effort flag"), cx))
-                                    .child(Input::new(&ui.p_effort_flag)),
-                            ),
-                    )
-                    .child(self.settings_label(&t("Extra arguments"), cx))
-                    .child(Self::wide_input(Input::new(&ui.p_args)))
-                    .child(self.settings_label(&t("System prompt"), cx))
-                    .child(Self::wide_input(Input::new(&ui.p_prompt).h(px(72.0))))
-                    .child(self.settings_label(&t("System-prompt injection"), cx))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_1()
-                            .child(
-                                Button::new("inj-none")
-                                    .ghost()
-                                    .selected(matches!(inj, InjectionMode::None))
-                                    .label(t("None"))
-                                    .on_click(cx.listener(|this, _e, _w, cx| {
-                                        this.set_editor_injection(InjectionMode::None, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("inj-flag")
-                                    .ghost()
-                                    .selected(is_flag)
-                                    .label(t("CLI flag"))
-                                    .on_click(cx.listener(|this, _e, _w, cx| {
-                                        this.set_editor_injection(
-                                            InjectionMode::CliFlag {
-                                                flag: String::new(),
-                                            },
-                                            cx,
-                                        )
-                                    })),
-                            )
-                            .child(
-                                Button::new("inj-typein")
-                                    .ghost()
-                                    .selected(matches!(inj, InjectionMode::TypeIn))
-                                    .label(t("Type-in"))
-                                    .on_click(cx.listener(|this, _e, _w, cx| {
-                                        this.set_editor_injection(InjectionMode::TypeIn, cx)
-                                    })),
-                            )
-                            .children((is_muse || matches!(inj, InjectionMode::SessionHook)).then(
-                                || {
-                                    Button::new("inj-session")
-                                        .ghost()
-                                        .selected(matches!(inj, InjectionMode::SessionHook))
-                                        .label(t("At session start"))
-                                        .on_click(cx.listener(|this, _e, _w, cx| {
-                                            this.set_editor_injection(
-                                                InjectionMode::SessionHook,
-                                                cx,
-                                            )
-                                        }))
-                                },
-                            )),
-                    )
-                    .children(is_flag.then(|| {
-                        v_flex()
-                            .gap_1()
-                            .child(self.settings_label(&t("Injection flag"), cx))
-                            .child(Self::wide_input(Input::new(&ui.p_inj_flag)))
-                    }))
-                    .child(self.settings_label(&t("Environment (KEY=VALUE per line)"), cx))
-                    .child(Self::wide_input(Input::new(&ui.p_env).h(px(60.0))))
-                    .child(self.settings_label(&t("Status: working markers (comma-separated)"), cx))
-                    .child(Self::wide_input(Input::new(&ui.p_working_markers)))
-                    .child(self.settings_label(&t("Status: blocked markers (comma-separated)"), cx))
-                    .child(Self::wide_input(Input::new(&ui.p_blocked_markers)))
-                    .child(
-                        self.settings_label(&t("Runner startup delay (ms after first output)"), cx),
-                    )
-                    .child(Self::wide_input(Input::new(&ui.p_startup_delay)))
-            }))
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .pt_2()
-                    .child(
-                        Button::new("save-preset")
-                            .primary()
-                            .label(t("Save"))
-                            .on_click(cx.listener(|this, _e, _w, cx| this.save_preset(cx))),
-                    )
-                    .child(
-                        Button::new("dup-preset")
-                            .ghost()
-                            .label(t("Duplicate"))
-                            .on_click(cx.listener(move |this, _e, window, cx| {
-                                this.duplicate_preset(idx, window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("del-preset")
-                            .ghost()
-                            .label(t("Delete"))
-                            .on_click(cx.listener(move |this, _e, _w, cx| {
-                                let name = this
-                                    .presets
-                                    .get(idx)
-                                    .map(|p| p.name.clone())
-                                    .unwrap_or_default();
-                                this.request_confirm(
-                                    t("Delete agent?"),
-                                    tf(
-                                        "The “{name}” agent preset will be deleted.",
-                                        &[("name", &name)],
-                                    ),
-                                    t("Delete"),
-                                    ConfirmAction::DeletePreset(idx),
-                                    cx,
-                                )
-                            })),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_settings_projects(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut list = v_flex().w(rems(10.0)).flex_none().gap_1();
-        for project in &self.workspace.projects {
-            let pid = project.id;
-            let selected = self.settings_ui.selected_project == Some(pid);
-            list = list.child(
-                Button::new(SharedString::from(format!("proj-item-{pid}")))
-                    .ghost()
-                    .selected(selected)
-                    .label(project.name.clone())
-                    .on_click(cx.listener(move |this, _e, window, cx| {
-                        this.open_project_editor(pid, window, cx)
-                    })),
-            );
-        }
-
-        let editor = match self.settings_ui.selected_project {
-            Some(pid) if self.workspace.project(pid).is_some() => {
-                self.render_project_editor(pid, cx)
-            }
-            _ => div()
-                .p_4()
-                .text_color(cx.theme().muted_foreground)
-                .child(t("Select a project to edit."))
-                .into_any_element(),
-        };
-
-        // Global (all projects): how much accomplishment-log history to keep.
-        let days = accomplishments::clamp_retention(self.settings.accomplishment_retention_days);
-        let retention = v_flex()
-            .gap_1()
-            .child(self.settings_label(&t("Accomplishment log history (all projects)"), cx))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("acc-days-dec")
-                            .ghost()
-                            .label("−")
-                            .disabled(days <= 1)
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.adjust_accomplishment_retention(-1, cx)
-                            })),
-                    )
-                    .child(
-                        div()
-                            .w(rems(6.0))
-                            .text_center()
-                            .child(tf("{days} days", &[("days", &days.to_string())])),
-                    )
-                    .child(
-                        Button::new("acc-days-inc")
-                            .ghost()
-                            .label("+")
-                            .disabled(days >= accomplishments::MAX_RETENTION_DAYS)
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.adjust_accomplishment_retention(1, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("acc-days-reset")
-                            .ghost()
-                            .small()
-                            .label(t("Default"))
-                            .disabled(days == accomplishments::DEFAULT_RETENTION_DAYS)
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.set_accomplishment_retention(
-                                    accomplishments::DEFAULT_RETENTION_DAYS,
-                                    cx,
-                                )
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t(
-                        "Older entries are pruned from each project's .muxel/ACCOMPLISHMENTS.md.",
-                    )),
-            );
-
-        // Global: what a project starts with. Existing projects keep their own.
-        let new_projects = v_flex()
-            .gap_1()
-            .child(self.settings_label(&t("New projects"), cx))
-            .child(self.setting_check(
-                "new-project-memory",
-                self.settings.new_project_memory,
-                &t("Turn on shared memory"),
-                cx,
-                |s, on| s.new_project_memory = on,
-            ))
-            .child(self.setting_check(
-                "new-project-accomplishments",
-                self.settings.new_project_accomplishments,
-                &t("Turn on the accomplishment log"),
-                cx,
-                |s, on| s.new_project_accomplishments = on,
-            ))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t(
-                        "Applies to projects added from now on. Change an existing project from its menu in the sidebar.",
-                    )),
-            );
-
-        v_flex()
-            .gap_4()
-            .child(new_projects)
-            .child(retention)
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_4()
-                    .child(list)
-                    .child(div().flex_1().min_w_0().child(editor)),
-            )
-            .into_any_element()
-    }
-
-    fn render_project_editor(&self, pid: Uuid, cx: &mut Context<Self>) -> AnyElement {
-        let root = self
-            .workspace
-            .project(pid)
-            .map(|p| p.root_path.display().to_string())
-            .unwrap_or_default();
-        let default_id = self.workspace.project(pid).and_then(|p| p.default_preset);
-        let mut preset_row = div().flex().flex_wrap().gap_1();
-        for p in &self.presets {
-            let id = p.id;
-            preset_row =
-                preset_row.child(
-                    Button::new(SharedString::from(format!("pdef-{id}")))
-                        .ghost()
-                        .selected(Some(id) == default_id)
-                        .label(p.name.clone())
-                        .on_click(cx.listener(move |this, _e, _w, cx| {
-                            this.set_project_default_preset(id, cx)
-                        })),
-                );
-        }
-        v_flex()
-            .gap_2()
-            .max_w(px(560.0))
-            .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&self.settings_ui.proj_name)))
-            .child(self.settings_label(&t("Folder"), cx))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().flex_1().min_w_0().text_sm().child(root))
-                    .child(
-                        Button::new("change-folder")
-                            .ghost()
-                            .label(t("Change…"))
-                            .on_click(cx.listener(|this, _e, window, cx| {
-                                this.change_project_folder(window, cx)
-                            })),
-                    ),
-            )
-            .child(self.settings_label(&t("Default preset"), cx))
-            .child(div().flex().child(preset_row.flex_1()))
-            .child(self.check_row(
-                Checkbox::new("proj-memory")
-                    .checked(
-                        self.workspace
-                            .project(pid)
-                            .is_some_and(|p| p.memory_enabled),
-                    )
-                    .on_click(cx.listener(move |this, _c: &bool, _w, cx| {
-                        this.toggle_project_memory(pid, cx)
-                    })),
-                &t("Shared agent memory — agents read + append lessons in .muxel/MEMORY.md across runs"),
-            ))
-            .child(self.check_row(
-                Checkbox::new("proj-accomplishments")
-                    .checked(
-                        self.workspace
-                            .project(pid)
-                            .is_some_and(|p| p.accomplishments_enabled),
-                    )
-                    .on_click(cx.listener(move |this, _c: &bool, _w, cx| {
-                        this.toggle_project_accomplishments(pid, cx)
-                    })),
-                &t("Accomplishment log — agents append each finished feature or fix to .muxel/ACCOMPLISHMENTS.md (they never read it)"),
-            ))
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .pt_2()
-                    .child(
-                        Button::new("save-project")
-                            .primary()
-                            .label(t("Save"))
-                            .on_click(cx.listener(|this, _e, _w, cx| this.save_project(cx))),
-                    )
-                    .child(
-                        Button::new("del-project")
-                            .ghost()
-                            .label(t("Delete project"))
-                            .on_click(cx.listener(move |this, _e, _w, cx| {
-                                this.request_confirm(
-                                    t("Delete project?"),
-                                    t("The project and its panes will be removed."),
-                                    t("Delete"),
-                                    ConfirmAction::DeleteProject(pid),
-                                    cx,
-                                )
-                            })),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_settings_keybindings(&self, content_w: Pixels, cx: &mut Context<Self>) -> AnyElement {
-        // gpui-component `Input`s only size reliably with an ABSOLUTE width here:
-        // inside the settings `overflow_y_scroll` pane, percentage/flex widths
-        // collapse to a tiny square (this is exactly how the new-remote dialog's
-        // `div().w(px(460))` card sizes its inputs). `content_w` is the pane's
-        // definite inner width; derive the form/input widths from it.
-        let form_w = {
-            let r = content_w - px(32.0); // the inner block's p_4 (both sides)
-            if r < px(280.0) { px(280.0) } else { r }
-        };
-        let name_w = px(150.0);
-        let input_w = {
-            let r = form_w - name_w - px(16.0);
-            if r < px(120.0) { px(120.0) } else { r }
-        };
-        let mut form = v_flex().gap_2().w(form_w);
-        for (name, input) in &self.settings_ui.keybinds {
-            form = form.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(div().w(name_w).flex_none().text_sm().child(name.clone()))
-                    .child(div().w(input_w).child(Input::new(input))),
-            );
-        }
-        let form = form
-            .child(
-                div()
-                    .pt_2()
-                    .child(
-                        self.settings_label(&t("Pass these keys through to the focused terminal"), cx),
-                    )
-                    .child(div().w(form_w).child(Input::new(&self.settings_ui.passthrough_keys))),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(
-                        "Comma-separated extra chords (e.g. ctrl-shift-p). Plain ctrl+letter app \
-                 shortcuts already yield to the terminal by default so agents get them \
-                 (Ctrl+S stash, etc.).",
-                    ),
-            )
-            .child(
-                div().pt_2().flex().items_center().gap_3().child(
-                    Button::new("apply-keys")
-                        .primary()
-                        .label(t("Apply keybindings"))
-                        .on_click(cx.listener(|this, _e, _w, cx| this.apply_keybindings(cx))),
-                ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(
-                        t("Examples: ctrl-shift-t, cmd-w, ctrl-shift-up. Applied immediately + saved."),
-                    ),
-            );
-        form.into_any_element()
-    }
 }
 
 /// Cap on how many files one project lists. The old 10k silently cut real repos
@@ -36719,8 +33608,25 @@ impl Render for MuxelApp {
         self.sync_diff_visibility(cx);
         // Cache the settings pane width so deep helpers can size wrapping labels
         // absolutely (their multi-line height is otherwise mis-measured).
-        if self.show_settings {
+        // Settings as a dialog over this window (floating, it renders in a
+        // window of its own). Its fields have to belong to this window first.
+        let settings_docked = self.show_settings && !self.settings.settings_floating;
+        let settings_here = self.settings_ui_window == Some(window.window_handle().window_id());
+        if settings_docked && settings_here {
             self.settings_pane_w = self.settings_content_w(window);
+            self.settings_rem = window.rem_size();
+        } else if settings_docked {
+            // By this window's handle: `defer_in` would run in whichever
+            // window rendered the app last, and bind the fields to that one.
+            let main = window.window_handle();
+            let this = cx.weak_entity();
+            cx.defer(move |cx| {
+                Self::update_in_window(&this, main, cx, |this, window, cx| {
+                    if this.settings_ui_window != Some(main.window_id()) {
+                        this.rebind_settings_ui(window, cx);
+                    }
+                });
+            });
         }
         drop(prep);
         // First-run Terms acceptance gates everything else. These screens still
@@ -37083,7 +33989,7 @@ impl Render for MuxelApp {
                 self.render_hotbar(cx)
             }))
             .children(
-                self.show_settings
+                (settings_docked && settings_here)
                     .then(|| ov(|| self.render_settings_modal(window, cx))),
             )
             .children(
@@ -37174,7 +34080,8 @@ impl Render for MuxelApp {
             .children(
                 (self.confirm.is_some()
                     && self.confirm_window_pid().is_none()
-                    && self.confirm_popout_iid().is_none())
+                    && self.confirm_popout_iid().is_none()
+                    && !self.confirm_in_settings())
                 .then(|| ov(|| self.render_confirm_modal(cx))),
             )
             .children(

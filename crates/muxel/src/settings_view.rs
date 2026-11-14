@@ -112,7 +112,7 @@ pub const KEEP_GLOBAL_WHILE_TERMINAL: &[&str] = &[
 ];
 
 /// Which settings section is shown.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsSection {
     Appearance,
     Editor,
@@ -280,10 +280,137 @@ pub struct SettingsUi {
     /// time Settings opens (`None` until then).
     pub tts_system_voices: Option<Vec<(String, String)>>,
 
-    // Keybindings (action name -> keystroke input).
-    pub keybinds: Vec<(String, Entity<InputState>)>,
+    // Keybindings.
+    /// Narrows the shortcut list by action name or key.
+    pub kb_filter: Entity<InputState>,
+    /// The row waiting for its new shortcut to be pressed: an action name, or
+    /// the shared prefix of a folded 1–9 range.
+    pub kb_recording: Option<String>,
     /// Comma/space-separated chords passed through to a focused terminal.
     pub passthrough_keys: Entity<InputState>,
+
+    // The window itself.
+    /// Searches every setting; non-empty replaces the section with results.
+    pub search: Entity<InputState>,
+    /// The theme picker shows every theme rather than the first few.
+    pub themes_expanded: bool,
+    /// One swatch per theme, resolved once when Settings opens.
+    pub theme_swatches: Vec<ThemeSwatch>,
+    /// The agent editor's Advanced group is open.
+    pub preset_advanced: bool,
+}
+
+/// A theme as the Appearance picker draws it.
+#[derive(Clone)]
+pub struct ThemeSwatch {
+    pub name: SharedString,
+    pub background: Hsla,
+    pub border: Hsla,
+    /// Foreground, then three of the theme's accents: the bars of the swatch.
+    pub bars: [Hsla; 4],
+}
+
+/// An icon beside a section in the Settings list.
+#[derive(Clone)]
+pub enum SectionIcon {
+    Named(gpui_component::IconName),
+    /// An SVG from muxel's own assets.
+    Path(&'static str),
+}
+
+impl SettingsSection {
+    /// The sections in the order and groups the Settings list shows them.
+    pub fn groups() -> [(SharedString, &'static [SettingsSection]); 5] {
+        use SettingsSection::*;
+        [
+            (
+                t("Application"),
+                &[Appearance, Behavior, Editor, Keybindings],
+            ),
+            (t("Alerts and voice"), &[Sounds, Speech, ReadAloud]),
+            (
+                t("Agents and automation"),
+                &[Agents, Runners, Snippets, Loops, Libraries, OutsideControl],
+            ),
+            (t("Remote"), &[Remotes, Identities]),
+            (t("Workspace"), &[Projects]),
+        ]
+    }
+
+    /// Every section, in list order.
+    pub fn all() -> Vec<SettingsSection> {
+        Self::groups()
+            .iter()
+            .flat_map(|(_, sections)| sections.iter().copied())
+            .collect()
+    }
+
+    pub fn title(self) -> SharedString {
+        match self {
+            Self::Appearance => t("Appearance"),
+            Self::Editor => t("Editor"),
+            Self::Behavior => t("General"),
+            Self::Sounds => t("Notifications"),
+            Self::Speech => t("Dictation"),
+            Self::ReadAloud => t("Read aloud"),
+            Self::Agents => t("Agents"),
+            Self::OutsideControl => t("Outside control"),
+            Self::Runners => t("Runners"),
+            Self::Snippets => t("Snippets"),
+            Self::Loops => t("Loops"),
+            Self::Libraries => t("Libraries"),
+            Self::Remotes => t("Hosts"),
+            Self::Identities => t("Identities"),
+            Self::Projects => t("Projects"),
+            Self::Keybindings => t("Keybindings"),
+        }
+    }
+
+    /// One line under the section's title.
+    pub fn description(self) -> SharedString {
+        match self {
+            Self::Appearance => t("Theme, text size and pane chrome."),
+            Self::Editor => t("The code editor and git-diff panes."),
+            Self::Behavior => t("How new agents, panes and the terminal behave."),
+            Self::Sounds => t("Desktop notifications and the chimes agents ring."),
+            Self::Speech => t("Speak instead of typing into the focused pane."),
+            Self::ReadAloud => t("Hear an agent's reply instead of reading it."),
+            Self::Agents => t("Presets for the agents, shells and browsers you launch into panes."),
+            Self::OutsideControl => t("Let another agent or a script drive muxel."),
+            Self::Runners => {
+                t("One-click tasks: an agent, a prompt and the details you add at run time.")
+            }
+            Self::Snippets => t("Text you send to the focused pane with one click."),
+            Self::Loops => t("Prompts an agent runs on a schedule."),
+            Self::Libraries => t("Snippets, runners and loops your team shares from git."),
+            Self::Remotes => t("SSH hosts for remote projects."),
+            Self::Identities => t("Logins that several hosts can share."),
+            Self::Projects => t("Defaults for new projects, and each project's own settings."),
+            Self::Keybindings => t("Click a shortcut, then press the keys you want instead."),
+        }
+    }
+
+    pub fn icon(self) -> SectionIcon {
+        use gpui_component::IconName;
+        match self {
+            Self::Appearance => SectionIcon::Named(IconName::Palette),
+            Self::Editor => SectionIcon::Path("icons/code.svg"),
+            Self::Behavior => SectionIcon::Named(IconName::Settings2),
+            Self::Sounds => SectionIcon::Named(IconName::Bell),
+            Self::Speech => SectionIcon::Path("icons/mic.svg"),
+            Self::ReadAloud => SectionIcon::Path("icons/volume-2.svg"),
+            Self::Agents => SectionIcon::Named(IconName::Bot),
+            Self::OutsideControl => SectionIcon::Path("icons/plug.svg"),
+            Self::Runners => SectionIcon::Named(IconName::Play),
+            Self::Snippets => SectionIcon::Named(IconName::SquareTerminal),
+            Self::Loops => SectionIcon::Path("icons/refresh.svg"),
+            Self::Libraries => SectionIcon::Named(IconName::BookOpen),
+            Self::Remotes => SectionIcon::Named(IconName::Network),
+            Self::Identities => SectionIcon::Named(IconName::CircleUser),
+            Self::Projects => SectionIcon::Named(IconName::Folder),
+            Self::Keybindings => SectionIcon::Path("icons/keyboard.svg"),
+        }
+    }
 }
 
 impl SettingsUi {
@@ -456,18 +583,43 @@ impl SettingsUi {
                 InputState::new(window, cx).placeholder(muxel_core::tts::DEFAULT_TTS_PROVIDER_MODEL)
             }),
             tts_system_voices: None,
-            keybinds: DEFAULT_KEYBINDINGS
-                .iter()
-                .map(|(name, default, _ctx)| {
-                    (
-                        name.to_string(),
-                        cx.new(|cx| InputState::new(window, cx).default_value(*default)),
-                    )
-                })
-                .collect(),
+            kb_filter: cx
+                .new(|cx| InputState::new(window, cx).placeholder(t("Filter by action or key"))),
+            kb_recording: None,
             passthrough_keys: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t("ctrl-p, ctrl-t"))),
+            search: cx.new(|cx| InputState::new(window, cx).placeholder(t("Search settings"))),
+            themes_expanded: false,
+            theme_swatches: Vec::new(),
+            preset_advanced: false,
         }
+    }
+}
+
+impl SettingsUi {
+    /// Take over what `old` was showing. A text field belongs to the window it
+    /// was made in, so moving Settings between the main window and a window of
+    /// its own means new fields; which section and items were open carries
+    /// over, and the editors are refilled from what was last saved.
+    pub fn adopt(&mut self, old: SettingsUi) {
+        self.section = old.section;
+        self.selected_preset = old.selected_preset;
+        self.selected_runner = old.selected_runner;
+        self.selected_snippet = old.selected_snippet;
+        self.selected_loop = old.selected_loop;
+        self.selected_library = old.selected_library;
+        self.selected_remote = old.selected_remote;
+        self.selected_identity = old.selected_identity;
+        self.selected_project = old.selected_project;
+        self.lib_add_error = old.lib_add_error;
+        self.control_test = old.control_test;
+        self.control_skill_preview = old.control_skill_preview;
+        self.control_skill_copied = old.control_skill_copied;
+        self.stt_has_key = old.stt_has_key;
+        self.tts_system_voices = old.tts_system_voices;
+        self.themes_expanded = old.themes_expanded;
+        self.theme_swatches = old.theme_swatches;
+        self.preset_advanced = old.preset_advanced;
     }
 }
 

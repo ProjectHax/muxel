@@ -514,7 +514,11 @@ impl MuxelApp {
     /// Settings → Outside control: setting an agent that can run commands on this
     /// computer (Grok Bot, …) up to drive muxel, step by step — turn outside control
     /// on, let the agent run commands here, give it the skill, check it works.
-    pub(super) fn render_settings_outside_control(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_settings_outside_control(
+        &self,
+        form: &settings_kit::Form,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme();
         let (muted, border, radius) = (theme.muted_foreground, theme.border, theme.radius);
         let (accent, accent_fg) = (theme.primary, theme.primary_foreground);
@@ -562,12 +566,7 @@ impl MuxelApp {
         // Checkbox labels need a definite width to wrap (see `check_row`): the
         // column, less the step's padding and the checkbox.
         let label_w = {
-            let column = if self.settings_pane_w < px(560.0) {
-                self.settings_pane_w
-            } else {
-                px(560.0)
-            };
-            let w = column - px(24.0 + 28.0);
+            let w = form.w - px(24.0 + 28.0);
             if w < px(180.0) { px(180.0) } else { w }
         };
         let check = |checkbox: Checkbox, label: SharedString| {
@@ -636,36 +635,60 @@ impl MuxelApp {
 
         v_flex()
             .gap_3()
-            .max_w(px(560.0))
+            .w(form.w)
             .child(text(t(
                 "Another agent, such as xAI's Grok Bot, a coding agent or a script, can work with the agents you run in muxel: list your projects and agents, see which are working or waiting on you, read their replies, send them prompts and answer their questions. It does this by running the muxel ctl command on this computer. Set it up in four steps.",
             )))
             .child(
                 step(1, t("Turn on outside control"))
-                    .child(check(
-                        Checkbox::new("control-enabled")
-                            .checked(enabled)
-                            .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                                this.set_control_enabled(*c, cx)
-                            })),
-                        t("Allow outside tools to control muxel"),
-                    ))
-                    .child(self.settings_label(&t("Outside terminal creation"), cx))
-                    .child(div().flex().gap_2().children([
-                        (ctl::CreationPolicy::Off, t("Off")),
-                        (ctl::CreationPolicy::Ask, t("Ask")),
-                        (ctl::CreationPolicy::Allow, t("Allow")),
-                    ].into_iter().map(|(policy, label)| {
-                        Button::new(SharedString::from(format!("control-new-{policy:?}")))
-                            .ghost().label(label).selected(self.settings.control_allow_new == policy)
-                            .disabled(!enabled)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.settings.control_allow_new = policy;
-                                this.persist_settings();
-                                this.sync_control_approvals(cx);
-                                cx.notify();
-                            }))
-                    })))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .w(label_w)
+                                    .text_sm()
+                                    .child(t("Allow outside tools to control muxel")),
+                            )
+                            .child(form.switch(
+                                "control-enabled",
+                                enabled,
+                                true,
+                                cx.listener(|this, on: &bool, _w, cx| {
+                                    this.set_control_enabled(*on, cx)
+                                }),
+                            )),
+                    )
+                    .child(hint(t("Outside terminal creation")))
+                    .child(
+                        div().flex().child(
+                            form.segmented(
+                                "control-new",
+                                [
+                                    (ctl::CreationPolicy::Off, t("Off")),
+                                    (ctl::CreationPolicy::Ask, t("Ask")),
+                                    (ctl::CreationPolicy::Allow, t("Allow")),
+                                ]
+                                .into_iter()
+                                .map(|(policy, label)| {
+                                    settings_kit::Seg::new(
+                                        label,
+                                        self.settings.control_allow_new == policy,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.settings.control_allow_new = policy;
+                                            this.persist_settings();
+                                            this.sync_control_approvals(cx);
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .disabled(!enabled)
+                                })
+                                .collect(),
+                            ),
+                        ),
+                    )
                     .child(hint(t(
                         "Off by default, including upgrades. Ask requires a click for each request. Allow opens presets that run a known agent (Claude, Codex, Grok, opencode, Amp, …) from an absolute path or PATH entry without a click; any other program, such as ssh, wsl or python, and any relative path still Asks. Literal commands and shell presets always Ask and also require the shell/command permission below. Approvals expire after 120 seconds. Turning creation or outside control off refuses all pending requests. Outside control off also stops the control server. Existing panes, admitted launches and typing permissions are unchanged. Toolbar creation is unaffected.",
                     )))
@@ -767,7 +790,7 @@ impl MuxelApp {
                         "Then ask the agent something like \"Which of my muxel agents are waiting on me?\"",
                     ))),
             )
-            .child(self.settings_label(&t("The muxel command on this computer"), cx))
+            .child(hint(t("The muxel command on this computer")))
             .child(
                 div()
                     .flex()

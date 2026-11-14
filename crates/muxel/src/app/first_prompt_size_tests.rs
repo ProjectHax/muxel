@@ -28,8 +28,10 @@ fn with_app(run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelApp>)) {
     let root = std::env::temp_dir().join(format!("muxel-first-prompt-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
-    let _temp = TempRoot(root.clone());
+    // Declared first, dropped last: the lease is held until the root is gone,
+    // so the next app test can't start while it is still being removed.
     let _storage = muxel_store::test_support::set_root(root.clone());
+    let _temp = TempRoot(root.clone());
     let mut cx = TestAppContext::single();
     cx.update(|cx| {
         gpui_component::init(cx);
