@@ -7,6 +7,7 @@
 //! calls this hands back.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -261,6 +262,30 @@ fn retarget(path: &Path, was: Option<Recursion>, now: Option<Recursion>, ops: &m
     }
 }
 
+/// Each path either list names, once and in order, with the depth `new` asks
+/// for there (the deepest, where it names a path twice), or `None` where only
+/// `old` does. Generic so a test can count the comparisons it makes.
+fn respec_depths<'a, K: Eq + Hash>(
+    old: &'a [(K, Recursion)],
+    new: &'a [(K, Recursion)],
+) -> Vec<(&'a K, Option<Recursion>)> {
+    let mut wanted: HashMap<&K, Recursion> = HashMap::with_capacity(new.len());
+    for (path, recursion) in new {
+        let depth = wanted.entry(path).or_insert(*recursion);
+        if *recursion == Recursion::Tree {
+            *depth = Recursion::Tree;
+        }
+    }
+    let mut listed = HashSet::with_capacity(old.len() + new.len());
+    let mut paths = Vec::with_capacity(old.len() + new.len());
+    for (path, _) in old.iter().chain(new) {
+        if listed.insert(path) {
+            paths.push((path, wanted.get(path).copied()));
+        }
+    }
+    paths
+}
+
 /// The pane a hook record's path names: `<pane>.json`, the extension in any
 /// case. Windows and macOS (by default) open a `.JSON` record at the path
 /// discovery reads; elsewhere such a name costs one lookup that finds nothing.
@@ -338,23 +363,16 @@ impl WatchRouter {
         };
         let old = std::mem::replace(&mut registration.spec, spec);
         let new = &registration.spec;
-        let mut paths: Vec<&PathBuf> = Vec::new();
-        for (path, _) in old.paths.iter().chain(&new.paths) {
-            if !paths.contains(&path) {
-                paths.push(path);
-            }
+        // A re-plan that lists the same paths changes no watch.
+        if old.paths == new.paths {
+            return Vec::new();
         }
         let mut ops = Vec::new();
-        for path in paths {
+        for (path, wanted) in respec_depths(&old.paths, &new.paths) {
             let users = self.os.entry(path.clone()).or_default();
             let was = depth(users);
             users.retain(|(user, _)| *user != id);
-            users.extend(
-                new.paths
-                    .iter()
-                    .filter(|(wanted, _)| wanted == path)
-                    .map(|(_, recursion)| (id, *recursion)),
-            );
+            users.extend(wanted.map(|recursion| (id, recursion)));
             let now = depth(users);
             if now.is_none() {
                 self.os.remove(path);
@@ -455,12 +473,68 @@ impl WatchRouter {
 mod tests {
     use super::{
         Change, DirNames, EventKind, OsWatch, Recursion, TrackedFiles, WatchEvent, WatchFilter,
-        WatchId, WatchRouter, WatchSpec,
+        WatchId, WatchRouter, WatchSpec, respec_depths,
     };
+    use std::cell::Cell;
     use std::collections::HashSet;
+    use std::hash::{Hash, Hasher};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use uuid::Uuid;
+
+    thread_local! {
+        static COMPARED: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// A path that counts the comparisons and hashes made of it.
+    #[derive(Debug)]
+    struct Counted(u32);
+
+    impl PartialEq for Counted {
+        fn eq(&self, other: &Self) -> bool {
+            COMPARED.set(COMPARED.get() + 1);
+            self.0 == other.0
+        }
+    }
+
+    impl Eq for Counted {}
+
+    impl Hash for Counted {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            COMPARED.set(COMPARED.get() + 1);
+            self.0.hash(state);
+        }
+    }
+
+    /// What pairing `n` old paths with `n` new ones costs, half of them
+    /// shared, in comparisons and hashes.
+    fn pairing_work(n: u32) -> u64 {
+        let list = |from: u32| -> Vec<(Counted, Recursion)> {
+            (from..from + n)
+                .map(|i| (Counted(i), Recursion::Dir))
+                .collect()
+        };
+        let (old, new) = (list(0), list(n / 2));
+        COMPARED.set(0);
+        let paired = respec_depths(&old, &new);
+        let work = COMPARED.get();
+        assert_eq!(paired.len(), (n + n / 2) as usize);
+        let dropped = paired.iter().filter(|(_, wanted)| wanted.is_none());
+        assert_eq!(dropped.count(), (n / 2) as usize);
+        work
+    }
+
+    /// A diff pane respecs on the UI thread, holding the router, after every
+    /// index write, with up to 4,096 paths on Linux. Pairing its old list
+    /// with the new grows with the paths, not with their square.
+    #[test]
+    fn pairing_a_respecs_paths_grows_with_them_not_their_square() {
+        let (small, large) = (pairing_work(1_000), pairing_work(4_000));
+        assert!(
+            large <= 5 * small,
+            "{small} comparisons at 1,000 paths, {large} at 4,000"
+        );
+    }
 
     #[test]
     fn a_diff_wakes_for_tracked_files_and_git_state_only() {

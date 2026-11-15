@@ -20,6 +20,7 @@ use muxel_core::file_watch::{
 };
 use notify::event::ModifyKind;
 use notify::{RecursiveMode, Watcher};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -79,8 +80,9 @@ fn diff_sources_with(
     let real_root = dir.canonicalize().ok()?;
     let root = DirNames::new(dir.to_path_buf(), Some(real_root.clone()));
     let mut paths: Vec<(PathBuf, Recursion)> = Vec::new();
+    let mut listed: HashSet<PathBuf> = HashSet::new();
     let mut watch = |path: PathBuf, recursion: Recursion| {
-        if !paths.iter().any(|(watched, _)| *watched == path) {
+        if listed.insert(path.clone()) {
             paths.push((path, recursion));
         }
     };
@@ -127,7 +129,11 @@ fn diff_sources_with(
     if per_dir {
         // A tracked directory that's gone gets its watch when it comes
         // back: its parent's watch reports that, and the pane re-plans.
-        for rel in &tracked.dirs {
+        // Sorted, so a plan that finds the same directories lists them in
+        // the same order and its respec returns at once.
+        let mut dirs: Vec<&PathBuf> = tracked.dirs.iter().collect();
+        dirs.sort_unstable();
+        for rel in dirs {
             let path = dir.join(rel);
             if path.is_dir() {
                 watch(path, Recursion::Dir);
@@ -575,6 +581,24 @@ mod tests {
         let per_dir = diff_sources_with(root, &plan, true, each.len()).expect("within budget");
         assert_eq!(resolved(&per_dir.paths), resolved(&each));
         assert!(diff_sources_with(root, &plan, true, each.len() - 1).is_none());
+    }
+
+    /// Two plans of the same checkout list its folders in the same order,
+    /// so the respec between them returns without a pass over the paths.
+    #[test]
+    fn a_diff_lists_the_same_folders_in_the_same_order_each_plan() {
+        let repo = TestRepo::init();
+        let names: Vec<String> = (0..8).map(|i| format!("d{i}/f.rs")).collect();
+        let files: Vec<(&str, &str)> = names.iter().map(|name| (name.as_str(), "")).collect();
+        repo.commit(&files, "seed");
+        let root = repo.path();
+        let paths = || {
+            let plan = diff_plan(root).expect("a work tree");
+            diff_sources_with(root, &plan, true, usize::MAX)
+                .expect("within budget")
+                .paths
+        };
+        assert_eq!(paths(), paths());
     }
 
     /// Real writes reach a diff pane's watch through the platform's backend,
