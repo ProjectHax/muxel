@@ -11,6 +11,8 @@ pub mod child_env;
 pub mod chime;
 pub mod control;
 pub mod diff;
+pub mod diff_schedule;
+pub mod file_watch;
 pub mod geometry;
 mod gui_path;
 pub mod import;

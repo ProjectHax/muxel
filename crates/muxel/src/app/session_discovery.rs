@@ -10,7 +10,7 @@ use super::{
     MuxelApp, home_dir, is_claude_program, is_codex_program, is_grok_program,
     validated_codex_session_id,
 };
-use crate::binding_watch::ClaudeBindingWatch;
+use crate::file_watch::claude_records;
 use crate::{session_binding, ui_profile};
 use gpui::{App, AsyncApp, Context, WeakEntity};
 use muxel_core::session_discovery::{
@@ -854,7 +854,7 @@ impl MuxelApp {
             .collect();
         // Before the first Claude lookup, so none can miss a write the watcher
         // would have reported.
-        if self.claude_binding_watch.is_none()
+        if !self.provider_watches.contains_key(&SessionProvider::Claude)
             && keys
                 .iter()
                 .any(|key| key.provider == SessionProvider::Claude)
@@ -912,86 +912,25 @@ impl MuxelApp {
     }
 
     /// Watch the Claude hook directory, once. A write it reports runs
-    /// discovery at once instead of at the next tick. Failing to start leaves
+    /// discovery at once instead of at the next tick. Failing to watch leaves
     /// Claude panes polling as they would without it.
     fn start_claude_binding_watch(&mut self, data_dir: &Path, cx: &mut Context<Self>) {
         let dir = session_binding::claude_binding_dir(data_dir);
-        let (watch, signal) = match ClaudeBindingWatch::start(&dir) {
-            Ok(started) => started,
-            Err(error) => {
-                log::warn!(
-                    "could not watch Claude session hook records in {}; polling instead: {error:#}",
-                    dir.display()
-                );
-                ui_profile::session_watch(SessionProvider::Claude, "failed");
-                self.claude_binding_watch = Some(None);
-                return;
-            }
-        };
-        self.follow_claude_binding_watch(watch, signal, cx);
-    }
-
-    /// Rely on `watch` for Claude panes, and apply its changes each time
-    /// `signal` fires.
-    fn follow_claude_binding_watch(
-        &mut self,
-        watch: ClaudeBindingWatch,
-        signal: async_channel::Receiver<()>,
-        cx: &mut Context<Self>,
-    ) {
-        self.claude_binding_watch = Some(Some(watch));
-        self.session_discoveries
-            .set_watched(SessionProvider::Claude, true);
-        ui_profile::session_watch(SessionProvider::Claude, "watching");
-        cx.spawn(async move |this, cx| {
-            while signal.recv().await.is_ok() {
-                if this
-                    .update(cx, |this, cx| this.apply_claude_binding_changes(cx))
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            // The sender went with the watcher: dropped here after a failure,
-            // or by a backend that stopped without reporting an error.
-            let _ = this.update(cx, |this, cx| {
-                if matches!(this.claude_binding_watch, Some(Some(_))) {
-                    log::warn!("Claude session hook watcher stopped; polling instead");
-                    this.stop_trusting_claude_binding_watch(cx);
-                }
-            });
-        })
-        .detach();
-    }
-
-    fn apply_claude_binding_changes(&mut self, cx: &mut Context<Self>) {
-        let Some(Some(watch)) = &self.claude_binding_watch else {
-            return;
-        };
-        let changes = watch.take();
-        for pane in changes.panes {
-            self.session_discoveries.wake(SessionProvider::Claude, pane);
+        // Created first, so the watch can resolve its canonical name.
+        let watched = self.watch_provider(
+            SessionProvider::Claude,
+            || {
+                std::fs::create_dir_all(&dir)?;
+                Ok(claude_records(&dir))
+            },
+            cx,
+        );
+        if let Err(error) = watched {
+            log::warn!(
+                "could not watch Claude session hook records in {}; polling instead: {error:#}",
+                dir.display()
+            );
         }
-        if changes.failed {
-            self.stop_trusting_claude_binding_watch(cx);
-            return;
-        }
-        if changes.rescan {
-            self.session_discoveries
-                .wake_provider(SessionProvider::Claude);
-            ui_profile::session_watch(SessionProvider::Claude, "rescan");
-        }
-        self.sync_provider_session_ids(cx);
-    }
-
-    /// Not trusted again in this run: back to polling, and every quiet Claude
-    /// pane looks now.
-    fn stop_trusting_claude_binding_watch(&mut self, cx: &mut Context<Self>) {
-        self.claude_binding_watch = Some(None);
-        self.session_discoveries
-            .set_watched(SessionProvider::Claude, false);
-        ui_profile::session_watch(SessionProvider::Claude, "failed");
-        self.sync_provider_session_ids(cx);
     }
 
     fn apply_discovery_batch(
@@ -2411,8 +2350,8 @@ mod grok_regressions {
 mod claude_watch_regressions {
     use super::super::{MuxelApp, claude_test_home, popout_lifecycle_tests::with_app};
     use super::{DiscoveryBatch, DiscoveryCandidate};
-    use crate::binding_watch::ClaudeBindingWatch;
-    use crate::binding_watch::test_backend::TestBackend;
+    use crate::file_watch::FileWatch;
+    use crate::file_watch::test_backend::TestBackend;
     use crate::session_binding;
     use gpui::{AppContext as _, TestAppContext, WindowHandle};
     use muxel_core::session_discovery::SessionProvider;
@@ -2443,7 +2382,7 @@ mod claude_watch_regressions {
                 app._status_timer = gpui::Task::ready(());
                 app.current_workspace = Some(Uuid::new_v4());
                 if watched {
-                    app.claude_binding_watch = Some(None);
+                    app.provider_watches.insert(SessionProvider::Claude, None);
                     app.session_discoveries
                         .set_watched(SessionProvider::Claude, true);
                 }
@@ -2541,22 +2480,16 @@ mod claude_watch_regressions {
         });
     }
 
-    /// Follow a watch on `backend`, a stand-in for notify's.
+    /// Make `backend`, a stand-in for notify's, the app's watcher. The first
+    /// lookup registers Claude with it, as it would with the real one.
     fn follow_test_backend(
         cx: &mut TestAppContext,
         window: WindowHandle<MuxelApp>,
-        data: &Path,
         backend: &TestBackend,
     ) {
-        let (watch, signal) =
-            ClaudeBindingWatch::start_with(&session_binding::claude_binding_dir(data), |handler| {
-                backend.build(handler)
-            })
-            .unwrap();
+        let (watch, signal) = FileWatch::start_with(|handler| backend.build(handler)).unwrap();
         window
-            .update(cx, |app, _, cx| {
-                app.follow_claude_binding_watch(watch, signal, cx)
-            })
+            .update(cx, |app, _, cx| app.follow_file_watch(watch, signal, cx))
             .unwrap();
     }
 
@@ -2580,7 +2513,7 @@ mod claude_watch_regressions {
             let _home = claude_test_home(Some(data.join("home")));
             let (pane, session, project) = claude_pane(cx, window, &data, false);
             let backend = TestBackend::default();
-            follow_test_backend(cx, window, &data, &backend);
+            follow_test_backend(cx, window, &backend);
             first_lookup(cx, window);
             let next = clear_hook(&data, &project, pane);
             backend.kill();
@@ -2602,7 +2535,7 @@ mod claude_watch_regressions {
             let _home = claude_test_home(Some(data.join("home")));
             let (pane, session, project) = claude_pane(cx, window, &data, false);
             let backend = TestBackend::default();
-            follow_test_backend(cx, window, &data, &backend);
+            follow_test_backend(cx, window, &backend);
             first_lookup(cx, window);
             let next = clear_hook(&data, &project, pane);
             backend.send(Err(notify::Error::generic("watch lost")));

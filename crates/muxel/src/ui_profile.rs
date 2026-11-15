@@ -168,6 +168,16 @@ pub(crate) fn session_watch(
     ));
 }
 
+/// A diff pane's watch began (`watching`), couldn't begin, so the pane polls
+/// while visible (`polling`), or was lost (`lost`).
+pub(crate) fn diff_watch(state: &'static str) {
+    if !is_enabled() {
+        return;
+    }
+    ensure_flusher();
+    emit(&format!("ui-prof[diff-watch v1] state={state}"));
+}
+
 enum DeferredRecord {
     SessionLookup {
         at: SystemTime,
