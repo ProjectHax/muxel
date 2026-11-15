@@ -47,7 +47,7 @@ pub(super) struct DiffSource {
     inputs: PlanInputs,
     /// Resolve the plan again at the next refresh: none yet, HEAD or the
     /// index changed, a tracked directory came or went, the watcher lost
-    /// events, or `dir` was gone.
+    /// events, the watch was lost or failed, or `dir` was gone.
     pub(super) replan: bool,
     pub(super) watch: Option<WatchId>,
     /// The tracked files `watch` filters by, for the next plan to compare.
@@ -318,6 +318,7 @@ impl MuxelApp {
             WatchFilter::Tracked(tracked) => Some(Arc::clone(tracked)),
             WatchFilter::RecordFiles { .. } => None,
         });
+        let mut replan = false;
         let watch = match (old, spec) {
             (Some(id), Some(spec)) => {
                 let respec = match self.file_watch.as_mut() {
@@ -339,6 +340,9 @@ impl MuxelApp {
                         log::warn!("diff pane for {} stopped watching: {error}", dir.display());
                         ui_profile::diff_watch("lost");
                         self.watch_targets.remove(&id);
+                        // Often a folder that went between the plan and the
+                        // watch, mid-checkout. Plan once more, to watch again.
+                        replan = matches!(self.file_watch, Some(Some(_)));
                         None
                     }
                 }
@@ -382,14 +386,20 @@ impl MuxelApp {
         if let Some(source) = self.diff_panes.sources.get_mut(&pane) {
             source.watch = watch;
             source.tracked = watch.and(tracked);
+            source.replan |= replan;
         }
         self.diff_panes.schedule.set_watched(pane, watch.is_some());
     }
 
-    /// `pane`'s watch is gone: it polls while visible.
+    /// `pane`'s watch is gone: it polls while visible. While the watcher
+    /// runs, its next refresh plans again and watches what it finds; if that
+    /// watch fails, the pane goes on polling.
     pub(super) fn diff_unwatched(&mut self, pane: Uuid) {
+        let running = matches!(self.file_watch, Some(Some(_)));
         if let Some(source) = self.diff_panes.sources.get_mut(&pane) {
             source.watch = None;
+            source.tracked = None;
+            source.replan |= running;
         }
         ui_profile::diff_watch("lost");
         self.diff_panes.schedule.set_watched(pane, false);

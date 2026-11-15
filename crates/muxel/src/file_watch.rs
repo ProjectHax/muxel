@@ -155,7 +155,8 @@ fn diff_sources_with(
     (paths.len() <= budget).then(|| WatchSpec {
         paths,
         filter: WatchFilter::Tracked(Arc::new(tracked)),
-        // Gone with its directory; a recreated one isn't watched.
+        // Gone with its directory. The pane polls, and watches a recreated
+        // one once it's back.
         lose_on: vec![root],
     })
 }

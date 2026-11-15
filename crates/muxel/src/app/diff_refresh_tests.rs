@@ -323,19 +323,27 @@ fn a_commit_on_the_branch_refreshes_the_diff() {
     target_os = "macos",
     ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
 )]
-fn a_lost_diff_watch_puts_the_pane_back_on_its_poll() {
+fn a_lost_diff_watch_refreshes_the_pane_and_watches_again() {
     with_app(|cx, main, fx| {
         let (backend, iid) = watched_diff(cx, main, fx);
+        add_line(&fx.a);
+        // As a checkout that moves the folder away and back reports it.
         send(
             &backend,
             notify::EventKind::Remove(RemoveKind::Folder),
             &[fx.a.path().to_path_buf()],
         );
         cx.run_until_parked();
-        assert!(!watched(cx, main, iid));
-        add_line(&fx.a);
-        tick(cx);
-        assert!(diff_text(cx, main, iid).contains("+second"));
+        assert!(diff_text(cx, main, iid).contains("+second"), "at once");
+        assert!(watched(cx, main, iid), "it planned again and watches");
+        let notes = fx.a.path().join("notes.txt");
+        std::fs::write(&notes, "first\nsecond\nthird\n").unwrap();
+        modified(&backend, notes);
+        wait(cx, SOON);
+        assert!(
+            diff_text(cx, main, iid).contains("+third"),
+            "through the new watch"
+        );
     });
 }
 

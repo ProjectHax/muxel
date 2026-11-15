@@ -1,7 +1,8 @@
 //! The app's side of its one file watcher ([`FileWatch`]): starting it with
 //! the first registration, and handing each registration's news to what it
-//! wakes. A target whose watch is lost polls for the rest of the run (a diff
-//! pane, until it re-plans), as it would have without one.
+//! wakes. A provider whose watch is lost polls for the rest of the run, as it
+//! would have without one; a diff pane polls, and plans once more to watch
+//! again.
 
 use super::MuxelApp;
 use crate::file_watch::FileWatch;
@@ -157,7 +158,7 @@ impl MuxelApp {
         self.watch_targets.remove(&id)
     }
 
-    /// `id` is blind: drop it, and its target polls for the rest of the run.
+    /// `id` is blind: drop it, and its target polls (see the module docs).
     fn lose_watch(&mut self, id: WatchId) {
         if let Some(target) = self.drop_watch(id) {
             self.unwatch_target(target);
