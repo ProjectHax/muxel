@@ -103,12 +103,14 @@ impl MuxelApp {
         let drained = watch.take();
         let now = cx.background_executor().now();
         let mut lost = Vec::new();
+        let mut providers = false;
         for (id, change) in drained.changes {
             let Some(target) = self.watch_targets.get(&id).copied() else {
                 continue;
             };
             match target {
                 WatchTarget::Provider(provider) => {
+                    providers = true;
                     for pane in change.hits {
                         self.session_discoveries.wake(provider, pane);
                     }
@@ -146,7 +148,10 @@ impl MuxelApp {
         for id in lost {
             self.lose_watch(id);
         }
-        self.sync_provider_session_ids(cx);
+        // Most news is a diff pane's alone, which makes no lookup due.
+        if providers {
+            self.sync_provider_session_ids(cx);
+        }
         self.pump_diffs(cx);
     }
 
