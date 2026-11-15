@@ -17,9 +17,10 @@ use crate::integrations::{self, DiffPlan, PlanInputs};
 use crate::ui_profile;
 use gpui::{Context, Task, WeakEntity};
 use muxel_core::diff_schedule::DiffSchedule;
-use muxel_core::file_watch::{WatchId, WatchSpec};
+use muxel_core::file_watch::{TrackedFiles, WatchFilter, WatchId, WatchSpec};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -49,6 +50,8 @@ pub(super) struct DiffSource {
     /// events, or `dir` was gone.
     pub(super) replan: bool,
     pub(super) watch: Option<WatchId>,
+    /// The tracked files `watch` filters by, for the next plan to compare.
+    tracked: Option<Arc<TrackedFiles>>,
 }
 
 /// One refresh, run off the UI thread.
@@ -60,14 +63,26 @@ struct DiffJob {
     /// pane that polls, which doesn't need its plan.
     inputs: Option<PlanInputs>,
     replan: bool,
+    tracked: Option<Arc<TrackedFiles>>,
+}
+
+/// A refresh's new plan.
+struct Planned {
+    /// The top level it resolved.
+    toplevel: Option<String>,
+    inputs: PlanInputs,
+    /// The watch built from it.
+    spec: Option<WatchSpec>,
+    /// It tracks other files than the pane's watch filtered by, so writes
+    /// to them since this refresh's `git diff` went unrouted.
+    retracked: bool,
 }
 
 struct DiffResult {
     pane: Uuid,
     text: String,
-    /// The top level this refresh resolved, what its plan was read from,
-    /// and the watch built from it; `None` when it reused the pane's.
-    planned: Option<(Option<String>, PlanInputs, Option<WatchSpec>)>,
+    /// `None` when it reused the pane's plan.
+    planned: Option<Planned>,
     /// `dir` was gone: resolve the plan once it's back.
     gone: bool,
 }
@@ -79,7 +94,12 @@ impl DiffJob {
             return DiffResult {
                 pane: self.pane,
                 text: integrations::not_a_git_repo(&self.dir),
-                planned: Some((None, PlanInputs::default(), None)),
+                planned: Some(Planned {
+                    toplevel: None,
+                    inputs: PlanInputs::default(),
+                    spec: None,
+                    retracked: false,
+                }),
                 gone: true,
             };
         }
@@ -89,12 +109,23 @@ impl DiffJob {
         let (toplevel, planned) = if self.replan || stale {
             let plan: Option<DiffPlan> = integrations::diff_plan(&self.dir);
             let spec = plan.as_ref().and_then(|plan| diff_sources(&self.dir, plan));
+            // Here, off the UI thread: a pane can track thousands of files.
+            let retracked = match (&self.tracked, spec.as_ref().map(|spec| &spec.filter)) {
+                (Some(old), Some(WatchFilter::Tracked(new))) => old != new,
+                _ => true,
+            };
             let inputs = plan
                 .as_ref()
                 .map(|plan| plan.inputs.clone())
                 .unwrap_or_default();
             let toplevel = plan.map(|plan| plan.toplevel);
-            (toplevel.clone(), Some((toplevel, inputs, spec)))
+            let planned = Planned {
+                toplevel: toplevel.clone(),
+                inputs,
+                spec,
+                retracked,
+            };
+            (toplevel, Some(planned))
         } else {
             (self.toplevel, None)
         };
@@ -145,6 +176,7 @@ impl MuxelApp {
                     inputs: PlanInputs::default(),
                     replan: true,
                     watch: None,
+                    tracked: None,
                 });
         }
         let closed: Vec<Uuid> = self
@@ -214,6 +246,7 @@ impl MuxelApp {
                     toplevel: source.toplevel.clone(),
                     inputs: source.watch.is_some().then(|| source.inputs.clone()),
                     replan: std::mem::take(&mut source.replan),
+                    tracked: source.tracked.clone(),
                 }),
                 // Asked for before its first frame; it rejoins once it's on
                 // screen.
@@ -246,10 +279,10 @@ impl MuxelApp {
             return; // closed meanwhile
         };
         source.replan |= result.gone;
-        if let Some((toplevel, inputs, spec)) = result.planned {
-            source.toplevel = toplevel;
-            source.inputs = inputs;
-            self.watch_diff(pane, spec, cx);
+        if let Some(planned) = result.planned {
+            source.toplevel = planned.toplevel;
+            source.inputs = planned.inputs;
+            self.watch_diff(pane, planned.spec, planned.retracked, cx);
         }
         let editor = self
             .editor_views()
@@ -269,11 +302,22 @@ impl MuxelApp {
     }
 
     /// Point `pane`'s watch at `spec`, or stop watching where there's none.
-    fn watch_diff(&mut self, pane: Uuid, spec: Option<WatchSpec>, cx: &mut Context<Self>) {
+    /// `retracked`: `spec` tracks other files than the watch did.
+    fn watch_diff(
+        &mut self,
+        pane: Uuid,
+        spec: Option<WatchSpec>,
+        retracked: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(source) = self.diff_panes.sources.get_mut(&pane) else {
             return;
         };
         let (old, dir) = (source.watch.take(), source.dir.clone());
+        let tracked = spec.as_ref().and_then(|spec| match &spec.filter {
+            WatchFilter::Tracked(tracked) => Some(Arc::clone(tracked)),
+            WatchFilter::RecordFiles { .. } => None,
+        });
         let watch = match (old, spec) {
             (Some(id), Some(spec)) => {
                 let respec = match self.file_watch.as_mut() {
@@ -281,7 +325,16 @@ impl MuxelApp {
                     _ => Err(anyhow::anyhow!("the file watcher stopped")),
                 };
                 match respec {
-                    Ok(()) => Some(id),
+                    Ok(moved) => {
+                        // Writes since this refresh's git diff under a
+                        // watch it moved, or to a file it now tracks, went
+                        // unseen, as before a first watch. Moving one also
+                        // restarts the stream on macOS, which loses events.
+                        if moved || retracked {
+                            self.diff_panes.schedule.changed(pane, None);
+                        }
+                        Some(id)
+                    }
                     Err(error) => {
                         log::warn!("diff pane for {} stopped watching: {error}", dir.display());
                         ui_profile::diff_watch("lost");
@@ -328,6 +381,7 @@ impl MuxelApp {
         };
         if let Some(source) = self.diff_panes.sources.get_mut(&pane) {
             source.watch = watch;
+            source.tracked = watch.and(tracked);
         }
         self.diff_panes.schedule.set_watched(pane, watch.is_some());
     }

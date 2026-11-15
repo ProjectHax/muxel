@@ -63,7 +63,17 @@ pub(crate) const DIFF_WATCH_DIRS: usize = 4096;
 pub(crate) fn diff_sources(dir: &Path, plan: &DiffPlan) -> Option<WatchSpec> {
     // Windows and macOS watch a tree with one handle or stream.
     let per_dir = !cfg!(any(windows, target_os = "macos"));
+    #[cfg(test)]
+    let per_dir = PER_DIR.get().unwrap_or(per_dir);
     diff_sources_with(dir, plan, per_dir, DIFF_WATCH_DIRS)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by a test to plan its thread's diff watches as another platform
+    /// does. An app test's background work runs on the test's thread.
+    pub(crate) static PER_DIR: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// [`diff_sources`], watching each directory on its own when `per_dir`, and
@@ -272,16 +282,17 @@ impl FileWatch {
     }
 
     /// Give a registration a new spec, adding and dropping only the OS
-    /// watches that differ. If one can't be added the registration is
-    /// dropped and the error returned, so its owner polls.
-    pub fn respec(&mut self, id: WatchId, spec: WatchSpec) -> anyhow::Result<()> {
+    /// watches that differ, and say whether any did. If one can't be added
+    /// the registration is dropped and the error returned, so its owner
+    /// polls.
+    pub fn respec(&mut self, id: WatchId, spec: WatchSpec) -> anyhow::Result<bool> {
         let ops = lock(&self.router).respec(id, spec);
         if let Err(error) = self.apply(&ops) {
             self.fail(id, &ops);
             return Err(error);
         }
         self.signal_news();
-        Ok(())
+        Ok(!ops.is_empty())
     }
 
     /// `ops` failed partway: drop `id`, and have the router mark the paths

@@ -62,7 +62,7 @@ impl DirNames {
 
 /// What a diff pane's text depends on: `git diff HEAD -- .` shows tracked
 /// files only, so only those and the git state behind HEAD can change it.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct TrackedFiles {
     /// The diff's directory.
     pub root: DirNames,

@@ -405,6 +405,75 @@ fn the_backstop_re_plans_after_a_lost_index_event() {
     });
 }
 
+/// `git add` of a new file, reported: the re-plan that follows watches the
+/// file from then on, and refreshes once more, since a write to it between
+/// the re-plan's `git diff` and the new watch went unrouted.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn a_re_plan_that_changes_the_watch_refreshes_once_more() {
+    with_app(|cx, main, fx| {
+        let (backend, iid) = watched_diff(cx, main, fx);
+        let added = add_unreported(&fx.a);
+        let git = fx.a.path().join(".git");
+        send(
+            &backend,
+            notify::EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            &[git.join("index.lock"), git.join("index")],
+        );
+        wait(cx, SOON);
+        assert!(
+            diff_text(cx, main, iid).contains("+one"),
+            "the re-plan refreshed"
+        );
+        // Unreported, as a write before the new watch would be.
+        std::fs::write(&added, "one\nmore\n").unwrap();
+        wait(cx, SOON);
+        assert!(
+            diff_text(cx, main, iid).contains("+more"),
+            "it refreshed once more"
+        );
+    });
+}
+
+/// A tracked folder reported removed and made again, where each folder is
+/// its own watch (inotify). The re-plan finds the same files but watches
+/// the folder afresh, so it refreshes once more for a write before then.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn a_re_plan_that_moves_only_the_watch_refreshes_once_more() {
+    crate::file_watch::PER_DIR.set(Some(true));
+    with_app(|cx, main, fx| {
+        fx.a.commit(&[("src/lib.rs", "")], "src");
+        let (backend, iid) = watched_diff(cx, main, fx);
+        let src = fx.a.path().join("src");
+        let folder = std::slice::from_ref(&src);
+        send(
+            &backend,
+            notify::EventKind::Remove(RemoveKind::Folder),
+            folder,
+        );
+        send(
+            &backend,
+            notify::EventKind::Create(CreateKind::Folder),
+            folder,
+        );
+        wait(cx, SOON);
+        // Unreported, as a write before the new watch would be.
+        std::fs::write(src.join("lib.rs"), "// edited\n").unwrap();
+        wait(cx, SOON);
+        assert!(
+            diff_text(cx, main, iid).contains("+// edited"),
+            "it refreshed once more"
+        );
+    });
+}
+
 /// An edit inside a submodule changes the diff (`-dirty`) without touching a
 /// file the plan tracks, so a repository with one polls instead of watching.
 #[test]
