@@ -5,6 +5,74 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.3.8] — 2026-11-15
+
+### Added
+- **Settings is redesigned, and can float in a window of its own** — Settings
+  was sixteen sections in one long list, with help text squeezed into the
+  labels and three different ways of saving on one screen. Its sections now sit
+  under five headings, every setting has its name and a line about it beside
+  its control, and a search field finds settings, shortcuts and saved items.
+  Changes apply as you make them: text fields apply on Enter or when you leave
+  them, **Revert changes** undoes what you changed, and **Done** closes it.
+  Appearance picks a theme from swatches above a live preview, and Keybindings
+  lists actions by name with click-to-record, a filter, conflict warnings and a
+  reset for each shortcut; a rebound shortcut's old keys now stop working at
+  once instead of at the next launch. A button in the Settings header moves it
+  into a window of its own and back again, and muxel remembers which you chose.
+  Behavior, Sounds, Speech and Remotes are now called General, Notifications,
+  Dictation and Hosts.
+- **The done chime can ring for the pane you're watching** — the done chime
+  only rang for panes you weren't looking at, so an agent you were watching
+  finished in silence, which is easy to miss if you glance away for a moment.
+  Settings → Notifications → **Chime for** now offers **Every pane**, which also
+  rings once per turn when the agent in front of you finishes. The default stays
+  **Background panes only**, and the blocked chime still never rings for the
+  pane you're looking at.
+
+### Changed
+- **Diff panes refresh when their files change** — a diff pane on screen ran
+  git every second and a half whether anything had changed or not. It now
+  watches the files its diff depends on and refreshes once writes to them
+  settle, so an idle diff pane costs almost nothing: on Windows, one went from
+  about 220 process starts a minute to 6. Writes to files git doesn't track,
+  such as a build filling `target/`, start no git at all. A pane still refreshes
+  every 30 seconds in case the system missed an event, and goes on refreshing
+  every second and a half in a repository it can't watch reliably, such as one
+  with submodules or, on Linux, one with more than 4,096 folders. On
+  Windows, while a diff pane is open, the folders above its folder can't be
+  renamed. Thanks to [@railapex](https://github.com/railapex)
+  ([#148](https://github.com/ProjectHax/muxel/pull/148)).
+
+### Fixed
+- **Copying works after a double or triple click in rendered Markdown** —
+  selecting a word or paragraph in a Markdown file's rendered view with a double
+  or triple click and pressing Ctrl+C left the clipboard as it was, however
+  often you pressed it. The selection now copies, and Ctrl+Insert copies in a
+  popped-out editor pane too. Thanks to [@railapex](https://github.com/railapex)
+  ([#146](https://github.com/ProjectHax/muxel/pull/146)).
+- **Grok 1.0.77 shows as working** — Grok 1.0.77 changed the spinner in its
+  window title, and muxel didn't recognise the new one: the pane read idle
+  through every turn, no finish was reported, the pane could be named after a
+  spinner frame, and a message sent with `muxel ctl send` came back unconfirmed
+  after a minute. The new spinner now counts as working, beside the old one.
+  Thanks to [@railapex](https://github.com/railapex)
+  ([#147](https://github.com/ProjectHax/muxel/pull/147)).
+- **Claude's input box is found under its usage notice** — Claude Code 2.1.323
+  can draw its usage notice into the top edge of its input box. While the notice
+  showed, and after Claude erased it, muxel lost track of the box, so a draft
+  you'd typed could change the pane's status, and `muxel ctl new --prompt`
+  couldn't find the box to type its prompt into. The box is found in both cases
+  now. Thanks to [@railapex](https://github.com/railapex)
+  ([#150](https://github.com/ProjectHax/muxel/pull/150)).
+- **`muxel ctl new --prompt` reaches Codex 0.167** — the prompt is typed once
+  Codex shows its empty input box, but muxel didn't recognise that box on Codex
+  0.167, whose status line ends with "← for agents", or on a model whose name
+  has no version number. The prompt waited about 35 seconds and was then
+  reported as not delivered, with nothing typed. Both are recognised now.
+  Thanks to [@railapex](https://github.com/railapex)
+  ([#151](https://github.com/ProjectHax/muxel/pull/151)).
+
 ## [0.3.7] — 2026-11-13
 
 ### Added
