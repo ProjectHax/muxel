@@ -129,6 +129,8 @@ fn diff_sources_with(
     if per_dir {
         // A tracked directory that's gone gets its watch when it comes
         // back: its parent's watch reports that, and the pane re-plans.
+        // One back before then is watched afresh, because the router
+        // marked it when it went.
         // Sorted, so a plan that finds the same directories lists them in
         // the same order and its respec returns at once.
         let mut dirs: Vec<&PathBuf> = tracked.dirs.iter().collect();
@@ -262,7 +264,7 @@ impl FileWatch {
     pub fn register(&mut self, spec: WatchSpec) -> anyhow::Result<WatchId> {
         let (id, ops) = lock(&self.router).register(spec);
         if let Err(error) = self.apply(&ops) {
-            self.unregister(id);
+            self.fail(id, &ops);
             return Err(error);
         }
         self.signal_news();
@@ -275,11 +277,19 @@ impl FileWatch {
     pub fn respec(&mut self, id: WatchId, spec: WatchSpec) -> anyhow::Result<()> {
         let ops = lock(&self.router).respec(id, spec);
         if let Err(error) = self.apply(&ops) {
-            self.unregister(id);
+            self.fail(id, &ops);
             return Err(error);
         }
         self.signal_news();
         Ok(())
+    }
+
+    /// `ops` failed partway: drop `id`, and have the router mark the paths
+    /// it shared, whose watch may have gone with them, for the others.
+    fn fail(&mut self, id: WatchId, ops: &[OsWatch]) {
+        self.unregister(id);
+        lock(&self.router).failed(ops);
+        self.signal_news();
     }
 
     /// Drop a registration, and the OS watches nothing else needs.
@@ -356,7 +366,8 @@ impl Drop for FileWatch {
 pub(crate) mod test_backend {
     use super::RouteEvents;
     use notify::{Config, EventHandler, RecursiveMode, Watcher, WatcherKind};
-    use std::path::Path;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -367,6 +378,10 @@ pub(crate) mod test_backend {
     pub(crate) struct TestBackend {
         handler: Arc<Mutex<Option<RouteEvents>>>,
         dropped: Arc<AtomicBool>,
+        /// The paths it watches.
+        held: Arc<Mutex<HashSet<PathBuf>>>,
+        /// It refuses new watches, as at the inotify limit.
+        full: Arc<AtomicBool>,
     }
 
     impl TestBackend {
@@ -376,7 +391,26 @@ pub(crate) mod test_backend {
             Ok(TestWatcher {
                 handler: Arc::clone(&self.handler),
                 dropped: Arc::clone(&self.dropped),
+                held: Arc::clone(&self.held),
+                full: Arc::clone(&self.full),
             })
+        }
+
+        pub fn holds(&self, path: &Path) -> bool {
+            self.held.lock().unwrap().contains(path)
+        }
+
+        /// Drop the watches on `dir` and under it, as inotify does when the
+        /// directory is moved away.
+        pub fn drop_under(&self, dir: &Path) {
+            self.held
+                .lock()
+                .unwrap()
+                .retain(|path| !path.starts_with(dir));
+        }
+
+        pub fn set_full(&self, full: bool) {
+            self.full.store(full, Ordering::SeqCst);
         }
 
         /// The backend reports `event` while alive.
@@ -404,6 +438,8 @@ pub(crate) mod test_backend {
     pub(crate) struct TestWatcher {
         handler: Arc<Mutex<Option<RouteEvents>>>,
         dropped: Arc<AtomicBool>,
+        held: Arc<Mutex<HashSet<PathBuf>>>,
+        full: Arc<AtomicBool>,
     }
 
     impl Watcher for TestWatcher {
@@ -411,12 +447,20 @@ pub(crate) mod test_backend {
             Err(notify::Error::generic("built by TestBackend"))
         }
 
-        fn watch(&mut self, _: &Path, _: RecursiveMode) -> notify::Result<()> {
+        fn watch(&mut self, path: &Path, _: RecursiveMode) -> notify::Result<()> {
+            if self.full.load(Ordering::SeqCst) {
+                return Err(notify::Error::new(notify::ErrorKind::MaxFilesWatch));
+            }
+            self.held.lock().unwrap().insert(path.to_path_buf());
             Ok(())
         }
 
-        fn unwatch(&mut self, _: &Path) -> notify::Result<()> {
-            Ok(())
+        fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+            if self.held.lock().unwrap().remove(path) {
+                Ok(())
+            } else {
+                Err(notify::Error::watch_not_found())
+            }
         }
 
         fn kind() -> WatcherKind {
@@ -443,11 +487,51 @@ mod tests {
     use super::{FileWatch, claude_records, diff_sources, diff_sources_with};
     use crate::integrations::diff_plan;
     use crate::test_support::{TestRepo, git_out, short_temp_path};
-    use muxel_core::file_watch::{Change, Recursion, WatchId};
+    use muxel_core::file_watch::{Change, DirNames, Recursion, WatchFilter, WatchId, WatchSpec};
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
     use uuid::Uuid;
+
+    /// Two registrations share a directory that's moved away and back. The
+    /// first one's respec can't add its watch again (the inotify limit),
+    /// so it's dropped. The second is told to re-plan, and its respec adds
+    /// the watch once there's room.
+    #[test]
+    fn a_shared_watch_that_fails_to_come_back_is_added_by_the_other_registration() {
+        let backend = TestBackend::default();
+        let (mut watch, _signal) = FileWatch::start_with(|handler| backend.build(handler)).unwrap();
+        let root = PathBuf::from("repo");
+        let src = root.join("src");
+        let spec = || WatchSpec {
+            paths: vec![
+                (root.clone(), Recursion::Dir),
+                (src.clone(), Recursion::Dir),
+            ],
+            filter: WatchFilter::RecordFiles {
+                dir: DirNames::new(root.clone(), None),
+            },
+            lose_on: Vec::new(),
+        };
+        let a = watch.register(spec()).unwrap();
+        let b = watch.register(spec()).unwrap();
+        backend.drop_under(&src);
+        backend.send(Ok(notify::Event::new(notify::EventKind::Remove(
+            notify::event::RemoveKind::Folder,
+        ))
+        .add_path(src.clone())));
+        let _ = watch.take();
+        backend.set_full(true);
+        assert!(watch.respec(a, spec()).is_err());
+        let told = watch.take().changes;
+        assert!(
+            told.iter().any(|(id, change)| *id == b && change.rescan),
+            "the other re-plans"
+        );
+        backend.set_full(false);
+        watch.respec(b, spec()).unwrap();
+        assert!(backend.holds(&src));
+    }
 
     /// A backend whose worker died has dropped its handler, which closes the
     /// signal. Dropping its watcher then must not run the destructor that
@@ -656,6 +740,73 @@ mod tests {
         }
         repo.git(&["worktree", "remove", "--force", &linked.to_string_lossy()]);
         let _ = std::fs::remove_dir_all(&linked);
+    }
+
+    /// Take all the news so far, and any still on its way: write a record
+    /// into `marks`, which `barrier` watches, and take news until its hit
+    /// arrives. One inotify instance reports its events in order, so
+    /// nothing from before the write comes after it.
+    fn drain_through(
+        watch: &FileWatch,
+        signal: &async_channel::Receiver<()>,
+        barrier: WatchId,
+        marks: &Path,
+    ) -> Vec<(WatchId, Change)> {
+        let pane = Uuid::new_v4();
+        std::fs::write(marks.join(format!("{pane}.json")), "{}").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut drained = Vec::new();
+        loop {
+            assert!(Instant::now() < deadline, "the barrier's record never came");
+            if signal.try_recv().is_err() {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            let news = watch.take().changes;
+            let through = news
+                .iter()
+                .any(|(from, change)| *from == barrier && change.hits.contains(&pane));
+            drained.extend(news);
+            if through {
+                return drained;
+            }
+        }
+    }
+
+    /// A tracked folder removed and made again before the pane re-plans:
+    /// the plan after lists the same folders as before, and an edit in the
+    /// new one still wakes the pane. inotify dropped the old one's watch.
+    #[test]
+    fn a_tracked_folder_back_before_the_re_plan_is_watched_through_the_platform_watcher() {
+        let repo = TestRepo::init();
+        repo.commit(&[("top.txt", ""), ("src/lib.rs", "")], "seed");
+        let root = repo.path();
+        let spec = || {
+            let plan = diff_plan(root).expect("a work tree");
+            diff_sources(root, &plan).expect("watchable")
+        };
+        let (mut watch, signal) = FileWatch::start().unwrap();
+        let id = watch.register(spec()).unwrap();
+        let marks = short_temp_path();
+        std::fs::create_dir_all(&marks).unwrap();
+        let barrier = watch.register(claude_records(&marks)).unwrap();
+        let src = root.join("src");
+        std::fs::remove_dir_all(&src).unwrap();
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), "").unwrap();
+        let drained = drain_through(&watch, &signal, barrier, &marks);
+        let back = drained
+            .iter()
+            .any(|(from, change)| *from == id && change.relist);
+        assert!(back, "src came back");
+        // Only the edit below can wake the pane from here.
+        watch.unregister(barrier);
+        watch.respec(id, spec()).unwrap();
+        std::fs::write(src.join("lib.rs"), "// edited\n").unwrap();
+        let seen = gather(&watch, &signal, id, |seen| seen.touched);
+        drop(watch);
+        let _ = std::fs::remove_dir_all(&marks);
+        assert!(seen.touched, "an edit in the new src");
     }
 
     /// Deleting or renaming the hook directory or its parent through the real

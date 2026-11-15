@@ -232,6 +232,11 @@ pub struct WatchRouter {
     /// Each watched path and the registrations that need it, with the depth
     /// each asked for. The OS watch takes the deepest.
     os: HashMap<PathBuf, Vec<(WatchId, Recursion)>>,
+    /// Watched paths whose OS watch the backend may have dropped (see
+    /// [`Self::mark_stale`]), or a failed apply may have taken (see
+    /// [`Self::failed`]). The next registration or respec that wants one
+    /// adds its watch again, though its depth stays.
+    stale: HashSet<PathBuf>,
     pending: BTreeMap<WatchId, Change>,
     failed: bool,
     /// Changing the watched set restarts the backend's event stream, and
@@ -249,9 +254,16 @@ fn depth(users: &[(WatchId, Recursion)]) -> Option<Recursion> {
     }
 }
 
-/// The calls that take `path`'s OS watch from `was` to `now`.
-fn retarget(path: &Path, was: Option<Recursion>, now: Option<Recursion>, ops: &mut Vec<OsWatch>) {
-    if was == now {
+/// The calls that take `path`'s OS watch from `was` to `now`. `again` adds
+/// a watch that stays afresh, because the backend dropped it.
+fn retarget(
+    path: &Path,
+    was: Option<Recursion>,
+    now: Option<Recursion>,
+    again: bool,
+    ops: &mut Vec<OsWatch>,
+) {
+    if was == now && !(again && now.is_some()) {
         return;
     }
     if was.is_some() {
@@ -306,6 +318,7 @@ impl WatchRouter {
             next: 0,
             registrations: BTreeMap::new(),
             os: HashMap::new(),
+            stale: HashSet::new(),
             pending: BTreeMap::new(),
             failed: false,
             restarts_stream,
@@ -322,7 +335,8 @@ impl WatchRouter {
             let users = self.os.entry(path.clone()).or_default();
             let was = depth(users);
             users.push((id, *recursion));
-            retarget(path, was, depth(users), &mut ops);
+            let now = depth(users);
+            retarget(path, was, now, self.stale.remove(path), &mut ops);
         }
         self.rescan_others_if_restarted(id, &ops);
         self.registrations
@@ -347,8 +361,9 @@ impl WatchRouter {
             let now = depth(users);
             if now.is_none() {
                 self.os.remove(path);
+                self.stale.remove(path);
             }
-            retarget(path, was, now, &mut ops);
+            retarget(path, was, now, false, &mut ops);
         }
         self.rescan_others_if_restarted(id, &ops);
         ops
@@ -363,8 +378,12 @@ impl WatchRouter {
         };
         let old = std::mem::replace(&mut registration.spec, spec);
         let new = &registration.spec;
-        // A re-plan that lists the same paths changes no watch.
-        if old.paths == new.paths {
+        // A re-plan that lists the same paths, none of them dropped by the
+        // backend, changes no watch.
+        let stale = &self.stale;
+        if old.paths == new.paths
+            && (stale.is_empty() || !new.paths.iter().any(|(path, _)| stale.contains(path)))
+        {
             return Vec::new();
         }
         let mut ops = Vec::new();
@@ -374,10 +393,15 @@ impl WatchRouter {
             users.retain(|(user, _)| *user != id);
             users.extend(wanted.map(|recursion| (id, recursion)));
             let now = depth(users);
+            // A dropped watch is added again by a registration that still
+            // wants it. One only others want waits for their respec, so a
+            // directory that isn't back yet can't fail this one's.
+            let again = wanted.is_some() && self.stale.remove(path);
             if now.is_none() {
                 self.os.remove(path);
+                self.stale.remove(path);
             }
-            retarget(path, was, now, &mut ops);
+            retarget(path, was, now, again, &mut ops);
         }
         self.rescan_others_if_restarted(id, &ops);
         ops
@@ -427,6 +451,62 @@ impl WatchRouter {
             }
             if !change.is_empty() {
                 self.pending.entry(*id).or_default().merge(change);
+            }
+        }
+        self.mark_stale(event);
+    }
+
+    /// A watched directory removed or renamed. inotify drops its watch and,
+    /// for a moved one, every watch under it, reporting nothing for those.
+    /// A respec whose paths stay the same would leave them all unwatched
+    /// once the directories are back, so they're marked to be added again,
+    /// and every registration holding one re-plans: one rooted under a
+    /// moved directory sees no event of its own. A watch's own removal or
+    /// move is reported through that watch, so a Create needs no mark. The
+    /// pass over the watched paths runs only for an event naming one,
+    /// which is when notify drops any.
+    fn mark_stale(&mut self, event: &WatchEvent) {
+        if !matches!(event.kind, EventKind::Remove | EventKind::Rename) {
+            return;
+        }
+        for gone in &event.paths {
+            if !self.os.contains_key(gone) {
+                continue;
+            }
+            let under: Vec<PathBuf> = self
+                .os
+                .keys()
+                .filter(|path| path.starts_with(gone))
+                .cloned()
+                .collect();
+            for path in &under {
+                self.mark(path);
+            }
+        }
+    }
+
+    /// The app couldn't apply all of `ops` and dropped the registration
+    /// they were for. A path among them that another registration still
+    /// holds may have lost its OS watch on the way, as when an unwatch went
+    /// through and the watch after it failed at the inotify limit. Mark it
+    /// to be added again, and have its holders re-plan.
+    pub fn failed(&mut self, ops: &[OsWatch]) {
+        for op in ops {
+            let (OsWatch::Watch(path, _) | OsWatch::Unwatch(path)) = op;
+            self.mark(path);
+        }
+    }
+
+    /// Mark `path`, if it's watched, to be added again (see `stale`), and
+    /// tell every live registration holding it to rescan.
+    fn mark(&mut self, path: &Path) {
+        let Some(users) = self.os.get(path) else {
+            return;
+        };
+        self.stale.insert(path.to_path_buf());
+        for (id, _) in users {
+            if self.registrations.get(id).is_some_and(|r| !r.lost) {
+                self.pending.entry(*id).or_default().rescan = true;
             }
         }
     }
@@ -892,6 +972,109 @@ mod tests {
                 OsWatch::Unwatch(root.join("b")),
                 OsWatch::Unwatch(root.join("c")),
             ]
+        );
+    }
+
+    /// A diff pane over `root` where each directory is its own watch (Linux).
+    fn tracked(root: &Path, files: &[&str], dirs: &[&Path]) -> WatchSpec {
+        WatchSpec {
+            paths: dirs
+                .iter()
+                .map(|dir| (dir.to_path_buf(), Recursion::Dir))
+                .collect(),
+            filter: WatchFilter::Tracked(Arc::new(TrackedFiles::new(
+                names(root),
+                files.iter().map(PathBuf::from),
+                Vec::new(),
+                Vec::new(),
+            ))),
+            lose_on: vec![names(root)],
+        }
+    }
+
+    /// The watches notify's inotify backend holds. It applies the router's
+    /// calls, and on its own drops the watch on a directory that's removed
+    /// or moved, and every watch under a moved one, reporting none of those.
+    #[derive(Default)]
+    struct Inotify(HashSet<PathBuf>);
+
+    impl Inotify {
+        fn apply(&mut self, ops: &[OsWatch]) {
+            for op in ops {
+                match op {
+                    OsWatch::Watch(path, _) => self.0.insert(path.clone()),
+                    OsWatch::Unwatch(path) => self.0.remove(path),
+                };
+            }
+        }
+
+        fn drop_under(&mut self, dir: &Path) {
+            self.0.retain(|path| !path.starts_with(dir));
+        }
+    }
+
+    /// `rm -r src && mkdir src` before the pane re-plans: the plan after
+    /// lists the same directories as before, and the respec watches the new
+    /// `src` all the same.
+    #[test]
+    fn a_folder_back_before_the_re_plan_is_watched_again() {
+        let root = PathBuf::from("repo");
+        let src = root.join("src");
+        let spec = || tracked(&root, &["src/a.rs"], &[&root, &src]);
+        let mut router = WatchRouter::new(false);
+        let mut backend = Inotify::default();
+        let (id, ops) = router.register(spec());
+        backend.apply(&ops);
+        backend.drop_under(&src);
+        router.event(&event(EventKind::Remove, std::slice::from_ref(&src)));
+        router.event(&event(EventKind::Create, std::slice::from_ref(&src)));
+        assert!(change(&mut router).relist);
+        backend.apply(&router.respec(id, spec()));
+        assert_eq!(backend.0, HashSet::from([root.clone(), src.clone()]));
+        assert!(
+            router.respec(id, spec()).is_empty(),
+            "added again once, not at every re-plan"
+        );
+    }
+
+    /// `mv src away && mkdir -p src/sub`, where pane A over the repository
+    /// watches `src` and pane B over `src/sub` watches only that. Dropping
+    /// the watches under `src` reports nothing, so no event names B's
+    /// directory; B is told to re-plan all the same, and the two respecs
+    /// watch both new directories.
+    #[test]
+    fn a_moved_folder_rewatches_every_pane_under_it() {
+        let root = PathBuf::from("repo");
+        let src = root.join("src");
+        let sub = src.join("sub");
+        let a_spec = || tracked(&root, &["src/a.rs"], &[&root, &src]);
+        let b_spec = || tracked(&sub, &["b.rs"], &[&sub]);
+        let mut router = WatchRouter::new(false);
+        let mut backend = Inotify::default();
+        let (a, ops) = router.register(a_spec());
+        backend.apply(&ops);
+        let (b, ops) = router.register(b_spec());
+        backend.apply(&ops);
+        backend.drop_under(&src);
+        router.event(&event(EventKind::Rename, std::slice::from_ref(&src)));
+        router.event(&event(EventKind::Create, std::slice::from_ref(&src)));
+        let changes = router.take().changes;
+        let of = |id: WatchId| -> Change {
+            let found = changes.iter().find(|(of, _)| *of == id);
+            found.map(|(_, change)| change.clone()).unwrap_or_default()
+        };
+        assert!(of(a).relist);
+        assert!(of(b).rescan && !of(b).lost, "B re-plans");
+        let ops = router.respec(a, a_spec());
+        assert!(
+            !ops.contains(&OsWatch::Watch(sub.clone(), Recursion::Dir)),
+            "A leaves B's directory to B, whose plan knows whether it's back"
+        );
+        backend.apply(&ops);
+        backend.apply(&router.respec(b, b_spec()));
+        assert_eq!(
+            backend.0,
+            HashSet::from([root.clone(), src.clone(), sub.clone()])
         );
     }
 
