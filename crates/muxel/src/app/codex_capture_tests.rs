@@ -7,7 +7,7 @@ use super::session_discovery::{
 use crate::theme;
 use gpui::{TestAppContext, WindowHandle};
 use muxel_core::{AgentPreset, CodexResumePath, CodexSession, Instance, Project, RemoteRef};
-use muxel_terminal::{CommandSpec, TerminalLaunch};
+use muxel_terminal::{CommandSpec, TerminalLaunch, TerminalSession};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -127,7 +127,48 @@ pub(super) fn with_app(run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelA
         theme::apply_initial_theme("", cx);
     });
     let window = cx.add_window(MuxelApp::new);
-    run(&mut cx, window);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&mut cx, window)));
+    // A failed test's processes must not outlive the root either.
+    let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        stop_pane_processes(&mut cx, window)
+    }));
+    drop(cx);
+    if let Err(panic) = result.and(stopped) {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// Kills every pane's child and waits until it has exited. A pane runs in a
+/// folder under the test root, and Windows won't remove a folder that is a
+/// live process's current folder. `kill` returns before the child has gone.
+/// Tests kill cmd just after spawning it, while it is still in its start
+/// folder (it moves to the Windows directory once it sees a `\\?\` path), so
+/// under load the root's removal could reach that folder first.
+fn stop_pane_processes(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) {
+    let sessions: Vec<Arc<TerminalSession>> = window
+        .update(cx, |app, _, cx| {
+            let popouts = app
+                .popouts
+                .values()
+                .filter_map(|popout| popout.terminal_view());
+            app.terminals
+                .values()
+                .chain(popouts)
+                .map(|view| view.read(cx).session().clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    for session in sessions {
+        // The session's own handle keeps the child's PID from being reused.
+        let Some(child) = session.child_pid().and_then(ChildHandle::open) else {
+            continue;
+        };
+        session.kill();
+        assert!(
+            child.exits_within(Duration::from_secs(10)),
+            "a pane's process outlived its kill"
+        );
+    }
 }
 
 fn codex_pane(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -> Uuid {
