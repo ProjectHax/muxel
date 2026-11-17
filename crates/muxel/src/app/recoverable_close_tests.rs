@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-    TerminateProcess, WaitForSingleObject,
+    CREATE_NO_WINDOW, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
 };
 
 /// Keep the original process handle: an unrelated process reusing its PID must
@@ -1066,7 +1066,8 @@ fn git_fixture_path(path: PathBuf) -> PathBuf {
     PathBuf::from(value.strip_prefix(r"\\?\").unwrap_or(&value))
 }
 
-fn git_fixture(root: &Path, args: &[&str]) {
+/// Run git in a fixture repository and return what it printed.
+fn git_fixture(root: &Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .args([
             "-c",
@@ -1091,6 +1092,199 @@ fn git_fixture(root: &Path, args: &[&str]) {
         "fixture git {args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// A program outside every pane, with `dir` as its current folder, on a
+/// console of its own as an agent's helper process runs. Closing a pane never
+/// ends it. Killed by its own handle when dropped.
+struct FolderHolder(std::process::Child);
+
+impl FolderHolder {
+    fn start(dir: &Path, ready: &Path) -> Self {
+        use std::os::windows::process::CommandExt;
+        // `cmd /k` runs its first command once it is in `dir`, then waits on
+        // the open stdin.
+        let child = std::process::Command::new("cmd.exe")
+            .raw_arg(format!("/d /q /k type nul > \"{}\"", ready.display()))
+            .current_dir(dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .spawn()
+            .expect("start the folder's holder");
+        let holder = Self(child);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the folder's holder never started"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        holder
+    }
+}
+
+impl Drop for FolderHolder {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Windows won't delete a folder a running program has as its current folder.
+/// `git worktree remove` then drops the registration but leaves the folder, so
+/// nothing can retry it through git and discarding must say where it is.
+#[test]
+fn discard_reports_a_worktree_folder_a_program_still_uses() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let data = git_fixture_path(muxel_store::data_dir().unwrap());
+        let path = data.join("held-worktree");
+        let wid = window
+            .update(cx, |app, _, _| {
+                let root = app.workspace.project(pid).unwrap().root_path.clone();
+                git_fixture(&root, &["init", "--initial-branch=main"]);
+                git_fixture(&root, &["commit", "--allow-empty", "-m", "fixture"]);
+                git_fixture(
+                    &root,
+                    &[
+                        "worktree",
+                        "add",
+                        "-b",
+                        "muxel/held-fixture",
+                        path.to_str().unwrap(),
+                    ],
+                );
+                let wid = Uuid::new_v4();
+                app.workspace.add_worktree(Worktree {
+                    id: wid,
+                    project_id: pid,
+                    name: "held fixture".into(),
+                    path: path.clone(),
+                    branch: "muxel/held-fixture".into(),
+                    color: 0,
+                    detached: false,
+                });
+                wid
+            })
+            .unwrap();
+        let _holder = FolderHolder::start(&path, &data.join("holder.ready"));
+        window
+            .update(cx, |app, _, cx| app.discard_worktree(wid, cx))
+            .unwrap();
+        assert!(path.is_dir(), "the held folder was deleted after all");
+        let root = window
+            .read_with(cx, |app, _| {
+                app.workspace.project(pid).unwrap().root_path.clone()
+            })
+            .unwrap();
+        let listed = git_fixture(&root, &["worktree", "list", "--porcelain"]);
+        assert!(
+            !listed.contains("held-worktree"),
+            "git still lists it: {listed}"
+        );
+        let branch = git_fixture(&root, &["branch", "--list", "muxel/held-fixture"]);
+        assert_eq!(branch.trim(), "", "git kept the branch");
+        let shown = path.display().to_string();
+        window
+            .read_with(cx, |app, _| {
+                assert!(app.workspace.worktree(wid).is_none());
+                assert_eq!(
+                    said_about(app, &shown),
+                    [(
+                        "Worktree folder left on disk".to_string(),
+                        format!(
+                            "The worktree and its branch were removed, but {shown} could not be \
+                             deleted, usually because a program is still using it. Delete the \
+                             folder once that program has exited."
+                        )
+                    )],
+                    "discard left {shown} without saying so"
+                );
+            })
+            .unwrap();
+    });
+}
+
+/// The error notifications that name `path`, as (title, detail).
+fn said_about(app: &MuxelApp, path: &str) -> Vec<(String, String)> {
+    app.notifications
+        .iter()
+        .filter(|n| matches!(n.kind, NotifKind::Error) && n.subtitle.contains(path))
+        .map(|n| (n.title.to_string(), n.subtitle.to_string()))
+        .collect()
+}
+
+/// Git refuses outright to remove a locked worktree: it stays registered, its
+/// folder whole and its branch checked out. Discarding one must say git kept
+/// it, with git's reason, and never tell the user to delete what is still a
+/// working checkout.
+#[test]
+fn discarding_a_worktree_git_keeps_says_so_without_delete_advice() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let data = git_fixture_path(muxel_store::data_dir().unwrap());
+        let path = data.join("kept-worktree");
+        let (root, wid) = window
+            .update(cx, |app, _, _| {
+                let root = app.workspace.project(pid).unwrap().root_path.clone();
+                git_fixture(&root, &["init", "--initial-branch=main"]);
+                git_fixture(&root, &["commit", "--allow-empty", "-m", "fixture"]);
+                let worktree = path.to_str().unwrap();
+                git_fixture(
+                    &root,
+                    &["worktree", "add", "-b", "muxel/kept-fixture", worktree],
+                );
+                git_fixture(&root, &["worktree", "lock", worktree]);
+                let wid = Uuid::new_v4();
+                app.workspace.add_worktree(Worktree {
+                    id: wid,
+                    project_id: pid,
+                    name: "kept fixture".into(),
+                    path: path.clone(),
+                    branch: "muxel/kept-fixture".into(),
+                    color: 0,
+                    detached: false,
+                });
+                (root, wid)
+            })
+            .unwrap();
+        window
+            .update(cx, |app, _, cx| app.discard_worktree(wid, cx))
+            .unwrap();
+        assert!(
+            path.join(".git").is_file(),
+            "the locked checkout lost its files"
+        );
+        let listed = git_fixture(&root, &["worktree", "list", "--porcelain"]);
+        assert!(listed.contains("kept-worktree"), "git dropped it: {listed}");
+        let branch = git_fixture(&root, &["branch", "--list", "muxel/kept-fixture"]);
+        assert_ne!(branch.trim(), "", "git deleted the checked-out branch");
+        let shown = path.display().to_string();
+        window
+            .read_with(cx, |app, _| {
+                let said = said_about(app, &shown);
+                let [(title, detail)] = said.as_slice() else {
+                    panic!("one notification should name {shown}: {said:?}");
+                };
+                assert_eq!(title, "Worktree not removed");
+                for claim in ["was removed", "were removed", "Delete the folder"] {
+                    assert!(!detail.contains(claim), "it says {claim:?}: {detail}");
+                }
+                assert!(
+                    detail.contains("muxel/kept-fixture"),
+                    "the kept branch: {detail}"
+                );
+                assert!(
+                    detail.contains("cannot remove a locked working tree"),
+                    "git's reason: {detail}"
+                );
+            })
+            .unwrap();
+    });
 }
 
 #[test]

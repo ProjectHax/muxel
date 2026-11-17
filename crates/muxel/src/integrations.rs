@@ -1635,14 +1635,29 @@ pub fn merge_worktree_branch(repo: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// Delete `branch` from `repo` (force). Best-effort — only valid once the branch
-/// is no longer checked out in any worktree.
-pub fn delete_branch(repo: &Path, branch: &str) {
-    let _ = command("git")
+/// Delete `branch` from `repo` (force), and say whether it is gone. Git keeps a
+/// branch a worktree still has checked out.
+pub fn delete_branch(repo: &Path, branch: &str) -> bool {
+    let deleted = command("git")
         .arg("-C")
         .arg(repo)
         .args(["branch", "-D", branch])
-        .profiled_output();
+        .profiled_output()
+        .is_ok_and(|out| out.status.success());
+    deleted || !branch_exists(repo, branch)
+}
+
+/// Whether `repo` has a local branch `branch`; yes when git can't say. A missing
+/// ref exits 1, and a repository git can't read exits 128.
+fn branch_exists(repo: &Path, branch: &str) -> bool {
+    let missing = command("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .profiled_output()
+        .is_ok_and(|out| out.status.code() == Some(1));
+    !missing
 }
 
 /// Stage **all** changes (tracked, untracked, and deletions) and commit them at
@@ -1887,9 +1902,27 @@ pub fn discard_worktree_changes(worktree_path: &Path, base_ref: &str) -> Result<
     Ok(())
 }
 
-/// Remove a worktree (force) and prune stale entries. Best-effort.
-pub fn remove_worktree(repo: &Path, worktree_path: &Path) {
-    let _ = command("git")
+/// What a worktree removal left on disk, as git and the disk tell it afterwards.
+#[derive(Debug)]
+pub struct WorktreeLeft {
+    /// Whether git still lists the worktree. `Some(true)`: git refused the
+    /// removal (a locked worktree, a repository error), so nothing was removed
+    /// and the folder is still a working checkout. `Some(false)`: git dropped
+    /// the worktree and only its folder is left. `None`: git can't be asked,
+    /// or the folder can't be checked, so neither is known.
+    pub registered: Option<bool>,
+    /// Git's error, or why the folder is still there.
+    pub error: String,
+}
+
+/// Remove a worktree (force) and prune stale entries. Fails when the folder is
+/// still on disk afterwards, or can't be checked, with what git says of it.
+/// Git drops the worktree's registration even when it can't delete the folder
+/// (on Windows, while a program has it as its current folder or holds a file in
+/// it open), and then nothing can retry the removal through git. It keeps the
+/// registration, and the folder whole, when it refuses the removal outright.
+pub fn remove_worktree(repo: &Path, worktree_path: &Path) -> Result<(), WorktreeLeft> {
+    let removed = command("git")
         .arg("-C")
         .arg(repo)
         .args(["worktree", "remove", "--force"])
@@ -1900,6 +1933,80 @@ pub fn remove_worktree(repo: &Path, worktree_path: &Path) {
         .arg(repo)
         .args(["worktree", "prune"])
         .profiled_output();
+    // A folder that can't be read is not known to be gone.
+    let exists = worktree_path.try_exists();
+    if matches!(exists, Ok(false)) {
+        return Ok(());
+    }
+    let error = match (removed, &exists) {
+        // Git wraps its advice onto a second line.
+        (Ok(out), _) if !out.status.success() => String::from_utf8_lossy(&out.stderr)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+        (Ok(_), Err(e)) => {
+            format!("git removed the worktree, but its folder can't be checked: {e}")
+        }
+        (Ok(_), Ok(_)) => "git removed the worktree but its folder is still there".to_string(),
+        (Err(e), _) => format!("running git worktree remove: {e}"),
+    };
+    Err(WorktreeLeft {
+        registered: exists
+            .ok()
+            .and_then(|_| worktree_registered(repo, worktree_path)),
+        error,
+    })
+}
+
+/// Whether `git worktree list` still names `worktree_path`, or `None` when git
+/// can't say.
+fn worktree_registered(repo: &Path, worktree_path: &Path) -> Option<bool> {
+    let out = command("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "list", "--porcelain"])
+        .profiled_output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    let resolve = |path: &Path| std::fs::canonicalize(path).ok();
+    let wanted = resolve(worktree_path);
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .any(|listed| {
+                let listed = Path::new(listed);
+                same_folder(
+                    (listed, resolve(listed).as_deref()),
+                    (worktree_path, wanted.as_deref()),
+                )
+            }),
+    )
+}
+
+/// Whether two paths, each as written and as the disk resolves it (`None`
+/// when it can't), name the same folder. Resolved paths are compared only
+/// with each other: on Windows a resolved path is verbatim (`\\?\D:\…`), which
+/// never equals one as written. When either can't be resolved, both are
+/// compared as written, which on Windows takes `/` and `\` alike and ignores
+/// case: git lists a worktree with its folders' case on disk, whatever case it
+/// was added with.
+fn same_folder(
+    (a, a_resolved): (&Path, Option<&Path>),
+    (b, b_resolved): (&Path, Option<&Path>),
+) -> bool {
+    match (a_resolved, b_resolved) {
+        (Some(a), Some(b)) => a == b,
+        _ if cfg!(windows) => {
+            let folded = |path: &Path| {
+                path.components()
+                    .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
+                    .collect::<Vec<_>>()
+            };
+            folded(a) == folded(b)
+        }
+        _ => a == b,
+    }
 }
 
 /// Maximum diff text we load into the viewer (bytes), so a giant diff can't
@@ -6559,10 +6666,63 @@ mod tests {
             "worktree should be checked out"
         );
 
-        remove_worktree(&repo, &worktree);
+        remove_worktree(&repo, &worktree).expect("worktree should be removed");
         assert!(!worktree.exists(), "worktree should be removed");
 
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// `git worktree list` names a worktree when both paths resolve to the
+    /// same folder or, when either can't be resolved, when both match as
+    /// written. A resolved path is never held against one as written.
+    #[test]
+    fn worktree_paths_compare_resolved_with_resolved_or_both_as_written() {
+        let p = Path::new;
+        let wt = p("/srv/wt");
+        assert!(same_folder(
+            (p("/srv/link"), Some(p("/data/wt"))),
+            (wt, Some(p("/data/wt")))
+        ));
+        assert!(!same_folder(
+            (wt, Some(p("/data/a"))),
+            (wt, Some(p("/data/b")))
+        ));
+        // Only the worktree's own path resolves.
+        assert!(same_folder((wt, None), (wt, Some(p("/data/wt")))));
+        #[cfg(windows)]
+        assert!(same_folder(
+            (p("D:/Work/wt"), None),
+            (p(r"d:\work\WT"), Some(p(r"\\?\D:\work\wt"))),
+        ));
+    }
+
+    /// Git won't delete a branch a worktree has checked out: `delete_branch`
+    /// says it stayed, and says it is gone once deleted, or already gone.
+    #[test]
+    fn delete_branch_says_whether_the_branch_is_gone() {
+        let base = std::env::temp_dir().join(format!("muxel-it-branch-{}", uuid::Uuid::new_v4()));
+        let (repo, worktree) = (base.join("repo"), base.join("worktree"));
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            command("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@muxel"]);
+        git(&["config", "user.name", "muxel test"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        create_worktree(&repo, &worktree, "muxel/held").expect("create worktree");
+        let while_checked_out = delete_branch(&repo, "muxel/held");
+        let removed = remove_worktree(&repo, &worktree);
+        let deleted = delete_branch(&repo, "muxel/held");
+        let again = delete_branch(&repo, "muxel/held");
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(removed.is_ok(), "{removed:?}");
+        assert_eq!([while_checked_out, deleted, again], [false, true, true]);
     }
 
     #[test]
@@ -6610,7 +6770,7 @@ mod tests {
         assert_eq!(worktree_unmerged_count(&worktree, &base2), 0);
 
         // Cleanup: remove the worktree, then the (now merged) branch.
-        remove_worktree(&repo, &worktree);
+        remove_worktree(&repo, &worktree).expect("remove the worktree");
         delete_branch(&repo, "muxel/test");
         let _ = std::fs::remove_dir_all(&repo);
     }
