@@ -54,6 +54,9 @@ struct Tracked {
     state: StartupTurnState,
     claimed: bool,
     may_have_pasted: bool,
+    /// The writer admitted the task's Enter. Kept when the task fails, which
+    /// `state` alone forgets.
+    entered: bool,
     guard: Option<(uuid::Uuid, u64)>,
     blocker: Option<StartupBlocker>,
     write_error: Option<String>,
@@ -70,6 +73,7 @@ impl Default for StartupTurn {
             state: StartupTurnState::Pending,
             claimed: false,
             may_have_pasted: false,
+            entered: false,
             guard: None,
             blocker: None,
             write_error: None,
@@ -173,7 +177,10 @@ impl StartupTurn {
         let tracked = self.lock();
         let outcome = match tracked.state {
             StartupTurnState::Pending | StartupTurnState::AwaitingAcceptance(_) => {
-                return PromptDelivery::pending(agent);
+                return PromptDelivery {
+                    enter_admitted: tracked.entered,
+                    ..PromptDelivery::pending(agent)
+                };
             }
             StartupTurnState::Submitted(_) => PromptOutcome::Submitted,
             StartupTurnState::Failed(StartupFailure::NotReady)
@@ -194,6 +201,7 @@ impl StartupTurn {
             }
         };
         let mut delivery = PromptDelivery::new(agent, outcome);
+        delivery.enter_admitted = tracked.entered;
         if let Some(blocker) = &tracked.blocker {
             delivery.blocked_by = Some(blocker.kind);
             delivery.screen_excerpt = Some(blocker.excerpt.clone());
@@ -247,6 +255,7 @@ impl StartupTurnOwner {
     /// A successful writer admission only starts the bounded acceptance check.
     pub fn enter_admitted(&self, at: i64) {
         let mut tracked = self.0.0.lock();
+        tracked.entered = true;
         if tracked.state == StartupTurnState::Pending {
             tracked.state = StartupTurnState::AwaitingAcceptance(at);
         }

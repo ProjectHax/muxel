@@ -859,10 +859,15 @@ feature is added or changed, update the matching entry here in the same change**
   Enter admission alone stays pending. Codex can receive one extra Enter after
   five seconds only if the exact task is visible on one ASCII editor row with
   its cursor at the end and no new user row; ambiguous reflow gets no retry. Task text
-  is never pasted twice. Grok and Claude do not inherit that retry. After ten
+  is never pasted twice. Grok and Claude do not inherit that retry. After sixty
   seconds without acceptance, `ctl wait` reports `submission_failed`, with an
-  explanation in `startup_error`. Providers without a verified input/acceptance
-  protocol (including Muse) refuse controller startup tasks without typing.
+  explanation in `startup_error`, unless the task's Enter went in (its
+  `prompt_delivery` says `enter_admitted`) and the wait sees the pane working
+  or blocked after the failure. That turn may be the task, so the wait follows
+  it. It may also be another turn, so `startup_error` stays in the reply. A
+  turn seen while the task was still pending doesn't count. Providers without
+  a verified input/acceptance protocol (including Muse) refuse controller
+  startup tasks without typing.
   A task's input stops if the pane is replaced, someone types, the writer fails,
   or readiness times out; it never replays a submitted task automatically.
 - **Post-run policy** — leave the agent running, or exit it once it finishes its
