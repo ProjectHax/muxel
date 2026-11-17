@@ -71,6 +71,8 @@ mod codex_capture_tests;
 #[cfg(all(test, windows))]
 mod conpty_test_support;
 mod control_api;
+#[cfg(test)]
+mod default_preset_tests;
 mod diff_panes;
 #[cfg(test)]
 mod diff_refresh_tests;
@@ -8607,12 +8609,7 @@ impl MuxelApp {
         } else {
             settings.presets.clone()
         };
-        let current_preset = presets
-            .iter()
-            .position(|p| {
-                p.id.to_string() == settings.default_preset || p.name == settings.default_preset
-            })
-            .unwrap_or(0);
+        let current_preset = settings.default_preset_index(&presets).unwrap_or(0);
         let available_programs = installed_programs(&presets);
         let settings_ui = SettingsUi::new(window, cx);
         let settings_input_subs =
@@ -13662,12 +13659,15 @@ impl MuxelApp {
             .active_project
             .and_then(|pid| self.workspace.project(pid))
             .and_then(|p| p.default_preset)
-            .or_else(|| {
-                self.presets
-                    .iter()
-                    .find(|p| p.id.to_string() == self.settings.default_preset)
-                    .map(|p| p.id)
-            })
+            .or_else(|| self.global_default_preset_id())
+    }
+
+    /// The global default preset's id, whether the setting names it by id or
+    /// by name.
+    fn global_default_preset_id(&self) -> Option<Uuid> {
+        self.settings
+            .default_preset_index(&self.presets)
+            .map(|index| self.presets[index].id)
     }
 
     fn toggle_tmux(&mut self, cx: &mut Context<Self>) {

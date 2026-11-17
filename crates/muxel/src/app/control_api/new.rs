@@ -71,12 +71,7 @@ impl MuxelApp {
                 project
                     .default_preset
                     .and_then(|id| self.presets.iter().position(|p| p.id == id))
-                    .or_else(|| {
-                        self.presets.iter().position(|p| {
-                            p.id.to_string() == self.settings.default_preset
-                                || p.name == self.settings.default_preset
-                        })
-                    })
+                    .or_else(|| self.settings.default_preset_index(&self.presets))
                     .unwrap_or(0)
             };
         let instance = options.instance(project, &self.presets, default_index)?;
