@@ -855,7 +855,9 @@ feature is added or changed, update the matching entry here in the same change**
   `startup_error` through `ctl status` and `show`.
   Permission text inside Claude's pasted task does not block its submission.
   `ctl wait` keeps a newly created task pending through startup and paste, then
-  confirms submission only from a fresh provider turn or rendered user row.
+  confirms submission only from a fresh provider turn (a Working title, or an
+  OSC 7501 report of a Working turn begun after the Enter) or rendered user
+  row.
   Enter admission alone stays pending. Codex can receive one extra Enter after
   five seconds only if the exact task is visible on one ASCII editor row with
   its cursor at the end and no new user row; ambiguous reflow gets no retry. Task text
@@ -1255,10 +1257,14 @@ feature is added or changed, update the matching entry here in the same change**
   `enter_retries`. Unknown acceptance is reported as false with an
   `unconfirmed_reason` (`timed_out`, `input_changed`, `interrupted`, or
   `retry_unanswered` when tmux didn't answer for the retry Enter); once
-  Enter is in, the reply is always this receipt, never an error. muxel doesn't
-  wait when the pane can't show a receipt — an unsupported provider, or no
-  readable idle status title (tmux hides titles) with a Grok, multi-paragraph or
-  repeated prompt — and reports null. Turning outside control off stops the
+  Enter is in, the reply is always this receipt, never an error. An OSC 7501
+  report of a Working turn begun after the Enter counts as a receipt (a turn
+  already running at the Enter doesn't, however often it reports), so a Claude
+  that reports its turns, whose title then has no status glyph, confirms a
+  multi-paragraph prompt too. muxel doesn't wait when the pane can't show a
+  receipt — an unsupported provider, or neither a readable idle status title nor OSC 7501
+  status reports (tmux hides both) with a Grok, multi-paragraph or repeated
+  prompt — and reports null. Turning outside control off stops the
   later Enters and keys of `send`, `answer` and `keys`. Only Windows Codex may
   receive one extra Enter after five seconds, with the same launch, permission
   and input guards and an exact fully visible ASCII prose draft in its idle

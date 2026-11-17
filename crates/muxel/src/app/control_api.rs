@@ -1776,7 +1776,7 @@ impl MuxelApp {
                 // This is the same UI update as local keyboard input and PTY
                 // draining. Re-read after the asynchronous tmux claim settle.
                 let admission = self.control_send_admission(iid, force, cx);
-                let attempt = self
+                let mut attempt = self
                     .terminal_view(iid)
                     .and_then(|view| view.read(cx).begin_prompt_submission(&text));
                 let (mut reply, paste) =
@@ -1811,6 +1811,11 @@ impl MuxelApp {
                             })
                         }) {
                             return Err(ctl::Error::from("the provider conversation changed after the paste, so Enter was withheld: check its `screen`").after_paste());
+                        }
+                        // A status report confirms only a turn begun after
+                        // this Enter, not one begun since the paste.
+                        if let Some(attempt) = attempt.as_mut() {
+                            attempt.enter_pressed();
                         }
                         press_prompt_enter(&session, pasted)
                     })
