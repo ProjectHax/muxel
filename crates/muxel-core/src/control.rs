@@ -963,9 +963,14 @@ pub fn pending_question(screen: &str) -> Option<Question> {
     let mut first = None;
     if let Some(last) = last {
         let mut gap = 0;
+        // Rule and blank lines crossed since the last option.
+        let mut divider = (0, 0);
         let mut expect: Option<u32> = None;
         for i in (reach..=last).rev() {
-            match option_line(lines[i]) {
+            let line = lines[i];
+            let blank = line.trim().is_empty();
+            let beside_rule = |j: usize| lines.get(j).is_some_and(|l| is_rule(l));
+            match option_line(line) {
                 Some(opt) => {
                     let n: u32 = opt.key.parse().unwrap_or(0);
                     if expect.is_some_and(|e| n != e) {
@@ -973,14 +978,29 @@ pub fn pending_question(screen: &str) -> Option<Question> {
                     }
                     options.push(opt);
                     first = Some(i);
-                    gap = 0;
+                    (gap, divider) = (0, (0, 0));
                     if n <= 1 {
                         break;
                     }
                     expect = Some(n - 1);
                 }
                 // A label wrapped onto the next line, or a hint under an option.
-                None if gap < 2 && !lines[i].trim().is_empty() && !is_rule(lines[i]) => gap += 1,
+                None if gap < 2 && !blank && !is_rule(line) => gap += 1,
+                // Claude's question card draws a rule between its choices and
+                // `Chat about this`. One rule, with a blank beside it, doesn't
+                // end the options: the next one up must still carry on the
+                // count, or nothing is added.
+                None if expect.is_some() && gap == 0 && is_rule(line) && divider.0 == 0 => {
+                    divider.0 += 1;
+                }
+                None if expect.is_some()
+                    && gap == 0
+                    && blank
+                    && divider.1 == 0
+                    && (beside_rule(i + 1) || i.checked_sub(1).is_some_and(beside_rule)) =>
+                {
+                    divider.1 += 1;
+                }
                 None => break,
             }
         }
@@ -2767,6 +2787,57 @@ mod tests {
         assert_eq!(pending_question("\n  \n"), None);
         // A screen that ends in a rule (a composer's frame) holds no question.
         assert_eq!(pending_question("⏺ Done.\n────────\n"), None);
+    }
+
+    /// Claude's AskUserQuestion card, as Claude Code 2.1.310 drew it (2.1.322
+    /// draws the same rows), puts a rule between its choices and `Chat about
+    /// this`. The choices above the rule are still the question's.
+    #[test]
+    fn a_rule_between_a_cards_choices_doesnt_end_them() {
+        let rule = "─".repeat(120);
+        let card = |between: &str| {
+            format!(
+                "❯ Ask me to choose Alpha or Beta.\n{rule}\n ☐ Choice\n\nWhich do \
+                 you choose: Alpha or Beta?\n\n❯ 1. Alpha\n     Choose Alpha.\n  2. Beta\n     \
+                 Choose Beta.\n  3. Type something.\n{between}  4. Chat about this\n\nEnter to \
+                 select · ↑/↓ to navigate · Esc to cancel\n\n\n"
+            )
+        };
+        let read = |screen: &str| {
+            let q = pending_question(screen).unwrap();
+            let options: Vec<(String, String, bool)> = q
+                .options
+                .into_iter()
+                .map(|o| (o.key, o.label, o.selected))
+                .collect();
+            (q.text, options)
+        };
+        let choices = vec![
+            ("1".into(), "Alpha".into(), true),
+            ("2".into(), "Beta".into(), false),
+            ("3".into(), "Type something.".into(), false),
+            ("4".into(), "Chat about this".into(), false),
+        ];
+        let text = "☐ Choice\n\nWhich do you choose: Alpha or Beta?".to_string();
+        assert_eq!(
+            read(&card(&format!("{rule}\n"))),
+            (text.clone(), choices.clone())
+        );
+        // A blank beside the rule, either side, doesn't end them either.
+        assert_eq!(
+            read(&card(&format!("{rule}\n\n"))),
+            (text.clone(), choices.clone())
+        );
+        assert_eq!(read(&card(&format!("\n{rule}\n"))), (text, choices));
+        // Two rules, or a blank with no rule, still end the options.
+        for between in [format!("{rule}\n{rule}\n"), "\n".to_string()] {
+            let (_, options) = read(&card(&between));
+            assert_eq!(options.len(), 1, "{between:?}");
+        }
+        // So does a numbered list above a rule that doesn't carry the count on.
+        let reply = format!("Steps:\n1. Build\n2. Test\n{rule}\n  4. Chat about this\n");
+        let (_, options) = read(&reply);
+        assert_eq!(options, [("4".into(), "Chat about this".into(), false)]);
     }
 
     #[test]
