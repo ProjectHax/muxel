@@ -6431,6 +6431,9 @@ pub struct MuxelApp {
     /// Cached changed-file list for the active project's git-diff panel
     /// (refreshed off the UI thread). `None` = not yet loaded / no git repo.
     git_diff_files: Option<Vec<integrations::GitChange>>,
+    /// The project `git_diff_files` was read for, with that project's folder
+    /// then. The panel shows the list only while both still hold.
+    git_diff_files_from: Option<(Uuid, PathBuf)>,
     /// Cached changed-file lists per worktree (keyed by worktree id), for the
     /// Worktrees tab; refreshed off the UI thread.
     git_diff_worktree_files: HashMap<Uuid, Vec<integrations::GitChange>>,
@@ -9050,6 +9053,7 @@ impl MuxelApp {
             show_git_diff: false,
             git_diff_tab: GitDiffTab::Files,
             git_diff_files: None,
+            git_diff_files_from: None,
             git_diff_worktree_files: HashMap::new(),
             git_diff_worktrees_expanded: std::collections::HashSet::new(),
             git_diff_branches: Vec::new(),
@@ -13771,6 +13775,7 @@ impl MuxelApp {
             return;
         };
         self.git_diff_loading = true;
+        let source = self.changes_source();
         cx.spawn(async move |this, cx| {
             let files = cx
                 .background_executor()
@@ -13781,11 +13786,34 @@ impl MuxelApp {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.git_diff_loading = false;
-                this.git_diff_files = Some(files);
+                // Another project was chosen, or this one moved to another
+                // folder, while git ran: the next refresh reads that one.
+                if this.changes_source() == source {
+                    this.git_diff_files = Some(files);
+                    this.git_diff_files_from = source;
+                }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// The active project and its folder: what the Changes view lists.
+    fn changes_source(&self) -> Option<(Uuid, PathBuf)> {
+        let pid = self.workspace.active_project?;
+        Some((pid, self.workspace.project(pid)?.root_path.clone()))
+    }
+
+    /// The changed files the panel shows: the list read for the active
+    /// project in its current folder, or `None` until that one is read.
+    fn shown_git_diff_files(&self) -> Option<&[integrations::GitChange]> {
+        let (pid, root) = self.git_diff_files_from.as_ref()?;
+        if self.workspace.active_project != Some(*pid)
+            || self.workspace.project(*pid)?.root_path != *root
+        {
+            return None;
+        }
+        self.git_diff_files.as_deref()
     }
 
     fn set_git_diff_panel_width(&mut self, width: f32) {
@@ -13996,6 +14024,7 @@ impl MuxelApp {
         }
         self.git_diff_worktrees_loading = true;
         let loc = self.repo_loc(pid);
+        let source = self.changes_source();
         cx.spawn(async move |this, cx| {
             let (results, branches): (Vec<(Uuid, Vec<integrations::GitChange>)>, Vec<String>) = cx
                 .background_executor()
@@ -14018,8 +14047,12 @@ impl MuxelApp {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.git_diff_worktrees_loading = false;
-                this.git_diff_worktree_files = results.into_iter().collect();
-                this.git_diff_branches = branches;
+                // As for the project's own list: another project's worktrees
+                // and branches don't land in this one's tab.
+                if this.changes_source() == source {
+                    this.git_diff_worktree_files = results.into_iter().collect();
+                    this.git_diff_branches = branches;
+                }
                 cx.notify();
             });
         })
@@ -28234,9 +28267,9 @@ impl MuxelApp {
         let files_body: AnyElement = if !is_repo {
             self.gitdiff_empty(t("Not a git repository."), cx)
         } else {
-            match &self.git_diff_files {
+            match self.shown_git_diff_files() {
                 None => self.gitdiff_empty(t("Loading…"), cx),
-                Some(files) if files.is_empty() => self.gitdiff_empty(t("Clean — no changes."), cx),
+                Some([]) => self.gitdiff_empty(t("Clean — no changes."), cx),
                 Some(files) => {
                     let mut list = div()
                         .id("gitdiff-list")
