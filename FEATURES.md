@@ -1064,8 +1064,8 @@ feature is added or changed, update the matching entry here in the same change**
   time behind another card; denial returns `approval_denied`. Turning creation
   or outside control off refuses every pending request and removes its card.
   Outside control off also stops the server, so polling callers receive
-  `host_unavailable` after connection retries. Connection and host-availability
-  failures retry up to three times against the same UUID; the CLI never reissues creation.
+  `host_unavailable` after connection retries. Connection, host-availability
+  and `busy` failures retry up to three times against the same UUID; the CLI never reissues creation.
   Exhausted retries and uncoded status errors name the UUID to query with
   `new-status` and advise against repeating `new` while the original may still wait.
   Finished replies remain available for ten minutes (latest 256); at most 64
@@ -1210,7 +1210,9 @@ feature is added or changed, update the matching entry here in the same change**
   Enter; never paste the task again after uncertain delivery. Startup pending
   proof preserves exact whitespace; ambiguous layout stays unconfirmed. A failed
   `send` or `new --prompt` is `not_delivered` only when a coded refusal came
-  before any input; other commands' failures carry no outcome. A send watches
+  before any input; other commands' failures carry no outcome. muxel serves 16
+  ctl connections at once; one more is answered `busy` before its request is
+  read, so a task sent on it is `not_delivered`. A send watches
   for its receipt for ten seconds, a second longer for each thousand characters
   past the first, up to a minute. Agent IDs also accept the `pane<ID>`
   spelling when no agent has that name.
