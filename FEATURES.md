@@ -633,7 +633,10 @@ feature is added or changed, update the matching entry here in the same change**
   (e.g. Claude's "esc to interrupt" spinner, a permission prompt), with built-in
   defaults per agent and **editable working/blocked markers per preset**. On a
   Claude pane, built-in and edited lists alike match outside its input box,
-  alongside Claude's own status-row and permission-form parsers. The status row
+  alongside Claude's own status-row and permission-form parsers. On a Codex pane,
+  markers added to its preset skip its editor, from the `›` prompt down to the
+  footer below it, so a draft can't match them even while the cursor is hidden;
+  without that footer, as in a menu, the whole screen is read. The status row
   reads Working on every frame of its spinner, with or without an arrow before the
   token count, so a remote Claude pane doesn't flash Done between frames.
 - **Heuristic fallback** — agents without markers fall back to bell + output
@@ -1007,7 +1010,8 @@ feature is added or changed, update the matching entry here in the same change**
   It defaults to **Off**. **Ask** requires a click for each request; **Allow**
   opens only presets whose program is a known agent provider (the built-in agent
   presets' programs — Claude, Codex, Grok, opencode, Amp, Muse, Hermes, Ollama,
-  pi — by executable name) without a click, when it is given as an absolute
+  pi — by executable name, ignoring case and a `.exe`, `.cmd` or `.bat` suffix,
+  so npm's `codex.cmd` shim is Codex) without a click, when it is given as an absolute
   path or found through absolute `PATH` entries. Any other program, such as
   `ssh host`, `wsl.exe`, `python` or `node`, and a relative path or `PATH`
   entry, which the caller's `--cwd` could supply, still Asks under Allow.
@@ -1064,8 +1068,8 @@ feature is added or changed, update the matching entry here in the same change**
   time behind another card; denial returns `approval_denied`. Turning creation
   or outside control off refuses every pending request and removes its card.
   Outside control off also stops the server, so polling callers receive
-  `host_unavailable` after connection retries. Connection and host-availability
-  failures retry up to three times against the same UUID; the CLI never reissues creation.
+  `host_unavailable` after connection retries. Connection, host-availability
+  and `busy` failures retry up to three times against the same UUID; the CLI never reissues creation.
   Exhausted retries and uncoded status errors name the UUID to query with
   `new-status` and advise against repeating `new` while the original may still wait.
   Finished replies remain available for ten minutes (latest 256); at most 64
@@ -1087,7 +1091,8 @@ feature is added or changed, update the matching entry here in the same change**
   turn (unless forced). It checks again at paste after the shared tmux claim settles.
   `send`, `answer`, and `keys` also refuse a call from the target pane itself unless
   forced. An older host ignores the caller ID. `answer` only picks an option
-  the prompt actually offers, and a pane that isn't running says so rather than
+  the prompt actually offers, numbered rows such as Claude's `1. Yes` or Grok's
+  `1 (○) Alpha`, and a pane that isn't running says so rather than
   swallowing the input. Shell panes are off limits unless "Also allow typing into
   shell panes" is on too, since typing into a shell is running commands. That
   setting also grants `new` shell preset/default and all literal argv launches
@@ -1097,7 +1102,8 @@ feature is added or changed, update the matching entry here in the same change**
   writes to every literal argv pane, even agent-looking or interpreter programs,
   and every program outside the known built-in agent providers, including SSH
   and WSL shell presets. Existing-pane writes recognize known agents by executable
-  name, including custom paths and agents in remote projects.
+  name the same way, including custom paths, `.cmd` shims and agents in remote
+  projects.
   An agent that falls back to a shell after a failed launch requires the same
   shell-input grant, including restored panes. A successful agent relaunch uses
   the agent policy again.
@@ -1139,7 +1145,9 @@ feature is added or changed, update the matching entry here in the same change**
   run beside its terminal: where the host refuses them, input is refused rather
   than typed through the client, and without a shared SSH connection each
   command, and so each key press, makes its own login. Panes not kept in tmux
-  take the same input as PTY bytes, as before. This needs tmux 2.1 or later on
+  take the same input as PTY bytes, as before; their `keys` reply likewise comes
+  after the last press, and a pane that restarts between presses gets
+  `keys_partly_pressed`. This needs tmux 2.1 or later on
   a remote host; local tmux panes already need 3.2.
   A pane in copy mode refuses input with `tmux_pane_in_mode`, preserving the
   user's scroll position. Leave copy mode before retrying. When the server
@@ -1212,10 +1220,11 @@ feature is added or changed, update the matching entry here in the same change**
   shell or literal-argv pane without the shell grant is refused
   `command_permission_required`, into an agent whose launch fell back to a
   shell `not_running`, and into a pane that closed before its input went in
-  `exited`. A send watches
-  for its receipt for ten seconds, a second longer for each thousand characters
-  past the first, up to a minute. Agent IDs also accept the `pane<ID>`
-  spelling when no agent has that name.
+  `exited`. muxel serves 16 ctl connections at once; one more is answered
+  `busy` before its request is read, so a task sent on it is `not_delivered`.
+  A send watches for its receipt for ten seconds, a second longer for each
+  thousand characters past the first, up to a minute. Agent IDs also accept the
+  `pane<ID>` spelling when no agent has that name.
 - **Startup input waits for the provider** — a `new --prompt` task waits for a
   real editable composer and provider acceptance. The reply comes once the pane
   exists, with the task submitted, refused, or `prompt_pending` and a `status`
@@ -2004,7 +2013,10 @@ feature is added or changed, update the matching entry here in the same change**
 - **Behavior** — immediate-save appearance, confirm destructive actions, quit
   confirmation, "Ask before closing a busy terminal" (on by default; see
   Recoverable terminal close), and auto-close a pane when its process exits
-  **cleanly** (an abnormal exit always leaves a tombstone pane instead).
+  **cleanly** (an abnormal exit always leaves a tombstone pane instead). While
+  a confirmation or the quit dialog shows, keys pressed in its window, a
+  pop-out's included, stay out of the pane behind it, and Esc cancels the
+  dialog.
 - **Local tmux by default** — General → "Run in a tmux session" defaults **on**
   whenever `tmux` is installed, so local panes survive a muxel restart and reattach
   (matching remote panes); the toggle greys out and has no effect when tmux isn't

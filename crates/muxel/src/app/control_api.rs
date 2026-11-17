@@ -1917,9 +1917,8 @@ impl MuxelApp {
                 app_cursor,
             } => {
                 debug_assert!(deferred.is_none(), "only forced prompts can defer a claim");
-                let through_tmux = session.delivers_through_tmux();
                 let total = presses.len();
-                let receipt = reply.clone();
+                let receipt = reply;
                 let pressed = cx.spawn(async move |this: WeakEntity<Self>, cx| {
                     for (i, (keys, submit)) in presses.into_iter().enumerate() {
                         if i > 0 {
@@ -1971,14 +1970,9 @@ impl MuxelApp {
                 });
                 let lead_ms = turn.as_ref().map_or(0, |turn| turn.lead_ms);
                 self.note_control_turn(iid, turn, at.unwrap_or_else(|| now_ms() + lead_ms));
-                if through_tmux {
-                    // The reply says whether tmux took every key.
-                    return pressed;
-                }
-                // A PTY write is in once queued, so the reply never waited for
-                // the keys' gaps.
-                pressed.detach();
-                Task::ready(Ok(reply))
+                // The reply says whether every key went in, through tmux or
+                // straight to the PTY: either can stop between delayed presses.
+                pressed
             }
         }
     }
@@ -3583,6 +3577,86 @@ mod prompt_submission_tests {
                 let reply = failure_body(refusal, Task::Unsent);
                 assert_eq!(reply["outcome"], "not_delivered", "{reply}");
             }
+        });
+    }
+
+    /// A pane can restart between the delayed presses of one `keys` request.
+    /// Written straight to the PTY, as through tmux, the reply waits for the
+    /// last press and says how many went in before it stopped.
+    #[cfg(windows)]
+    #[test]
+    fn direct_keys_reply_after_the_last_press_and_report_a_restart_between_presses() {
+        use gpui::AppContext as _;
+        use muxel_core::{Instance, Project};
+        use muxel_terminal::{TerminalLaunch, TerminalView};
+        use std::time::Instant;
+
+        super::super::popout_lifecycle_tests::with_app(|cx, window| {
+            let args: Vec<String> = vec!["/D".into(), "/Q".into(), "/K".into()];
+            let spec = CommandSpec::program("cmd.exe", args.clone());
+            let (pane, session, pressed) = window
+                .update(cx, |app, window, cx| {
+                    let root = muxel_store::data_dir().unwrap().join("control-keys");
+                    std::fs::create_dir_all(&root).unwrap();
+                    let project = app.workspace.add_project(Project::new("control", root));
+                    let mut instance = Instance::shell(project);
+                    instance.program = Some("cmd.exe".into());
+                    instance.args = args.clone();
+                    let pane = instance.id;
+                    app.workspace.add_instance(instance);
+                    app.settings.control_enabled = true;
+                    app.settings.control_allow_shells = true;
+                    let launch = TerminalLaunch::spawn(spec.clone(), (80, 24)).unwrap();
+                    let view =
+                        cx.new(|cx| TerminalView::new(launch, pane, Instant::now(), window, cx));
+                    let session = view.read(cx).session().clone();
+                    app.terminals.insert(pane, view);
+                    let typing = app
+                        .control_keys(pane, &["x".into(), "enter".into()], cx)
+                        .unwrap();
+                    let pressed = app.control_press(typing, None, None, cx);
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    cx.spawn(async move |_, _| {
+                        tx.send(pressed.await).unwrap();
+                    })
+                    .detach();
+                    (pane, session, rx)
+                })
+                .unwrap();
+            // `x` goes at once; the Enter waits for the gap between presses.
+            cx.run_until_parked();
+            assert!(
+                pressed.try_recv().is_err(),
+                "the reply came before the Enter was pressed"
+            );
+            let replacement = window
+                .update(cx, |app, window, cx| {
+                    let launch = TerminalLaunch::spawn(spec.clone(), (80, 24)).unwrap();
+                    let view =
+                        cx.new(|cx| TerminalView::new(launch, pane, Instant::now(), window, cx));
+                    let replacement = view.read(cx).session().clone();
+                    app.terminals.insert(pane, view);
+                    replacement
+                })
+                .unwrap();
+            let untouched = replacement.input_rev();
+            cx.executor()
+                .advance_clock(Duration::from_millis(super::KEY_GAP_MS));
+            cx.run_until_parked();
+            let error = pressed
+                .try_recv()
+                .expect("no reply after the last press")
+                .expect_err("the Enter went to the restarted pane");
+            assert_eq!(error.code, Some(ErrorCode::KeysPartlyPressed), "{error:?}");
+            assert_eq!(error.pasted, Some(true), "{error:?}");
+            assert!(error.message.contains("1 of 2 keys"), "{error:?}");
+            assert_eq!(
+                replacement.input_rev(),
+                untouched,
+                "the new launch took a key"
+            );
+            session.kill();
+            replacement.kill();
         });
     }
 

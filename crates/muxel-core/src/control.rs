@@ -339,6 +339,9 @@ pub enum ErrorCode {
     HostUnavailable,
     /// The endpoint's owner process did not pass the liveness check.
     StaleEndpoint,
+    /// muxel was already serving as many `muxel ctl` connections as it takes at
+    /// once, and read nothing of this one. Try again shortly.
+    Busy,
 }
 
 /// A failed request: what to tell the user, and its [`ErrorCode`] when it has one.
@@ -910,7 +913,10 @@ fn is_rule(line: &str) -> bool {
             .any(|c| is_box_char(c) && !matches!(c, '│' | '┃' | '║'))
 }
 
-/// `❯ 1. Yes` → ("1", "Yes", selected).
+/// `❯ 1. Yes` → ("1", "Yes", selected). Grok draws its question's options as
+/// `1 (○) Alpha (Recommended)  Choose Alpha.`, the description in a column
+/// after the name and a scrollbar `█` at the row's end; its label keeps the
+/// name and the description two spaces apart.
 fn option_line(line: &str) -> Option<QuestionOption> {
     let s = unbox(line);
     let (selected, s) = match s.strip_prefix(SELECT_GLYPHS) {
@@ -921,14 +927,23 @@ fn option_line(line: &str) -> Option<QuestionOption> {
     if digits.is_empty() || digits.len() > 2 {
         return None;
     }
-    let rest = s[digits.len()..].strip_prefix(['.', ')'])?;
-    if !rest.starts_with(char::is_whitespace) {
-        return None;
-    }
-    let label = rest.trim();
-    (!label.is_empty()).then(|| QuestionOption {
+    let after = &s[digits.len()..];
+    let label = match after.strip_prefix(['.', ')']) {
+        Some(rest) if rest.starts_with(char::is_whitespace) => rest.trim().to_string(),
+        Some(_) => return None,
+        None => after
+            .strip_prefix(" (○) ")
+            .or_else(|| after.strip_prefix(" (●) "))?
+            .trim_end_matches(|c: char| c == '█' || c.is_whitespace())
+            .split("  ")
+            .map(str::trim)
+            .filter(|column| !column.is_empty())
+            .collect::<Vec<_>>()
+            .join("  "),
+    };
+    (!label.is_empty()).then_some(QuestionOption {
         key: digits,
-        label: label.to_string(),
+        label,
         selected,
     })
 }
@@ -949,9 +964,14 @@ pub fn pending_question(screen: &str) -> Option<Question> {
     let mut first = None;
     if let Some(last) = last {
         let mut gap = 0;
+        // Rule and blank lines crossed since the last option.
+        let mut divider = (0, 0);
         let mut expect: Option<u32> = None;
         for i in (reach..=last).rev() {
-            match option_line(lines[i]) {
+            let line = lines[i];
+            let blank = line.trim().is_empty();
+            let beside_rule = |j: usize| lines.get(j).is_some_and(|l| is_rule(l));
+            match option_line(line) {
                 Some(opt) => {
                     let n: u32 = opt.key.parse().unwrap_or(0);
                     if expect.is_some_and(|e| n != e) {
@@ -959,14 +979,29 @@ pub fn pending_question(screen: &str) -> Option<Question> {
                     }
                     options.push(opt);
                     first = Some(i);
-                    gap = 0;
+                    (gap, divider) = (0, (0, 0));
                     if n <= 1 {
                         break;
                     }
                     expect = Some(n - 1);
                 }
                 // A label wrapped onto the next line, or a hint under an option.
-                None if gap < 2 && !lines[i].trim().is_empty() && !is_rule(lines[i]) => gap += 1,
+                None if gap < 2 && !blank && !is_rule(line) => gap += 1,
+                // Claude's question card draws a rule between its choices and
+                // `Chat about this`. One rule, with a blank beside it, doesn't
+                // end the options: the next one up must still carry on the
+                // count, or nothing is added.
+                None if expect.is_some() && gap == 0 && is_rule(line) && divider.0 == 0 => {
+                    divider.0 += 1;
+                }
+                None if expect.is_some()
+                    && gap == 0
+                    && blank
+                    && divider.1 == 0
+                    && (beside_rule(i + 1) || i.checked_sub(1).is_some_and(beside_rule)) =>
+                {
+                    divider.1 += 1;
+                }
                 None => break,
             }
         }
@@ -2035,6 +2070,8 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
 - `self_target` - this command would type into its caller's own pane; select a
   different target or pass `--force` deliberately.
 - `host_unavailable`, `stale_endpoint` - no running muxel to ask.
+- `busy` - muxel was already serving as many ctl connections as it takes and
+  read nothing of this request; nothing was done. Try again shortly.
 - `control_disabled` - outside control was turned off before the mutation.
 - `creation_disabled` - Outside terminal creation is Off; the user must choose Ask or Allow.
 - `command_permission_required` - literal argv, a shell launch, or typing into a shell or literal-argv pane needs the shell/command grant.
@@ -2337,6 +2374,7 @@ mod tests {
             (ErrorCode::SelfTarget, "self_target"),
             (ErrorCode::HostUnavailable, "host_unavailable"),
             (ErrorCode::StaleEndpoint, "stale_endpoint"),
+            (ErrorCode::Busy, "busy"),
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), word);
             let response = Response::err(Error::new(code, "refused"));
@@ -2505,6 +2543,7 @@ mod tests {
             ErrorCode::KeysPartlyPressed,
             ErrorCode::HostUnavailable,
             ErrorCode::StaleEndpoint,
+            ErrorCode::Busy,
         ] {
             let word = serde_json::to_value(code).unwrap();
             let word = format!("`{}`", word.as_str().unwrap());
@@ -2704,6 +2743,42 @@ mod tests {
         assert!(q.options[0].selected);
     }
 
+    /// Grok 1.0.70's ask_user_question card, as muxel-terminal's
+    /// provider-state-screens fixture records it. The free-text row (`z`)
+    /// isn't a numbered option. Grok 1.0.77 draws the same rows, and pressing
+    /// `1` answers Alpha.
+    #[test]
+    fn grok_question_rows_are_numbered_options() {
+        let screen = "\
+   ♦ Waiting on answers for Which option do you want?                                               9.2s ↓13.7k [stop]
+
+  │
+  │  Which option do you want?
+  │
+  │
+  │  1 (○) Alpha (Recommended)  Choose Alpha.                                                                        █
+  │  2 (○) Beta                 Choose Beta.                                                                         █
+  │  z (○) Type your answer here
+  │
+  │  ↑/↓ navigate · y copy                                                                            Enter:submit
+  │
+
+  Tab:next answer  │  Esc:scrollback  │  Shift+x:dismiss
+";
+        let q = pending_question(screen).unwrap();
+        assert_eq!(q.text, "Which option do you want?");
+        assert_eq!(
+            q.options
+                .iter()
+                .map(|o| (o.key.as_str(), o.label.as_str(), o.selected))
+                .collect::<Vec<_>>(),
+            [
+                ("1", "Alpha (Recommended)  Choose Alpha.", false),
+                ("2", "Beta  Choose Beta.", false),
+            ]
+        );
+    }
+
     #[test]
     fn prompt_without_numbered_options_is_the_screen_tail() {
         let screen = "working on it\n\nOverwrite config.toml? (y/n)\n";
@@ -2713,6 +2788,57 @@ mod tests {
         assert_eq!(pending_question("\n  \n"), None);
         // A screen that ends in a rule (a composer's frame) holds no question.
         assert_eq!(pending_question("⏺ Done.\n────────\n"), None);
+    }
+
+    /// Claude's AskUserQuestion card, as Claude Code 2.1.310 drew it (2.1.322
+    /// draws the same rows), puts a rule between its choices and `Chat about
+    /// this`. The choices above the rule are still the question's.
+    #[test]
+    fn a_rule_between_a_cards_choices_doesnt_end_them() {
+        let rule = "─".repeat(120);
+        let card = |between: &str| {
+            format!(
+                "❯ Ask me to choose Alpha or Beta.\n{rule}\n ☐ Choice\n\nWhich do \
+                 you choose: Alpha or Beta?\n\n❯ 1. Alpha\n     Choose Alpha.\n  2. Beta\n     \
+                 Choose Beta.\n  3. Type something.\n{between}  4. Chat about this\n\nEnter to \
+                 select · ↑/↓ to navigate · Esc to cancel\n\n\n"
+            )
+        };
+        let read = |screen: &str| {
+            let q = pending_question(screen).unwrap();
+            let options: Vec<(String, String, bool)> = q
+                .options
+                .into_iter()
+                .map(|o| (o.key, o.label, o.selected))
+                .collect();
+            (q.text, options)
+        };
+        let choices = vec![
+            ("1".into(), "Alpha".into(), true),
+            ("2".into(), "Beta".into(), false),
+            ("3".into(), "Type something.".into(), false),
+            ("4".into(), "Chat about this".into(), false),
+        ];
+        let text = "☐ Choice\n\nWhich do you choose: Alpha or Beta?".to_string();
+        assert_eq!(
+            read(&card(&format!("{rule}\n"))),
+            (text.clone(), choices.clone())
+        );
+        // A blank beside the rule, either side, doesn't end them either.
+        assert_eq!(
+            read(&card(&format!("{rule}\n\n"))),
+            (text.clone(), choices.clone())
+        );
+        assert_eq!(read(&card(&format!("\n{rule}\n"))), (text, choices));
+        // Two rules, or a blank with no rule, still end the options.
+        for between in [format!("{rule}\n{rule}\n"), "\n".to_string()] {
+            let (_, options) = read(&card(&between));
+            assert_eq!(options.len(), 1, "{between:?}");
+        }
+        // So does a numbered list above a rule that doesn't carry the count on.
+        let reply = format!("Steps:\n1. Build\n2. Test\n{rule}\n  4. Chat about this\n");
+        let (_, options) = read(&reply);
+        assert_eq!(options, [("4".into(), "Chat about this".into(), false)]);
     }
 
     #[test]

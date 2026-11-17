@@ -412,6 +412,35 @@ impl Screen {
         )
     }
 
+    /// Status leaves out Codex's editor, draft or placeholder, even while the
+    /// cursor is hidden: from the last prompt at column zero down to the footer
+    /// below it. Draft rows are drawn two columns in, a pasted `›` with them, so
+    /// a row at column zero in between means the two frame something else.
+    /// Then, or without the footer, or with the cursor shown outside the
+    /// editor, nothing is left out.
+    pub(crate) fn codex_status_context(&self) -> Option<String> {
+        if !self.bracketed_paste {
+            return None;
+        }
+        let rows: Vec<_> = self.text.lines().collect();
+        let bottom = rows.iter().rposition(|row| codex_footer(row))?;
+        let top = rows[..bottom].iter().rposition(|row| {
+            row.strip_prefix('›')
+                .is_some_and(|after| after.is_empty() || after.starts_with(char::is_whitespace))
+        })?;
+        if !rows[top + 1..bottom]
+            .iter()
+            .all(|row| row.is_empty() || row.starts_with(char::is_whitespace))
+        {
+            return None;
+        }
+        let cursor = usize::try_from(self.cursor_row).ok();
+        if self.cursor_visible && !cursor.is_some_and(|row| (top..bottom).contains(&row)) {
+            return None;
+        }
+        Some(self.context_without_rows(top..bottom))
+    }
+
     /// Ctl receipts must exclude the geometry-proven live composer regardless
     /// of its height. The general read-aloud scan has a bounded footer reach;
     /// a long retained draft must never become its own submitted-user receipt.

@@ -5486,8 +5486,17 @@ mod windows_child_exit_tests {
             match rx.try_recv() {
                 Ok(PtyChunk::Output(bytes)) => {
                     session.process_output(&bytes);
+                    // A streaming fixture can scroll its marker off the screen
+                    // in the read that brings it, so the output gathered so far
+                    // counts too: the new bytes, and enough before them to catch
+                    // a marker split between reads.
+                    let from = output.len().saturating_sub(marker.len() - 1);
                     output.extend_from_slice(&bytes);
-                    if session.visible_text().contains(marker) {
+                    if session.visible_text().contains(marker)
+                        || output[from..]
+                            .windows(marker.len())
+                            .any(|window| window == marker.as_bytes())
+                    {
                         return output;
                     }
                 }
@@ -5507,6 +5516,31 @@ mod windows_child_exit_tests {
             session._monitor.is_finished(),
             String::from_utf8_lossy(&output),
         );
+    }
+
+    /// A streaming fixture's first read can carry its marker and more than a
+    /// screen of output after it, so the marker has scrolled away before the
+    /// wait looks at the screen. The marker can also be split between reads.
+    #[test]
+    fn a_marker_that_scrolls_away_in_its_own_read_is_still_found() {
+        let (session, _output) = spawn("Start-Sleep -Seconds 60");
+        let screenful = vec![b'X'; 80 * 30];
+        let screenful = screenful.as_slice();
+        for reads in [
+            vec![[b"FIXTURE_READY\r\n".as_slice(), screenful].concat()],
+            vec![
+                b"FIXTURE_".to_vec(),
+                [b"READY\r\n".as_slice(), screenful].concat(),
+            ],
+        ] {
+            let (tx, rx) = super::output_queue(1 << 20, 16);
+            for bytes in reads {
+                assert!(tx.send_blocking(PtyChunk::Output(bytes)));
+            }
+            let rx = super::PtyReceiver { inner: rx };
+            wait_output(&session, &rx, "FIXTURE_READY", Duration::from_secs(1));
+        }
+        session.kill();
     }
 
     #[test]

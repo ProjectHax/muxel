@@ -71,6 +71,8 @@ mod codex_capture_tests;
 #[cfg(all(test, windows))]
 mod conpty_test_support;
 mod control_api;
+#[cfg(test)]
+mod default_preset_tests;
 mod diff_panes;
 #[cfg(test)]
 mod diff_refresh_tests;
@@ -6429,6 +6431,9 @@ pub struct MuxelApp {
     /// Cached changed-file list for the active project's git-diff panel
     /// (refreshed off the UI thread). `None` = not yet loaded / no git repo.
     git_diff_files: Option<Vec<integrations::GitChange>>,
+    /// The project `git_diff_files` was read for, with that project's folder
+    /// then. The panel shows the list only while both still hold.
+    git_diff_files_from: Option<(Uuid, PathBuf)>,
     /// Cached changed-file lists per worktree (keyed by worktree id), for the
     /// Worktrees tab; refreshed off the UI thread.
     git_diff_worktree_files: HashMap<Uuid, Vec<integrations::GitChange>>,
@@ -7813,6 +7818,9 @@ impl Render for PopoutView {
             .relative()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _w, cx| {
+                this.central_close_confirm_key(event, cx)
+            }))
             .on_action(cx.listener(|_, _: &UndoClose, window, cx| {
                 if let Some(app) = cx
                     .try_global::<MuxelHandle>()
@@ -8607,12 +8615,7 @@ impl MuxelApp {
         } else {
             settings.presets.clone()
         };
-        let current_preset = presets
-            .iter()
-            .position(|p| {
-                p.id.to_string() == settings.default_preset || p.name == settings.default_preset
-            })
-            .unwrap_or(0);
+        let current_preset = settings.default_preset_index(&presets).unwrap_or(0);
         let available_programs = installed_programs(&presets);
         let settings_ui = SettingsUi::new(window, cx);
         let settings_input_subs =
@@ -9053,6 +9056,7 @@ impl MuxelApp {
             show_git_diff: false,
             git_diff_tab: GitDiffTab::Files,
             git_diff_files: None,
+            git_diff_files_from: None,
             git_diff_worktree_files: HashMap::new(),
             git_diff_worktrees_expanded: std::collections::HashSet::new(),
             git_diff_branches: Vec::new(),
@@ -13662,12 +13666,15 @@ impl MuxelApp {
             .active_project
             .and_then(|pid| self.workspace.project(pid))
             .and_then(|p| p.default_preset)
-            .or_else(|| {
-                self.presets
-                    .iter()
-                    .find(|p| p.id.to_string() == self.settings.default_preset)
-                    .map(|p| p.id)
-            })
+            .or_else(|| self.global_default_preset_id())
+    }
+
+    /// The global default preset's id, whether the setting names it by id or
+    /// by name.
+    fn global_default_preset_id(&self) -> Option<Uuid> {
+        self.settings
+            .default_preset_index(&self.presets)
+            .map(|index| self.presets[index].id)
     }
 
     fn toggle_tmux(&mut self, cx: &mut Context<Self>) {
@@ -13771,6 +13778,7 @@ impl MuxelApp {
             return;
         };
         self.git_diff_loading = true;
+        let source = self.changes_source();
         cx.spawn(async move |this, cx| {
             let files = cx
                 .background_executor()
@@ -13781,11 +13789,34 @@ impl MuxelApp {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.git_diff_loading = false;
-                this.git_diff_files = Some(files);
+                // Another project was chosen, or this one moved to another
+                // folder, while git ran: the next refresh reads that one.
+                if this.changes_source() == source {
+                    this.git_diff_files = Some(files);
+                    this.git_diff_files_from = source;
+                }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// The active project and its folder: what the Changes view lists.
+    fn changes_source(&self) -> Option<(Uuid, PathBuf)> {
+        let pid = self.workspace.active_project?;
+        Some((pid, self.workspace.project(pid)?.root_path.clone()))
+    }
+
+    /// The changed files the panel shows: the list read for the active
+    /// project in its current folder, or `None` until that one is read.
+    fn shown_git_diff_files(&self) -> Option<&[integrations::GitChange]> {
+        let (pid, root) = self.git_diff_files_from.as_ref()?;
+        if self.workspace.active_project != Some(*pid)
+            || self.workspace.project(*pid)?.root_path != *root
+        {
+            return None;
+        }
+        self.git_diff_files.as_deref()
     }
 
     fn set_git_diff_panel_width(&mut self, width: f32) {
@@ -13996,6 +14027,7 @@ impl MuxelApp {
         }
         self.git_diff_worktrees_loading = true;
         let loc = self.repo_loc(pid);
+        let source = self.changes_source();
         cx.spawn(async move |this, cx| {
             let (results, branches): (Vec<(Uuid, Vec<integrations::GitChange>)>, Vec<String>) = cx
                 .background_executor()
@@ -14018,8 +14050,12 @@ impl MuxelApp {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.git_diff_worktrees_loading = false;
-                this.git_diff_worktree_files = results.into_iter().collect();
-                this.git_diff_branches = branches;
+                // As for the project's own list: another project's worktrees
+                // and branches don't land in this one's tab.
+                if this.changes_source() == source {
+                    this.git_diff_worktree_files = results.into_iter().collect();
+                    this.git_diff_branches = branches;
+                }
                 cx.notify();
             });
         })
@@ -22130,6 +22166,11 @@ impl MuxelApp {
     /// open main-window-only chrome raise the main window first.
     fn attach_workspace_actions<E: InteractiveElement>(&self, el: E, cx: &mut Context<Self>) -> E {
         el
+            // A dialog this window shows is modal: no key reaches the panes
+            // behind it.
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.dialog_key(event, window, cx)
+            }))
             // While a tab/pane is dragged, this fires first (capture phase) each
             // move and clears the drop indicators; the element under the cursor
             // then sets the right one. So indicators vanish over no pane, and the
@@ -22377,6 +22418,7 @@ impl MuxelApp {
                 .into_any_element()
         };
 
+        self.focus_root_for_dialog(root_focus, window, cx);
         let root = div()
             .size_full()
             .flex()
@@ -22865,6 +22907,51 @@ impl MuxelApp {
         self.cancel_close_prompt_answers();
         self.confirm = None;
         cx.notify();
+    }
+
+    /// Whether the confirm dialog draws in `window`. A pop-out answers its
+    /// own, and Settings' own window has no pane under it.
+    fn confirm_shown_in(&self, window: &Window) -> bool {
+        self.confirm.is_some()
+            && self.confirm_popout_iid().is_none()
+            && !self.confirm_in_settings()
+            && match self.confirm_window_pid() {
+                Some(pid) => self.secondary_pid_for(window) == Some(pid),
+                None => self.is_main_window(window),
+            }
+    }
+
+    /// Whether `window` shows the confirm dialog or the Quit question.
+    fn dialog_shown_in(&self, window: &Window) -> bool {
+        self.confirm_shown_in(window) || (self.show_quit_confirm && self.is_main_window(window))
+    }
+
+    /// Keys while `window` shows a dialog. The dialog is modal: no key reaches
+    /// the pane under it, and Escape cancels it. Key bindings, such as Ctrl+Q,
+    /// have already run.
+    fn dialog_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.dialog_shown_in(window) {
+            return;
+        }
+        cx.stop_propagation();
+        if event.keystroke.key != "escape" || event.keystroke.modifiers.modified() {
+            return;
+        }
+        if self.confirm_shown_in(window) {
+            self.cancel_confirm(cx);
+        } else {
+            self.show_quit_confirm = false;
+            cx.notify();
+        }
+    }
+
+    /// A key goes from the window's root to the focused element, so with
+    /// nothing under `root` focused it never reaches the root's handlers.
+    /// While a dialog shows, `root` takes focus then, so Escape answers it.
+    fn focus_root_for_dialog(&self, root: &FocusHandle, window: &mut Window, cx: &mut App) {
+        if self.dialog_shown_in(window) && !root.contains_focused(window, cx) {
+            window.focus(root, cx);
+        }
     }
 
     /// Execute the pending confirmed action.
@@ -28234,9 +28321,9 @@ impl MuxelApp {
         let files_body: AnyElement = if !is_repo {
             self.gitdiff_empty(t("Not a git repository."), cx)
         } else {
-            match &self.git_diff_files {
+            match self.shown_git_diff_files() {
                 None => self.gitdiff_empty(t("Loading…"), cx),
-                Some(files) if files.is_empty() => self.gitdiff_empty(t("Clean — no changes."), cx),
+                Some([]) => self.gitdiff_empty(t("Clean — no changes."), cx),
                 Some(files) => {
                     let mut list = div()
                         .id("gitdiff-list")
@@ -33986,6 +34073,7 @@ impl Render for MuxelApp {
             body
         };
 
+        self.focus_root_for_dialog(&self.focus_handle, window, cx);
         let root = div()
             .size_full()
             .flex()

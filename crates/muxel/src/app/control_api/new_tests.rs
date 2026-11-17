@@ -1218,6 +1218,7 @@ fn control_new_policy_allow_opens_only_known_agent_programs_without_a_click() {
         ("claude", true),
         (grok.to_str().unwrap(), true),
         (opencode.to_str().unwrap(), true),
+        ("codex.cmd", true),
         // A relative path resolves against the caller's --cwd.
         ("./node_modules/.bin/claude", false),
         ("bin/codex", false),
@@ -1226,7 +1227,7 @@ fn control_new_policy_allow_opens_only_known_agent_programs_without_a_click() {
         ("python3", false),
         (node.to_str().unwrap(), false),
         ("claude-wrapper.sh", false),
-        ("codex.cmd", false),
+        ("claude-wrapper.cmd", false),
     ] {
         let mut app = MuxelApp::fixture();
         app.settings.control_allow_new = CreationPolicy::Allow;

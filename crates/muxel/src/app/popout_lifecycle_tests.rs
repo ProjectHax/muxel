@@ -601,3 +601,195 @@ fn actual_popout_lifecycle_restart_kills_old_pty_and_installs_one_docked_replace
         }
     });
 }
+
+/// A `more` pane in `project`'s layout, its terminal made and focused in
+/// `window`.
+fn focused_pane(
+    app: &Entity<MuxelApp>,
+    project: Uuid,
+    window: &mut gpui::Window,
+    cx: &mut gpui::App,
+) -> (Uuid, Entity<TerminalView>) {
+    let mut instance = Instance::shell(project);
+    instance.program = Some("cmd.exe".into());
+    instance.args = ["/d", "/q", "/c", "more"].map(String::from).to_vec();
+    let pane = instance.id;
+    let spec = CommandSpec::program("cmd.exe", instance.args.clone());
+    let launch = TerminalLaunch::spawn(spec, (80, 24)).expect("spawn fixture");
+    let view = cx.new(|cx| TerminalView::new(launch, pane, Instant::now(), window, cx));
+    app.update(cx, |app, _| {
+        app.workspace.project_mut(project).unwrap().layout = Some(muxel_core::PaneNode::leaf(pane));
+        app.workspace.add_instance(instance);
+        app.terminals.insert(pane, view.clone());
+    });
+    let focus = gpui::Focusable::focus_handle(view.read(cx), cx);
+    window.focus(&focus, cx);
+    (pane, view)
+}
+
+/// Whether an `x` typed into `window` reached `view`'s terminal.
+fn types_into(
+    cx: &mut TestAppContext,
+    window: gpui::AnyWindowHandle,
+    view: &Entity<TerminalView>,
+) -> bool {
+    let session = view.read_with(cx, |view, _| view.session().clone());
+    let before = session.input_rev();
+    cx.simulate_keystrokes(window, "x");
+    cx.run_until_parked();
+    session.input_rev() != before
+}
+
+/// Past the first-run screens, so the main window draws the active project.
+fn showing_a_project(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -> Uuid {
+    window
+        .update(cx, |app, _, _| {
+            app.show_terms = false;
+            app.show_workspace_selector = false;
+            app.current_workspace = Some(Uuid::new_v4());
+            let root = muxel_store::data_dir().unwrap().join("dialog-project");
+            std::fs::create_dir_all(&root).unwrap();
+            let project = app.workspace.add_project(Project::new("dialogs", root));
+            app.workspace.active_project = Some(project);
+            project
+        })
+        .unwrap()
+}
+
+/// A confirm or the Quit question over the focused terminal takes the keys:
+/// none reaches the terminal, and Escape cancels the dialog.
+#[test]
+fn a_dialog_keeps_keys_from_the_terminal_under_it() {
+    with_app_drawing(true, |cx, window| {
+        let app = window.entity(&*cx).unwrap();
+        let project = showing_a_project(cx, window);
+        let main: gpui::AnyWindowHandle = window.into();
+        let (_, view) = cx
+            .update_window(main, |_, window, cx| {
+                focused_pane(&app, project, window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            types_into(cx, main, &view),
+            "the focused terminal takes keys"
+        );
+
+        window
+            .update(cx, |app, _, cx| {
+                let action = super::ConfirmAction::DeleteProject(project);
+                app.request_confirm("Remove project?", "", "Remove", action, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            !types_into(cx, main, &view),
+            "a key reached the terminal under the confirm"
+        );
+        cx.simulate_keystrokes(main, "escape");
+        assert!(
+            window
+                .read_with(cx, |app, _| app.confirm.is_none())
+                .unwrap()
+        );
+
+        window
+            .update(cx, |app, _, cx| {
+                app.show_quit_confirm = true;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            !types_into(cx, main, &view),
+            "a key reached the terminal under the Quit question"
+        );
+        cx.simulate_keystrokes(main, "escape");
+        assert!(
+            !window
+                .read_with(cx, |app, _| app.show_quit_confirm)
+                .unwrap()
+        );
+        assert!(types_into(cx, main, &view), "the terminal takes keys again");
+    });
+}
+
+/// The confirm about a pane in a project's own window shows there, and keeps
+/// that window's keys from the pane.
+#[test]
+fn a_dialog_in_a_project_window_keeps_keys_from_its_terminal() {
+    with_app_drawing(true, |cx, window| {
+        let app = window.entity(&*cx).unwrap();
+        showing_a_project(cx, window);
+        let (project, secondary) = secondary_fixture(cx, window);
+        let (pane, view) = cx
+            .update_window(secondary, |_, window, cx| {
+                focused_pane(&app, project, window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            types_into(cx, secondary, &view),
+            "the focused terminal takes keys"
+        );
+
+        window
+            .update(cx, |app, _, cx| {
+                let action = super::ConfirmAction::CloseBatch(vec![pane]);
+                app.request_confirm("Close pane?", "", "Close", action, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            !types_into(cx, secondary, &view),
+            "a key reached the terminal under the confirm"
+        );
+        cx.simulate_keystrokes(secondary, "escape");
+        assert!(
+            window
+                .read_with(cx, |app, _| app.confirm.is_none())
+                .unwrap()
+        );
+    });
+}
+
+/// A popped-out pane's close confirm keeps the pop-out's keys from the pane.
+#[test]
+fn a_popouts_close_confirm_keeps_keys_from_its_terminal() {
+    with_app_drawing(true, |cx, window| {
+        let (pane, view, _child) = popout_fixture(cx, window);
+        let popout: gpui::AnyWindowHandle = window
+            .read_with(cx, |app, _| app.popouts[&pane].window)
+            .unwrap()
+            .into();
+        cx.update_window(popout, |_, window, cx| {
+            let focus = gpui::Focusable::focus_handle(view.read(cx), cx);
+            window.focus(&focus, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(
+            types_into(cx, popout, &view),
+            "the focused terminal takes keys"
+        );
+
+        window
+            .update(cx, |app, _, cx| {
+                let action = super::ConfirmAction::CloseBatch(vec![pane]);
+                app.request_confirm("Close pane?", "", "Close", action, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            !types_into(cx, popout, &view),
+            "a key reached the terminal under the confirm"
+        );
+        cx.simulate_keystrokes(popout, "escape");
+        cx.run_until_parked();
+        assert!(
+            window
+                .read_with(cx, |app, _| app.confirm.is_none())
+                .unwrap()
+        );
+    });
+}

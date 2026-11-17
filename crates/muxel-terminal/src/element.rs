@@ -806,7 +806,11 @@ fn build_draw_list_rows(
                 if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                     continue;
                 }
-                if cell.c == ' ' && !cell.flags.intersects(Flags::UNDERLINE | Flags::STRIKEOUT) {
+                if cell.c == ' '
+                    && !cell
+                        .flags
+                        .intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT)
+                {
                     continue;
                 }
 
@@ -1872,5 +1876,62 @@ impl TerminalElement {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_draw_list;
+    use crate::colors::TerminalPalette;
+    use crate::session::{CommandSpec, PaintMetrics, TerminalSession};
+
+    /// The text runs the first row paints, as (column, text), once a screen
+    /// has parsed `bytes`.
+    fn first_row_runs(bytes: &[u8]) -> Vec<(i32, String)> {
+        // The child's own output is never parsed, so the screen holds only
+        // `bytes`.
+        #[cfg(windows)]
+        let spec = CommandSpec::program("cmd.exe", vec!["/D".into(), "/Q".into(), "/K".into()]);
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        let (session, _output) = TerminalSession::spawn(spec, 40, 4).expect("spawn fixture");
+        session.process_output(bytes);
+        let metrics = PaintMetrics {
+            cell_w: 8.0,
+            line_h: 17.0,
+            font_size: 13.0,
+            cols: 40,
+            rows: 4,
+            bg: [0.0; 4],
+        };
+        let list = build_draw_list(&session, &TerminalPalette::default(), 0, metrics);
+        session.kill();
+        list.runs
+            .iter()
+            .filter(|run| run.start_line == 0)
+            .map(|run| (run.start_col, run.text.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn every_kind_of_underline_runs_on_under_the_space_between_words() {
+        for (kind, sgr) in [
+            ("single underline", "4"),
+            ("double underline", "4:2"),
+            ("curly underline", "4:3"),
+            ("dotted underline", "4:4"),
+            ("dashed underline", "4:5"),
+            ("strike", "9"),
+        ] {
+            let runs = first_row_runs(format!("\x1b[{sgr}ma b\x1b[0m").as_bytes());
+            assert_eq!(
+                runs,
+                [(0, "a b".to_string())],
+                "a {kind} breaks at the space"
+            );
+        }
+        // A space with nothing under or through it paints nothing.
+        let plain = first_row_runs(b"a b");
+        assert_eq!(plain, [(0, "a".to_string()), (2, "b".to_string())]);
     }
 }

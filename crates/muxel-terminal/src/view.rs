@@ -1283,17 +1283,17 @@ fn sticky_title_status(
     observed.or(previous)
 }
 
-/// Leave Claude's input box out of every screen-based status source, markers
-/// included, so a draft can't set status. Chrome outside the box still counts:
-/// a permission form's `❯ 1.` row, or the `esc to interrupt` footer below the
-/// box in a tmux pane, which never sees Claude's title.
+/// Leave Claude's input box and Codex's editor out of every screen-based status
+/// source, markers included, so a draft can't set status. Chrome outside them
+/// still counts: a permission form's `❯ 1.` row, or the `esc to interrupt`
+/// footer below Claude's box in a tmux pane, which never sees Claude's title.
 fn status_screen_context(provider: TitleProvider, screen: &crate::startup::Screen) -> Cow<'_, str> {
-    if provider == TitleProvider::Claude
-        && let Some(context) = screen.claude_status_context()
-    {
-        return Cow::Owned(context);
-    }
-    Cow::Borrowed(&screen.text)
+    let context = match provider {
+        TitleProvider::Claude => screen.claude_status_context(),
+        TitleProvider::Codex => screen.codex_status_context(),
+        _ => None,
+    };
+    context.map_or(Cow::Borrowed(screen.text.as_str()), Cow::Owned)
 }
 
 /// Provider-owned visible UI that adds state not carried by the terminal title.
@@ -8845,6 +8845,84 @@ mod provider_switch_tests {
         fn claude_sample(text: &str, cursor_row: usize, cursor_column: usize) -> AgentStatus {
             let (working, blocked) = builtin();
             claude_sample_with(text, (cursor_row, cursor_column), &working, &blocked)
+        }
+
+        /// Codex with the user's own markers, its cursor on `cursor_row` and
+        /// shown or hidden.
+        fn codex_sample_with(
+            text: &str,
+            cursor_row: usize,
+            shown: bool,
+            working: &[String],
+            blocked: &[String],
+        ) -> AgentStatus {
+            let (session, _receiver) = fixture();
+            session.process_output(
+                format!(
+                    "\x1b[2J\x1b[H\x1b[?2004h{}\x1b[{};3H\x1b[?25{}",
+                    text.replace('\n', "\r\n"),
+                    cursor_row + 1,
+                    if shown { 'h' } else { 'l' },
+                )
+                .as_bytes(),
+            );
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Codex,
+                working,
+                blocked,
+                false,
+                Instant::now(),
+            );
+            let status = runtime.snapshot(&session).status;
+            session.kill();
+            status
+        }
+
+        #[test]
+        fn codex_markers_match_outside_its_editor_but_not_in_a_draft() {
+            let busy = markers(&["custom busy"]);
+            let asking = markers(&["Allow this command"]);
+            let footer = "  gpt-5.4 high · scratch";
+            // Above the editor both still count, as before.
+            let reply = format!("• Reply: custom busy, Allow this command\n\n› \n\n{footer}");
+            assert_eq!(
+                codex_sample_with(&reply, 2, true, &busy, &[]),
+                AgentStatus::Working
+            );
+            assert_eq!(
+                codex_sample_with(&reply, 2, true, &[], &asking),
+                AgentStatus::Blocked
+            );
+            // A menu has no footer, and an earlier prompt above a footer frames
+            // the transcript, not an editor, so the whole screen is still read.
+            let menu = "Allow this command?\n› 1. Yes\n  2. No\n\n  Press enter to confirm or esc to cancel";
+            assert_eq!(
+                codex_sample_with(menu, 1, false, &[], &asking),
+                AgentStatus::Blocked
+            );
+            let transcript = format!("› Earlier prompt\n\n• custom busy\n\n{footer}");
+            assert_eq!(
+                codex_sample_with(&transcript, 0, false, &busy, &[]),
+                AgentStatus::Working
+            );
+            // In a draft neither counts, with the cursor shown or hidden, and a
+            // `›` pasted into the draft doesn't cut the editor short.
+            let draft =
+                format!("Earlier output\n\n› custom busy\n  › Allow this command\n\n{footer}");
+            for shown in [true, false] {
+                assert_eq!(
+                    codex_sample_with(&draft, 3, shown, &busy, &[]),
+                    AgentStatus::Idle,
+                    "shown: {shown}"
+                );
+                assert_eq!(
+                    codex_sample_with(&draft, 3, shown, &[], &asking),
+                    AgentStatus::Idle,
+                    "shown: {shown}"
+                );
+            }
         }
 
         #[test]

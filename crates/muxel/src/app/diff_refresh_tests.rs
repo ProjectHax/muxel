@@ -685,3 +685,123 @@ fn a_diff_pane_docked_back_refreshes_at_once() {
         assert!(diff_text(cx, main, a).contains("+second"));
     });
 }
+
+// The Changes view: its lists are read off the UI thread, and the project they
+// were read for may no longer be the one shown when they land.
+
+/// A second project, on repository B, beside the fixture's on A.
+fn project_on_b(cx: &mut TestAppContext, main: &Main, fx: &Fixture) -> Uuid {
+    main.update(cx, |app, _, _| {
+        app.workspace
+            .add_project(Project::new("second fixture", fx.b.path().to_path_buf()))
+    })
+}
+
+/// The paths the Changes view lists, or `None` while it shows none.
+fn changes_shown(cx: &mut TestAppContext, main: &Main) -> Option<Vec<String>> {
+    main.update(cx, |app, _, _| {
+        app.shown_git_diff_files()
+            .map(|files| files.iter().map(|file| file.path.clone()).collect())
+    })
+}
+
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn changes_read_for_one_project_dont_land_in_the_next() {
+    with_app(|cx, main, fx| {
+        add_line(&fx.a);
+        let b = project_on_b(cx, main, fx);
+        // A's list is still being read when B is chosen.
+        main.update(cx, |app, window, cx| {
+            app.refresh_git_diff_panel(cx);
+            app.select_project(b, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(changes_shown(cx, main), None, "A's changes landed in B");
+        // B's own read lists B's.
+        main.update(cx, |app, _, cx| app.refresh_git_diff_panel(cx));
+        cx.run_until_parked();
+        assert_eq!(changes_shown(cx, main), Some(Vec::new()));
+    });
+}
+
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn changes_read_before_the_folder_moved_dont_land() {
+    with_app(|cx, main, fx| {
+        add_line(&fx.a);
+        // As Settings > Projects > Change folder does, while A is read.
+        main.update(cx, |app, _, cx| {
+            app.refresh_git_diff_panel(cx);
+            app.workspace.project_mut(fx.pid).unwrap().root_path = fx.b.path().to_path_buf();
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            changes_shown(cx, main),
+            None,
+            "the old folder's changes landed"
+        );
+    });
+}
+
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn switching_projects_stops_showing_the_last_ones_changes() {
+    with_app(|cx, main, fx| {
+        add_line(&fx.a);
+        let b = project_on_b(cx, main, fx);
+        main.update(cx, |app, _, cx| app.refresh_git_diff_panel(cx));
+        cx.run_until_parked();
+        assert_eq!(changes_shown(cx, main), Some(vec!["notes.txt".to_string()]));
+        // Until B's own read lands, B has nothing to show.
+        main.update(cx, |app, window, cx| app.select_project(b, window, cx));
+        assert_eq!(changes_shown(cx, main), None, "B shows A's changes");
+    });
+}
+
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn worktree_lists_read_for_one_project_dont_land_in_the_next() {
+    with_app(|cx, main, fx| {
+        fx.a.git(&["branch", "only-in-a"]);
+        let b = project_on_b(cx, main, fx);
+        main.update(cx, |app, window, cx| {
+            for (pid, repo) in [(fx.pid, &fx.a), (b, &fx.b)] {
+                app.workspace.add_worktree(muxel_core::Worktree {
+                    id: Uuid::new_v4(),
+                    project_id: pid,
+                    name: "fixture".into(),
+                    path: repo.path().to_path_buf(),
+                    branch: "main".into(),
+                    color: 0,
+                    detached: false,
+                });
+            }
+            // A's worktrees and branches are still being read when B is
+            // chosen.
+            app.refresh_git_diff_worktrees(cx);
+            app.select_project(b, window, cx);
+        });
+        cx.run_until_parked();
+        main.update(cx, |app, _, _| {
+            assert!(
+                app.git_diff_branches.is_empty(),
+                "A's branches landed in B's Merge into menu: {:?}",
+                app.git_diff_branches
+            );
+            assert!(app.git_diff_worktree_files.is_empty());
+        });
+    });
+}
