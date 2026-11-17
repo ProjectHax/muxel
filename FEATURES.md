@@ -2008,7 +2008,10 @@ feature is added or changed, update the matching entry here in the same change**
 - **Behavior** — immediate-save appearance, confirm destructive actions, quit
   confirmation, "Ask before closing a busy terminal" (on by default; see
   Recoverable terminal close), and auto-close a pane when its process exits
-  **cleanly** (an abnormal exit always leaves a tombstone pane instead).
+  **cleanly** (an abnormal exit always leaves a tombstone pane instead). While
+  a confirmation or the quit dialog shows, keys pressed in its window, a
+  pop-out's included, stay out of the pane behind it, and Esc cancels the
+  dialog.
 - **Local tmux by default** — General → "Run in a tmux session" defaults **on**
   whenever `tmux` is installed, so local panes survive a muxel restart and reattach
   (matching remote panes); the toggle greys out and has no effect when tmux isn't

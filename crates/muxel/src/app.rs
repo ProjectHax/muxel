@@ -7818,6 +7818,9 @@ impl Render for PopoutView {
             .relative()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _w, cx| {
+                this.central_close_confirm_key(event, cx)
+            }))
             .on_action(cx.listener(|_, _: &UndoClose, window, cx| {
                 if let Some(app) = cx
                     .try_global::<MuxelHandle>()
@@ -22163,6 +22166,11 @@ impl MuxelApp {
     /// open main-window-only chrome raise the main window first.
     fn attach_workspace_actions<E: InteractiveElement>(&self, el: E, cx: &mut Context<Self>) -> E {
         el
+            // A dialog this window shows is modal: no key reaches the panes
+            // behind it.
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.dialog_key(event, window, cx)
+            }))
             // While a tab/pane is dragged, this fires first (capture phase) each
             // move and clears the drop indicators; the element under the cursor
             // then sets the right one. So indicators vanish over no pane, and the
@@ -22410,6 +22418,7 @@ impl MuxelApp {
                 .into_any_element()
         };
 
+        self.focus_root_for_dialog(root_focus, window, cx);
         let root = div()
             .size_full()
             .flex()
@@ -22898,6 +22907,51 @@ impl MuxelApp {
         self.cancel_close_prompt_answers();
         self.confirm = None;
         cx.notify();
+    }
+
+    /// Whether the confirm dialog draws in `window`. A pop-out answers its
+    /// own, and Settings' own window has no pane under it.
+    fn confirm_shown_in(&self, window: &Window) -> bool {
+        self.confirm.is_some()
+            && self.confirm_popout_iid().is_none()
+            && !self.confirm_in_settings()
+            && match self.confirm_window_pid() {
+                Some(pid) => self.secondary_pid_for(window) == Some(pid),
+                None => self.is_main_window(window),
+            }
+    }
+
+    /// Whether `window` shows the confirm dialog or the Quit question.
+    fn dialog_shown_in(&self, window: &Window) -> bool {
+        self.confirm_shown_in(window) || (self.show_quit_confirm && self.is_main_window(window))
+    }
+
+    /// Keys while `window` shows a dialog. The dialog is modal: no key reaches
+    /// the pane under it, and Escape cancels it. Key bindings, such as Ctrl+Q,
+    /// have already run.
+    fn dialog_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.dialog_shown_in(window) {
+            return;
+        }
+        cx.stop_propagation();
+        if event.keystroke.key != "escape" || event.keystroke.modifiers.modified() {
+            return;
+        }
+        if self.confirm_shown_in(window) {
+            self.cancel_confirm(cx);
+        } else {
+            self.show_quit_confirm = false;
+            cx.notify();
+        }
+    }
+
+    /// A key goes from the window's root to the focused element, so with
+    /// nothing under `root` focused it never reaches the root's handlers.
+    /// While a dialog shows, `root` takes focus then, so Escape answers it.
+    fn focus_root_for_dialog(&self, root: &FocusHandle, window: &mut Window, cx: &mut App) {
+        if self.dialog_shown_in(window) && !root.contains_focused(window, cx) {
+            window.focus(root, cx);
+        }
     }
 
     /// Execute the pending confirmed action.
@@ -34019,6 +34073,7 @@ impl Render for MuxelApp {
             body
         };
 
+        self.focus_root_for_dialog(&self.focus_handle, window, cx);
         let root = div()
             .size_full()
             .flex()
