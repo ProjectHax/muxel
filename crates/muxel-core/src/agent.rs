@@ -572,9 +572,10 @@ impl AgentPreset {
 
 /// Whether `program` runs one of muxel's built-in agent providers — the program
 /// of a [`AgentPreset::builtin_agents`] preset — matched on the executable's
-/// basename, ignoring its directory, a trailing `.exe` and case. Anything else
-/// (`ssh`, `wsl.exe`, `python`, a wrapper script, a shell) is not, even if a
-/// user preset runs it.
+/// basename, ignoring its directory, case and a trailing `.exe`, `.cmd` or
+/// `.bat` (npm's Windows shims, which a bare name already reaches through
+/// `PATH`). Anything else (`ssh`, `wsl.exe`, `python`, a wrapper script with its
+/// own name, a shell) is not, even if a user preset runs it.
 pub fn is_known_agent_program(program: Option<&str>) -> bool {
     fn stem(program: &str) -> Option<String> {
         let program = program.trim();
@@ -583,7 +584,10 @@ pub fn is_known_agent_program(program: Option<&str>) -> bool {
             .next()
             .unwrap_or(program)
             .to_ascii_lowercase();
-        let stem = leaf.strip_suffix(".exe").unwrap_or(&leaf);
+        let stem = [".exe", ".cmd", ".bat"]
+            .iter()
+            .find_map(|suffix| leaf.strip_suffix(suffix))
+            .unwrap_or(&leaf);
         (!stem.is_empty()).then(|| stem.to_string())
     }
     let Some(name) = program.and_then(stem) else {
@@ -1443,6 +1447,10 @@ mod tests {
             "/usr/local/bin/codex",
             r"C:\Users\me\AppData\Roaming\npm\Claude.EXE",
             "  GROK  ",
+            // npm's shims, which a bare `codex` already finds through PATH.
+            "codex.cmd",
+            r"C:\Users\me\AppData\Roaming\npm\claude.cmd",
+            "AMP.BAT",
         ] {
             assert!(is_known_agent_program(Some(program)), "{program}");
         }
@@ -1457,7 +1465,8 @@ mod tests {
             Some("cmd.exe"),
             Some("pwsh"),
             Some("claude-wrapper"),
-            Some("codex.cmd"),
+            Some("claude-wrapper.cmd"),
+            Some(".cmd"),
             Some("/opt/codex/"),
         ] {
             assert!(!is_known_agent_program(program), "{program:?}");

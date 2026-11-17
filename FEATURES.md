@@ -1010,7 +1010,8 @@ feature is added or changed, update the matching entry here in the same change**
   It defaults to **Off**. **Ask** requires a click for each request; **Allow**
   opens only presets whose program is a known agent provider (the built-in agent
   presets' programs — Claude, Codex, Grok, opencode, Amp, Muse, Hermes, Ollama,
-  pi — by executable name) without a click, when it is given as an absolute
+  pi — by executable name, ignoring case and a `.exe`, `.cmd` or `.bat` suffix,
+  so npm's `codex.cmd` shim is Codex) without a click, when it is given as an absolute
   path or found through absolute `PATH` entries. Any other program, such as
   `ssh host`, `wsl.exe`, `python` or `node`, and a relative path or `PATH`
   entry, which the caller's `--cwd` could supply, still Asks under Allow.
@@ -1101,7 +1102,8 @@ feature is added or changed, update the matching entry here in the same change**
   writes to every literal argv pane, even agent-looking or interpreter programs,
   and every program outside the known built-in agent providers, including SSH
   and WSL shell presets. Existing-pane writes recognize known agents by executable
-  name, including custom paths and agents in remote projects.
+  name the same way, including custom paths, `.cmd` shims and agents in remote
+  projects.
   An agent that falls back to a shell after a failed launch requires the same
   shell-input grant, including restored panes. A successful agent relaunch uses
   the agent policy again.
