@@ -1139,7 +1139,9 @@ feature is added or changed, update the matching entry here in the same change**
   run beside its terminal: where the host refuses them, input is refused rather
   than typed through the client, and without a shared SSH connection each
   command, and so each key press, makes its own login. Panes not kept in tmux
-  take the same input as PTY bytes, as before. This needs tmux 2.1 or later on
+  take the same input as PTY bytes, as before; their `keys` reply likewise comes
+  after the last press, and a pane that restarts between presses gets
+  `keys_partly_pressed`. This needs tmux 2.1 or later on
   a remote host; local tmux panes already need 3.2.
   A pane in copy mode refuses input with `tmux_pane_in_mode`, preserving the
   user's scroll position. Leave copy mode before retrying. When the server
