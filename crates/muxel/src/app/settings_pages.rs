@@ -412,11 +412,7 @@ impl MuxelApp {
         };
 
         // The default preset: a menu, since there can be many.
-        let default_id = self
-            .presets
-            .iter()
-            .find(|p| p.id.to_string() == settings.default_preset)
-            .map(|p| p.id);
+        let default_id = self.global_default_preset_id();
         let default_name: SharedString = default_id
             .and_then(|id| self.presets.iter().find(|p| p.id == id))
             .map(|p| unnamed_or(&p.name).into())

@@ -3406,6 +3406,14 @@ impl Settings {
         project.reminders_enabled = self.new_project_reminders;
         project
     }
+
+    /// Where the global default preset is in `presets`: the one whose id, or
+    /// (as older settings hold it) name, `default_preset` gives.
+    pub fn default_preset_index(&self, presets: &[AgentPreset]) -> Option<usize> {
+        presets
+            .iter()
+            .position(|p| p.id.to_string() == self.default_preset || p.name == self.default_preset)
+    }
 }
 
 /// Current version of the bundled built-in preset + runner set. Bump when adding
