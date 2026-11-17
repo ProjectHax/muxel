@@ -41,6 +41,9 @@ struct RemoteLayout: Codable, Equatable {
     /// file), and carried through the same way: optional, never written back when
     /// absent, so this app doesn't erase what desktop recorded.
     var accomplishmentsEnabled: Bool?
+    /// Whether the project's reminders (`.muxel/REMINDERS.md`) are on. Shared and
+    /// carried through exactly like `accomplishmentsEnabled`.
+    var remindersEnabled: Bool?
 
     private enum CodingKeys: String, CodingKey {
         case version
@@ -48,6 +51,7 @@ struct RemoteLayout: Codable, Equatable {
         case remoteRoot = "remote_root"
         case memoryEnabled = "memory_enabled"
         case accomplishmentsEnabled = "accomplishments_enabled"
+        case remindersEnabled = "reminders_enabled"
         case layout, instances, worktrees
     }
 
@@ -68,6 +72,7 @@ struct RemoteLayout: Codable, Equatable {
         worktrees = (try c.decodeIfPresent([Worktree].self, forKey: .worktrees)) ?? []
         memoryEnabled = try c.decodeIfPresent(Bool.self, forKey: .memoryEnabled)
         accomplishmentsEnabled = try c.decodeIfPresent(Bool.self, forKey: .accomplishmentsEnabled)
+        remindersEnabled = try c.decodeIfPresent(Bool.self, forKey: .remindersEnabled)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -82,6 +87,7 @@ struct RemoteLayout: Codable, Equatable {
         // than being written back as `false`.
         try c.encodeIfPresent(memoryEnabled, forKey: .memoryEnabled)
         try c.encodeIfPresent(accomplishmentsEnabled, forKey: .accomplishmentsEnabled)
+        try c.encodeIfPresent(remindersEnabled, forKey: .remindersEnabled)
     }
 
     /// Whether this document is consumable for `root` (correct version + root).

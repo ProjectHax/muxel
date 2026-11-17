@@ -6,8 +6,10 @@
 //!
 //! - **Done** — a rising fourth, G5 then C6 over a soft C5: settled, "finished".
 //! - **Blocked** — the same bright B5 + E6 knocked twice: "come here".
+//! - **Reminder** — an arpeggio up E5–G#5–B5–E6, an alarm-clock "it's time" that
+//!   still reads clearly when it repeats.
 //!
-//! Both are normalized to the same peak, so the volume setting treats them alike.
+//! All are normalized to the same peak, so the volume setting treats them alike.
 
 use crate::sound_alert::AlertSound;
 use std::f64::consts::{PI, TAU};
@@ -66,11 +68,21 @@ const BLOCKED: [Strike; 4] = [
     strike(0.17, 987.77, 0.55, 0.26, 1.3),
 ];
 
+const REMINDER_SECS: f64 = 1.3;
+const REMINDER: [Strike; 5] = [
+    strike(0.0, 659.25, 0.7, 0.2, 1.1),   // E5
+    strike(0.12, 830.61, 0.8, 0.2, 1.1),  // G#5
+    strike(0.24, 987.77, 0.9, 0.24, 1.1), // B5
+    strike(0.36, 1318.51, 1.0, 0.4, 1.1), // E6
+    strike(0.36, 659.25, 0.25, 0.4, 0.0), // E5, underneath
+];
+
 /// `sound`'s built-in chime: mono samples at [`RATE`].
 pub fn render(sound: AlertSound) -> Vec<f32> {
     let (secs, strikes): (f64, &[Strike]) = match sound {
         AlertSound::Done => (DONE_SECS, &DONE),
         AlertSound::Blocked => (BLOCKED_SECS, &BLOCKED),
+        AlertSound::Reminder => (REMINDER_SECS, &REMINDER),
     };
     let rate = f64::from(RATE);
     let len = (secs * rate) as usize;
@@ -109,7 +121,7 @@ pub fn render(sound: AlertSound) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BLOCKED_SECS, DONE_SECS, PEAK, RATE, render};
+    use super::{BLOCKED_SECS, DONE_SECS, PEAK, RATE, REMINDER_SECS, render};
     use crate::sound_alert::AlertSound;
 
     fn peak(samples: &[f32]) -> f32 {
@@ -121,6 +133,7 @@ mod tests {
         for (sound, secs) in [
             (AlertSound::Done, DONE_SECS),
             (AlertSound::Blocked, BLOCKED_SECS),
+            (AlertSound::Reminder, REMINDER_SECS),
         ] {
             let samples = render(sound);
             assert_eq!(samples.len(), (secs * f64::from(RATE)) as usize);
@@ -131,7 +144,7 @@ mod tests {
 
     #[test]
     fn chimes_start_and_end_without_a_click() {
-        for sound in [AlertSound::Done, AlertSound::Blocked] {
+        for sound in AlertSound::ALL {
             let samples = render(sound);
             assert_eq!(samples[0], 0.0, "{sound:?} starts at rest");
             // The attack ramps in rather than jumping.

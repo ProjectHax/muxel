@@ -39,15 +39,15 @@ use muxel_core::winshell::WindowsShell;
 use muxel_core::{
     ACCOMPLISHMENTS_FILE, AgentActivity, AgentActivityState, AgentPreset, FocusDir, Identity,
     InjectionMode, Instance, InstanceKind, Loop, LoopSchedule, MEMORY_DIR, MEMORY_FILE, PaneNode,
-    PostRunAction, Project, RemoteHost, RemoteLayout, RemoteOs, RemoteRef, ResolvedLaunch, Runner,
-    SavedAgent, Snippet, SplitDirection, SshAuth, StartupAgent, Workspace, WorkspaceMeta,
-    WorkspacesIndex, Worktree, accomplishments_instruction, add_tab, add_tab_at,
+    PostRunAction, Project, REMINDERS_FILE, RemoteHost, RemoteLayout, RemoteOs, RemoteRef,
+    ResolvedLaunch, Runner, SavedAgent, Snippet, SplitDirection, SshAuth, StartupAgent, Workspace,
+    WorkspaceMeta, WorkspacesIndex, Worktree, accomplishments_instruction, add_tab, add_tab_at,
     agent_activity_label, append_agent_instruction, codex_developer_instructions_override,
     file_link_instruction, focus_in_direction, memory_instruction, memory_reference,
     migrate_worktrees, move_into_split, move_into_tabs, move_pane_beside, move_tab_to,
-    muxel_file_reference, remove, resolve_launch_for_session, saved_agent, set_active_tab,
-    set_split_sizes, set_tab_order, split, split_beside, ssh, swap_instances, swap_panes,
-    sync_agent_injection_modes, sync_codex_approval_args,
+    muxel_file_reference, reminders_instruction, remove, resolve_launch_for_session, saved_agent,
+    set_active_tab, set_split_sizes, set_tab_order, split, split_beside, ssh, swap_instances,
+    swap_panes, sync_agent_injection_modes, sync_codex_approval_args,
 };
 use muxel_terminal::{
     AgentStatus, CommandSpec, DisplayEpoch, LaunchBinding, TerminalLaunch, TerminalMouseMode,
@@ -97,6 +97,7 @@ mod recoverable_close_ui;
 mod recoverable_layout;
 #[cfg(test)]
 mod recoverable_layout_tests;
+mod reminders_ui;
 #[cfg(all(test, windows))]
 mod remote_reconnect_tests;
 #[cfg(all(test, windows))]
@@ -2792,6 +2793,22 @@ fn resolve_agent_launch(
         let agent = accomplishments::agent_label(instance.program.as_deref(), &instance.preset);
         add_automatic(accomplishments_instruction(&path, &agent), &mut instance);
     }
+    if !resuming
+        && let Some(project) = project
+        && project.reminders_enabled
+        && instance.injection != InjectionMode::None
+    {
+        let root = match &project.remote {
+            Some(remote) => remote.remote_root.clone(),
+            None => project.root_path.display().to_string(),
+        };
+        let cwd = instance
+            .working_directory()
+            .map(|w| w.display().to_string());
+        let path = muxel_file_reference(&root, cwd.as_deref(), REMINDERS_FILE);
+        let agent = accomplishments::agent_label(instance.program.as_deref(), &instance.preset);
+        add_automatic(reminders_instruction(&path, &agent), &mut instance);
+    }
     let mut resolved = resolve_launch_for_session(&instance, resuming);
     if !codex_instructions.is_empty() {
         resolved.args.push("--config".to_string());
@@ -3076,6 +3093,33 @@ mod launch_instruction_transport_tests {
             resolve_agent_launch(&muse, Some(&project), false)
                 .args
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn reminders_instruction_follows_the_project_toggle() {
+        let mut project = Project::new("repo", "/tmp/repo");
+        let pane = Instance::from_preset(project.id, &AgentPreset::opencode());
+        let off = resolve_agent_launch(&pane, Some(&project), false);
+        assert!(
+            !off.startup_input
+                .unwrap_or_default()
+                .contains("REMINDERS.md"),
+            "opt-in: nothing until the project enables it"
+        );
+
+        project.reminders_enabled = true;
+        let on = resolve_agent_launch(&pane, Some(&project), false);
+        let instructions = on.startup_input.expect("TypeIn delivers the bundle");
+        assert!(instructions.contains(">> .muxel/REMINDERS.md"));
+        assert!(
+            instructions.contains("| opencode | #KEY'"),
+            "agent filled in"
+        );
+        assert!(
+            resolve_agent_launch(&pane, Some(&project), true)
+                .startup_input
+                .is_none()
         );
     }
 }
@@ -6464,6 +6508,9 @@ pub struct MuxelApp {
     accomplishments_overview: Option<Entity<accomplishments_view::AccomplishmentsOverview>>,
     /// The popped-out overview window, if open.
     accomplishments_window: Option<WindowHandle<gpui_component::Root>>,
+    /// Reminders (`.muxel/REMINDERS.md`): the per-project cache, what's ringing,
+    /// the popup, and the docked panel (see `reminders_ui`).
+    reminders: reminders_ui::ReminderState,
     /// Whether the settings page is shown.
     show_settings: bool,
     /// Settings-page widgets + selection state.
@@ -6884,6 +6931,7 @@ enum PaletteCommand {
     OpenSettings,
     OpenMemory,
     OpenAccomplishments,
+    OpenReminders,
     ShowAllAccomplishments,
     PopOutAccomplishments,
     ReadAloud,
@@ -7630,6 +7678,7 @@ enum SaveTarget {
     WorkspaceIndex,
     Memory,
     Accomplishments,
+    Reminders,
     LayoutBackup,
 }
 
@@ -7641,6 +7690,7 @@ impl SaveTarget {
             Self::WorkspaceIndex => t("Couldn't save workspace list"),
             Self::Memory => t("Couldn't save project memory"),
             Self::Accomplishments => t("Couldn't save the accomplishment log"),
+            Self::Reminders => t("Couldn't save reminders"),
             Self::LayoutBackup => t("Layout backup failed"),
         }
     }
@@ -8771,6 +8821,22 @@ impl MuxelApp {
             },
         )
         .detach();
+        let reminder_when_input = cx
+            .new(|cx| InputState::new(window, cx).placeholder(t("When: 15m, 14:30, tomorrow 9am")));
+        let reminder_message_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t("Remind me to…")));
+        for input in [&reminder_when_input, &reminder_message_input] {
+            cx.subscribe_in(
+                input,
+                window,
+                |this, _input, ev: &InputEvent, window, cx| {
+                    if let InputEvent::PressEnter { .. } = ev {
+                        this.add_reminder(window, cx);
+                    }
+                },
+            )
+            .detach();
+        }
         let accomplishments_add_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(t("Log one: fix: what was done")));
         cx.subscribe_in(
@@ -8913,6 +8979,10 @@ impl MuxelApp {
             accomplishments_maintained: HashMap::new(),
             accomplishments_retry_at: HashMap::new(),
             accomplishments_overview: None,
+            reminders: reminders_ui::ReminderState::new(
+                reminder_when_input,
+                reminder_message_input,
+            ),
             accomplishments_window: None,
             show_settings: false,
             settings_ui,
@@ -10194,6 +10264,14 @@ impl MuxelApp {
                 file.display().to_string(),
             ));
         }
+        if let Some(p) = project
+            && p.reminders_enabled
+            && p.remote.is_none()
+        {
+            let file = p.root_path.join(MEMORY_DIR).join(REMINDERS_FILE);
+            spec.env
+                .push(("MUXEL_REMINDERS_FILE".into(), file.display().to_string()));
+        }
 
         // Status markers: the preset's overrides per field, else the program's
         // built-in defaults (empty → bell/activity heuristic).
@@ -11245,6 +11323,14 @@ impl MuxelApp {
             && self.accomplishments_ensured.insert(pid)
         {
             self.ensure_project_accomplishments(pid, cx);
+        }
+        if self
+            .workspace
+            .project(pid)
+            .is_some_and(|p| p.reminders_enabled)
+            && self.reminders.ensured.insert(pid)
+        {
+            self.ensure_project_reminders(pid, cx);
         }
         let is_remote = self.workspace.project(pid).is_some_and(|p| p.is_remote());
         // The first time we reach a layout-synced project this session, reconcile its
@@ -12820,6 +12906,7 @@ impl MuxelApp {
         self.accomplishments_checked_at = None;
         self.accomplishments_generation += 1;
         self.show_accomplishments = false;
+        self.reminders.reset();
         self.maximized = None;
         self.workspace = Workspace::default();
         self.active_instance = None;
@@ -13089,13 +13176,17 @@ impl MuxelApp {
         pid
     }
 
-    /// Set up the shared memory and accomplishment log a new project starts with
+    /// Set up the shared memory, accomplishment log and reminders a new project starts with
     /// (Settings → Projects), the way turning each one on does.
     fn start_new_project_logs(&mut self, pid: Uuid, cx: &mut Context<Self>) {
         let Some(project) = self.workspace.project(pid) else {
             return;
         };
-        let (memory, accomplishments) = (project.memory_enabled, project.accomplishments_enabled);
+        let (memory, accomplishments, reminders) = (
+            project.memory_enabled,
+            project.accomplishments_enabled,
+            project.reminders_enabled,
+        );
         if memory && self.memory_ensured.insert(pid) {
             self.ensure_project_memory(pid, cx);
             self.memory_upkeep.check_soon();
@@ -13106,6 +13197,9 @@ impl MuxelApp {
             }
             self.accomplishments_checked_at = None;
             self.accomplishments_generation += 1;
+        }
+        if reminders && self.reminders.ensured.insert(pid) {
+            self.ensure_project_reminders(pid, cx);
         }
     }
 
@@ -14594,6 +14688,7 @@ impl MuxelApp {
             updated_at,
             memory_enabled,
             accomplishments_enabled,
+            reminders_enabled,
             ..
         } = remote;
         let mut instances = muxel_core::merge_peer_instances(&local, instances, pid);
@@ -14645,6 +14740,9 @@ impl MuxelApp {
             }
             if let Some(enabled) = accomplishments_enabled {
                 p.accomplishments_enabled = enabled;
+            }
+            if let Some(enabled) = reminders_enabled {
+                p.reminders_enabled = enabled;
             }
         }
         self.seed_adopted_layout(pid, remote_key);
@@ -15589,9 +15687,11 @@ impl MuxelApp {
             self.enqueue_read_aloud(iid, cx);
         }
         self.note_memory_turns(&turns_finished);
+        self.refresh_reminders_after_turns(&turns_finished, cx);
         self.refresh_accomplishments_after_turns(turns_finished, cx);
         self.poll_accomplishments(cx);
         self.poll_memory(cx);
+        self.poll_reminders(window, cx);
 
         let popout_activity = self.sync_popout_activity(now_epoch, cx);
         activity_changed |= popout_activity.persist;
@@ -17373,6 +17473,7 @@ impl MuxelApp {
             || self.git_modal.is_some()
             || self.password_prompt.is_some()
             || self.auto_message_popup.is_some()
+            || self.reminders.popup
             || self.confirm.is_some()
             || self.show_close_list
             || self.place_menu.is_some()
@@ -17959,6 +18060,7 @@ impl MuxelApp {
         if self.workspace.active_project.is_some() {
             cmds.push(OpenMemory);
             cmds.push(OpenAccomplishments);
+            cmds.push(OpenReminders);
         }
         cmds.push(ShowAllAccomplishments);
         cmds.push(PopOutAccomplishments);
@@ -17992,6 +18094,7 @@ impl MuxelApp {
             PaletteCommand::OpenSettings => t("Open settings").into(),
             PaletteCommand::OpenMemory => t("Open project memory (.muxel/MEMORY.md)").into(),
             PaletteCommand::OpenAccomplishments => t("Open project accomplishments").into(),
+            PaletteCommand::OpenReminders => t("Open project reminders").into(),
             PaletteCommand::ShowAllAccomplishments => {
                 t("Show accomplishments (all projects)").into()
             }
@@ -18049,6 +18152,11 @@ impl MuxelApp {
             PaletteCommand::OpenAccomplishments => {
                 if let Some(pid) = self.workspace.active_project {
                     self.open_accomplishments_panel(pid, window, cx);
+                }
+            }
+            PaletteCommand::OpenReminders => {
+                if let Some(pid) = self.workspace.active_project {
+                    self.open_reminders_panel(pid, window, cx);
                 }
             }
             PaletteCommand::ShowAllAccomplishments => {
@@ -20033,6 +20141,7 @@ impl MuxelApp {
         // The docked panels share one slot.
         self.show_file_browser = false;
         self.show_accomplishments = false;
+        self.reminders.show_panel = false;
         self.point_memory_at(pid, window, cx);
     }
 
@@ -20626,6 +20735,7 @@ impl MuxelApp {
             updated_at,
             memory_enabled,
             accomplishments_enabled,
+            reminders_enabled,
             ..
         } = remote;
         // Shared memory is the host's state, not this machine's: the memory file
@@ -20641,6 +20751,12 @@ impl MuxelApp {
             && let Some(project) = self.workspace.project_mut(pid)
         {
             project.accomplishments_enabled = enabled;
+        }
+        // Reminders too: agents on every machine append to the one file.
+        if let Some(enabled) = reminders_enabled
+            && let Some(project) = self.workspace.project_mut(pid)
+        {
+            project.reminders_enabled = enabled;
         }
         // What this machine observed of each pane (program title, grid, activity) is
         // its own; a structural pull must not replace it with the peer's.
@@ -25296,6 +25412,13 @@ impl MuxelApp {
         }
     }
 
+    fn set_reminders_panel_width(&mut self, width: f32, _cx: &mut Context<Self>) {
+        if self.workspace.reminders_panel_width != Some(width) {
+            self.workspace.reminders_panel_width = Some(width);
+            self.persist();
+        }
+    }
+
     fn set_accomplishments_panel_width(&mut self, width: f32, _cx: &mut Context<Self>) {
         if self.workspace.accomplishments_panel_width != Some(width) {
             self.workspace.accomplishments_panel_width = Some(width);
@@ -25328,6 +25451,7 @@ impl MuxelApp {
         // The docked panels share one slot.
         self.show_memory = false;
         self.show_accomplishments = false;
+        self.reminders.show_panel = false;
         // `select_project` re-points the open browser at `pid` (see its tail).
         self.select_project(pid, window, cx);
     }
@@ -28511,6 +28635,7 @@ impl MuxelApp {
             let has_startup = !project.startup.is_empty();
             let memory_on = project.memory_enabled;
             let accomplishments_on = project.accomplishments_enabled;
+            let reminders_on = project.reminders_enabled;
             let is_repo = self.project_branches.get(&pid).is_some_and(|b| b.is_some());
             let is_local = project.remote.is_none();
             let remote_host_id = project.remote.as_ref().map(|r| r.host_id);
@@ -28670,6 +28795,30 @@ impl MuxelApp {
                                     })),
                             )
                     }))
+                    .children(reminders_on.then(|| {
+                        let ringing = self.reminders.ringing.iter().any(|r| r.pid == pid);
+                        div()
+                            .flex_none()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                Button::new(SharedString::from(format!("reminders-{ix}")))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(if ringing {
+                                        Icon::new(IconName::Bell).text_color(cx.theme().warning)
+                                    } else {
+                                        Icon::new(IconName::Bell)
+                                    })
+                                    .selected(
+                                        self.reminders.show_panel
+                                            && self.reminders.pid == Some(pid),
+                                    )
+                                    .tooltip(t("Reminders"))
+                                    .on_click(cx.listener(move |this, _e, window, cx| {
+                                        this.toggle_reminders_panel(pid, window, cx)
+                                    })),
+                            )
+                    }))
                     .child(
                         div()
                             .flex_none()
@@ -28770,22 +28919,6 @@ impl MuxelApp {
                                         )),
                                 )
                                 .item(
-                                    PopupMenuItem::new(if memory_on {
-                                        t("Disable shared memory")
-                                    } else {
-                                        t("Enable shared memory")
-                                    })
-                                    .icon(IconName::File)
-                                    .on_click(
-                                        window.listener_for(
-                                            &entity,
-                                            move |this, _, _window, cx| {
-                                                this.toggle_project_memory(pid, cx)
-                                            },
-                                        ),
-                                    ),
-                                )
-                                .item(
                                     PopupMenuItem::new(t("Open accomplishments"))
                                         .icon(IconName::CircleCheck)
                                         .on_click(window.listener_for(
@@ -28796,20 +28929,14 @@ impl MuxelApp {
                                         )),
                                 )
                                 .item(
-                                    PopupMenuItem::new(if accomplishments_on {
-                                        t("Disable accomplishment log")
-                                    } else {
-                                        t("Enable accomplishment log")
-                                    })
-                                    .icon(IconName::File)
-                                    .on_click(
-                                        window.listener_for(
+                                    PopupMenuItem::new(t("Open reminders"))
+                                        .icon(IconName::Bell)
+                                        .on_click(window.listener_for(
                                             &entity,
-                                            move |this, _, _window, cx| {
-                                                this.toggle_project_accomplishments(pid, cx)
+                                            move |this, _, window, cx| {
+                                                this.open_reminders_panel(pid, window, cx)
                                             },
-                                        ),
-                                    ),
+                                        )),
                                 );
                             // Remote projects: reconnect a dropped/failed SSH
                             // connection, or scan the host for more projects.
@@ -30053,6 +30180,7 @@ impl MuxelApp {
                                 cx.listener(|this, _ev, _window, cx| this.toggle_dashboard(cx)),
                             ),
                     ))
+                    .children(self.render_reminders_titlebar(cx).map(nodrag))
                     .children(
                         self.workspace
                             .projects
@@ -33583,6 +33711,8 @@ impl Render for MuxelApp {
             && let Some(overview) = &self.accomplishments_overview
         {
             overview.clone().into_any_element()
+        } else if self.main_view == hotbar::MainView::Reminders {
+            self.render_reminders_view(cx)
         } else if let Some((fpid, msg)) = failed_remote {
             self.render_remote_connect_failed(fpid, &msg, cx)
         } else if let Some(leaf) = maximized_here {
@@ -33726,6 +33856,37 @@ impl Render for MuxelApp {
                     }
                 })
                 .into_any_element()
+        } else if self.reminders.show_panel && !full_view {
+            let rem_half = (f32::from(window.viewport_size().width) * 0.5).max(360.0);
+            let rem_saved = self
+                .workspace
+                .reminders_panel_width
+                .unwrap_or(300.0)
+                .clamp(220.0, rem_half);
+            let rem_key = SharedString::from(format!(
+                "rem-split-{}",
+                self.current_workspace
+                    .map(|p| p.simple().to_string())
+                    .unwrap_or_default()
+            ));
+            h_resizable(rem_key)
+                .child(
+                    resizable_panel()
+                        .fixed_size(px(rem_saved))
+                        .size_range(px(220.0)..px(rem_half))
+                        .child(self.render_reminders_panel(cx)),
+                )
+                .child(resizable_panel().child(main_column))
+                .on_resize(|state, _window, cx| {
+                    let width = state.read(cx).sizes().first().map(|p| f32::from(*p));
+                    if let Some(width) = width
+                        && let Some(app) =
+                            cx.try_global::<MuxelHandle>().and_then(|h| h.0.upgrade())
+                    {
+                        app.update(cx, |app, cx| app.set_reminders_panel_width(width, cx));
+                    }
+                })
+                .into_any_element()
         } else {
             main_column.into_any_element()
         };
@@ -33736,7 +33897,7 @@ impl Render for MuxelApp {
                 180.0
             } else if self.show_memory {
                 200.0
-            } else if self.show_accomplishments {
+            } else if self.show_accomplishments || self.reminders.show_panel {
                 220.0
             } else {
                 0.0
@@ -33956,6 +34117,11 @@ impl Render for MuxelApp {
             .children(
                 (self.auto_message_popup.is_some() && self.auto_message_window_pid().is_none())
                     .then(|| ov(|| self.render_auto_message_popup(cx))),
+            )
+            .children(
+                self.reminders
+                    .popup
+                    .then(|| ov(|| self.render_reminder_popup(cx))),
             )
             .children(
                 {

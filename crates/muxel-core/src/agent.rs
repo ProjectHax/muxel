@@ -1157,6 +1157,8 @@ pub const MEMORY_DIR: &str = ".muxel";
 pub const MEMORY_FILE: &str = "MEMORY.md";
 /// The per-project accomplishment log agents append to, inside [`MEMORY_DIR`].
 pub const ACCOMPLISHMENTS_FILE: &str = "ACCOMPLISHMENTS.md";
+/// The per-project reminders file agents append to, inside [`MEMORY_DIR`].
+pub const REMINDERS_FILE: &str = "REMINDERS.md";
 
 /// How to refer to a project's `.muxel/MEMORY.md` from inside an agent's system
 /// prompt, given the project `root` and the `cwd` the agent will run in.
@@ -1229,6 +1231,36 @@ with the same #KEY and muxel replaces the old entry; if you no longer know the k
 grep the file for it rather than reading it. Log finished results only (not plans, \
 attempts, or intermediate steps), and each result once."
     )
+}
+
+/// The system-prompt snippet appended when a project has reminders enabled. `path`
+/// refers to the project's `.muxel/REMINDERS.md` (see [`muxel_file_reference`]);
+/// `agent` is the short name muxel fills into the line template.
+///
+/// Like the accomplishment log, it's append-only for agents: muxel watches the file,
+/// alerts the user when a reminder comes due, and removes it once dismissed. The
+/// time carries its UTC offset (from `date %z`), so a remote host on another zone
+/// still writes the moment the user meant.
+pub fn reminders_instruction(path: &str, agent: &str) -> String {
+    format!(
+        "Muxel can remind the user at a set time. When the user asks to be reminded \
+of something (or to have you check back with them later), append one line to \
+`{path}` without reading it: `echo '- YYYY-MM-DD HH:MM +HHMM | MESSAGE | {agent} | \
+#KEY' >> {path}` (in PowerShell: `Add-Content {path} '...'`). The time is when the \
+user should be alerted, in their local time with its UTC offset; compute it with \
+`date`, e.g. `date -d '+2 hours' '+%Y-%m-%d %H:%M %z'` (macOS: `date -v+2H '+%Y-%m-%d \
+%H:%M %z'`; PowerShell: `(Get-Date).AddHours(2).ToString('yyyy-MM-dd HH:mm zzz')`). \
+MESSAGE is one short plain sentence without `|` or single quotes, written to the \
+user; KEY is a short kebab-case name. To move a reminder, append a new line with \
+the same #KEY; to cancel one, append `- cancel | #KEY`. Muxel alerts the user when \
+it's due, so don't wait or poll for it yourself, and only add reminders the user \
+asked for."
+    )
+}
+
+/// Seed contents written when a project's `REMINDERS.md` is first created.
+pub fn reminders_header() -> &'static str {
+    crate::reminders::document_header()
 }
 
 /// Seed contents written when a project's `ACCOMPLISHMENTS.md` is first created.
@@ -2418,6 +2450,29 @@ mod tests {
         let e = crate::accomplishments::parse_line(line).expect("parses");
         assert_eq!(e.agent.as_deref(), Some("claude"));
         assert_eq!(e.key.as_deref(), Some("fixed-it"));
+    }
+
+    #[test]
+    fn reminders_instruction_says_append_never_read() {
+        let s = reminders_instruction(".muxel/REMINDERS.md", "claude");
+        assert!(s.contains("without reading it"));
+        assert!(s.contains(">> .muxel/REMINDERS.md"));
+        assert!(
+            s.contains("| claude | #KEY'"),
+            "muxel fills in the agent: {s}"
+        );
+        assert!(s.contains("- cancel | #KEY"), "says how to cancel: {s}");
+        // The template, filled in the way `date %z` writes it, parses.
+        let line = "- 2026-11-16 15:00 -0500 | Check the deploy | claude | #deploy";
+        let zone = crate::reminders::FixedZone(0);
+        match crate::reminders::parse_line(line, &zone) {
+            Some(crate::reminders::Line::Reminder(r)) => {
+                assert_eq!(r.agent.as_deref(), Some("claude"));
+                assert_eq!(r.key.as_deref(), Some("deploy"));
+                assert!(r.due.is_some());
+            }
+            other => panic!("didn't parse: {other:?}"),
+        }
     }
 
     #[test]

@@ -411,7 +411,7 @@ impl Render for AccomplishmentsOverview {
         if snap.projects.is_empty() {
             body = body.child(div().text_sm().text_color(muted).child(t(
                 "No project has its accomplishment log turned on. Enable it per project \
-                 from the sidebar's right-click menu or Settings → Projects.",
+                 in Settings → Projects.",
             )));
         } else if in_window.is_empty() {
             body = body.child(div().text_sm().text_color(muted).child(tf(

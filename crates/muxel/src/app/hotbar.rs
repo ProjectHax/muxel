@@ -1,6 +1,6 @@
 //! The bottom hotbar: one-click, full-size views of things that otherwise live in
 //! side panels or windows — the agent dashboard, the active project's git changes,
-//! shared memory and files, and every project's accomplishments.
+//! shared memory and files, and every project's accomplishments and reminders.
 //!
 //! A view fills everything right of the project sidebar (the docked panels and the
 //! git-diff panel step aside while it's up); clicking its button again returns to
@@ -25,16 +25,18 @@ pub(super) enum MainView {
     Memory,
     Files,
     Accomplishments,
+    Reminders,
 }
 
 impl MainView {
     /// The hotbar's views, in button order.
-    pub(super) const HOTBAR: [Self; 5] = [
+    pub(super) const HOTBAR: [Self; 6] = [
         Self::Dashboard,
         Self::Changes,
         Self::Memory,
         Self::Files,
         Self::Accomplishments,
+        Self::Reminders,
     ];
 
     /// The view after clicking `target`'s button: `target`, or back to the panes
@@ -56,6 +58,7 @@ impl MainView {
             Self::Memory => t("Memory"),
             Self::Files => t("Files"),
             Self::Accomplishments => t("Accomplishments"),
+            Self::Reminders => t("Reminders"),
         }
     }
 
@@ -67,6 +70,7 @@ impl MainView {
             Self::Memory => t("Shared memory for the active project, full view"),
             Self::Files => t("Files in the active project, full view"),
             Self::Accomplishments => t("Accomplishments across all projects, full view"),
+            Self::Reminders => t("Reminders across all projects, full view"),
         }
     }
 
@@ -78,6 +82,7 @@ impl MainView {
             Self::Memory => IconName::Star.into(),
             Self::Files => Icon::empty().path("icons/files.svg"),
             Self::Accomplishments => IconName::CircleCheck.into(),
+            Self::Reminders => IconName::Bell.into(),
         }
     }
 
@@ -89,6 +94,7 @@ impl MainView {
             Self::Memory => "hotbar-memory",
             Self::Files => "hotbar-files",
             Self::Accomplishments => "hotbar-accomplishments",
+            Self::Reminders => "hotbar-reminders",
         }
     }
 }
@@ -134,6 +140,7 @@ impl MuxelApp {
                 self.ensure_accomplishments_overview(window, cx);
                 self.refresh_all_accomplishments(cx);
             }
+            MainView::Reminders => self.refresh_all_reminders(cx),
         }
         cx.notify();
     }
@@ -172,9 +179,17 @@ impl MuxelApp {
             .border_t_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().sidebar);
+        let ringing = self.reminders.ringing.len();
         for view in MainView::HOTBAR {
             let showing = self.main_view == view;
             let disabled = view.per_project() && project.is_none();
+            // Due reminders show their count on the Reminders button.
+            let alarm = view == MainView::Reminders && ringing > 0;
+            let label: SharedString = if alarm {
+                format!("{} · {ringing}", view.label()).into()
+            } else {
+                view.label()
+            };
             bar = bar.child(
                 // The accent bar above the active button, tab-style.
                 div()
@@ -192,12 +207,14 @@ impl MuxelApp {
                         Button::new(view.id())
                             .with_variant(if showing {
                                 ButtonVariant::Primary
+                            } else if alarm {
+                                ButtonVariant::Warning
                             } else {
                                 ButtonVariant::Ghost
                             })
                             .small()
                             .icon(view.icon())
-                            .label(view.label())
+                            .label(label)
                             .disabled(disabled)
                             .tooltip(if disabled {
                                 t("Select a project first")

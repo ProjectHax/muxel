@@ -29,6 +29,7 @@ pub mod placement;
 pub mod readaloud;
 pub mod recoverable_close;
 pub mod refresh_gate;
+pub mod reminders;
 pub mod remote_ops;
 pub mod rich_copy;
 pub mod session_discovery;
@@ -47,14 +48,15 @@ pub mod worktree;
 pub use agent::{
     ACCOMPLISHMENTS_FILE, AgentPreset, ClaudeSession, ClaudeSessionRequest, CodexHintMiss,
     CodexResumePath, CodexSession, CodexSessionNames, EnvVar, InjectionMode, MEMORY_DIR,
-    MEMORY_FILE, PresetKind, ResolvedLaunch, accomplishments_header, accomplishments_instruction,
-    append_agent_instruction, claude_session_cwd, claude_session_cwd_with_len, claude_session_path,
-    codex_developer_instructions_override, codex_latest_session_id, codex_latest_sessions,
-    codex_resume_path, codex_rollout_by_walk, codex_session_from_hint,
-    codex_session_hint_from_title, codex_session_id_from_hint, codex_session_names,
-    codex_terminal_title_override, discover_claude_sessions, file_link_instruction,
-    find_claude_session_path, git_bash_program, is_known_agent_program, launches_known_agent,
-    memory_header, memory_instruction, memory_reference, muxel_file_reference, resolve_launch,
+    MEMORY_FILE, PresetKind, REMINDERS_FILE, ResolvedLaunch, accomplishments_header,
+    accomplishments_instruction, append_agent_instruction, claude_session_cwd,
+    claude_session_cwd_with_len, claude_session_path, codex_developer_instructions_override,
+    codex_latest_session_id, codex_latest_sessions, codex_resume_path, codex_rollout_by_walk,
+    codex_session_from_hint, codex_session_hint_from_title, codex_session_id_from_hint,
+    codex_session_names, codex_terminal_title_override, discover_claude_sessions,
+    file_link_instruction, find_claude_session_path, git_bash_program, is_known_agent_program,
+    launches_known_agent, memory_header, memory_instruction, memory_reference,
+    muxel_file_reference, reminders_header, reminders_instruction, resolve_launch,
     resolve_launch_for_session, session_resume_args, stored_claude_session_path,
 };
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
@@ -1119,6 +1121,11 @@ pub struct Project {
     /// append each finished feature/fix/… to `.muxel/ACCOMPLISHMENTS.md`.
     #[serde(default)]
     pub accomplishments_enabled: bool,
+    /// Inject the reminders instruction into this project's agents, so they append
+    /// reminders the user asks for to `.muxel/REMINDERS.md`, which muxel watches and
+    /// alerts on when each comes due.
+    #[serde(default)]
+    pub reminders_enabled: bool,
     /// Unix-seconds version stamp for this project's pane layout, advanced when the
     /// layout/instances change. Drives newer-wins sync of a remote project's layout
     /// to/from `<remote_root>/.muxel/workspace.json`. `None` until first change/sync.
@@ -1163,6 +1170,7 @@ impl Project {
             remote: None,
             memory_enabled: false,
             accomplishments_enabled: false,
+            reminders_enabled: false,
             layout_updated_at: None,
             closed_sessions: Vec::new(),
             layout_synced: None,
@@ -1308,6 +1316,9 @@ pub struct Workspace {
     /// Persisted accomplishments-panel sidebar width in pixels (None = default).
     #[serde(default)]
     pub accomplishments_panel_width: Option<f32>,
+    /// Persisted reminders-panel sidebar width in pixels (None = default).
+    #[serde(default)]
+    pub reminders_panel_width: Option<f32>,
     /// Persisted git-diff panel width in pixels (None = default).
     #[serde(default)]
     pub gitdiff_panel_width: Option<f32>,
@@ -1553,6 +1564,11 @@ pub struct RemoteLayout {
     /// the host appends to the one file. `None` = a doc from before the field.
     #[serde(default)]
     pub accomplishments_enabled: Option<bool>,
+    /// Whether the project's reminders (`.muxel/REMINDERS.md`) are on. Shared for
+    /// the same reason: agents on every machine append to the one file. `None` = a
+    /// doc from before the field.
+    #[serde(default)]
+    pub reminders_enabled: Option<bool>,
 }
 
 // Local Workspace persistence keeps receipts; only the shared document omits them.
@@ -1614,6 +1630,7 @@ impl RemoteLayout {
             worktrees,
             memory_enabled: Some(project.memory_enabled),
             accomplishments_enabled: Some(project.accomplishments_enabled),
+            reminders_enabled: Some(project.reminders_enabled),
         }
     }
 
@@ -1717,6 +1734,7 @@ impl RemoteLayout {
             // the host rather than sitting on one machine.
             "memory_enabled": self.memory_enabled,
             "accomplishments_enabled": self.accomplishments_enabled,
+            "reminders_enabled": self.reminders_enabled,
         })
         .to_string()
     }
@@ -2303,6 +2321,15 @@ pub const DONE_CHIME_BACKGROUND: &str = "background";
 /// [`Settings::sound_done_when`]: the done chime also rings for the pane you're
 /// looking at.
 pub const DONE_CHIME_ALWAYS: &str = "always";
+
+fn default_reminder_alert() -> String {
+    REMINDER_ALERT_POPUP.to_string()
+}
+
+/// [`Settings::reminder_alert`]: a due reminder opens a dialog in muxel.
+pub const REMINDER_ALERT_POPUP: &str = "popup";
+/// [`Settings::reminder_alert`]: a due reminder sends a desktop notification.
+pub const REMINDER_ALERT_NOTIFICATION: &str = "notification";
 
 /// A user keybinding override: an action name bound to a keystroke string.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2931,6 +2958,18 @@ pub struct Settings {
     /// Alert volume, 0–100.
     #[serde(default = "default_sound_volume")]
     pub sound_volume: u8,
+    // --- Reminders (see `reminders`) ---
+    /// How a due reminder alerts: [`REMINDER_ALERT_POPUP`] (a dialog in muxel, which
+    /// raises its window) or [`REMINDER_ALERT_NOTIFICATION`] (a desktop
+    /// notification). Anything else reads as popup.
+    #[serde(default = "default_reminder_alert")]
+    pub reminder_alert: String,
+    /// Repeat the reminder sound until the user silences or dismisses it.
+    #[serde(default = "default_true")]
+    pub reminder_sound: bool,
+    /// The user's own sound for reminders; `None` plays the built-in chime.
+    #[serde(default)]
+    pub reminder_sound_file: Option<PathBuf>,
     // --- Outside control (`muxel ctl`; see `control`) ---
     /// Let other programs on this computer (an orchestrating agent such as Grok
     /// Bot) list and drive the agents through `muxel ctl`. Off by default.
@@ -2969,6 +3008,9 @@ pub struct Settings {
     /// Turn the accomplishment log on for every project created from now on.
     #[serde(default)]
     pub new_project_accomplishments: bool,
+    /// Turn reminders on for every project created from now on.
+    #[serde(default)]
+    pub new_project_reminders: bool,
     /// The memory limit for local panes, in GB (0 = no limit). On Windows it
     /// is how much each process a pane starts may commit: a process that asks
     /// for more is refused, which usually stops it. On Linux it is how much the
@@ -3009,6 +3051,12 @@ impl Settings {
     /// [`Settings::sound_done_when`]).
     pub fn done_chime_always(&self) -> bool {
         self.sound_done_when == DONE_CHIME_ALWAYS
+    }
+
+    /// Whether a due reminder alerts with a desktop notification rather than a
+    /// popup (see [`Settings::reminder_alert`]).
+    pub fn reminder_notifies(&self) -> bool {
+        self.reminder_alert == REMINDER_ALERT_NOTIFICATION
     }
 }
 
@@ -3330,6 +3378,9 @@ impl Default for Settings {
             sound_done_file: None,
             sound_blocked_file: None,
             sound_volume: sound_alert::DEFAULT_VOLUME,
+            reminder_alert: default_reminder_alert(),
+            reminder_sound: true,
+            reminder_sound_file: None,
             control_enabled: false,
             control_allow_new: control::CreationPolicy::Off,
             control_allow_shells: false,
@@ -3339,6 +3390,7 @@ impl Default for Settings {
             accomplishment_retention_days: default_accomplishment_retention_days(),
             new_project_memory: false,
             new_project_accomplishments: false,
+            new_project_reminders: false,
             pane_memory_limit_gb: default_pane_memory_limit_gb(),
         }
     }
@@ -3351,6 +3403,7 @@ impl Settings {
         let mut project = Project::new(name, root_path);
         project.memory_enabled = self.new_project_memory;
         project.accomplishments_enabled = self.new_project_accomplishments;
+        project.reminders_enabled = self.new_project_reminders;
         project
     }
 }
@@ -3730,6 +3783,20 @@ mod settings_tests {
         assert!(p.memory_enabled && !p.accomplishments_enabled);
         s.new_project_accomplishments = true;
         assert!(s.new_project("app", "/srv/app").accomplishments_enabled);
+        assert!(!s.new_project("app", "/srv/app").reminders_enabled);
+        s.new_project_reminders = true;
+        assert!(s.new_project("app", "/srv/app").reminders_enabled);
+    }
+
+    #[test]
+    fn reminder_alert_settings_default_for_old_configs() {
+        let mut s: Settings = serde_json::from_str("{}").expect("parse");
+        assert_eq!(s.reminder_alert, REMINDER_ALERT_POPUP);
+        assert!(!s.reminder_notifies());
+        assert!(s.reminder_sound);
+        assert!(s.reminder_sound_file.is_none());
+        s.reminder_alert = REMINDER_ALERT_NOTIFICATION.to_string();
+        assert!(s.reminder_notifies());
     }
 
     #[test]

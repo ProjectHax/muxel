@@ -159,6 +159,29 @@ impl MuxelApp {
                 when_seg(muxel_core::DONE_CHIME_ALWAYS, t("Every pane"), always),
             ],
         );
+        let notifies = settings.reminder_notifies();
+        let alert_seg = |value: &'static str, label: SharedString, selected: bool| {
+            Seg::new(
+                label,
+                selected,
+                cx.listener(move |this, _e, _w, cx| {
+                    this.settings.reminder_alert = value.to_string();
+                    this.persist_settings();
+                    cx.notify();
+                }),
+            )
+        };
+        let reminder_alert = form.segmented(
+            "rem-alert",
+            vec![
+                alert_seg(muxel_core::REMINDER_ALERT_POPUP, t("Popup"), !notifies),
+                alert_seg(
+                    muxel_core::REMINDER_ALERT_NOTIFICATION,
+                    t("Desktop notification"),
+                    notifies,
+                ),
+            ],
+        );
         let step = |percent: i32| -> Click {
             Box::new(cx.listener(move |this, _e, _w, cx| this.set_alert_volume(percent, cx)))
         };
@@ -258,6 +281,34 @@ impl MuxelApp {
                     )),
                 ],
             )),
+            Block::Group(Group::new(
+                t("Reminders"),
+                vec![
+                    Row::new(t("Alert with"), reminder_alert)
+                        .desc(t(
+                            "When a reminder in a project's .muxel/REMINDERS.md comes due. Popup opens a dialog in muxel and brings its window forward; a desktop notification is quieter. Either way a bell shows in the title bar until you dismiss it.",
+                        ))
+                        .keywords("reminder alarm popup notification"),
+                    Row::narrow(
+                        t("Repeat a sound until stopped"),
+                        self.setting_switch(
+                            form,
+                            "rem-sound",
+                            settings.reminder_sound,
+                            cx,
+                            |s, on| s.reminder_sound = on,
+                        ),
+                    )
+                    .desc(t(
+                        "Rings every few seconds until you silence, snooze or dismiss the reminder. Uses the volume above.",
+                    ))
+                    .keywords("reminder alarm sound"),
+                    Row::stacked(
+                        t("Reminder sound"),
+                        self.alert_sound_control(AlertSound::Reminder, form, cx),
+                    ),
+                ],
+            )),
             Block::Note(t(
                 "Your own sound can be WAV, AIFF, MP3, OGG, FLAC or M4A. Anything longer than 10 seconds is cut short.",
             )),
@@ -274,6 +325,7 @@ impl MuxelApp {
         let id = match sound {
             AlertSound::Done => "done",
             AlertSound::Blocked => "blocked",
+            AlertSound::Reminder => "reminder",
         };
         let file = sound.file(&self.settings);
         let name: SharedString = match file {
@@ -347,6 +399,7 @@ fn set_alert_file(settings: &mut muxel_core::Settings, sound: AlertSound, file: 
     match sound {
         AlertSound::Done => settings.sound_done_file = file,
         AlertSound::Blocked => settings.sound_blocked_file = file,
+        AlertSound::Reminder => settings.reminder_sound_file = file,
     }
 }
 

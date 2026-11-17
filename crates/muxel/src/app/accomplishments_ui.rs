@@ -343,6 +343,7 @@ impl MuxelApp {
         // The docked panels share one slot.
         self.show_file_browser = false;
         self.show_memory = false;
+        self.reminders.show_panel = false;
         if self.accomplishments_pid != Some(pid) {
             for input in [
                 &self.accomplishments_search,
@@ -616,7 +617,7 @@ impl MuxelApp {
         if !enabled {
             list = list.child(div().text_xs().text_color(muted).child(t(
                 "The log is off for this project, so agents aren't adding to it. Turn it \
-                 on from the project's right-click menu or Settings → Projects.",
+                 on in Settings → Projects.",
             )));
         }
         if !log.is_some_and(|l| l.loaded) {

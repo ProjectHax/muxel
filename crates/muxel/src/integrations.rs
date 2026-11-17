@@ -9,10 +9,11 @@ use muxel_core::accomplishments::{self, Accomplishment};
 use muxel_core::library::GitFailure;
 use muxel_core::library::resync::LocalChanges;
 use muxel_core::memory::{self, MemoryEntry};
+use muxel_core::reminders::{self, Reminder};
 use muxel_core::tmux::{ClaimWrite, ServerOrigin, SessionTarget, Socket};
 use muxel_core::{
-    ACCOMPLISHMENTS_FILE, MEMORY_DIR, MEMORY_FILE, RemoteHost, RemoteOs, SshAuth,
-    accomplishments_header, memory_header, remote_ops, ssh,
+    ACCOMPLISHMENTS_FILE, MEMORY_DIR, MEMORY_FILE, REMINDERS_FILE, RemoteHost, RemoteOs, SshAuth,
+    accomplishments_header, memory_header, reminders_header, remote_ops, ssh,
 };
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -455,6 +456,16 @@ pub fn ensure_accomplishments_file(loc: &RepoLoc) -> Result<()> {
     )
 }
 
+/// [`ensure_memory_file`] for the project's `.muxel/REMINDERS.md`.
+pub fn ensure_reminders_file(loc: &RepoLoc) -> Result<()> {
+    ensure_muxel_file(
+        loc,
+        REMINDERS_FILE,
+        reminders_header(),
+        "ensure reminders failed",
+    )
+}
+
 /// Create `<root>/.muxel/`, seed `<file>` in it with `header` if absent, and make
 /// sure `.muxel/` is git-ignored. `failed` is the error when a remote host says
 /// nothing about why it couldn't.
@@ -654,6 +665,50 @@ pub fn edit_accomplishments(
     edit(&mut entries);
     let kept = accomplishments::maintain(entries, now, retention_days).kept;
     write_accomplishments_text(loc, &accomplishments::render_document(&kept))?;
+    Ok(kept)
+}
+
+/// Overwrite a project's reminders with `text`, creating `.muxel/` (git-ignored)
+/// first if needed.
+fn write_reminders_text(loc: &RepoLoc, text: &str) -> Result<()> {
+    ensure_reminders_file(loc)?;
+    let path = muxel_file_abs(loc, REMINDERS_FILE);
+    match loc {
+        RepoLoc::Local(_) => std::fs::write(&path, text).with_context(|| format!("writing {path}")),
+        RepoLoc::Remote(_) => write_remote_file(loc, &path, text),
+    }
+}
+
+/// Load a project's reminders, maintained (keyed moves and cancels folded, sorted
+/// soonest first), rewriting the file only when that changes it, and re-reading
+/// just before the write so a line an agent appended in between is kept.
+pub fn maintain_reminders(loc: &RepoLoc, zone: &impl reminders::Zone) -> Result<Vec<Reminder>> {
+    let text = read_muxel_text(loc, REMINDERS_FILE)?;
+    if reminders::plan_rewrite(&text, zone).is_none() {
+        return Ok(reminders::reminders_in(&text, zone));
+    }
+    let fresh = read_muxel_text(loc, REMINDERS_FILE)?;
+    match reminders::plan_rewrite(&fresh, zone) {
+        Some(doc) => {
+            write_reminders_text(loc, &doc)?;
+            Ok(reminders::reminders_in(&doc, zone))
+        }
+        None => Ok(reminders::reminders_in(&fresh, zone)),
+    }
+}
+
+/// Apply a user edit (dismiss, snooze, add, delete) to the reminders as they are on
+/// disk *now*, then write the maintained result and return it.
+pub fn edit_reminders(
+    loc: &RepoLoc,
+    zone: &impl reminders::Zone,
+    edit: impl FnOnce(&mut Vec<Reminder>),
+) -> Result<Vec<Reminder>> {
+    let text = read_muxel_text(loc, REMINDERS_FILE)?;
+    let mut list = reminders::reminders_in(&text, zone);
+    edit(&mut list);
+    let kept = reminders::maintain(list.into_iter().map(reminders::Line::Reminder).collect());
+    write_reminders_text(loc, &reminders::render_document(&kept, zone))?;
     Ok(kept)
 }
 

@@ -1291,7 +1291,7 @@ impl MuxelApp {
                         ),
                     )
                     .desc(t(
-                        "For projects added from now on. Change an existing project below, or from its menu in the sidebar.",
+                        "For projects added from now on. Change an existing project below.",
                     )),
                     Row::narrow(
                         t("Turn on the accomplishment log"),
@@ -1303,15 +1303,24 @@ impl MuxelApp {
                             |s, on| s.new_project_accomplishments = on,
                         ),
                     ),
+                    Row::narrow(
+                        t("Turn on reminders"),
+                        self.setting_switch(
+                            form,
+                            "new-project-reminders",
+                            settings.new_project_reminders,
+                            cx,
+                            |s, on| s.new_project_reminders = on,
+                        ),
+                    )
+                    .keywords("reminder alarm"),
                 ],
             )),
             Block::Group(Group::new(
                 t("All projects"),
-                vec![
-                    Row::new(t("Accomplishment log history"), retention).desc(t(
-                        "Older entries are pruned from each project's .muxel/ACCOMPLISHMENTS.md.",
-                    )),
-                ],
+                vec![Row::new(t("Accomplishment log history"), retention).desc(t(
+                    "Older entries are pruned from each project's .muxel/ACCOMPLISHMENTS.md.",
+                ))],
             )),
         ]
     }
@@ -1454,6 +1463,21 @@ impl MuxelApp {
                         .desc(t(
                             "Agents append each finished feature or fix to .muxel/ACCOMPLISHMENTS.md. They never read it.",
                         )),
+                        Row::narrow(
+                            t("Reminders"),
+                            form.switch(
+                                "proj-reminders",
+                                project.reminders_enabled,
+                                true,
+                                cx.listener(move |this, _on: &bool, _w, cx| {
+                                    this.toggle_project_reminders(pid, cx)
+                                }),
+                            ),
+                        )
+                        .desc(t(
+                            "When you ask an agent to remind you of something, it appends it to .muxel/REMINDERS.md and muxel alerts you when it's due.",
+                        ))
+                        .keywords("reminder alarm"),
                     ],
                 ),
                 &[],

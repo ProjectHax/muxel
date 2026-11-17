@@ -40,14 +40,21 @@ pub enum AlertSound {
     Done,
     /// An agent is waiting on you (a permission prompt, a question).
     Blocked,
+    /// A reminder came due (see `reminders`). Never chosen by [`AlertGate`]; it
+    /// rings on its own, repeating until silenced.
+    Reminder,
 }
 
 impl AlertSound {
+    /// Every alert, in Settings order.
+    pub const ALL: [AlertSound; 3] = [Self::Done, Self::Blocked, Self::Reminder];
+
     /// Whether the user wants this alert to play.
     pub fn enabled(self, settings: &Settings) -> bool {
         match self {
             Self::Done => settings.sound_on_done,
             Self::Blocked => settings.sound_on_blocked,
+            Self::Reminder => settings.reminder_sound,
         }
     }
 
@@ -56,6 +63,7 @@ impl AlertSound {
         match self {
             Self::Done => settings.sound_done_file.as_deref(),
             Self::Blocked => settings.sound_blocked_file.as_deref(),
+            Self::Reminder => settings.reminder_sound_file.as_deref(),
         }
     }
 }

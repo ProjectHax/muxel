@@ -6,6 +6,8 @@
 //! through cpal like speech does (`tts::play_clip`). *When* an alert plays is
 //! decided in `muxel_core::sound_alert`.
 //!
+//! A reminder's sound repeats ([`ring_repeating`]) until its stop flag is raised.
+//!
 //! A chime is a nicety on top of the status badge and the notification feed,
 //! so nothing here raises: a file that won't decode falls back to the built-in
 //! chime, and a machine with no audio device stays quiet.
@@ -14,7 +16,8 @@ use anyhow::{Context, Result, bail};
 use muxel_core::sound_alert::AlertSound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::errors::Error as DecodeError;
@@ -142,6 +145,50 @@ pub fn ring(sound: AlertSound, file: Option<PathBuf>, gain: f32, stop: Arc<Atomi
     );
 }
 
+/// Ring `sound` over and over, `gap` apart, until `stop` is raised (a due
+/// reminder, until the user silences or dismisses it). The clip is loaded once. A
+/// machine with no audio device stops trying after the first failure rather than
+/// spinning.
+pub fn ring_repeating(
+    sound: AlertSound,
+    file: Option<PathBuf>,
+    gain: f32,
+    gap: Duration,
+    stop: Arc<AtomicBool>,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("muxel-reminder-sound".into())
+        .spawn(move || {
+            let clip = file
+                .and_then(|path| {
+                    decode(&path)
+                        .map_err(|e| log::warn!("reminder sound {}: {e:#}", path.display()))
+                        .ok()
+                })
+                .unwrap_or_else(|| Clip::chime(sound));
+            let samples: Vec<f32> = clip
+                .samples
+                .iter()
+                .map(|s| (s * gain).clamp(-1.0, 1.0))
+                .collect();
+            const STEP: Duration = Duration::from_millis(100);
+            while !stop.load(Ordering::Relaxed) {
+                if let Err(e) = crate::tts::play_clip(samples.clone(), clip.rate, &stop) {
+                    log::warn!("reminder sound: {e:#}");
+                    return;
+                }
+                let mut waited = Duration::ZERO;
+                while waited < gap && !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(STEP);
+                    waited += STEP;
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        log::warn!("reminder sound thread: {e}");
+    }
+}
+
 fn spawn(load: impl FnOnce() -> Clip + Send + 'static, gain: f32, stop: Arc<AtomicBool>) {
     let spawned = std::thread::Builder::new()
         .name("muxel-alert-sound".into())
@@ -252,7 +299,7 @@ mod tests {
 
     #[test]
     fn the_builtin_chimes_are_ready_to_play() {
-        for sound in [AlertSound::Done, AlertSound::Blocked] {
+        for sound in AlertSound::ALL {
             let clip = Clip::chime(sound);
             assert_eq!(clip.rate, muxel_core::chime::RATE);
             assert!(!clip.samples.is_empty());

@@ -13,7 +13,8 @@ feature is added or changed, update the matching entry here in the same change**
 - **Hotbar** — a bar along the bottom of the main window opens full views in place
   of the panes: **Dashboard** (every agent's status), **Changes** (the active
   project's git changes, with commit), **Memory** (its shared memory), **Files** (its
-  file tree), and **Accomplishments** (every project's log). A view fills everything
+  file tree), **Accomplishments** (every project's log), and **Reminders** (every
+  project's reminders, with a due count on the button while any are ringing). A view fills everything
   right of the project sidebar (docked panels and the git-diff panel step aside);
   switching projects in the sidebar retargets Changes, Memory, and Files. The active
   button is drawn filled with an accent bar above it, the bar names what's showing,
@@ -476,8 +477,8 @@ feature is added or changed, update the matching entry here in the same change**
   across every agent and run in that project. muxel creates the file, git-ignores
   `.muxel/`, and works for local and remote SSH projects (the file lives in the
   project's working dir on whichever host). Local agents also get its path in a
-  `MUXEL_MEMORY_FILE` env var. Enable it on a project (sidebar right-click or
-  Settings → Projects); a memory button on the project row opens the manager. Plain
+  `MUXEL_MEMORY_FILE` env var. Enable it on a project in Settings → Projects; a
+  memory button on the project row opens the manager. Plain
   shells are skipped.
   Settings → Projects → **New projects** can turn it on for every project added later.
 - **Self-maintaining memory** — each fact is one `##` section carrying a machine
@@ -498,8 +499,7 @@ feature is added or changed, update the matching entry here in the same change**
   raw `MEMORY.md` in the editor. Each change is applied to the file as it is on disk
   when saved, so sections agents added while the panel was open are kept. Entries
   load and persist over SSH for remote projects too.
-- **Accomplishment log** — opt-in per project (sidebar right-click or Settings →
-  Projects): agents are told to append one line to `.muxel/ACCOMPLISHMENTS.md` each
+- **Accomplishment log** — opt-in per project (Settings → Projects): agents are told to append one line to `.muxel/ACCOMPLISHMENTS.md` each
   time they finish a feature, fix, refactor, or perf/docs/test improvement —
   `- date | type | summary | agent | #key` — with a shell append, **never reading the
   file**, so logging costs agents almost nothing. **Entries can be corrected**: if a
@@ -526,6 +526,43 @@ feature is added or changed, update the matching entry here in the same change**
   "Show accomplishments") swaps the pane area for an overview of every log-enabled
   project, grouped by day and then project, with type and project filters and
   search. It can **pop out** into its own window, to keep on another monitor.
+
+- **Reminders** — opt-in per project (Settings → Projects, or **New projects** to turn
+  it on for every project added later): when you ask an agent to remind you of
+  something, it appends one line to `.muxel/REMINDERS.md` —
+  `- YYYY-MM-DD HH:MM ±HHMM | message | agent | #key` — with a shell append, never
+  reading the file. The time carries its UTC offset (agents compute it with `date`), so
+  a remote host in another zone still means the moment you meant. Appending the same
+  `#key` again moves a reminder, and `- cancel | #key` removes it. muxel folds those,
+  keys and sorts the file soonest-first, and keeps any line whose time it can't read
+  (flagged in the panel) rather than deleting it. Works for local and remote SSH
+  projects; local agents also get the path in `MUXEL_REMINDERS_FILE`. Plain shells are
+  skipped.
+- **Reminder alerts** — watching costs almost nothing: each second muxel only compares
+  the cached due times against the clock; local files are `stat`ed every 15 s and
+  re-read only when they change; remote files are re-read when an agent finishes a
+  turn there (and once a day while the host is connected), never over a connection
+  opened just for reminders. Right before a reminder rings, muxel re-reads its file
+  once so one cancelled elsewhere doesn't go off. A due reminder alerts with a
+  **popup** in muxel that brings its window forward, or a **desktop notification**
+  (Settings → Notifications → Reminders), and optionally a sound that **repeats until
+  you stop it**. Each reminder can be **dismissed** (its line is removed from the file)
+  or **snoozed** 5 min, 15 min or 1 h; **Silence** stops the sound and keeps the
+  reminder. A bell in the title bar (shown while any project has reminders on) opens
+  the all-projects Reminders view; while anything is due it turns into an alarm showing
+  how many, which reopens the popup, with a button beside it to silence the sound. A
+  reminder that came due while muxel was closed goes off at the next launch.
+- **Reminders panel** — a bell button on the project row (also "Open reminders" in its
+  right-click menu and the palette) opens a docked, resizable panel (sharing the
+  file-browser/memory/accomplishments slot) listing the project's reminders soonest
+  first with their time and how far off it is, highlighting due ones with
+  dismiss/snooze, plus delete and a quick-add: a message and a time like `15m`, `2h`,
+  `14:30`, `3pm`, `tomorrow 9am` or `2026-12-01 09:00`. It can open the raw
+  `REMINDERS.md` in the editor.
+- **All-projects reminders** — the hotbar's **Reminders** button (or the title-bar bell)
+  swaps the pane area for every reminders-enabled project's reminders, grouped by
+  project, soonest first, with the same dismiss/snooze/delete and a quick-add that adds
+  to the active project.
 
 ## Agent status
 
@@ -892,6 +929,10 @@ feature is added or changed, update the matching entry here in the same change**
   many notifications it holds, so incoming notifications stop pushing PROJECTS
   down; the choice is remembered per workspace.
 - **Controls** — an enable/disable toggle and a "send test notification" button.
+- **Reminder alerts** (Settings → Notifications → Reminders) — choose whether a due
+  reminder opens a **popup** (and brings muxel forward) or sends a **desktop
+  notification**, whether a sound **repeats until stopped**, and which sound plays
+  (a built-in rising four-note chime, or your own file). See *Reminders* under Agents.
 - **System tray** (Settings → General → "Minimize to the system tray on close") —
   closing the window iconifies muxel to a tray icon instead of quitting. The tray
   menu lists every agent with its live status and the most recent notifications;
