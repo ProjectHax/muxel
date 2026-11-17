@@ -909,7 +909,10 @@ fn is_rule(line: &str) -> bool {
             .any(|c| is_box_char(c) && !matches!(c, '│' | '┃' | '║'))
 }
 
-/// `❯ 1. Yes` → ("1", "Yes", selected).
+/// `❯ 1. Yes` → ("1", "Yes", selected). Grok draws its question's options as
+/// `1 (○) Alpha (Recommended)  Choose Alpha.`, the description in a column
+/// after the name and a scrollbar `█` at the row's end; its label keeps the
+/// name and the description two spaces apart.
 fn option_line(line: &str) -> Option<QuestionOption> {
     let s = unbox(line);
     let (selected, s) = match s.strip_prefix(SELECT_GLYPHS) {
@@ -920,14 +923,23 @@ fn option_line(line: &str) -> Option<QuestionOption> {
     if digits.is_empty() || digits.len() > 2 {
         return None;
     }
-    let rest = s[digits.len()..].strip_prefix(['.', ')'])?;
-    if !rest.starts_with(char::is_whitespace) {
-        return None;
-    }
-    let label = rest.trim();
-    (!label.is_empty()).then(|| QuestionOption {
+    let after = &s[digits.len()..];
+    let label = match after.strip_prefix(['.', ')']) {
+        Some(rest) if rest.starts_with(char::is_whitespace) => rest.trim().to_string(),
+        Some(_) => return None,
+        None => after
+            .strip_prefix(" (○) ")
+            .or_else(|| after.strip_prefix(" (●) "))?
+            .trim_end_matches(|c: char| c == '█' || c.is_whitespace())
+            .split("  ")
+            .map(str::trim)
+            .filter(|column| !column.is_empty())
+            .collect::<Vec<_>>()
+            .join("  "),
+    };
+    (!label.is_empty()).then_some(QuestionOption {
         key: digits,
-        label: label.to_string(),
+        label,
         selected,
     })
 }
@@ -2701,6 +2713,42 @@ mod tests {
         assert_eq!(q.options.len(), 2);
         assert_eq!(q.options[1].label, "No (esc)");
         assert!(q.options[0].selected);
+    }
+
+    /// Grok 1.0.70's ask_user_question card, as muxel-terminal's
+    /// provider-state-screens fixture records it. The free-text row (`z`)
+    /// isn't a numbered option. Grok 1.0.77 draws the same rows, and pressing
+    /// `1` answers Alpha.
+    #[test]
+    fn grok_question_rows_are_numbered_options() {
+        let screen = "\
+   ♦ Waiting on answers for Which option do you want?                                               9.2s ↓13.7k [stop]
+
+  │
+  │  Which option do you want?
+  │
+  │
+  │  1 (○) Alpha (Recommended)  Choose Alpha.                                                                        █
+  │  2 (○) Beta                 Choose Beta.                                                                         █
+  │  z (○) Type your answer here
+  │
+  │  ↑/↓ navigate · y copy                                                                            Enter:submit
+  │
+
+  Tab:next answer  │  Esc:scrollback  │  Shift+x:dismiss
+";
+        let q = pending_question(screen).unwrap();
+        assert_eq!(q.text, "Which option do you want?");
+        assert_eq!(
+            q.options
+                .iter()
+                .map(|o| (o.key.as_str(), o.label.as_str(), o.selected))
+                .collect::<Vec<_>>(),
+            [
+                ("1", "Alpha (Recommended)  Choose Alpha.", false),
+                ("2", "Beta  Choose Beta.", false),
+            ]
+        );
     }
 
     #[test]
