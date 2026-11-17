@@ -633,7 +633,10 @@ feature is added or changed, update the matching entry here in the same change**
   (e.g. Claude's "esc to interrupt" spinner, a permission prompt), with built-in
   defaults per agent and **editable working/blocked markers per preset**. On a
   Claude pane, built-in and edited lists alike match outside its input box,
-  alongside Claude's own status-row and permission-form parsers. The status row
+  alongside Claude's own status-row and permission-form parsers. On a Codex pane,
+  markers added to its preset skip its editor, from the `›` prompt down to the
+  footer below it, so a draft can't match them even while the cursor is hidden;
+  without that footer, as in a menu, the whole screen is read. The status row
   reads Working on every frame of its spinner, with or without an arrow before the
   token count, so a remote Claude pane doesn't flash Done between frames.
 - **Heuristic fallback** — agents without markers fall back to bell + output
