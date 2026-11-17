@@ -139,6 +139,184 @@ fn wait_for_exit(cx: &mut TestAppContext, child: &OwnedChild) {
     }
 }
 
+/// A line editor may already hold a line when close hides the pane. The next
+/// prompt must invalidate that close even if the shell becomes idle again.
+#[test]
+fn powershell_prompt_changed_during_undo_requires_a_decision() {
+    powershell_close_evidence(ShellCloseScenario::RedrawDuringUndo);
+}
+
+#[test]
+fn powershell_child_started_during_undo_requires_a_decision() {
+    powershell_close_evidence(ShellCloseScenario::ChildDuringUndo);
+}
+
+#[test]
+fn powershell_child_started_after_quiet_read_asks_at_admission() {
+    powershell_close_evidence(ShellCloseScenario::ChildBeforeAdmission);
+}
+
+#[test]
+fn powershell_snapshot_failure_after_quiet_read_asks_at_admission() {
+    powershell_close_evidence(ShellCloseScenario::UnreadableAtAdmission);
+}
+
+#[derive(Clone, Copy)]
+enum ShellCloseScenario {
+    RedrawDuringUndo,
+    ChildDuringUndo,
+    ChildBeforeAdmission,
+    UnreadableAtAdmission,
+}
+
+fn powershell_close_evidence(scenario: ShellCloseScenario) {
+    use super::recoverable_close::CloseAdmission;
+    use ShellCloseScenario::*;
+    use muxel_core::recoverable_close::{CloseDecision, CloseEvidence, decide};
+
+    let start_child = matches!(scenario, ChildDuringUndo | ChildBeforeAdmission);
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let path = muxel_store::data_dir().unwrap().join("readline.hold");
+        std::fs::write(&path, b"").unwrap();
+        struct Release(PathBuf);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let hold = Release(path);
+        let child_hold = Release(hold.0.with_file_name("child.hold"));
+        std::fs::write(&child_hold.0, b"").unwrap();
+        let after_wait = if start_child {
+            let command = format!(
+                "while (Test-Path -LiteralPath '{}') {{ Start-Sleep -Milliseconds 20 }}",
+                child_hold.0.display().to_string().replace('\'', "''")
+            );
+            let encoded = muxel_core::winshell::encoded_command(&command);
+            format!(
+                "Start-Process -NoNewWindow -FilePath powershell.exe -ArgumentList '-NoProfile', '-EncodedCommand', '{encoded}'; [Console]::WriteLine('CHILD' + 'STARTED'); return [Console]::ReadLine()"
+            )
+        } else {
+            "return ''".to_string()
+        };
+        let script = format!(
+            r#"function global:prompt {{ $global:fixture_prompts++; "$([char]27)]133;A$([char]27)\COUNT=$global:fixture_prompts> $([char]27)]133;B$([char]27)\" }}; function global:PSConsoleHostReadLine {{ if ($global:fixture_reads++ -eq 0) {{ while (Test-Path -LiteralPath '{}') {{ Start-Sleep -Milliseconds 20 }}; {after_wait} }}; [Console]::ReadLine() }}"#,
+            hold.0.display().to_string().replace('\'', "''")
+        );
+        let (iid, view, child) = window
+            .update(cx, |app, window, cx| {
+                let mut instance = Instance::shell(pid);
+                instance.program = Some("powershell.exe".into());
+                instance.args = vec![
+                    "-NoLogo".into(),
+                    "-NoProfile".into(),
+                    "-NoExit".into(),
+                    "-EncodedCommand".into(),
+                    muxel_core::winshell::encoded_command(&script),
+                ];
+                let iid = instance.id;
+                let launch = TerminalLaunch::spawn(
+                    CommandSpec::program("powershell.exe", instance.args.clone()),
+                    (100, 24),
+                )
+                .unwrap();
+                let view = cx.new(|cx| TerminalView::new(launch, iid, Instant::now(), window, cx));
+                let child = OwnedChild::new(view.read(cx).session().clone());
+                app.workspace.add_instance(instance);
+                app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::leaf(iid));
+                app.terminals.insert(iid, view.clone());
+                (iid, view, child)
+            })
+            .unwrap();
+        let wait_prompt = |cx: &mut TestAppContext, marker: &str| {
+            let limit = Instant::now() + Duration::from_secs(20);
+            loop {
+                cx.executor().advance_clock(Duration::from_millis(10));
+                cx.run_until_parked();
+                if view.read_with(cx, |v, _| v.visible_text().contains(marker)) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < limit,
+                    "no {marker}: {}",
+                    view.read_with(cx, |v, _| v.visible_text())
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        wait_prompt(cx, "COUNT=1>");
+        if matches!(scenario, ChildBeforeAdmission | UnreadableAtAdmission) {
+            let preview = window
+                .read_with(cx, |app, cx| app.close_facts(iid, cx))
+                .unwrap();
+            assert_eq!(decide(preview, true), CloseDecision::Hold { forced: false });
+            if start_child {
+                std::fs::remove_file(&hold.0).unwrap();
+                wait_prompt(cx, "CHILDSTARTED");
+            }
+            window
+                .update(cx, |app, _, cx| {
+                    let mut reads = 0;
+                    app.admit_close_with_facts(vec![iid], CloseAdmission::Requested, cx, |app, id, cx| {
+                        reads += 1;
+                        let mut current = app.close_facts(id, cx);
+                        if matches!(scenario, UnreadableAtAdmission) {
+                            // The terminal's failed walk maps its marked prompt
+                            // to Quiet. Inject that result at the app boundary.
+                            current.evidence = CloseEvidence::Quiet;
+                        }
+                        assert_eq!(preview.input_rev, current.input_rev, "no new pane input");
+                        assert_eq!(decide(current, true), CloseDecision::Ask);
+                        current
+                    });
+                    assert!(
+                        matches!(app.confirm.as_ref().map(|p| &p.action), Some(ConfirmAction::CloseBatch(ids)) if ids == &[iid]),
+                        "fresh uncertainty was treated as a confirmed close"
+                    );
+                    assert_eq!(reads, 1, "one admission reading");
+                    assert!(!app.is_closing(iid));
+                    assert!(!child.exited());
+                })
+                .unwrap();
+            return;
+        }
+        let (gid, deadline, before) = window
+            .update(cx, |app, _, cx| {
+                app.request_recoverable_close(vec![iid], cx);
+                assert!(app.is_closing(iid), "marked idle prompt did not enter Undo");
+                let group = app.close_groups.last().unwrap();
+                assert!(!app.closing[&iid].forced);
+                (group.id, group.deadline, app.closing[&iid].facts)
+            })
+            .unwrap();
+        std::fs::remove_file(&hold.0).unwrap();
+        wait_prompt(
+            cx,
+            if start_child {
+                "CHILDSTARTED"
+            } else {
+                "COUNT=2>"
+            },
+        );
+        window
+            .update(cx, |app, _, cx| {
+                let now = app.close_facts(iid, cx);
+                assert_eq!(before.input_rev, now.input_rev, "no new pane input");
+                app.expire_closes(deadline + Duration::from_secs(1), cx);
+                assert!(app.is_closing(iid), "new shell activity finalized silently");
+                assert!(
+                    app.close_groups
+                        .iter()
+                        .any(|g| g.id == gid && g.needs_decision)
+                );
+                assert!(!child.exited(), "expiry killed the changed shell");
+            })
+            .unwrap();
+        std::fs::remove_file(&child_hold.0).unwrap();
+    });
+}
+
 #[test]
 fn idle_agent_close_holds_process_and_undo_restores_tab_order() {
     with_app(|cx, window| {

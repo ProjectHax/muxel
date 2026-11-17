@@ -7,7 +7,7 @@ use muxel_core::recoverable_close::{
     LayoutWait, UndoLaunch, decide, departure_finalizes, exit_proves_closed, expired_close_sync,
     held_launch, may_finalize, rehide_held, session_may_outlive, shell_close_evidence, undo_launch,
 };
-use muxel_terminal::TerminalStatusReason;
+use muxel_terminal::{ShellCloseCheck, TerminalStatusReason};
 use std::borrow::Cow;
 
 pub(super) const CLOSE_GRACE: Duration = Duration::from_secs(15);
@@ -123,9 +123,17 @@ enum AcceptedClose {
     Now,
     Hold {
         forced: bool,
+        facts: CloseFacts,
     },
     /// Left open: "Close only the idle ones" skipped it, or it has unsaved edits.
     Stays,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum CloseAdmission {
+    Requested,
+    Confirmed,
+    IdleOnly,
 }
 
 impl MuxelApp {
@@ -210,7 +218,12 @@ impl MuxelApp {
         session_may_outlive(inst.literal_argv, remote_unix, inst.tmux_session.is_some())
     }
 
+    #[cfg(all(test, windows))]
     pub(super) fn close_facts(&self, iid: Uuid, cx: &App) -> CloseFacts {
+        self.close_facts_in(iid, cx, &ShellCloseCheck::default())
+    }
+
+    fn close_facts_in(&self, iid: Uuid, cx: &App, shell_check: &ShellCloseCheck) -> CloseFacts {
         let inst = self.workspace.instance(iid);
         let mut state = inst
             .and_then(|inst| self.control_state(inst, cx))
@@ -220,6 +233,7 @@ impl MuxelApp {
         let attributable = view.zip(snapshot).is_some_and(|(view, snapshot)| {
             snapshot.is_attributable_to(view.session().binding_revision())
         });
+        let mut shell_marks = 0;
         let evidence = if let Some(view) = view {
             if !muxel_core::is_known_agent_program(inst.and_then(|inst| inst.program.as_deref())) {
                 let program = inst.and_then(|inst| inst.program.as_deref());
@@ -230,12 +244,9 @@ impl MuxelApp {
                             .project(inst.project_id)
                             .is_some_and(Project::is_remote)
                 });
-                shell_close_evidence(
-                    program,
-                    via_client,
-                    view.session().foreground_idle(),
-                    view.session().shell_at_prompt(),
-                )
+                let (foreground, shell) = view.session().shell_close_probe(shell_check);
+                shell_marks = shell.marks;
+                shell_close_evidence(program, via_client, foreground, shell.idle)
             } else if !attributable {
                 CloseEvidence::Settling
             } else {
@@ -275,6 +286,7 @@ impl MuxelApp {
             binding_rev: view.map_or(0, |view| view.session().binding_revision()),
             input_rev: view.map_or(0, |view| view.session().input_rev()),
             completion_rev: view.map_or(0, TerminalView::launch_completion_revision),
+            shell_marks,
         }
     }
 
@@ -361,98 +373,120 @@ impl MuxelApp {
         let Some(ids) = self.preflight_close_worktrees(ids, cx) else {
             return;
         };
-        let busy: Vec<_> = ids
+        self.admit_close_request(ids, CloseAdmission::Requested, cx);
+    }
+
+    fn ask_close_request(
+        &mut self,
+        ids: Vec<Uuid>,
+        busy: &[(Uuid, CloseFacts)],
+        cx: &mut Context<Self>,
+    ) {
+        let message = busy
             .iter()
-            .filter(|&&iid| {
-                self.workspace
-                    .instance(iid)
-                    .is_some_and(|inst| inst.kind == InstanceKind::Terminal)
-                    && decide(
-                        self.close_facts(iid, cx),
-                        self.settings.confirm_close_terminal,
-                    ) == CloseDecision::Ask
-            })
-            .copied()
-            .collect();
-        if !busy.is_empty() {
-            let message = busy
-                .iter()
-                .map(|&iid| {
-                    let inst = self.workspace.instance(iid).unwrap();
-                    let facts = self.close_facts(iid, cx);
-                    if facts.session_may_outlive
-                        && matches!(
-                            facts.status,
-                            AgentState::Exited | AgentState::NotRunning | AgentState::Failed
-                        )
-                    {
+            .map(|&(iid, facts)| {
+                let inst = self.workspace.instance(iid).unwrap();
+                if facts.session_may_outlive
+                    && matches!(
+                        facts.status,
+                        AgentState::Exited | AgentState::NotRunning | AgentState::Failed
+                    )
+                {
+                    return tf(
+                        "{name}'s tmux session may still be running.",
+                        &[("name", inst.display_name())],
+                    );
+                }
+                if let Some(work) = self.terminal_view(iid).and_then(|view| {
+                    let view = view.read(cx);
+                    let runtime = view.runtime_snapshot();
+                    view.background_work()
+                        .filter(|_| listed_work_is_why_busy(runtime.status, runtime.reason))
+                }) {
+                    return tf(
+                        "{name} is still running {work}.",
+                        &[
+                            ("name", inst.display_name()),
+                            ("work", &super::background_label(work)),
+                        ],
+                    );
+                }
+                let state = match facts.status {
+                    AgentState::Working => t("working"),
+                    AgentState::Idle | AgentState::Done => {
                         return tf(
-                            "{name}'s tmux session may still be running.",
+                            "Muxel cannot confirm that {name} is idle.",
                             &[("name", inst.display_name())],
                         );
                     }
-                    if let Some(work) = self.terminal_view(iid).and_then(|view| {
-                        let view = view.read(cx);
-                        let runtime = view.runtime_snapshot();
-                        view.background_work()
-                            .filter(|_| listed_work_is_why_busy(runtime.status, runtime.reason))
-                    }) {
-                        return tf(
-                            "{name} is still running {work}.",
-                            &[
-                                ("name", inst.display_name()),
-                                ("work", &super::background_label(work)),
-                            ],
-                        );
-                    }
-                    let state = match facts.status {
-                        AgentState::Working => t("working"),
-                        AgentState::Idle | AgentState::Done => {
-                            return tf(
-                                "Muxel cannot confirm that {name} is idle.",
-                                &[("name", inst.display_name())],
-                            );
-                        }
-                        AgentState::Blocked => t("waiting for input"),
-                        AgentState::Exited => t("exited"),
-                        AgentState::Starting => t("starting"),
-                        AgentState::NotRunning => t("not running"),
-                        AgentState::Failed => t("unable to start"),
-                    };
-                    tf(
-                        "{name} is {status}.",
-                        &[("name", inst.display_name()), ("status", state.as_ref())],
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let label = if ids.len() > 1 {
-                t("Close all")
-            } else {
-                t("Close")
-            };
-            self.request_confirm(
-                t("Close terminals?"),
-                message,
-                label,
-                ConfirmAction::CloseBatch(ids),
-                cx,
-            );
-            return;
-        }
-        self.accept_close_request(ids, false, cx);
+                    AgentState::Blocked => t("waiting for input"),
+                    AgentState::Exited => t("exited"),
+                    AgentState::Starting => t("starting"),
+                    AgentState::NotRunning => t("not running"),
+                    AgentState::Failed => t("unable to start"),
+                };
+                tf(
+                    "{name} is {status}.",
+                    &[("name", inst.display_name()), ("status", state.as_ref())],
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let label = if ids.len() > 1 {
+            t("Close all")
+        } else {
+            t("Close")
+        };
+        self.request_confirm(
+            t("Close terminals?"),
+            message,
+            label,
+            ConfirmAction::CloseBatch(ids),
+            cx,
+        );
     }
 
+    /// Only the dialog's Close and Close only idle buttons enter here.
     pub(super) fn accept_close_request(
         &mut self,
         ids: Vec<Uuid>,
         idle_only: bool,
         cx: &mut Context<Self>,
     ) {
+        let admission = if idle_only {
+            CloseAdmission::IdleOnly
+        } else {
+            CloseAdmission::Confirmed
+        };
+        self.admit_close_request(ids, admission, cx);
+    }
+
+    fn admit_close_request(
+        &mut self,
+        ids: Vec<Uuid>,
+        admission: CloseAdmission,
+        cx: &mut Context<Self>,
+    ) {
+        let shell_check = ShellCloseCheck::default();
+        self.admit_close_with_facts(ids, admission, cx, |app, iid, cx| {
+            app.close_facts_in(iid, cx, &shell_check)
+        });
+    }
+
+    pub(super) fn admit_close_with_facts(
+        &mut self,
+        ids: Vec<Uuid>,
+        admission: CloseAdmission,
+        cx: &mut Context<Self>,
+        mut read: impl FnMut(&Self, Uuid, &App) -> CloseFacts,
+    ) {
         // Decide every pane first. Closing one can finish its worktree, and a file
         // answer has to know by then whether this close takes all its panes.
+        let ask_busy =
+            admission == CloseAdmission::IdleOnly || self.settings.confirm_close_terminal;
         let mut steps = Vec::new();
-        for iid in ids {
+        let mut busy = Vec::new();
+        for &iid in &ids {
             let Some(inst) = self.workspace.instance(iid) else {
                 continue;
             };
@@ -469,26 +503,38 @@ impl MuxelApp {
                     AcceptedClose::Now
                 }
             } else {
-                let facts = self.close_facts(iid, cx);
-                match decide(facts, idle_only || self.settings.confirm_close_terminal) {
+                let facts = read(self, iid, cx);
+                match decide(facts, ask_busy) {
                     CloseDecision::Immediate => AcceptedClose::Now,
-                    CloseDecision::Hold { forced } => AcceptedClose::Hold { forced },
-                    CloseDecision::Ask if !idle_only => AcceptedClose::Hold { forced: true },
-                    CloseDecision::Ask => AcceptedClose::Stays,
+                    CloseDecision::Hold { forced } => AcceptedClose::Hold { forced, facts },
+                    CloseDecision::Ask if admission == CloseAdmission::Confirmed => {
+                        AcceptedClose::Hold {
+                            forced: true,
+                            facts,
+                        }
+                    }
+                    CloseDecision::Ask => {
+                        busy.push((iid, facts));
+                        AcceptedClose::Stays
+                    }
                 }
             };
             steps.push((iid, step));
+        }
+        if admission == CloseAdmission::Requested && !busy.is_empty() {
+            self.ask_close_request(ids, &busy, cx);
+            return;
         }
         self.settle_worktree_answers(&steps);
         let mut holds = Vec::new();
         for (iid, step) in steps {
             match step {
                 AcceptedClose::Now => self.close_instance_inner(iid, "close", cx),
-                AcceptedClose::Hold { forced } => holds.push((iid, forced)),
+                AcceptedClose::Hold { forced, facts } => holds.push((iid, forced, facts)),
                 AcceptedClose::Stays => {}
             }
         }
-        self.hold_closes(holds, None, cx);
+        self.hold_closes_with_facts(holds, None, cx);
     }
 
     /// A file answer covers a close only if that close takes every pane it counted.
@@ -545,9 +591,25 @@ impl MuxelApp {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn hold_closes(
         &mut self,
         ids: Vec<(Uuid, bool)>,
+        caller: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Option<Uuid> {
+        let shell_check = ShellCloseCheck::default();
+        let holds = ids
+            .into_iter()
+            .filter(|(iid, _)| !self.is_closing(*iid) && self.workspace.instance(*iid).is_some())
+            .map(|(iid, forced)| (iid, forced, self.close_facts_in(iid, cx, &shell_check)))
+            .collect();
+        self.hold_closes_with_facts(holds, caller, cx)
+    }
+
+    fn hold_closes_with_facts(
+        &mut self,
+        ids: Vec<(Uuid, bool, CloseFacts)>,
         caller: Option<String>,
         cx: &mut Context<Self>,
     ) -> Option<Uuid> {
@@ -568,7 +630,7 @@ impl MuxelApp {
             focus: self.active_instance,
             caller,
         };
-        for (iid, forced) in ids {
+        for (iid, forced, facts) in ids {
             if self.is_closing(iid) {
                 continue;
             }
@@ -576,7 +638,6 @@ impl MuxelApp {
                 continue;
             };
             let pid = inst.project_id;
-            let facts = self.close_facts(iid, cx);
             // An attach in flight is not a restart: Undo attaches again.
             let launch = held_launch(
                 self.terminal_restarts.contains(iid),
@@ -1037,11 +1098,14 @@ impl MuxelApp {
                 .flat_map(|g| g.members.iter())
                 .filter_map(|&iid| {
                     self.closing.get(&iid).filter(|held| !held.forced)?;
-                    if exit_proves_closed(self.close_facts(iid, cx)) {
+                    let (loc, target) = self.close_tmux_site(iid)?;
+                    let inst = self.workspace.instance(iid)?;
+                    if self.control_state(inst, cx) == Some(AgentState::Exited)
+                        && !self.close_session_may_outlive(inst)
+                    {
                         return None;
                     }
-                    self.close_tmux_site(iid)
-                        .map(|(loc, target)| (iid, loc, target))
+                    Some((iid, loc, target))
                 })
                 .collect();
             if jobs.is_empty() {
@@ -1150,6 +1214,7 @@ impl MuxelApp {
         if group.undoing {
             return;
         }
+        let shell_check = ShellCloseCheck::default();
         let ready: Vec<_> = group
             .members
             .iter()
@@ -1157,7 +1222,8 @@ impl MuxelApp {
             .filter(|&iid| {
                 self.workspace.instance(iid).is_none()
                     || self.closing.get(&iid).is_none_or(|held| {
-                        let now = self.close_facts(iid, cx);
+                        // Includes fresh shell marks and child-process evidence.
+                        let now = self.close_facts_in(iid, cx, &shell_check);
                         exit_proves_closed(now) || may_finalize(held.facts, now, held.forced)
                     })
             })
@@ -1662,6 +1728,7 @@ mod tests {
             binding_rev: 0,
             input_rev: 0,
             completion_rev: 0,
+            shell_marks: 0,
         }
     }
 

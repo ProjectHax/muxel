@@ -1,6 +1,9 @@
 //! Launch-local input cancellation and bounded OSC 133 shell evidence.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(windows)]
+use std::time::Instant;
 
 #[derive(Default)]
 pub(crate) struct InputGate(AtomicU64);
@@ -27,17 +30,45 @@ impl InputGate {
     }
 }
 
+/// A coherent prompt observation and revision for close admission and expiry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShellCloseReading {
+    pub idle: bool,
+    pub marks: u64,
+    #[cfg(windows)]
+    pub(crate) observed: Option<Instant>,
+}
+
 #[derive(Default)]
-pub(super) struct ShellPrompt(AtomicBool);
+pub(super) struct ShellPrompt(Mutex<ShellCloseReading>);
 
 impl ShellPrompt {
     pub fn at_prompt(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.lock().idle
+    }
+
+    pub fn reading(&self) -> ShellCloseReading {
+        *self.0.lock()
     }
 
     pub fn submitted(&self, bytes: &[u8]) {
         if bytes.iter().any(|&byte| matches!(byte, b'\r' | b'\n')) {
-            self.0.store(false, Ordering::Release);
+            let mut reading = self.0.lock();
+            reading.idle = false;
+            #[cfg(windows)]
+            {
+                reading.observed = Some(Instant::now());
+            }
+        }
+    }
+
+    fn mark(&self, at_prompt: bool) {
+        let mut reading = self.0.lock();
+        reading.idle = at_prompt;
+        reading.marks = reading.marks.wrapping_add(1);
+        #[cfg(windows)]
+        {
+            reading.observed = Some(Instant::now());
         }
     }
 }
@@ -95,10 +126,7 @@ impl ShellMarks {
                     } else if (!escaped && byte == 0x07) || (escaped && byte == b'\\') {
                         if len >= 5 && &prefix[..4] == b"133;" {
                             let valid = len == 5 || prefix[5] == b';';
-                            prompt.0.store(
-                                valid && matches!(prefix[4], b'A' | b'B'),
-                                Ordering::Release,
-                            );
+                            prompt.mark(valid && matches!(prefix[4], b'A' | b'B'));
                         }
                         State::Ground
                     } else if escaped {
@@ -175,6 +203,7 @@ mod tests {
                 marks.advance(&bytes[..split], &prompt);
                 marks.advance(&bytes[split..], &prompt);
                 assert!(prompt.at_prompt(), "split {split}");
+                assert_eq!(prompt.reading().marks, 1, "one complete mark per split");
                 prompt.submitted(b"command\r");
                 assert!(!prompt.at_prompt());
                 marks.advance(bytes, &prompt);

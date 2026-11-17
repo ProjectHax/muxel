@@ -38,11 +38,71 @@ use uuid::Uuid;
 #[path = "input_hold.rs"]
 mod input_hold;
 pub(crate) use input_hold::InputGate;
+pub use input_hold::ShellCloseReading;
+
+/// One close pass shares a fresh process snapshot across its shell panes.
+/// It is acquired only if a pane otherwise has idle prompt evidence. Use a
+/// new check at expiry; it must not retain the admission snapshot.
+#[derive(Default)]
+pub struct ShellCloseCheck {
+    #[cfg(windows)]
+    processes: std::cell::OnceCell<Option<crate::shell_process::Snapshot>>,
+}
 use input_hold::{ShellMarks, ShellPrompt};
+
+fn read_shell_after_foreground(
+    foreground: impl FnOnce() -> Option<bool>,
+    prompt: impl FnOnce() -> ShellCloseReading,
+) -> (Option<bool>, ShellCloseReading) {
+    // A builtin can start and emit C while still owning a childless foreground.
+    let idle = foreground();
+    (idle, prompt())
+}
+
+#[test]
+fn a_command_mark_during_the_foreground_probe_blocks_expiry() {
+    use muxel_core::control::AgentState;
+    use muxel_core::recoverable_close::{
+        CloseEvidence, CloseFacts, may_finalize, shell_close_evidence,
+    };
+
+    let prompt = ShellPrompt::default();
+    ShellMarks::default().advance(b"\x1b]133;A\x07\x1b]133;B\x07", &prompt);
+    let facts = |foreground, reading: ShellCloseReading| CloseFacts {
+        status: AgentState::Idle,
+        evidence: shell_close_evidence(Some("bash"), false, foreground, reading.idle),
+        attributable: true,
+        awaiting_reply: false,
+        another_tmux_client: false,
+        session_may_outlive: false,
+        launch_id: None,
+        binding_rev: 0,
+        input_rev: 0,
+        completion_rev: 0,
+        shell_marks: reading.marks,
+    };
+    let before = facts(Some(true), prompt.reading());
+    assert_eq!(before.evidence, CloseEvidence::ShellPrompt);
+    let (foreground, reading) = read_shell_after_foreground(
+        || {
+            ShellMarks::default().advance(b"\x1b]133;C\x07", &prompt);
+            Some(true)
+        },
+        || prompt.reading(),
+    );
+    assert!(
+        !may_finalize(before, facts(foreground, reading), false),
+        "accepted the old idle mark after the foreground probe"
+    );
+}
 
 #[cfg(all(test, unix))]
 #[path = "unix_shell_idle_tests.rs"]
 mod unix_shell_idle_tests;
+
+#[cfg(all(test, windows))]
+#[path = "windows_shell_close_tests.rs"]
+mod windows_shell_close_tests;
 
 type SharedChildKiller = Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>;
 
@@ -1279,6 +1339,10 @@ pub struct TerminalSession {
     /// Only read on Unix (`tcgetpgrp`); kept on all platforms for spawn symmetry.
     #[cfg_attr(not(unix), allow(dead_code))]
     child_pid: Option<u32>,
+    #[cfg(windows)]
+    child_started: Option<u64>,
+    #[cfg(windows)]
+    selected_git_image: Option<std::path::PathBuf>,
     /// `exec` can replace the shell without changing its pid or foreground group.
     #[cfg(unix)]
     child_identity: Option<crate::process_tree_unix::ProcessIdentity>,
@@ -1700,6 +1764,12 @@ impl TerminalSession {
         }
         let setup_started = std::time::Instant::now();
         let child_pid = child.process_id();
+        #[cfg(windows)]
+        let child_started = child_pid.and_then(crate::shell_process::started);
+        #[cfg(windows)]
+        let selected_git_image = child_pid.and_then(|pid| {
+            crate::shell_process::selected_git_image(std::path::Path::new(&program), pid)
+        });
         #[cfg(unix)]
         let child_identity =
             child_pid
@@ -1924,6 +1994,10 @@ impl TerminalSession {
             shell_prompt,
             input_stop: write_tx,
             child_pid,
+            #[cfg(windows)]
+            child_started,
+            #[cfg(windows)]
+            selected_git_image,
             #[cfg(unix)]
             child_identity,
             title,
@@ -2537,6 +2611,58 @@ impl TerminalSession {
     /// unknown, including Windows shells without shell integration.
     pub fn shell_at_prompt(&self) -> bool {
         self.shell_prompt.at_prompt()
+    }
+
+    /// Pair Windows prompt revisions with a fresh child-process snapshot.
+    /// Reread marks after the walk so a changed prompt invalidates it.
+    /// Unix keeps its existing prompt/foreground-group interpretation.
+    pub fn shell_close_reading(&self) -> ShellCloseReading {
+        self.shell_close_reading_in(&ShellCloseCheck::default())
+    }
+
+    pub fn shell_close_probe(&self, check: &ShellCloseCheck) -> (Option<bool>, ShellCloseReading) {
+        read_shell_after_foreground(
+            || self.foreground_idle(),
+            || self.shell_close_reading_in(check),
+        )
+    }
+
+    pub fn shell_close_reading_in(
+        &self,
+        #[cfg_attr(not(windows), allow(unused_variables))] check: &ShellCloseCheck,
+    ) -> ShellCloseReading {
+        #[cfg(windows)]
+        {
+            let mut reading = self.shell_prompt.reading();
+            if reading.idle {
+                let childless = self
+                    .child_pid
+                    .zip(self.child_started)
+                    .zip(reading.observed)
+                    .is_some_and(|((pid, at), observed)| {
+                        check
+                            .processes
+                            .get_or_init(crate::shell_process::Snapshot::read)
+                            .as_ref()
+                            .is_some_and(|snapshot| {
+                                snapshot.has_no_children(
+                                    pid,
+                                    at,
+                                    observed,
+                                    self.selected_git_image.as_deref(),
+                                )
+                            })
+                    });
+                if !childless || self.shell_prompt.reading() != reading {
+                    reading.idle = false;
+                }
+            }
+            reading
+        }
+        #[cfg(not(windows))]
+        {
+            self.shell_prompt.reading()
+        }
     }
 
     /// [`Self::write_input`] for input the user produced themselves — a key typed

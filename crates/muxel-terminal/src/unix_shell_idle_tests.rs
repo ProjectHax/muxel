@@ -1,6 +1,6 @@
 //! Real shell close decisions, with the test owning every command's lifetime.
 
-use super::{CommandSpec, PtyChunk, PtyReceiver, TerminalSession};
+use super::{CommandSpec, PtyChunk, PtyReceiver, ShellCloseCheck, TerminalSession};
 use muxel_core::control::AgentState;
 use muxel_core::recoverable_close::{CloseDecision, CloseFacts, decide, shell_close_evidence};
 use std::cell::RefCell;
@@ -87,15 +87,11 @@ impl Shell {
     }
 
     fn close_decision(&self) -> CloseDecision {
+        let (foreground, shell) = self.session.shell_close_probe(&ShellCloseCheck::default());
         decide(
             CloseFacts {
                 status: AgentState::Idle,
-                evidence: shell_close_evidence(
-                    None,
-                    false,
-                    self.session.foreground_idle(),
-                    self.session.shell_at_prompt(),
-                ),
+                evidence: shell_close_evidence(None, false, foreground, shell.idle),
                 attributable: true,
                 awaiting_reply: false,
                 another_tmux_client: false,
@@ -104,6 +100,7 @@ impl Shell {
                 binding_rev: 0,
                 input_rev: 0,
                 completion_rev: 0,
+                shell_marks: shell.marks,
             },
             true,
         )

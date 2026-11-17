@@ -28,6 +28,8 @@ mod program_status;
 mod replies;
 mod search;
 mod session;
+#[cfg(windows)]
+mod shell_process;
 mod startup;
 mod view;
 
@@ -42,8 +44,8 @@ pub use profile::startup_event;
 pub use program_status::ProgramStatusKind;
 pub use session::{
     CommandSpec, LaunchBinding, PTY_OUTPUT_QUEUE_BYTE_CAPACITY, PTY_OUTPUT_QUEUE_CHUNK_CAPACITY,
-    PtyChunk, PtyOutputQueueStats, PtyReceiver, TerminalSession, TitleSource,
-    literal_program_for_spawn, muse_config_supported,
+    PtyChunk, PtyOutputQueueStats, PtyReceiver, ShellCloseCheck, ShellCloseReading,
+    TerminalSession, TitleSource, literal_program_for_spawn, muse_config_supported,
 };
 pub use view::{
     AgentStatus, DisplayEpoch, LocalPaste, LocalPasteHandler, OpenLink, OpenLinkBackground,

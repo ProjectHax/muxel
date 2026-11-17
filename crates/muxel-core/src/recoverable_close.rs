@@ -60,6 +60,9 @@ pub struct CloseFacts {
     pub binding_rev: u64,
     pub input_rev: u64,
     pub completion_rev: u64,
+    /// Shell marks observed at admission. A later prompt, even idle,
+    /// must not silently finalize the earlier prompt's close.
+    pub shell_marks: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -331,6 +334,7 @@ mod recoverable_close_policy_tests {
             binding_rev: 3,
             input_rev: 7,
             completion_rev: 2,
+            shell_marks: 0,
         }
     }
 
@@ -532,6 +536,10 @@ mod recoverable_close_policy_tests {
             },
             CloseFacts {
                 completion_rev: 3,
+                ..before
+            },
+            CloseFacts {
+                shell_marks: 2,
                 ..before
             },
             CloseFacts {
