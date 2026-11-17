@@ -338,6 +338,9 @@ pub enum ErrorCode {
     HostUnavailable,
     /// The endpoint's owner process did not pass the liveness check.
     StaleEndpoint,
+    /// muxel was already serving as many `muxel ctl` connections as it takes at
+    /// once, and read nothing of this one. Try again shortly.
+    Busy,
 }
 
 /// A failed request: what to tell the user, and its [`ErrorCode`] when it has one.
@@ -2034,6 +2037,8 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
 - `self_target` - this command would type into its caller's own pane; select a
   different target or pass `--force` deliberately.
 - `host_unavailable`, `stale_endpoint` - no running muxel to ask.
+- `busy` - muxel was already serving as many ctl connections as it takes and
+  read nothing of this request; nothing was done. Try again shortly.
 - `control_disabled` - outside control was turned off before the mutation.
 - `creation_disabled` - Outside terminal creation is Off; the user must choose Ask or Allow.
 - `command_permission_required` - literal argv or a shell launch needs the shell/command grant.
@@ -2336,6 +2341,7 @@ mod tests {
             (ErrorCode::SelfTarget, "self_target"),
             (ErrorCode::HostUnavailable, "host_unavailable"),
             (ErrorCode::StaleEndpoint, "stale_endpoint"),
+            (ErrorCode::Busy, "busy"),
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), word);
             let response = Response::err(Error::new(code, "refused"));
@@ -2504,6 +2510,7 @@ mod tests {
             ErrorCode::KeysPartlyPressed,
             ErrorCode::HostUnavailable,
             ErrorCode::StaleEndpoint,
+            ErrorCode::Busy,
         ] {
             let word = serde_json::to_value(code).unwrap();
             let word = format!("`{}`", word.as_str().unwrap());

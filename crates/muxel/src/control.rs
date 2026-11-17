@@ -35,8 +35,13 @@ use uuid::Uuid;
 
 /// Largest request line read; a prompt longer than this is refused.
 const MAX_REQUEST_BYTES: u64 = 1 << 20;
-/// Connections served at once; more are dropped rather than queued.
+/// Connections served at once; more are answered `busy` rather than queued.
 const MAX_CONNECTIONS: usize = 16;
+/// How long the accept thread spends on each read or write of a connection
+/// over [`MAX_CONNECTIONS`].
+const BUSY_IO: Duration = Duration::from_millis(100);
+/// How long, at most, the accept thread reads a refused connection's request.
+const BUSY_DRAIN: Duration = Duration::from_millis(300);
 /// How long a connection waits for the app to answer.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(90);
 /// Socket read/write timeout, so a stalled peer can't hold a thread.
@@ -110,6 +115,7 @@ impl Server {
                     }
                     let Ok(stream) = stream else { continue };
                     if active.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+                        refuse_busy(stream);
                         continue;
                     }
                     active.fetch_add(1, Ordering::Relaxed);
@@ -209,6 +215,38 @@ fn serve(stream: TcpStream, token: &str, tx: &async_channel::Sender<Incoming>) {
         .unwrap_or_else(|_| r#"{"ok":false,"error":"unencodable reply"}"#.to_string());
     line.push('\n');
     let _ = (&stream).write_all(line.as_bytes());
+}
+
+/// Answer a connection over [`MAX_CONNECTIONS`] `busy` without reading its
+/// request, so its caller knows nothing was done. The request is then read and
+/// dropped, briefly: closing a socket with input unread resets the connection,
+/// and a TCP stack may discard an answer its caller hasn't read yet when the
+/// reset arrives.
+fn refuse_busy(stream: TcpStream) {
+    let _ = stream.set_write_timeout(Some(BUSY_IO));
+    let _ = stream.set_read_timeout(Some(BUSY_IO));
+    let busy = control::Error::new(
+        ErrorCode::Busy,
+        format!(
+            "muxel is already serving {MAX_CONNECTIONS} ctl connections and read nothing of \
+             this one, so nothing was done: try again shortly"
+        ),
+    );
+    let mut line = serde_json::to_string(&Response::err(busy))
+        .expect("control errors have a JSON representation");
+    line.push('\n');
+    if (&stream).write_all(line.as_bytes()).is_err() {
+        return;
+    }
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let deadline = Instant::now() + BUSY_DRAIN;
+    let mut sink = [0u8; 4096];
+    while Instant::now() < deadline {
+        // Done when the caller hangs up, or sends nothing for a while.
+        if !matches!((&stream).read(&mut sink), Ok(read) if read > 0) {
+            break;
+        }
+    }
 }
 
 fn read_request(stream: &TcpStream) -> Result<Request, String> {
@@ -503,8 +541,11 @@ pub(crate) fn failure_body(error: control::Error, task: Task) -> Value {
     let refused = error.pasted != Some(true)
         && match (task, error.code) {
             (_, None) => false,
-            // A lost poll says nothing of the creation it was asking after.
-            (Task::Admitted, Some(ErrorCode::HostUnavailable | ErrorCode::StaleEndpoint)) => false,
+            // A lost or refused poll says nothing of the creation it was asking after.
+            (
+                Task::Admitted,
+                Some(ErrorCode::HostUnavailable | ErrorCode::StaleEndpoint | ErrorCode::Busy),
+            ) => false,
             (_, Some(_)) => true,
         };
     let mut reply = serde_json::to_value(control::Response::err(error))
@@ -739,7 +780,7 @@ fn wait_creation_with(
             Err(error)
                 if matches!(
                     error.code,
-                    Some(ErrorCode::HostUnavailable | ErrorCode::StaleEndpoint)
+                    Some(ErrorCode::HostUnavailable | ErrorCode::StaleEndpoint | ErrorCode::Busy)
                 ) =>
             {
                 if retries < 3 {
@@ -914,15 +955,15 @@ fn wait(agent: &str, timeout: Duration, full: bool, turn: bool) -> Result<Value,
 #[cfg(test)]
 mod tests {
     use super::{
-        DELIVERY_WAIT, Server, Task, choose_endpoint, create, dispatch, failure_body,
-        process_alive, read_endpoint, request_at, same_secret, task_of, wait_creation_with,
-        wait_prompt_delivery_with, write_endpoint,
+        DELIVERY_WAIT, MAX_CONNECTIONS, Server, Task, choose_endpoint, create, dispatch,
+        failure_body, process_alive, read_endpoint, request_at, same_secret, task_of,
+        wait_creation_with, wait_prompt_delivery_with, write_endpoint,
     };
     use muxel_core::control::{
         self, CliCommand, Command, Endpoint, ErrorCode, PROTOCOL_VERSION, Response,
     };
     use std::io::{BufRead as _, BufReader, Write as _};
-    use std::net::{Ipv4Addr, TcpListener};
+    use std::net::{Ipv4Addr, TcpListener, TcpStream};
     use std::path::PathBuf;
 
     /// `muxel ctl new ARGS`, run against a muxel that answers each request
@@ -995,6 +1036,10 @@ mod tests {
         assert_eq!(lost["code"], "host_unavailable");
         let denied = creation(control::Error::new(ErrorCode::ApprovalDenied, "denied"));
         assert_eq!(denied["outcome"], "not_delivered", "{denied}");
+        // A busy muxel refused the poll, not the creation.
+        let busy = creation(control::Error::new(ErrorCode::Busy, "busy"));
+        assert_eq!(busy["outcome"], "unconfirmed", "{busy}");
+        assert_eq!(busy["code"], "busy");
     }
 
     #[test]
@@ -1188,6 +1233,45 @@ mod tests {
         assert!(!file(one).exists());
         assert!(!data.join(control::ENDPOINT_FILE).exists());
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// A connection past the limit is told so with a code, not cut off: a cut
+    /// connection reads as a muxel that isn't running, and a task sent on it as
+    /// one that may have gone in.
+    #[test]
+    fn a_connection_over_the_limit_is_refused_busy_before_its_request_is_read() {
+        let dir = scratch("over-the-limit");
+        let (tx, rx) = async_channel::unbounded();
+        let server = Server::start_in(&dir, tx).unwrap();
+        // Connections that send nothing hold their places until they time out.
+        let held: Vec<TcpStream> = (0..MAX_CONNECTIONS)
+            .map(|_| TcpStream::connect((Ipv4Addr::LOCALHOST, server.port)).unwrap())
+            .collect();
+        let refused = request_at(
+            &dir.join(control::ENDPOINT_FILE),
+            Command::Send {
+                agent: "claude".into(),
+                text: "hi".into(),
+                force: false,
+                launch_id: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            serde_json::to_value(refused.code).unwrap(),
+            "busy",
+            "{refused:?}"
+        );
+        assert!(refused.message.contains("try again"), "{refused:?}");
+        let reply = failure_body(refused, Task::Unsent);
+        assert_eq!(reply["outcome"], "not_delivered", "{reply}");
+        assert!(
+            rx.try_recv().is_err(),
+            "the refused request reached the app"
+        );
+        drop(held);
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
