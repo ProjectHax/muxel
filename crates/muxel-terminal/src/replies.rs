@@ -31,6 +31,26 @@ const SECONDARY_DA: &str = "\x1b[>0;2501;1c";
 /// `CSI 5 n` operating status: OK.
 const STATUS_OK: &str = "\x1b[0n";
 
+/// Who reads the replies on the far side of the PTY, which decides whether
+/// device attributes get answered at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplyPeer {
+    /// Any program run directly: device attributes are answered, since a
+    /// probe ("query X, then primary DA") waits for that answer.
+    Program,
+    /// A tmux client, local or over SSH. tmux asks for both device
+    /// attributes on every attach and treats any that arrive after its 5s
+    /// timer as typing for the pane, so a reply delayed by a busy or sleeping
+    /// machine fills an agent's prompt with `6c0;2501;1`. The delay can be
+    /// anywhere between tmux and the attaching muxel, even on a peer machine
+    /// that dozes off mid-attach, so no reply is fast enough to be safe. And
+    /// tmux learns nothing from muxel's VT102 `?6c` and alacritty `>0;…c`
+    /// replies: it only acts on VT levels 61–65 and on mintty, tmux and rxvt
+    /// identifiers. Left unanswered, tmux applies the same defaults when its
+    /// timer fires.
+    TmuxClient,
+}
+
 /// The size, `(cols, rows)`, the PTY and the emulator grid have been resized
 /// to; the two always change together. It lets the reader answer the
 /// text-area size query (`CSI 18 t`) without the grid. tmux's client sends that
@@ -165,6 +185,7 @@ impl ImmediateReplies {
         replies: Arc<Replies>,
         palette: Arc<Mutex<TerminalPalette>>,
         grid_size: Arc<GridSize>,
+        peer: ReplyPeer,
         config: &TermConfig,
     ) -> Self {
         Self {
@@ -174,6 +195,7 @@ impl ImmediateReplies {
                 replies,
                 palette,
                 grid_size,
+                device_attributes: peer == ReplyPeer::Program,
                 kitty_keyboard: config.kitty_keyboard,
                 clipboard_reads: matches!(config.osc52, Osc52::OnlyPaste | Osc52::CopyPaste),
             },
@@ -229,12 +251,19 @@ struct ReplyHandler {
     replies: Arc<Replies>,
     palette: Arc<Mutex<TerminalPalette>>,
     grid_size: Arc<GridSize>,
+    /// False for a tmux client; see [`ReplyPeer::TmuxClient`].
+    device_attributes: bool,
     kitty_keyboard: bool,
     clipboard_reads: bool,
 }
 
 impl Handler for ReplyHandler {
+    /// alacritty's own answer is always dropped (see [`answered_by_reader`]),
+    /// so skipping it here leaves the query unanswered.
     fn identify_terminal(&mut self, intermediate: Option<char>) {
+        if !self.device_attributes {
+            return;
+        }
         match intermediate {
             None => self.replies.send(PRIMARY_DA.to_string()),
             Some('>') => self.replies.send(SECONDARY_DA.to_string()),
@@ -303,7 +332,7 @@ impl Handler for ReplyHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{GridSize, ImmediateReplies, Replies, SECONDARY_DA};
+    use super::{GridSize, ImmediateReplies, Replies, ReplyPeer, SECONDARY_DA};
     use crate::colors::{TerminalPalette, index_to_rgb};
     use crate::listener::MuxelListener;
     use crate::program_status::CAPABILITY_REPLY;
@@ -354,6 +383,10 @@ mod tests {
 
     impl Pipeline {
         fn new() -> Self {
+            Self::for_peer(ReplyPeer::Program)
+        }
+
+        fn for_peer(peer: ReplyPeer) -> Self {
             let sent = Sent::default();
             let replies = Arc::new(Replies::new(Arc::new(Mutex::new(Box::new(sent.clone())))));
             let listener = MuxelListener {
@@ -370,6 +403,7 @@ mod tests {
                 replies,
                 Arc::new(Mutex::new(palette())),
                 Arc::new(GridSize::new(80, 24)),
+                peer,
                 &term_config(),
             );
             let term = Term::new(term_config(), &TermSize::new(80, 24), listener);
@@ -487,6 +521,25 @@ mod tests {
         assert_eq!(pipeline.drain(attach), "\x1b[?2026;2$y");
     }
 
+    /// A late device-attributes reply is typed into the pane by tmux, and
+    /// muxel's tell tmux nothing, so a tmux client gets none. Its other
+    /// attach queries are still answered.
+    #[test]
+    fn a_tmux_client_gets_no_device_attributes() {
+        let mut pipeline = Pipeline::for_peer(ReplyPeer::TmuxClient);
+        // tmux 3.4's attach requests, as it writes them.
+        let attach = b"\x1b[c\x1b[>c\x1b[>q\x1b]10;?\x1b\\\x1b]11;?\x1b\\";
+        assert_eq!(
+            pipeline.read(attach),
+            "\x1b]10;rgb:cdcd/d6d6/f4f4\x1b\\\x1b]11;rgb:1111/2222/3333\x1b\\"
+        );
+        assert_eq!(pipeline.drain(attach), "");
+        // tmux 3.6 adds a size query ahead of them, and a mode report after.
+        let attach = b"\x1b[18t\x1b[c\x1b[>c\x1b[>q\x1b[?2026$p";
+        assert_eq!(pipeline.read(attach), "\x1b[8;24;80t");
+        assert_eq!(pipeline.drain(attach), "\x1b[?2026;2$y");
+    }
+
     #[test]
     fn size_report_follows_resizes() {
         let sent = Sent::default();
@@ -496,6 +549,7 @@ mod tests {
             replies,
             Arc::new(Mutex::new(palette())),
             size.clone(),
+            ReplyPeer::Program,
             &term_config(),
         );
         size.set(198, 51);

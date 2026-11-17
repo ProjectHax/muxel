@@ -14,7 +14,7 @@ use crate::profile;
 use crate::program_status::{
     Event as ProgramStatusEvent, Observer, ProgramStatusSnapshot, ThreadKey,
 };
-use crate::replies::{GridSize, ImmediateReplies, Replies};
+use crate::replies::{GridSize, ImmediateReplies, Replies, ReplyPeer};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{
@@ -1812,6 +1812,11 @@ impl TerminalSession {
             replies.clone(),
             palette.clone(),
             grid_size.clone(),
+            if spec.tmux_input.is_some() {
+                ReplyPeer::TmuxClient
+            } else {
+                ReplyPeer::Program
+            },
             &term_config,
         );
         let output_queue = tx.queue_state();

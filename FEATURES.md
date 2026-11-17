@@ -1446,10 +1446,13 @@ feature is added or changed, update the matching entry here in the same change**
   size (`CSI 18 t`), color and OSC-52 read queries are answered directly on the
   PTY reader thread, while the asker is still waiting, even when the UI is busy
   or backgrounded. A late reply is read as typing (tmux forwards one into the
-  pane, so a remote agent's prompt fills with `6c0;2501;1c`; tmux 3.6+ asks for
-  the size on every resize, just before its device-attributes queries). Replies
-  keep query order: anything asked after a cursor-position or mode report waits
-  for that report to go first.
+  pane, so an agent's prompt fills with `6c0;2501;1c`; tmux 3.6+ asks for
+  the size on every resize, just before its device-attributes queries). tmux
+  panes, local or over SSH, get no device-attributes reply at all: tmux learns
+  nothing from muxel's, and a reply delayed by a busy or sleeping machine (a
+  peer reattaching as it wakes) can't miss tmux's window if none is sent.
+  Replies keep query order: anything asked after a cursor-position or mode
+  report waits for that report to go first.
 - **Exit codes** — a pane's child exit status is captured, so close-on-exit and
   session-resume recovery can tell a clean `exit` from a crash (a deliberate quit
   no longer triggers resume recovery). On Windows, process exit is observed
