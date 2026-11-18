@@ -15,7 +15,7 @@ use muxel_core::{
     ACCOMPLISHMENTS_FILE, MEMORY_DIR, MEMORY_FILE, REMINDERS_FILE, RemoteHost, RemoteOs, SshAuth,
     accomplishments_header, memory_header, reminders_header, remote_ops, ssh,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -1085,6 +1085,23 @@ pub fn ssh_verify(host: &RemoteHost, password: Option<&str>) -> Result<()> {
         bail!("{msg}");
     }
     Ok(())
+}
+
+/// How long the remote agent lookup may take, the user's login shell included,
+/// before it is abandoned (and then nothing is hidden).
+const REMOTE_PROGRAMS_BUDGET: Duration = Duration::from_secs(20);
+
+/// Which of `programs` the connection's host can launch (see
+/// [`remote_ops::find_programs`]), or `None` when the lookup failed or ran out
+/// of time, which says nothing about what is installed.
+pub fn remote_installed_programs(
+    conn: &RemoteConn,
+    programs: &[String],
+) -> Option<HashSet<String>> {
+    let cmd = remote_ssh_command(conn, remote_ops::find_programs(conn.host.os, programs));
+    let out = run_tmux_output_until(cmd, Instant::now() + REMOTE_PROGRAMS_BUDGET).ok()?;
+    let found = remote_ops::parse_found_programs(&String::from_utf8_lossy(&out.stdout))?;
+    Some(found.into_iter().collect())
 }
 
 /// Check that `dir` exists (and is a directory) on the remote host.
@@ -6410,6 +6427,62 @@ mod tests {
             b"ssh: connect to host h port 22: Connection refused\n"
         ));
         assert!(!is_sshpass_pty_failure(Some(5), b""));
+    }
+
+    /// The host's agent lookup, run here as the far side would run it: through
+    /// `sh`, with a login shell that prints a banner and adds the bin dir an
+    /// agent was installed into, as a user's rc files do.
+    #[cfg(unix)]
+    #[test]
+    fn remote_program_lookup_finds_agents_on_the_login_shell_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("muxel-remote-programs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let exe = |path: &Path, body: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        // `pi` is only on the login shell's PATH (an npm or nvm prefix), `amp`
+        // sits in `~/.local/bin`, and `codex` isn't installed at all. Prefixed,
+        // so a real agent in a fallback dir like /usr/local/bin can't answer.
+        exe(&root.join("npm/bin/muxel-test-pi"), "#!/bin/sh\n");
+        exe(&root.join("home/.local/bin/muxel-test-amp"), "#!/bin/sh\n");
+        exe(
+            &root.join("login-shell"),
+            &format!(
+                "#!/bin/sh\necho 'Welcome to the host'\nPATH={}:$PATH\nshift\nexec /bin/sh -c \"$1\"\n",
+                root.join("npm/bin").display()
+            ),
+        );
+        let programs = ["muxel-test-amp", "muxel-test-codex", "muxel-test-pi"].map(String::from);
+        let found = |shell: &Path| {
+            let out = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(remote_ops::find_programs(RemoteOs::Unix, &programs))
+                .env("SHELL", shell)
+                .env("HOME", root.join("home"))
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .unwrap();
+            remote_ops::parse_found_programs(&String::from_utf8_lossy(&out.stdout))
+        };
+
+        assert_eq!(
+            found(&root.join("login-shell")),
+            Some(vec![
+                "muxel-test-amp".to_string(),
+                "muxel-test-pi".to_string()
+            ])
+        );
+        // A login shell that can't be run leaves sshd's PATH and the usual user
+        // prefixes: `pi` is out of reach then, but the lookup still answers.
+        assert_eq!(
+            found(&root.join("no-such-shell")),
+            Some(vec!["muxel-test-amp".to_string()])
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A stand-in for sshpass that fails to get its pty on the first two runs.

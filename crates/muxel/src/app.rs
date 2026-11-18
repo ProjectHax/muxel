@@ -6357,6 +6357,11 @@ pub struct MuxelApp {
     /// Agent programs whose binary is currently installed (rescanned when a `PATH`
     /// directory changes). New-agent menus hide presets whose program isn't here.
     available_programs: HashSet<String>,
+    /// The same for each remote host, by host id: every program asked about,
+    /// and whether the host can launch it. Looked up again each time the host
+    /// connects (see [`Self::probe_remote_programs`]); a host or program not
+    /// asked about yet hides nothing.
+    remote_programs: HashMap<Uuid, HashMap<String, bool>>,
     /// Cached git status so the sidebar doesn't shell out per render: each
     /// project's current branch, and each worktree's change count. Refreshed by
     /// `refresh_status` as `status_polls` finds them due.
@@ -8957,6 +8962,7 @@ impl MuxelApp {
             presets,
             current_preset,
             available_programs,
+            remote_programs: HashMap::new(),
             project_branches: HashMap::new(),
             project_branch_lists: HashMap::new(),
             status_refresh_in_flight: false,
@@ -11510,6 +11516,7 @@ impl MuxelApp {
                                 tf("Connected to “{name}”", &[("name", &name.to_string())]),
                                 String::new(),
                             );
+                            this.probe_remote_programs(pid, cx);
                         }
                         if first_sync {
                             this.apply_remote_layout_sync(pid, fetched, has_memory, window, cx);
@@ -22433,7 +22440,7 @@ impl MuxelApp {
             .flex()
             .flex_col()
             .child(ui_profile::region(ui_profile::Region::Toolbar, || {
-                self.render_toolbar(cx)
+                self.render_toolbar(Some(pid), cx)
             }))
             .child(div().flex_1().min_h_0().child(main_content))
             .child(pane_grid::layout_done(self.pane_grids.clone(), pid));
@@ -29686,7 +29693,8 @@ impl MuxelApp {
         )
     }
 
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The toolbar of the window showing project `pid` (`None` = none open).
+    fn render_toolbar(&self, pid: Option<Uuid>, cx: &mut Context<Self>) -> impl IntoElement {
         let mut bar = div()
             .flex_none()
             .h(rems(2.5))
@@ -29712,7 +29720,7 @@ impl MuxelApp {
         let preset_items: Vec<(Uuid, String, bool, SharedString)> = self
             .presets
             .iter()
-            .filter(|p| self.agent_runnable(p))
+            .filter(|p| self.agent_runnable_in(pid, p))
             .map(|p| {
                 (
                     p.id,
@@ -31930,18 +31938,89 @@ impl MuxelApp {
         }
     }
 
+    /// [`Self::agent_runnable`] for a new pane in project `pid`. A remote
+    /// project's agent runs on its host, so it's the host's programs that count,
+    /// not this machine's. A host not yet asked offers every preset rather than
+    /// hiding one it may well have.
+    fn agent_runnable_in(&self, pid: Option<Uuid>, preset: &AgentPreset) -> bool {
+        let remote = pid
+            .and_then(|pid| self.workspace.project(pid))
+            .and_then(|project| project.remote.as_ref());
+        match (remote, &preset.program) {
+            (_, None) => true,
+            (Some(remote), Some(prog)) => self
+                .remote_programs
+                .get(&remote.host_id)
+                .and_then(|found| found.get(prog))
+                .copied()
+                .unwrap_or(true),
+            (None, Some(_)) => self.agent_runnable(preset),
+        }
+    }
+
+    /// Ask project `pid`'s host which preset programs it can launch, for the
+    /// new-agent menus (see [`Self::agent_runnable_in`]). Runs on each connect,
+    /// so an agent installed on the host since shows up after a reconnect. A
+    /// failed lookup keeps what was known before.
+    fn probe_remote_programs(&mut self, pid: Uuid, cx: &mut Context<Self>) {
+        let Some(integrations::RepoLoc::Remote(conn)) = self.repo_loc(pid) else {
+            return;
+        };
+        let host_id = conn.host.id;
+        let mut programs: Vec<String> = self
+            .presets
+            .iter()
+            .filter_map(|p| p.program.clone())
+            .collect();
+        programs.sort();
+        programs.dedup();
+        if programs.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let (programs, found) = cx
+                .background_executor()
+                .spawn(async move {
+                    let found = integrations::remote_installed_programs(&conn, &programs);
+                    (programs, found)
+                })
+                .await;
+            let Some(found) = found else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                let answers = programs
+                    .into_iter()
+                    .map(|p| {
+                        let installed = found.contains(&p);
+                        (p, installed)
+                    })
+                    .collect();
+                this.remote_programs.insert(host_id, answers);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn render_place_menu(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some((_, placement, pos)) = self.place_menu else {
+        let Some((iid, placement, pos)) = self.place_menu else {
             return div().into_any_element();
         };
         let heading = match placement {
             PlacementMode::Tab => t("New tab agent"),
             PlacementMode::Split(_) => t("New pane agent"),
         };
+        let pid = self
+            .workspace
+            .instance(iid)
+            .map(|i| i.project_id)
+            .or(self.workspace.active_project);
         let mut list = v_flex().gap_px().w_full();
         for (idx, preset) in self.presets.iter().enumerate() {
-            // Hide agents whose binary isn't installed (shell has no program).
-            if !self.agent_runnable(preset) {
+            // Hide agents whose binary isn't installed where the pane would run
+            // (shell has no program).
+            if !self.agent_runnable_in(pid, preset) {
                 continue;
             }
             let name = preset.name.clone();
@@ -33898,7 +33977,7 @@ impl Render for MuxelApp {
             .flex()
             .flex_col()
             .child(ui_profile::region(ui_profile::Region::Toolbar, || {
-                self.render_toolbar(cx)
+                self.render_toolbar(self.workspace.active_project, cx)
             }))
             .child(div().flex_1().min_h_0().child(main_content))
             .children(

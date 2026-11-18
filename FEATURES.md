@@ -279,7 +279,10 @@ feature is added or changed, update the matching entry here in the same change**
   environment otherwise omits — on macOS a Dock/Finder launch restores Homebrew and
   `~/.local/bin`; on Linux a desktop-entry / AppImage launch restores `~/.local/bin`,
   `~/.opencode/bin` (opencode's installer default), Linuxbrew, and friends — so
-  agents are detected and spawnable the same as from a terminal.
+  agents are detected and spawnable the same as from a terminal. A remote
+  project's menus list the agents installed on its host instead, looked up on
+  the login-shell `PATH` its panes launch with each time muxel connects to it;
+  until the host has answered, every agent is offered.
 - **Graceful launch failure** — if an agent can't be spawned, the pane falls back
   to a shell showing the underlying error instead of crashing. If even the
   fallback shell can't start, the pane shows the failure in place (the toolbar

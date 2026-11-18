@@ -476,12 +476,77 @@ pub fn paste_file_name(unique: &str, original: &str) -> String {
     }
 }
 
+/// Which of `programs` the host can launch: a `MUXEL_PROG\t<program>` line for
+/// each one found, then `MUXEL_DONE` (see [`parse_found_programs`]).
+///
+/// On Unix the lookup uses the `PATH` a pane's agent actually gets. A remote
+/// program launches through the user's login+interactive shell
+/// (`ssh::login_shell_command`), so an agent in `~/.local/bin` or an nvm or
+/// npm-global prefix runs fine where sshd's bare `PATH` never sees it. That
+/// shell's `PATH` is read once, from a marked line, so anything its rc files
+/// print is ignored. When it can't be read (no `-ilc`, a failing rc, a hang cut
+/// off by `timeout`), sshd's `PATH` stands in. Either way the usual user prefixes
+/// are appended. The whole script runs under `sh -c`, since the shell running
+/// the ssh command may not be POSIX (fish).
+pub fn find_programs(os: RemoteOs, programs: &[String]) -> String {
+    match os {
+        RemoteOs::Unix => {
+            let read_path = sh_quote(r#"printf '\nMUXEL_PATH=%s\n' "$PATH""#);
+            let list = programs
+                .iter()
+                .map(|p| sh_quote(p))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let script = format!(
+                "t=; command -v timeout >/dev/null 2>&1 && t='timeout 10'; \
+                 lp=$($t \"${{SHELL:-/bin/sh}}\" -ilc {read_path} </dev/null 2>/dev/null \
+                 | sed -n 's/^MUXEL_PATH=//p' | tail -n 1); \
+                 [ -n \"$lp\" ] && PATH=\"$lp\"; {prelude}; \
+                 for p in {list}; do \
+                 command -v \"$p\" >/dev/null 2>&1 && printf 'MUXEL_PROG\\t%s\\n' \"$p\"; \
+                 done; echo MUXEL_DONE",
+                prelude = crate::ssh::tmux_path_prelude(),
+            );
+            format!("sh -c {}", sh_quote(&script))
+        }
+        RemoteOs::Windows => {
+            let list = programs
+                .iter()
+                .map(|p| ps_quote(p))
+                .collect::<Vec<_>>()
+                .join(",");
+            ps(&format!(
+                "foreach ($p in @({list})) {{ \
+                 if (Get-Command -Name $p -ErrorAction SilentlyContinue) \
+                 {{ Write-Output (\"MUXEL_PROG`t\" + $p) }} }}; \
+                 Write-Output 'MUXEL_DONE'"
+            ))
+        }
+    }
+}
+
+/// Parse [`find_programs`]' output: the programs found, or `None` when the
+/// listing never finished (the command died or was cut off), which says nothing
+/// about what is installed.
+pub fn parse_found_programs(out: &str) -> Option<Vec<String>> {
+    let mut found = Vec::new();
+    let mut done = false;
+    for line in out.lines().map(|l| l.trim_end_matches('\r')) {
+        if line == "MUXEL_DONE" {
+            done = true;
+        } else if let Some(program) = line.strip_prefix("MUXEL_PROG\t") {
+            found.push(program.to_string());
+        }
+    }
+    done.then_some(found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        BRANCHES_FAILED, branches, ensure_seeded_file, git, git_read_only, list_files,
-        paste_file_name, push_prep, read_file, scan_projects, test_dir, test_file, upload_paste,
-        write_file,
+        BRANCHES_FAILED, branches, ensure_seeded_file, find_programs, git, git_read_only,
+        list_files, parse_found_programs, paste_file_name, push_prep, read_file, scan_projects,
+        test_dir, test_file, upload_paste, write_file,
     };
     use crate::RemoteOs;
     use base64::Engine as _;
@@ -519,6 +584,43 @@ mod tests {
 
     const WIN: RemoteOs = RemoteOs::Windows;
     const UNIX: RemoteOs = RemoteOs::Unix;
+
+    #[test]
+    fn found_programs_need_the_closing_line() {
+        assert_eq!(
+            parse_found_programs("MUXEL_PROG\tpi\r\nMUXEL_PROG\tamp\nMUXEL_DONE\n"),
+            Some(vec!["pi".to_string(), "amp".to_string()])
+        );
+        // Finished, and nothing found: an honest empty answer.
+        assert_eq!(parse_found_programs("MUXEL_DONE\n"), Some(Vec::new()));
+        // Cut off before the end: no answer at all, not "nothing installed".
+        assert_eq!(parse_found_programs("MUXEL_PROG\tpi\n"), None);
+        assert_eq!(parse_found_programs(""), None);
+        // Stray output around the markers is ignored.
+        assert_eq!(
+            parse_found_programs("motd\nMUXEL_PROG\tpi\nPROG\tnope\nMUXEL_DONE\n"),
+            Some(vec!["pi".to_string()])
+        );
+    }
+
+    #[test]
+    fn program_lookup_uses_the_login_shell_path() {
+        let programs = ["pi".to_string(), "my agent".to_string()];
+        let cmd = find_programs(UNIX, &programs);
+        // POSIX sh on the far side, whatever the login shell is.
+        assert!(cmd.starts_with("sh -c '"), "{cmd}");
+        assert!(cmd.contains("-ilc"), "reads the login shell's PATH: {cmd}");
+        assert!(
+            cmd.contains("$HOME/.local/bin"),
+            "falls back on user prefixes"
+        );
+        assert!(cmd.ends_with("echo MUXEL_DONE'"), "{cmd}");
+
+        let script = script_of(&find_programs(WIN, &programs));
+        assert_opaque(&find_programs(WIN, &programs));
+        assert!(script.contains("@('pi','my agent')"), "{script}");
+        assert!(script.contains("Write-Output 'MUXEL_DONE'"), "{script}");
+    }
 
     #[test]
     fn unix_forms_are_unchanged() {
