@@ -113,6 +113,7 @@ mod settings_kit;
 mod settings_lists;
 mod settings_pages;
 mod settings_shell;
+mod skills_ui;
 mod sound_alerts;
 mod strip_button;
 #[cfg(test)]
@@ -2619,7 +2620,7 @@ mod page_icon_tests {
 /// Whether `program` resolves to an executable: a path is checked directly,
 /// otherwise each `PATH` entry is searched (so the agent picker can hide agents
 /// whose binary isn't installed).
-fn program_on_path(program: &str) -> bool {
+pub(crate) fn program_on_path(program: &str) -> bool {
     fn is_exec(p: &std::path::Path) -> bool {
         #[cfg(unix)]
         {
@@ -6395,6 +6396,8 @@ pub struct MuxelApp {
     /// Team library state, kept out of `settings` so Cancel in Settings never
     /// restores it; written back on every save.
     library_hub: muxel_core::library::hub::LibraryHub,
+    /// Settings → Skills: what it shows and is doing.
+    skills_page: skills_ui::SkillsPage,
     /// The open library dialog (an overlay listed in `any_overlay_open`).
     library_dialog: Option<libraries_ui::LibraryDialog>,
     git_env: Arc<integrations::GitEnv>,
@@ -7505,6 +7508,9 @@ enum ConfirmAction {
     /// Re-sync a team library from its repository, discarding local changes
     /// of its clone.
     ResyncLibrary(Uuid),
+    /// Remove a skill (by folder name) from every agent on the Skills page's
+    /// machine and scope.
+    RemoveSkill(String),
 }
 
 impl ConfirmAction {
@@ -8967,6 +8973,7 @@ impl MuxelApp {
             tmux_available,
             tmux_install,
             library_hub,
+            skills_page: Default::default(),
             library_dialog: None,
             git_env: Arc::new(integrations::GitEnv::production()),
             remote_connect_failed: HashMap::new(),
@@ -23039,6 +23046,7 @@ impl MuxelApp {
                 self.trust_host_key(entry, file, retry, window, cx)
             }
             ConfirmAction::ResyncLibrary(id) => self.confirm_library_resync(id, cx),
+            ConfirmAction::RemoveSkill(key) => self.skills_remove(key, cx),
         }
         cx.notify();
     }

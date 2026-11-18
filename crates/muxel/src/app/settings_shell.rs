@@ -73,6 +73,9 @@ impl MuxelApp {
     /// Show `section`, from the top, leaving any search or key recording.
     pub(super) fn set_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         self.settings_ui.section = section;
+        if section == SettingsSection::Skills {
+            self.skills_page_opened(cx);
+        }
         self.stop_key_recording(cx);
         self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
         cx.notify();
@@ -100,6 +103,7 @@ impl MuxelApp {
             SettingsSection::Snippets => self.snippets.len(),
             SettingsSection::Loops => self.loops.len(),
             SettingsSection::Libraries => self.library_hub.configs.len(),
+            SettingsSection::Skills => self.skills_count()?,
             SettingsSection::Remotes => self.remotes.len(),
             SettingsSection::Identities => self.identities.len(),
             SettingsSection::Projects => self.workspace.projects.len(),
@@ -1152,6 +1156,7 @@ impl MuxelApp {
             SettingsSection::Snippets => self.render_settings_snippets(form, cx),
             SettingsSection::Loops => self.render_settings_loops(form, cx),
             SettingsSection::Libraries => self.render_settings_libraries(form, cx),
+            SettingsSection::Skills => self.render_settings_skills(form, cx),
             SettingsSection::Remotes => self.render_settings_remotes(form, cx),
             SettingsSection::Identities => self.render_settings_identities(form, cx),
             SettingsSection::Keybindings => self.render_settings_keybindings(form, cx),

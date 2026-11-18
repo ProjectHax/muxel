@@ -122,6 +122,8 @@ pub enum SettingsSection {
     Speech,
     ReadAloud,
     Agents,
+    /// Agent Skills for every installed agent.
+    Skills,
     /// Outside control: letting another agent (Grok Bot, a script, …) drive muxel
     /// through `muxel ctl`.
     OutsideControl,
@@ -199,6 +201,10 @@ pub struct SettingsUi {
     pub lib_rename: Entity<InputState>,
     /// Inline message of the last refused or rolled-back add.
     pub lib_add_error: Option<String>,
+
+    // Skills; the rest of the page lives in `MuxelApp::skills_page`.
+    /// Where to install skills from (`owner/repo`, a URL, …).
+    pub skill_source: Entity<InputState>,
 
     // Outside control tab.
     /// Inline result of the last "Test" (running `muxel ctl` as the agent would).
@@ -330,7 +336,15 @@ impl SettingsSection {
             (t("Alerts and voice"), &[Sounds, Speech, ReadAloud]),
             (
                 t("Agents and automation"),
-                &[Agents, Runners, Snippets, Loops, Libraries, OutsideControl],
+                &[
+                    Agents,
+                    Skills,
+                    Runners,
+                    Snippets,
+                    Loops,
+                    Libraries,
+                    OutsideControl,
+                ],
             ),
             (t("Remote"), &[Remotes, Identities]),
             (t("Workspace"), &[Projects]),
@@ -354,6 +368,7 @@ impl SettingsSection {
             Self::Speech => t("Dictation"),
             Self::ReadAloud => t("Read aloud"),
             Self::Agents => t("Agents"),
+            Self::Skills => t("Skills"),
             Self::OutsideControl => t("Outside control"),
             Self::Runners => t("Runners"),
             Self::Snippets => t("Snippets"),
@@ -376,6 +391,9 @@ impl SettingsSection {
             Self::Speech => t("Speak instead of typing into the focused pane."),
             Self::ReadAloud => t("Hear an agent's reply instead of reading it."),
             Self::Agents => t("Presets for the agents, shells and browsers you launch into panes."),
+            Self::Skills => t(
+                "Skills for every installed agent: install, share between agents, update and remove.",
+            ),
             Self::OutsideControl => t("Let another agent or a script drive muxel."),
             Self::Runners => {
                 t("One-click tasks: an agent, a prompt and the details you add at run time.")
@@ -400,6 +418,7 @@ impl SettingsSection {
             Self::Speech => SectionIcon::Path("icons/mic.svg"),
             Self::ReadAloud => SectionIcon::Path("icons/volume-2.svg"),
             Self::Agents => SectionIcon::Named(IconName::Bot),
+            Self::Skills => SectionIcon::Path("icons/sparkles.svg"),
             Self::OutsideControl => SectionIcon::Path("icons/plug.svg"),
             Self::Runners => SectionIcon::Named(IconName::Play),
             Self::Snippets => SectionIcon::Named(IconName::SquareTerminal),
@@ -498,6 +517,9 @@ impl SettingsUi {
                 InputState::new(window, cx).placeholder(t("Display name (blank = from the URL)"))
             }),
             lib_add_error: None,
+            skill_source: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("cloudflare/security-audit-skill")
+            }),
             control_test: RemoteTestState::Idle,
             control_skill_preview: false,
             control_skill_copied: false,

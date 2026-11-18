@@ -27,7 +27,7 @@ use std::time::{Duration, Instant, SystemTime};
 /// Windows. muxel is a GUI app, so spawning a console child (git, ssh, gh, …)
 /// would otherwise flash a cmd window on every call — extremely visible because
 /// muxel polls git in the background. No-op off Windows.
-fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+pub(crate) fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[allow(unused_mut)]
     let mut cmd = muxel_core::child_env::command(program);
     #[cfg(windows)]
@@ -142,7 +142,7 @@ impl RepoLoc {
 
 /// Build the local `ssh`/`sshpass` Command that runs `remote_cmd` (one shell
 /// string) on the connection's host, reusing its ControlMaster.
-fn remote_ssh_command(c: &RemoteConn, remote_cmd: String) -> Command {
+pub(crate) fn remote_ssh_command(c: &RemoteConn, remote_cmd: String) -> Command {
     let mut argv = ssh::connection_args(&c.host, &c.control_path);
     // `ConnectTimeout` comes from `base_args`; `BatchMode` makes a key/agent
     // failure fail fast instead of blocking on a password prompt to a non-tty.
@@ -373,7 +373,7 @@ pub fn upload_paste(loc: &RepoLoc, name: &str, bytes: &[u8]) -> Result<String> {
 
 /// Run `cmd` on the host with `input` piped to its stdin. `Err` with ssh's stderr
 /// (or `failed` when it said nothing) unless the command succeeds.
-fn pipe_to_remote(
+pub(crate) fn pipe_to_remote(
     c: &RemoteConn,
     cmd: String,
     input: &[u8],
@@ -5253,7 +5253,7 @@ fn clone_ceiling(lib_dir: &Path) -> &Path {
 
 /// 8 random hex digits for a clone's temporary siblings (`<id>.c-…`, `.r-…`,
 /// `.o-…`). Short so git's paths below them stay under Windows `MAX_PATH`.
-fn temp_suffix() -> String {
+pub(crate) fn temp_suffix() -> String {
     let mut hex = uuid::Uuid::new_v4().simple().to_string();
     hex.truncate(8);
     hex

@@ -566,6 +566,46 @@ feature is added or changed, update the matching entry here in the same change**
   project, soonest first, with the same dismiss/snooze/delete and a quick-add that adds
   to the active project.
 
+## Skills
+
+- **One skill manager for every agent** — Settings → Skills lists the Agent
+  Skills (`SKILL.md` folders) that each installed agent can use: Claude Code,
+  Codex, opencode, Amp, Grok, pi, Hermes, Gemini CLI, Cursor, Copilot CLI and
+  Factory Droid. Agents count as installed when their program is on `PATH` or
+  their config folder exists. Each skill shows the icons of the agents that load
+  it, its description, source, license and every folder it's installed in.
+- **This computer, SSH hosts, user or project** — the Machine picker switches to
+  any saved SSH host (one connection over its existing ControlMaster; Windows
+  hosts included), and the Scope picker switches between user-level skills and
+  one project's (`<project>/.claude/skills`, `.agents/skills`, …).
+- **Install from GitHub** — enter `owner/repo`, `owner/repo@skill`, a GitHub URL
+  (also `…/tree/<branch>/<folder>`) or any git URL. muxel clones it with your git
+  login, finds its skills the way the `skills` CLI does (`skills/`, agents'
+  skills folders, Claude plugin marketplaces), and previews each with its
+  license, a warning when it ships scripts, and whether it replaces one you have.
+- **For all agents or only some** — an install targets every detected agent or
+  the ones you pick. One real copy is kept (in `~/.agents/skills` when every
+  agent that reads that folder is included, as the `skills` CLI does) and the
+  other agents get a symlink to it (a copy on Windows). Each skill's **Available
+  to** switches move it between agents later; since several agents also read
+  each other's folders, the page shows who will actually see it.
+- **One-click recommended skills** — curated installs grouped by Security
+  (Cloudflare's security audit, Trail of Bits' differential review, supply-chain
+  auditor and Semgrep rule creator), Workflow (Superpowers and its debugging,
+  TDD and brainstorming skills), Building (Anthropic's skill creator, MCP
+  builder, frontend design, web app testing) and Documents (PDF, Word, Excel,
+  PowerPoint).
+- **Updates and removal** — **Check for updates** compares each skill's git tree
+  with its repository (one clone per source) and marks changed ones; **Update**
+  rewrites it in place. **Remove…** deletes a skill from every agent's folder.
+  Skills synced from claude.ai and those bundled with Codex, Grok or Hermes are
+  never changed; they're hidden from the list until you click **Show
+  built-in**.
+- **Works with the `skills` CLI** — muxel reads and writes the CLI's
+  `~/.agents/.skill-lock.json`, so skills installed by either tool show their
+  source and update in both; muxel also keeps a `.muxel-skill.json` record in
+  each skill it installs, which travels with project and remote installs.
+
 ## Agent status
 
 - **Program Status Protocol** — direct PTY panes answer an OSC 7501 capability

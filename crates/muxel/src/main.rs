@@ -30,6 +30,7 @@ mod secrets;
 mod session_binding;
 mod settings_model;
 mod settings_view;
+mod skills;
 mod sound;
 mod split;
 mod stt;

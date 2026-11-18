@@ -34,6 +34,7 @@ pub mod remote_ops;
 pub mod rich_copy;
 pub mod session_discovery;
 mod shell;
+pub mod skills;
 pub mod sound_alert;
 pub mod ssh;
 pub mod startup_flags;
