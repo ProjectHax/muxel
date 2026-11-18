@@ -2898,7 +2898,47 @@ fn resolve_agent_launch(
             control_task.filter(|task| !task.is_empty() && !resuming && instance.auto_submit);
         resolved.submit = resolved.startup_input.is_some();
     }
+    // Codex's startup update menu would take a typed task and its Enter. Decided
+    // here because only here is the typed task final: a ctl task is put back
+    // just above, after the core resolver ran without it (`command_for` leaves
+    // out one nobody owns). A preset that sets the key itself keeps its value.
+    if is_codex
+        && resolved.startup_input.is_some()
+        && !codex_config_set(&resolved.args, "check_for_update_on_startup")
+    {
+        resolved.args.push("--config".to_string());
+        resolved
+            .args
+            .push("check_for_update_on_startup=false".to_string());
+    }
     resolved
+}
+
+/// Whether Codex `args` set config `key`, in any spelling Codex reads:
+/// `--config k=v`, `-c k=v`, `--config=k=v` or `-ck=v`, before a `--`.
+fn codex_config_set(args: &[String], key: &str) -> bool {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            return false;
+        }
+        let setting = if matches!(arg.as_str(), "--config" | "-c") {
+            args.next().map(String::as_str)
+        } else {
+            arg.strip_prefix("--config=").or_else(|| {
+                arg.strip_prefix("-c")
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.strip_prefix('=').unwrap_or(value))
+            })
+        };
+        if setting
+            .and_then(|setting| setting.split_once('='))
+            .is_some_and(|(name, _)| name.trim() == key)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn path_paste_error(error: muxel_core::path_paste::PastePathError) -> SharedString {
@@ -3082,6 +3122,100 @@ mod launch_instruction_transport_tests {
                 assert_eq!(launch.startup_input, None);
                 assert!(!launch.submit);
             }
+        }
+    }
+
+    /// Codex's startup update menu takes whatever muxel types next, so a Codex
+    /// launch skips the update check when muxel will type a task into it,
+    /// whoever wrote the task, once, and not over a preset's own setting.
+    /// Asked of the launch the app runs: the core resolver never sees a ctl
+    /// task, and an ordinary pane's rules go to hidden config, not typed.
+    #[test]
+    fn codex_skips_the_update_check_exactly_when_a_task_is_typed() {
+        let project = Project::new("repo", std::env::current_dir().unwrap());
+        let codex = AgentPreset::codex();
+        let runner_on = |preset: &AgentPreset| {
+            muxel_core::Runner {
+                id: Uuid::new_v4(),
+                name: "Review".into(),
+                preset_id: None,
+                auto_mode_presses: 3,
+                prompt: "Review the change".into(),
+            }
+            .build_instance(project.id, preset, "")
+        };
+        let runner = runner_on(&codex);
+        let mut reopened = runner.clone();
+        assert!(reopened.consume_runner_prompt());
+        let mut fire = muxel_core::Loop::new("Nightly", project.id);
+        fire.prompt = "Check the build".into();
+        let looped = fire.build_instance(&codex);
+        let task = muxel_core::control::NewOptions {
+            prompt: Some("Fix the flaky test".into()),
+            ..Default::default()
+        }
+        .instance(&project, std::slice::from_ref(&codex), 0)
+        .unwrap();
+        let mut ruled = codex.clone();
+        ruled.system_prompt = Some("Prefer small commits".into());
+        let ruled = Instance::from_preset(project.id, &ruled);
+        let bare = Instance::from_preset(project.id, &codex);
+        let mut skipping = codex.clone();
+        skipping.args = vec![
+            "--config".into(),
+            "check_for_update_on_startup=false".into(),
+        ];
+        let skipping = runner_on(&skipping);
+        let mut checking = codex.clone();
+        checking.args = vec!["-c".into(), "check_for_update_on_startup=true".into()];
+        let checking = runner_on(&checking);
+
+        /// (case, pane, resuming, the task typed, the update check's settings
+        /// in argv)
+        type Case<'a> = (&'a str, &'a Instance, bool, Option<&'a str>, &'a [&'a str]);
+        const SKIP: &[&str] = &["check_for_update_on_startup=false"];
+        let review = Some("Review the change");
+        let cases: [Case; 13] = [
+            ("a runner", &runner, false, review, SKIP),
+            ("a runner resumed", &runner, true, None, &[]),
+            ("a reopened runner", &reopened, false, review, SKIP),
+            ("a reopened runner resumed", &reopened, true, None, &[]),
+            ("a loop", &looped, false, Some("Check the build"), SKIP),
+            ("a loop resumed", &looped, true, None, &[]),
+            ("a ctl task", &task, false, Some("Fix the flaky test"), SKIP),
+            ("a ctl task resumed", &task, true, None, &[]),
+            ("a preset's rules", &ruled, false, None, &[]),
+            ("no task", &bare, false, None, &[]),
+            ("no task resumed", &bare, true, None, &[]),
+            (
+                "a preset that skips the check itself",
+                &skipping,
+                false,
+                review,
+                SKIP,
+            ),
+            (
+                "a preset that keeps the check",
+                &checking,
+                false,
+                review,
+                &["check_for_update_on_startup=true"],
+            ),
+        ];
+        for (case, pane, resuming, typed, settings) in cases {
+            let launch = resolve_agent_launch(pane, Some(&project), resuming);
+            assert_eq!(
+                launch.startup_input.as_deref(),
+                typed,
+                "{case}: the task typed"
+            );
+            let set: Vec<&str> = launch
+                .args
+                .iter()
+                .map(String::as_str)
+                .filter(|arg| arg.contains("check_for_update_on_startup"))
+                .collect();
+            assert_eq!(set, settings, "{case}: the update check's settings in argv");
         }
     }
 
@@ -10117,7 +10251,25 @@ impl MuxelApp {
         // TypeIn submits one visible turn only for a new conversation. Codex's
         // developer-instructions override also becomes a submitted turn when it is
         // supplied to `resume`, so a resumed Codex receives no launch bundle.
-        let mut resolved = inst
+        // A ctl task its owner won't type (`control_launch_spec`, below) is
+        // left out here too, before the command is wrapped, so nothing about
+        // the launch assumes it: Codex keeps its update check.
+        let unowned;
+        let inst_for_launch = match inst {
+            Some(instance)
+                if instance.control_prompt
+                    && instance.system_prompt.is_some()
+                    && !self.control_startup_will_own(instance_id) =>
+            {
+                unowned = Instance {
+                    system_prompt: None,
+                    ..instance.clone()
+                };
+                Some(&unowned)
+            }
+            other => other,
+        };
+        let mut resolved = inst_for_launch
             .map(|instance| resolve_agent_launch(instance, project, resuming))
             .unwrap_or(ResolvedLaunch {
                 program: None,
