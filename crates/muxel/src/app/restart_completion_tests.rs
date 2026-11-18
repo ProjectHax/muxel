@@ -1,3 +1,4 @@
+use super::codex_capture_tests::{TempRoot, stop_pane_processes};
 use super::{
     Instance, MuxelApp, PaneNode, Project, RemoteHost, RemoteRestartCompletion, SecondaryWindow,
     WorkspaceWindow,
@@ -55,7 +56,10 @@ pub(super) fn with_app(run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelA
         .join(Uuid::new_v4().to_string());
     std::fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
+    // Declared first, dropped last: the lease is held until the root is gone,
+    // so the next app test can't start while it is still being removed.
     let _storage = muxel_store::test_support::set_root(root.clone());
+    let _temp = TempRoot(root.clone());
     assert_eq!(muxel_store::data_dir(), Some(root.join("data")));
     assert_eq!(muxel_store::config_dir(), Some(root.join("config")));
     let mut cx = TestAppContext::single();
@@ -68,22 +72,30 @@ pub(super) fn with_app(run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelA
         theme::apply_initial_theme("", cx);
     });
     let main = cx.add_window(MuxelApp::new);
-    let app = main.entity(&cx).unwrap();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&mut cx, main)));
     // A failing regression must stop any replacement it created before the
-    // scoped root disappears, including a failure before a StopChild is retained.
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        app.update(&mut cx, |app, cx| {
-            for view in app.terminals.values() {
-                view.read(cx).session().kill();
-            }
-        });
+    // scoped root disappears, including a failure before a StopChild is retained,
+    // and a pane's process must be gone before its folder under the root can be
+    // removed.
+    let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        stop_pane_processes(&mut cx, main)
     }));
-    drop(app);
     drop(cx);
-    if let Err(panic) = result {
+    if let Err(panic) = result.and(stopped) {
         std::panic::resume_unwind(panic);
     }
+}
+
+#[test]
+fn with_app_removes_its_root() {
+    let mut data = None;
+    with_app(|_, _| data = muxel_store::data_dir());
+    let root = data.unwrap().parent().unwrap().to_path_buf();
+    assert!(
+        !root.try_exists().unwrap(),
+        "{} is still there",
+        root.display()
+    );
 }
 
 /// Pause immediately after remote I/O has started and the old PTY was removed.

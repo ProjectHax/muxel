@@ -1,8 +1,9 @@
 use muxel_terminal::TerminalSession;
 use std::time::Duration;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    WaitForSingleObject,
 };
 
 /// Keep the fixture's process identity after exit, independently of PTY delivery.
@@ -54,6 +55,16 @@ impl ChildHandle {
         let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
         // SAFETY: this guard owns the retained handle until Drop.
         unsafe { WaitForSingleObject(self.0, millis) == WAIT_OBJECT_0 }
+    }
+
+    /// When the process started, in Windows file time (100 ns ticks).
+    pub(super) fn created(&self) -> u64 {
+        let mut times = [FILETIME::default(); 4];
+        let [created, exited, kernel, user] = &mut times;
+        // SAFETY: this guard owns the retained handle until Drop, and each
+        // pointer is to a live FILETIME.
+        unsafe { GetProcessTimes(self.0, created, exited, kernel, user) }.expect("process times");
+        (u64::from(times[0].dwHighDateTime) << 32) | u64::from(times[0].dwLowDateTime)
     }
 }
 

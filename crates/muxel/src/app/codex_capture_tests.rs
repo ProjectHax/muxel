@@ -18,7 +18,7 @@ use uuid::Uuid;
 /// The test's storage root, removed on drop. A root that won't go fails the
 /// test, and the panic names the path that refused, so one sighting is enough
 /// to trace what held it.
-struct TempRoot(PathBuf);
+pub(super) struct TempRoot(pub(super) PathBuf);
 
 impl Drop for TempRoot {
     fn drop(&mut self) {
@@ -138,13 +138,16 @@ pub(super) fn with_app(run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelA
     }
 }
 
-/// Kills every pane's child and waits until it has exited. A pane runs in a
-/// folder under the test root, and Windows won't remove a folder that is a
-/// live process's current folder. `kill` returns before the child has gone.
-/// Tests kill cmd just after spawning it, while it is still in its start
-/// folder (it moves to the Windows directory once it sees a `\\?\` path), so
-/// under load the root's removal could reach that folder first.
-fn stop_pane_processes(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) {
+/// Kills every pane's child and waits until it, and each process it started,
+/// has exited. A pane runs in a folder under the test root, and Windows won't
+/// remove a folder that is a live process's current folder. `kill` returns
+/// before the child has gone. Tests kill cmd just after spawning it, while it
+/// is still in its start folder (it moves to the Windows directory once it
+/// sees a `\\?\` path), so under load the root's removal could reach that
+/// folder first. A process the child started in that folder (a fixture's
+/// `more`) isn't killed at all. It ends when the pane's console closes after
+/// the child exits, later still.
+pub(super) fn stop_pane_processes(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) {
     let sessions: Vec<Arc<TerminalSession>> = window
         .update(cx, |app, _, cx| {
             let popouts = app
@@ -159,8 +162,11 @@ fn stop_pane_processes(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) 
         })
         .unwrap_or_default();
     for session in sessions {
+        let Some(pid) = session.child_pid() else {
+            continue;
+        };
         // The session's own handle keeps the child's PID from being reused.
-        let Some(child) = session.child_pid().and_then(ChildHandle::open) else {
+        let Some(child) = ChildHandle::open(pid) else {
             continue;
         };
         session.kill();
@@ -168,7 +174,39 @@ fn stop_pane_processes(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) 
             child.exits_within(Duration::from_secs(10)),
             "a pane's process outlived its kill"
         );
+        // Listed only now: a child that has exited can't start another.
+        for process in started_by(&child, pid) {
+            assert!(
+                process.exits_within(Duration::from_secs(10)),
+                "a process a pane started outlived the pane's console"
+            );
+        }
     }
+}
+
+/// The processes `child`, PID `pid`, started that are still running.
+///
+/// One counts only if it names `pid` as its parent and started after `child`.
+/// `child`'s handle keeps `pid` from being reused, so such a process can only
+/// be `child`'s own. An older one names `pid` by chance, from before Windows
+/// gave a dead parent's PID to `child`.
+fn started_by(child: &ChildHandle, pid: u32) -> Vec<ChildHandle> {
+    let listed: Vec<(u32, ChildHandle)> = super::process_parent_map()
+        .into_iter()
+        .filter(|&(_, parent)| parent == pid)
+        .filter_map(|(process, _)| Some((process, ChildHandle::open(process)?)))
+        .collect();
+    // A listed process can exit, and its PID go to another, before it is
+    // opened. An open handle keeps its PID, so a second list names the parent
+    // of the process each handle holds.
+    let parents = super::process_parent_map();
+    listed
+        .into_iter()
+        .filter(|(process, handle)| {
+            parents.get(process) == Some(&pid) && handle.created() >= child.created()
+        })
+        .map(|(_, handle)| handle)
+        .collect()
 }
 
 fn codex_pane(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -> Uuid {
