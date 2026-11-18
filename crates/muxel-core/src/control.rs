@@ -872,6 +872,10 @@ pub fn key_submits(key: &str) -> bool {
 pub struct QuestionOption {
     pub key: String,
     pub label: String,
+    /// What the prompt prints beside the label, a column two or more spaces
+    /// on (Codex's `1. Alpha (Recommended)  Choose Alpha for this request.`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// The option the prompt's cursor is on.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub selected: bool,
@@ -914,9 +918,12 @@ fn is_rule(line: &str) -> bool {
 }
 
 /// `❯ 1. Yes` → ("1", "Yes", selected). Grok draws its question's options as
-/// `1 (○) Alpha (Recommended)  Choose Alpha.`, the description in a column
-/// after the name and a scrollbar `█` at the row's end; its label keeps the
-/// name and the description two spaces apart.
+/// `1 (○) Alpha (Recommended)  Choose Alpha.`, with a scrollbar `█` at the
+/// row's end. Codex and Grok both set an option's description in a column
+/// after its name, two or more spaces on: the name is the label, and the
+/// rest its `description`. Padding between Grok's marker and the name is
+/// not a column. A label with a double space of its own is cut short there,
+/// which only shortens what `show` lists: an answer goes by key.
 fn option_line(line: &str) -> Option<QuestionOption> {
     let s = unbox(line);
     let (selected, s) = match s.strip_prefix(SELECT_GLYPHS) {
@@ -928,22 +935,23 @@ fn option_line(line: &str) -> Option<QuestionOption> {
         return None;
     }
     let after = &s[digits.len()..];
-    let label = match after.strip_prefix(['.', ')']) {
-        Some(rest) if rest.starts_with(char::is_whitespace) => rest.trim().to_string(),
+    let row = match after.strip_prefix(['.', ')']) {
+        Some(rest) if rest.starts_with(char::is_whitespace) => rest.trim(),
         Some(_) => return None,
         None => after
             .strip_prefix(" (○) ")
             .or_else(|| after.strip_prefix(" (●) "))?
-            .trim_end_matches(|c: char| c == '█' || c.is_whitespace())
-            .split("  ")
-            .map(str::trim)
-            .filter(|column| !column.is_empty())
-            .collect::<Vec<_>>()
-            .join("  "),
+            .trim_start()
+            .trim_end_matches(|c: char| c == '█' || c.is_whitespace()),
     };
-    (!label.is_empty()).then_some(QuestionOption {
+    let (label, description) = match row.find("  ") {
+        Some(at) => (&row[..at], Some(row[at..].trim().to_string())),
+        None => (row, None),
+    };
+    (!label.is_empty()).then(|| QuestionOption {
         key: digits,
-        label,
+        label: label.to_string(),
+        description,
         selected,
     })
 }
@@ -1901,7 +1909,8 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
 - `muxel ctl status [AGENT]` - one agent's status, or every agent's.
 - `muxel ctl show AGENT [--full]` - the agent's last prompt, its last reply (the
   final message; `--full` for everything it wrote that turn), and, when it is
-  blocked, the `question` it's asking with its numbered `options`. `controller`
+  blocked, the `question` it's asking with its numbered `options` (each a `key`,
+  a `label`, and the `description` some prompts print beside it). `controller`
   says which computer's muxel last typed into the agent through `muxel ctl`
   (`this_muxel` is true when it was this one) and whether that turn is still open.
 - `muxel ctl screen AGENT [--lines N]` - the raw text of the agent's terminal.
@@ -2136,8 +2145,8 @@ mod tests {
     use super::{
         AgentEntry, AgentInfo, AgentState, CliCommand, Command, Error, ErrorCode, PaneNode,
         Request, Response, WaitOutcome, awaiting_reply, describe_layout, flag_value, key_bytes,
-        parse_cli, pending_question, prompt_from_claude_transcript, resolve_agent, resolve_project,
-        short_id, skill, wait_outcome,
+        option_line, parse_cli, pending_question, prompt_from_claude_transcript, resolve_agent,
+        resolve_project, short_id, skill, wait_outcome,
     };
     use crate::{AgentActivity, SplitDirection};
     use uuid::Uuid;
@@ -2770,12 +2779,84 @@ mod tests {
         assert_eq!(
             q.options
                 .iter()
-                .map(|o| (o.key.as_str(), o.label.as_str(), o.selected))
+                .map(|o| (
+                    o.key.as_str(),
+                    o.label.as_str(),
+                    o.description.as_deref(),
+                    o.selected
+                ))
                 .collect::<Vec<_>>(),
             [
-                ("1", "Alpha (Recommended)  Choose Alpha.", false),
-                ("2", "Beta  Choose Beta.", false),
+                ("1", "Alpha (Recommended)", Some("Choose Alpha."), false),
+                ("2", "Beta", Some("Choose Beta."), false),
             ]
+        );
+        // Padding after the marker, which no captured row has, is not the
+        // gap before a description.
+        for (row, description) in [
+            ("  │  1 (○)   Alpha", None),
+            (
+                "  │  1 (○)   Alpha   Choose Alpha.  █",
+                Some("Choose Alpha."),
+            ),
+        ] {
+            let option = option_line(row).expect("a padded row is still an option");
+            assert_eq!(
+                (option.key.as_str(), option.label.as_str()),
+                ("1", "Alpha"),
+                "{row:?}"
+            );
+            assert_eq!(option.description.as_deref(), description, "{row:?}");
+        }
+    }
+
+    /// Codex 0.164.0's question overlay sets each option's description in a
+    /// column beside its label. The rows are as Codex drew them.
+    #[test]
+    fn a_codex_options_description_is_not_its_label() {
+        let screen = "  Question 1/1 (1 unanswered)\n  Would you like to choose Alpha or Beta?\n\n  \
+                      › 1. Alpha (Recommended)  Choose Alpha for this request.\n    2. Beta                 \
+                      Choose Beta for this request.\n    3. None of the above    Optionally, add details \
+                      in notes (tab)\n\n  tab to add notes · enter to submit answer · esc to interrupt\n";
+        let q = pending_question(screen).unwrap();
+        let options: Vec<(&str, &str, Option<&str>, bool)> = q
+            .options
+            .iter()
+            .map(|o| {
+                let description = o.description.as_deref();
+                (o.key.as_str(), o.label.as_str(), description, o.selected)
+            })
+            .collect();
+        assert_eq!(
+            options,
+            [
+                (
+                    "1",
+                    "Alpha (Recommended)",
+                    Some("Choose Alpha for this request."),
+                    true
+                ),
+                ("2", "Beta", Some("Choose Beta for this request."), false),
+                (
+                    "3",
+                    "None of the above",
+                    Some("Optionally, add details in notes (tab)"),
+                    false
+                ),
+            ]
+        );
+        assert_eq!(
+            q.text,
+            "Question 1/1 (1 unanswered)\nWould you like to choose Alpha or Beta?"
+        );
+        // A label with no column beside it has no description, and `show` says
+        // nothing about one.
+        let claude = pending_question(" Continue?\n ❯ 1. Yes\n   2. No").unwrap();
+        assert_eq!(claude.options[0].description, None);
+        let shown = serde_json::to_value(&claude.options[0]).unwrap();
+        assert_eq!(
+            shown,
+            serde_json::json!({"key": "1", "label": "Yes", "selected": true})
         );
     }
 
