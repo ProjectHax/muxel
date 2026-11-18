@@ -97,7 +97,9 @@ feature is added or changed, update the matching entry here in the same change**
 ## Tabs
 
 - **Tabs per pane** — each pane is a tab group; `Ctrl+T` opens a new tab in the
-  active pane.
+  active pane. A terminal shows its agent's icon and a file, diff or browser
+  page a file, diff or globe icon, on its tab, its sidebar row, the All agents
+  list and in search.
 - **New agents open as tabs** — the toolbar's agent button and `Ctrl+Alt+1–9`
   add the new agent as a tab in the focused pane, so starting an agent never adds
   a column. Settings → General → **Open in** switches them to **New pane**

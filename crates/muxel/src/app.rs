@@ -2578,6 +2578,44 @@ fn agent_icon_path(program: Option<&str>) -> SharedString {
     .into()
 }
 
+/// Asset path for a pane's icon: a page shows what it holds, a terminal its
+/// agent. Pages have no program, so the agent icon would be the shell's.
+fn instance_icon_path(kind: InstanceKind, program: Option<&str>) -> SharedString {
+    match kind {
+        InstanceKind::Editor => "icons/files.svg".into(),
+        InstanceKind::Diff => "icons/diff.svg".into(),
+        InstanceKind::Browser => "icons/globe.svg".into(),
+        InstanceKind::Terminal => agent_icon_path(program),
+    }
+}
+
+#[cfg(test)]
+mod page_icon_tests {
+    use super::{InstanceKind, instance_icon_path};
+
+    #[test]
+    fn only_a_terminal_without_a_program_shows_the_shell_icon() {
+        for kind in [
+            InstanceKind::Terminal,
+            InstanceKind::Editor,
+            InstanceKind::Diff,
+            InstanceKind::Browser,
+        ] {
+            for program in [None, Some("claude"), Some("unknown")] {
+                let icon = instance_icon_path(kind, program);
+                assert_eq!(
+                    icon.as_ref() == "icons/agent-shell.svg",
+                    kind == InstanceKind::Terminal && program.is_none(),
+                    "{kind:?}, {program:?}: {icon}"
+                );
+                if kind != InstanceKind::Terminal {
+                    assert_eq!(icon, instance_icon_path(kind, None), "{kind:?}");
+                }
+            }
+        }
+    }
+}
+
 /// Whether `program` resolves to an executable: a path is checked directly,
 /// otherwise each `PATH` entry is searched (so the agent picker can hide agents
 /// whose binary isn't installed).
@@ -3128,8 +3166,13 @@ mod launch_instruction_transport_tests {
 
 /// An agent's icon (per-program SVG), tinted `color` and sized `size`.
 fn agent_icon(program: Option<&str>, size: Pixels, color: Hsla) -> Svg {
+    instance_icon(InstanceKind::Terminal, program, size, color)
+}
+
+/// A pane's icon (see [`instance_icon_path`]), tinted `color` and sized `size`.
+fn instance_icon(kind: InstanceKind, program: Option<&str>, size: Pixels, color: Hsla) -> Svg {
     svg()
-        .path(agent_icon_path(program))
+        .path(instance_icon_path(kind, program))
         .size(size)
         .flex_none()
         .text_color(color)
@@ -26782,6 +26825,10 @@ impl MuxelApp {
                         let tab_title = self.instance_title(tab, cx);
                         let tab_program =
                             self.workspace.instance(tab).and_then(|i| i.program.clone());
+                        let tab_kind = self
+                            .workspace
+                            .instance(tab)
+                            .map_or(InstanceKind::Terminal, |i| i.kind);
                         let tab_active = tab == iid;
                         let tab_wt_id = self.workspace.instance(tab).and_then(|i| i.worktree_id);
                         let tab_is_terminal = self.workspace.instance(tab).map(|i| i.kind)
@@ -26819,7 +26866,8 @@ impl MuxelApp {
                                         this.cancel_rename(cx);
                                     }
                                 }))
-                                .child(agent_icon(
+                                .child(instance_icon(
+                                    tab_kind,
                                     tab_program.as_deref(),
                                     px(12.0),
                                     cx.theme().muted_foreground,
@@ -27062,7 +27110,8 @@ impl MuxelApp {
                                         )
                                 }
                             })
-                            .child(agent_icon(
+                            .child(instance_icon(
+                                tab_kind,
                                 tab_program.as_deref(),
                                 px(12.0),
                                 cx.theme().muted_foreground,
@@ -27809,6 +27858,7 @@ impl MuxelApp {
                     .map(|i| i.display_name().to_string())
                     .unwrap_or_default();
                 let program = inst.and_then(|i| i.program.clone());
+                let kind = inst.map_or(InstanceKind::Terminal, |i| i.kind);
                 let status = self.terminals.get(&iid).map(|v| {
                     shown_terminal_status(
                         v.read(cx),
@@ -27836,7 +27886,7 @@ impl MuxelApp {
                                 this.focus_instance(iid, window, cx);
                             }),
                         )
-                        .child(agent_icon(program.as_deref(), px(15.0), color))
+                        .child(instance_icon(kind, program.as_deref(), px(15.0), color))
                         .child(
                             div()
                                 .text_xs()
@@ -29356,6 +29406,7 @@ impl MuxelApp {
                     }
                     let inst = self.workspace.instance(iid);
                     let program = inst.and_then(|i| i.program.clone());
+                    let kind = inst.map_or(InstanceKind::Terminal, |i| i.kind);
                     let custom = inst
                         .and_then(|i| i.custom_name.clone())
                         .filter(|c| !c.trim().is_empty());
@@ -29434,7 +29485,8 @@ impl MuxelApp {
                         } else {
                             cx.theme().sidebar
                         })
-                        .child(agent_icon(
+                        .child(instance_icon(
+                            kind,
                             program.as_deref(),
                             px(15.0),
                             pane_status_hsla(
@@ -29841,15 +29893,16 @@ impl MuxelApp {
             } else {
                 None
             };
-            // Icon: agent logo for terminal instances, a file glyph for editor
-            // instances and on-disk files.
+            // Icon: an open pane's own (its agent, or what a page holds), a
+            // file glyph for on-disk files.
             let icon: AnyElement = match item {
-                SearchItem::FocusInstance(_)
-                    if inst.map(|x| x.kind) != Some(InstanceKind::Editor) =>
-                {
-                    agent_icon(inst.and_then(|x| x.program.as_deref()), px(16.0), muted)
-                        .into_any_element()
-                }
+                SearchItem::FocusInstance(_) => instance_icon(
+                    inst.map_or(InstanceKind::Terminal, |x| x.kind),
+                    inst.and_then(|x| x.program.as_deref()),
+                    px(16.0),
+                    muted,
+                )
+                .into_any_element(),
                 SearchItem::RunCommand(_) => {
                     Icon::new(IconName::ChevronRight).small().into_any_element()
                 }
