@@ -1791,7 +1791,9 @@ feature is added or changed, update the matching entry here in the same change**
     new right, aligned, changed rows tinted green/red with line numbers) for quick
     at-a-glance reading. Re-clicking focuses the existing window. Per-file context menu:
     View diff, Stage, Unstage, Discard (with confirmation), Open file. A footer
-    commits **all** changes with a message.
+    commits **all** changes with a message. A project opened in a folder below
+    its repository's root lists the whole repository's changes, as git does, and
+    every action works on the file listed, inside the folder or not.
   - **Worktrees** — every worktree of the active project, expandable to its changed
     files (same rows + diff windows). Per worktree: **Merge into…** any branch
     (checks it out + merges, then offers to remove the worktree), and **Delete** the

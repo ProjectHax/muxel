@@ -768,6 +768,125 @@ fn switching_projects_stops_showing_the_last_ones_changes() {
     });
 }
 
+/// A project can be opened in a folder below its repository's root, and git
+/// lists its changes from the root, files outside the folder included. Open
+/// file finds each listed file, and the file browser marks the folder's.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn a_project_below_its_repositorys_root_finds_its_listed_files() {
+    with_app(|cx, main, fx| {
+        let repo = fx.a.path();
+        fx.a.commit(
+            &[("app/src/main.rs", "one\n"), ("docs/notes.md", "one\n")],
+            "layout",
+        );
+        let (in_folder, outside) = (repo.join("app/src/main.rs"), repo.join("docs/notes.md"));
+        std::fs::write(&in_folder, "two\n").unwrap();
+        std::fs::write(&outside, "two\n").unwrap();
+        let folder = repo.join("app");
+        main.update(cx, |app, _, cx| {
+            app.workspace.project_mut(fx.pid).unwrap().root_path = folder.clone();
+            app.refresh_git_diff_panel(cx);
+            app.load_file_browser(fx.pid, cx);
+        });
+        cx.run_until_parked();
+        let mut listed = changes_shown(cx, main).expect("the folder's changes are read");
+        listed.sort();
+        assert_eq!(listed, ["app/src/main.rs", "docs/notes.md"]);
+        let (opened, marked) = main.update(cx, |app, _, _| {
+            (
+                ["app/src/main.rs", "docs/notes.md"].map(|rel| {
+                    app.changes_file(GitSource::Project(fx.pid), rel)
+                        .map(|(_, path)| path)
+                }),
+                app.file_browser_status
+                    .get(&folder.join("src").join("main.rs"))
+                    .cloned(),
+            )
+        });
+        let resolved =
+            |path: Option<&PathBuf>| path.and_then(|path| std::fs::canonicalize(path).ok());
+        assert_eq!(
+            opened.each_ref().map(|path| resolved(path.as_ref())),
+            [&in_folder, &outside].map(|path| resolved(Some(path))),
+            "Open file: {opened:?}"
+        );
+        assert_eq!(marked.as_deref(), Some(" M"), "the browser's mark");
+    });
+}
+
+/// Initializing a new repository inside a project folder that previously sat
+/// below an outer repository's root must not leave Open file using the outer
+/// repository's cached prefix after a refresh.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn refreshing_changes_rereads_the_folders_repository_place() {
+    with_app(|cx, main, fx| {
+        let repo = fx.a.path();
+        fx.a.commit(&[("app/src/main.rs", "one\n")], "layout");
+        let folder = repo.join("app");
+        let file = folder.join("src").join("main.rs");
+        std::fs::write(&file, "two\n").unwrap();
+        main.update(cx, |app, _, cx| {
+            app.workspace.project_mut(fx.pid).unwrap().root_path = folder.clone();
+            app.refresh_git_diff_panel(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            changes_shown(cx, main),
+            Some(vec!["app/src/main.rs".to_string()])
+        );
+
+        // Now initialize an inner repository in the same project folder and
+        // refresh Changes without changing project id or folder path.
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "test@muxel"],
+            &["config", "user.name", "muxel test"],
+            &["config", "core.autocrlf", "false"],
+            &["add", "."],
+            &["commit", "-q", "-m", "inner"],
+        ] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&folder)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::fs::write(&file, "three\n").unwrap();
+        main.update(cx, |app, _, cx| app.refresh_git_diff_panel(cx));
+        cx.run_until_parked();
+
+        assert_eq!(
+            changes_shown(cx, main),
+            Some(vec!["src/main.rs".to_string()])
+        );
+        let opened = main.update(cx, |app, _, _| {
+            app.changes_file(GitSource::Project(fx.pid), "src/main.rs")
+                .map(|(_, path)| path)
+        });
+        assert_eq!(
+            opened
+                .as_ref()
+                .and_then(|path| std::fs::canonicalize(path).ok()),
+            std::fs::canonicalize(&file).ok(),
+            "Open file resolved against stale outer prefix: {opened:?}"
+        );
+    });
+}
+
 #[test]
 #[cfg_attr(
     target_os = "macos",
@@ -898,6 +1017,11 @@ fn a_remote_projects_changed_file_opens_on_the_host() {
                 host_id: Uuid::new_v4(),
                 remote_root: "/srv/app".into(),
             });
+            app.git_diff_files_from = app.changes_source();
+            app.git_diff_files_place = Some(crate::integrations::RepoPlace {
+                top: "/srv/app".into(),
+                prefix: String::new(),
+            });
             let opened = |app: &MuxelApp| {
                 app.changes_file(GitSource::Project(fx.pid), "src/main.rs")
                     .map(|(pid, path)| (pid, path.to_string_lossy().into_owned()))
@@ -909,5 +1033,41 @@ fn a_remote_projects_changed_file_opens_on_the_host() {
             app.workspace.project_mut(fx.pid).unwrap().root_path = fx.b.path().to_path_buf();
             assert_eq!(opened(app), on_the_host, "it opened the label's folder");
         });
+    });
+}
+
+/// When a Changes list is shown without a known repository place (for example,
+/// `git_place` failed during a refresh), Open file must decline to guess a
+/// path from the project folder rather than opening a wrong location.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn changes_file_returns_none_when_place_is_unknown() {
+    with_app(|cx, main, fx| {
+        let repo = fx.a.path();
+        fx.a.commit(&[("app/src/main.rs", "one\n")], "layout");
+        let folder = repo.join("app");
+        std::fs::write(folder.join("src").join("main.rs"), "two\n").unwrap();
+        main.update(cx, |app, _, cx| {
+            app.workspace.project_mut(fx.pid).unwrap().root_path = folder.clone();
+            app.refresh_git_diff_panel(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            changes_shown(cx, main),
+            Some(vec!["app/src/main.rs".to_string()])
+        );
+
+        let opened = main.update(cx, |app, _, _| {
+            app.git_diff_files_place = None;
+            assert!(app.shown_git_diff_files().is_some());
+            app.changes_file(GitSource::Project(fx.pid), "app/src/main.rs")
+        });
+        assert_eq!(
+            opened, None,
+            "Open file guessed a path without a known place"
+        );
     });
 }

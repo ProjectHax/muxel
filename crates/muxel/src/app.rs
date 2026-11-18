@@ -6865,6 +6865,9 @@ pub struct MuxelApp {
     /// The project `git_diff_files` was read for, with that project's folder
     /// then. The panel shows the list only while both still hold.
     git_diff_files_from: Option<(Uuid, PathBuf)>,
+    /// Where that folder sits in its repository, read with the list: git
+    /// lists paths from the repository's root, whatever folder it runs in.
+    git_diff_files_place: Option<integrations::RepoPlace>,
     /// Cached changed-file lists per worktree (keyed by worktree id), for the
     /// Worktrees tab; refreshed off the UI thread.
     git_diff_worktree_files: HashMap<Uuid, Vec<integrations::GitChange>>,
@@ -9540,6 +9543,7 @@ impl MuxelApp {
             git_diff_tab: GitDiffTab::Files,
             git_diff_files: None,
             git_diff_files_from: None,
+            git_diff_files_place: None,
             git_diff_worktree_files: HashMap::new(),
             git_diff_worktrees_expanded: std::collections::HashSet::new(),
             git_diff_branches: Vec::new(),
@@ -14353,11 +14357,14 @@ impl MuxelApp {
         self.git_diff_loading = true;
         let source = self.changes_source();
         cx.spawn(async move |this, cx| {
-            let files = cx
+            let (files, place) = cx
                 .background_executor()
                 .spawn(async move {
                     let _git = ui_profile::git_caller("git-panel");
-                    integrations::git_status_files(&loc)
+                    (
+                        integrations::git_status_files(&loc),
+                        integrations::git_place(&loc),
+                    )
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -14367,6 +14374,7 @@ impl MuxelApp {
                 if this.changes_source() == source {
                     this.git_diff_files = Some(files);
                     this.git_diff_files_from = source;
+                    this.git_diff_files_place = place;
                 }
                 cx.notify();
             });
@@ -14383,19 +14391,32 @@ impl MuxelApp {
         }
     }
 
-    /// The file at `rel` in a Changes list, and its project: under the folder
-    /// the list was read in. A remote project's path is the host's, so it
-    /// joins with `/` whatever this machine's separator, as git lists it.
+    /// The file at `rel` in a Changes list, and its project. git lists a
+    /// project's paths from its repository's root, so the file is under the
+    /// folder the list was read in when it lies in that folder, else under the
+    /// root git reported with the list; when the folder's place in its
+    /// repository is unknown, returns `None` rather than guessing from the
+    /// project folder. A remote project's path is the host's, so it joins with
+    /// `/` whatever this machine's separator, as git lists it.
     fn changes_file(&self, src: GitSource, rel: &str) -> Option<(Uuid, PathBuf)> {
         match src {
             GitSource::Project(pid) => {
                 let project = self.workspace.project(pid)?;
                 let folder = Self::changes_folder(project);
+                let read_for = self.git_diff_files_from.as_ref();
+                let place = self.git_diff_files_place.as_ref().filter(|_| {
+                    read_for.is_some_and(|(from, _)| *from == pid)
+                        && self.changes_shown_from(read_for)
+                })?;
+                let (base, rest) = match place.in_folder(rel) {
+                    Some(rest) => (folder, rest),
+                    None => (Path::new(place.top.as_str()), rel),
+                };
                 let path = if project.remote.is_some() {
-                    let folder = folder.to_string_lossy();
-                    PathBuf::from(format!("{}/{rel}", folder.trim_end_matches('/')))
+                    let base = base.to_string_lossy();
+                    PathBuf::from(format!("{}/{rest}", base.trim_end_matches('/')))
                 } else {
-                    folder.join(rel)
+                    base.join(rest)
                 };
                 Some((pid, path))
             }
@@ -26445,9 +26466,17 @@ impl MuxelApp {
                         return HashMap::new();
                     };
                     let _git = ui_profile::git_caller("file-browser");
+                    // git lists paths from the repository's root; the rows are
+                    // the project folder's, which may lie below it.
+                    let Some(place) = integrations::git_place(&loc) else {
+                        return HashMap::new();
+                    };
                     let changes: Vec<(PathBuf, String)> = integrations::git_status_files(&loc)
                         .into_iter()
-                        .map(|c| (status_root.join(&c.path), c.status))
+                        .filter_map(|c| {
+                            let rest = place.in_folder(&c.path)?;
+                            Some((status_root.join(rest), c.status))
+                        })
                         .collect();
                     crate::filetree::status_index(&changes, &status_root)
                 })
