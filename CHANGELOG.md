@@ -5,6 +5,140 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.3.9] — 2026-11-18
+
+### Added
+- **Agents can set reminders, and muxel rings when they're due** — ask an agent
+  to remind you of something ("remind me to check the deploy at 3pm") and it
+  adds the reminder to the project's `.muxel/REMINDERS.md`. When it comes due,
+  muxel brings its window forward with a popup, or sends a desktop notification
+  if you'd rather, and can keep playing a sound until you deal with it. Each
+  reminder can be dismissed, snoozed for 5 minutes, 15 minutes or an hour, or
+  silenced. A bell on the project row opens that project's reminders, where you
+  can also add one yourself with a time like `15m`, `14:30` or `tomorrow 9am`;
+  the hotbar's **Reminders** button and a bell in the title bar show every
+  project's, and the bell turns into a count while anything is due. Reminders
+  work in remote SSH projects too, keep the moment you meant when the host is in
+  another time zone, and one that came due while muxel was closed goes off at
+  the next launch. Turn them on per project, or for every new project, in
+  Settings → Projects; the popup, notification and sound are under Settings →
+  Notifications → Reminders.
+- **One Skills page for every agent's skills** — Settings → **Skills** lists the
+  skills each agent you have installed can use (Claude Code, Codex, opencode,
+  Amp, Grok, pi, Hermes, Gemini CLI, Cursor, Copilot CLI and Factory Droid), on
+  this computer or a saved SSH host, for your user or for one project. **Add
+  skills** installs from GitHub or any git repository, or in one click from a
+  recommended list: security reviews from Cloudflare and Trail of Bits, the
+  Superpowers workflow, and Anthropic's skill creator, MCP builder and document
+  skills. An install can go to every agent or only the ones you pick, and each
+  skill's **Available to** switches change that later; because several agents
+  also read each other's skills folders, the page shows who will actually see
+  it. **Check for updates** compares each skill with its source, and
+  **Remove…** deletes it from every agent. Skills synced from claude.ai or
+  bundled with an agent are never changed, and stay hidden until you show them.
+  Skills installed with the `skills` command-line tool show their source here
+  and can be updated from either.
+
+### Changed
+- **npm's `.cmd` agent launchers count as agents on Windows** — a preset whose
+  program was `codex.cmd` or `claude.cmd`, as npm installs them, was treated as
+  a plain shell: `muxel ctl send` refused it unless "Also allow typing into
+  shell panes" was on, the Allow policy for `muxel ctl new` asked before opening
+  it, and closing it went by its shell prompt instead of the agent's status. The
+  same preset with plain `codex` was treated as an agent, though it starts the
+  very same file. A `.cmd` or `.bat` ending is now ignored the way `.exe` is; a
+  launcher with a name of its own, like `claude-wrapper.cmd`, still isn't an
+  agent. Thanks to [@railapex](https://github.com/railapex)
+  ([#164](https://github.com/ProjectHax/muxel/pull/164)).
+- **Shared memory and the accomplishment log are switched on in Settings →
+  Projects** — their Enable and Disable items left the project's right-click
+  menu, which has **Open reminders** in their place. Both can still be turned
+  on per project, or for every new project, in Settings → Projects.
+
+### Fixed
+- **Changes shows the project you switched to** — the Changes view reads git
+  status in the background and showed the result in whichever project was
+  active when it came back. Switching projects while a read was running, which
+  is easy on a remote project where one takes seconds, put the first project's
+  files in the second one's list, where Stage, Unstage and Discard act on the
+  second project's repository. Even with no read running, the old project's list
+  stayed up until the new one's arrived. A result now lands only in the project
+  it was read for, and the list shows Loading until that project's own files
+  are in. The Worktrees tab's **Merge into** menu could show another project's
+  branches the same way, and no longer does. Thanks to
+  [@railapex](https://github.com/railapex) ([#162](https://github.com/ProjectHax/muxel/pull/162)).
+- **Keys typed while a confirmation shows stay out of the terminal** — while
+  "Close pane?", "Remove project?", a changed host key warning or the Quit
+  dialog was up, the pane behind it kept the keyboard: whatever you typed went
+  into its terminal, Enter included, and the Esc you pressed to dismiss the
+  dialog reached the agent as an interrupt. Keys now stop at the dialog, in
+  popped-out windows too, and Esc cancels it. Enter deliberately doesn't
+  confirm, because some of these dialogs open on their own, like a changed host
+  key found while reconnecting, and a keypress meant for the pane mustn't accept
+  one. Thanks to [@railapex](https://github.com/railapex)
+  ([#163](https://github.com/ProjectHax/muxel/pull/163)).
+- **tmux no longer types `6c0;2501;1` into your panes, with any tmux** — the fix
+  in 0.3.6 only helped tmux 3.6 and newer. With older tmux, or whenever any
+  computer attached to the same tmux session answered slowly, such as a second
+  machine reattaching to every pane as it wakes from sleep, the stray text could
+  still appear at an agent's prompt. tmux learns nothing from those answers, so
+  panes running in tmux no longer give them, and there is nothing left to
+  arrive late. Update muxel on every computer that attaches to the same panes,
+  since the late answer can come from any of them.
+- **A shell that starts something during Undo isn't closed under it** — after
+  you closed a quiet shell, anything it started or ran while its pane waited out
+  the 15 seconds of Undo was closed with it when the time ran out, without
+  asking. muxel now checks the shell again before the close is final and asks
+  you to Close or Keep it if anything changed. On Windows, a shell at its prompt with a program it started still
+  running, such as a GUI app or a background job, now asks before closing
+  instead of offering Undo, as on Linux and macOS; Git Bash and WSL are
+  recognised, so it's the real shell behind them that's checked. Thanks to
+  [@railapex](https://github.com/railapex) ([#168](https://github.com/ProjectHax/muxel/pull/168)).
+- **`muxel ctl show` and `answer` read more question cards** — a Claude question
+  whose card draws a line above its last option, "Chat about this", listed only
+  that last option, and `muxel ctl answer` refused 1, 2 and 3. Grok's question
+  cards listed no options at all, and Codex's and Grok's options came back with
+  their description run into the option's name. All three list every option
+  now, with its description apart from its name. Thanks to
+  [@railapex](https://github.com/railapex) ([#159](https://github.com/ProjectHax/muxel/pull/159),
+  [#160](https://github.com/ProjectHax/muxel/pull/160),
+  [#167](https://github.com/ProjectHax/muxel/pull/167)).
+- **`muxel ctl` says so when nothing was typed** — some refusals made before any
+  input carried no error code, so `muxel ctl send` reported `unconfirmed`, as if
+  the prompt might have gone in: a send to a shell pane without "Also allow
+  typing into shell panes", to an agent whose launch fell back to a shell, or to
+  a pane that closed first. These now report `not_delivered`. muxel serves 16
+  ctl connections at once; one more used to be dropped, which printed "muxel
+  isn't running", and is now answered `busy`, so a send on it is
+  `not_delivered` too. And `muxel ctl keys` on a pane not kept
+  in tmux replied before its keys were pressed, so a pane that restarted partway
+  still read as having received them all; it now replies after the last one,
+  with `keys_partly_pressed` when the pane stopped taking them. Thanks to
+  [@railapex](https://github.com/railapex) ([#156](https://github.com/ProjectHax/muxel/pull/156),
+  [#157](https://github.com/ProjectHax/muxel/pull/157),
+  [#158](https://github.com/ProjectHax/muxel/pull/158)).
+- **A default preset saved by name shows as the default** — a `default_preset`
+  in `config.toml` that names a preset rather than giving its id, as older and
+  hand-edited settings do, started muxel with that preset, but the preset menu
+  starred nothing and Settings → General showed no default. Both show it now.
+  Thanks to [@railapex](https://github.com/railapex)
+  ([#155](https://github.com/ProjectHax/muxel/pull/155)).
+- **File, diff and browser tabs have their own icons** — they showed the shell
+  icon on their tabs, their sidebar rows, the All agents list and in search. A
+  file now shows the files icon, a diff the diff icon and a browser page a
+  globe. Thanks to [@railapex](https://github.com/railapex)
+  ([#165](https://github.com/ProjectHax/muxel/pull/165)).
+- **Double, curly, dotted and dashed underlines continue under spaces** — text
+  with one of these underlines had a gap at every space; plain underlines were
+  already unbroken. Thanks to [@railapex](https://github.com/railapex)
+  ([#152](https://github.com/ProjectHax/muxel/pull/152)).
+- **A draft in Codex can't change its pane's status** — with working or blocked
+  markers added to a Codex preset, typing one of those words into Codex's
+  prompt without sending it changed the pane's status. muxel now leaves Codex's
+  input box out when matching markers, as it already did for Claude's. Thanks
+  to [@railapex](https://github.com/railapex)
+  ([#161](https://github.com/ProjectHax/muxel/pull/161)).
+
 ## [0.3.8] — 2026-11-15
 
 ### Added
