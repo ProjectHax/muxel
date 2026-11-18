@@ -1394,12 +1394,17 @@ fn git_on_path() -> Option<PathBuf> {
 /// canonical install path when Git is absent, so the preset still points
 /// somewhere meaningful rather than a bare `bash` that could resolve to WSL.
 pub fn git_bash_program() -> String {
+    resolved_git_bash_program()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| GIT_BASH_DEFAULT_PATH.to_string())
+}
+
+/// The existing executable selected by the Git Bash preset's resolver.
+pub fn resolved_git_bash_program() -> Option<PathBuf> {
     select_git_bash(
         git_bash_candidates(|key| std::env::var(key).ok(), git_on_path().as_deref()),
         |path| path.is_file(),
     )
-    .map(|path| path.display().to_string())
-    .unwrap_or_else(|| GIT_BASH_DEFAULT_PATH.to_string())
 }
 
 fn is_codex_program(program: &str) -> bool {

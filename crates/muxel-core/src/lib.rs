@@ -58,7 +58,8 @@ pub use agent::{
     file_link_instruction, find_claude_session_path, git_bash_program, is_known_agent_program,
     launches_known_agent, memory_header, memory_instruction, memory_reference,
     muxel_file_reference, reminders_header, reminders_instruction, resolve_launch,
-    resolve_launch_for_session, session_resume_args, stored_claude_session_path,
+    resolve_launch_for_session, resolved_git_bash_program, session_resume_args,
+    stored_claude_session_path,
 };
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
 pub use diff::{SplitRow, split_diff};

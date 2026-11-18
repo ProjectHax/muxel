@@ -147,7 +147,7 @@ feature is added or changed, update the matching entry here in the same change**
   15 seconds. The title-bar chip or Ctrl+Alt+Z restores its tabs and live process;
   a popped-out terminal returns to the main window. Busy or uncertain terminals
   ask first; confirmed busy closes still get Undo. Quiet closes recheck launch,
-  binding, input and completion before expiry; changed work gets Close / Keep.
+  binding, input, completion, shell marks and children before expiry; changed work gets Close / Keep.
   On Linux and macOS, a shell prompt counts as idle only when the shell owns
   the foreground group, still runs its launched executable (or another
   interactive shell it exec'd, like `exec zsh` in a `.bashrc`) and has no child
