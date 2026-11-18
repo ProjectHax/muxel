@@ -412,7 +412,7 @@ impl std::fmt::Display for Error {
 }
 
 /// Check immediately before pasting, including after asynchronous claim work.
-/// `--force` only overrides busy state; it never overrides a launch mismatch.
+/// `--force` never overrides a launch mismatch.
 pub fn check_launch_id(expected: Option<Uuid>, current: Option<Uuid>) -> Result<(), Error> {
     if let Some(expected) = expected
         && current != Some(expected)
@@ -1449,7 +1449,7 @@ pub fn command_help(command: &str) -> Option<&'static str> {
             "usage: muxel ctl screen AGENT [--lines N]\nShow raw terminal text; default 60 lines, maximum 2000."
         }
         "send" => {
-            "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. Provider confirmation can take up to 63 seconds. Inspect outcome and follow the read-only next command. Never re-send text after an uncertain receipt. pending_in_composer describes the observed draft; it does not authorize a later Enter. not_delivered means nothing was typed: resolve the refusal before trying again. --force overrides busy and own-pane refusal, but never a launch mismatch."
+            "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. Provider confirmation can take up to 63 seconds. Inspect outcome and follow the read-only next command. Never re-send text after an uncertain receipt. pending_in_composer describes the observed draft; it does not authorize a later Enter. not_delivered means nothing was typed: resolve the refusal before trying again. --force overrides working, blocked and self_target, and claimed_elsewhere when another send to the agent hasn't pressed Enter or another request holds its tmux claim; it never overrides launch_mismatch."
         }
         "wait" => {
             "usage: muxel ctl wait AGENT [--timeout SECS] [--full] [--turn]\nWait for the turn and any subagent hold to finish, or for the agent to block, exit or time out, then show its result. Shell and monitor listings do not delay completion. Subagent holds last at most three hours. --turn stops at an observable turn end even during a subagent hold; it cannot override a provider still reporting Working."

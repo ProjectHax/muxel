@@ -1284,6 +1284,8 @@ feature is added or changed, update the matching entry here in the same change**
   shell `not_running`, and into a pane that closed before its input went in
   `exited`. muxel serves 16 ctl connections at once; one more is answered
   `busy` before its request is read, so a task sent on it is `not_delivered`.
+  When more than four callers are refused at once, the rest can lose that answer
+  and have their tasks reported `unconfirmed`. Nothing is typed either way.
   A send watches for its receipt for ten seconds, a second longer for each
   thousand characters past the first, up to a minute. Agent IDs also accept the
   `pane<ID>` spelling when no agent has that name.

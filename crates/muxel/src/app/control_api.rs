@@ -293,7 +293,7 @@ pub(super) struct Typing {
 /// pane kept in tmux so can its paste and Enter, which are tmux commands too
 /// (see [`TerminalSession::control_write`]). This marker never ages, and goes
 /// only once the Enter is in, through tmux once tmux has taken it.
-/// `--force` passes it, as it passes the other busy refusals.
+/// `--force` passes it, as it passes a working or blocked agent.
 #[derive(Debug)]
 struct SendInFlight(Uuid);
 
@@ -3786,7 +3786,8 @@ mod prompt_submission_tests {
         let failure = muxel_core::control::Error::new(ErrorCode::InputChanged, "Enter withheld")
             .after_paste();
         assert!(!super::release_claim_after_result(&Err(failure)));
-        let before_paste = muxel_core::control::Error::new(ErrorCode::Working, "busy");
+        let before_paste =
+            muxel_core::control::Error::new(ErrorCode::Working, "the agent is working");
         assert!(super::release_claim_after_result(&Err(before_paste)));
         assert!(!super::release_claim_after_result(&Ok(
             json!({"pasted": true})
@@ -4533,8 +4534,8 @@ mod prompt_submission_tests {
 #[cfg(test)]
 mod runtime_control_tests {
     use super::{
-        AgentState, AgentStatus, SendAdmission, check_send_state, ctl, runtime_control_state,
-        turn_has_reply_evidence,
+        AgentState, AgentStatus, SendAdmission, SendInFlight, check_send_state, ctl,
+        runtime_control_state, turn_has_reply_evidence,
     };
     use muxel_core::AgentActivity;
     use muxel_terminal::{
@@ -4660,6 +4661,37 @@ mod runtime_control_tests {
                 !super::background_turn_over(runtime, 1),
                 "foreground evidence keeps its refusal"
             );
+        }
+    }
+
+    /// `send`'s help names, by code, each refusal `--force` passes: every one
+    /// below refuses without `--force` and lets the send through with it.
+    #[test]
+    fn send_help_names_every_refusal_force_passes() {
+        let pane = uuid::Uuid::new_v4();
+        let state = |state, just_submitted, force| {
+            check_send_state(SendAdmission {
+                state,
+                just_submitted,
+                force,
+            })
+        };
+        // Another send to the pane that hasn't pressed Enter yet.
+        let _in_flight = SendInFlight::begin(pane, false).unwrap();
+        let refusals: [&dyn Fn(bool) -> Result<(), ctl::Error>; 5] = [
+            &|force| state(Some(AgentState::Working), false, force),
+            &|force| state(Some(AgentState::Blocked), false, force),
+            &|force| state(None, true, force),
+            &|force| ctl::check_self_target(Some(pane), pane, force),
+            &|force| SendInFlight::begin(pane, force).map(drop),
+        ];
+        let help = ctl::command_help("send").unwrap();
+        for refusal in refusals {
+            let code = refusal(false).unwrap_err().code.unwrap();
+            assert!(refusal(true).is_ok(), "--force didn't pass {code:?}");
+            let code = serde_json::to_value(code).unwrap();
+            let code = code.as_str().unwrap();
+            assert!(help.contains(code), "send's help doesn't name {code}");
         }
     }
 
