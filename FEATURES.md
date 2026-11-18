@@ -1084,7 +1084,8 @@ feature is added or changed, update the matching entry here in the same change**
 - **Reads what the agent actually said** — `show` returns the last prompt and the
   model's last reply the way read-aloud finds them (a local Claude pane's session
   transcript, otherwise the pane's scrollback), and for a blocked
-  agent the question with its numbered options read off the screen. `wait` blocks
+  agent the question with its numbered options read off the screen (each option's
+  label, and the description Codex and Grok print beside it). `wait` blocks
   until the agent's turn ends — it finishes, asks something, or exits — then
   returns the same, so a caller can `send` then `wait` without polling. An answer
   to a question counts as a turn too, so `answer` then `wait` works the same way.
