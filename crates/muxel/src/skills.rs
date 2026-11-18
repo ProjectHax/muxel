@@ -1287,21 +1287,27 @@ fn local_move(from_dir: &Path, to_dir: &Path, name: &str) -> std::io::Result<()>
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::Arc;
 
-    use muxel_core::RemoteOs;
-    use muxel_core::skills::{Scope, SkillAgent, SkillHome};
-
-    use super::{
-        Host, UpdateState, check_updates, collect_files, connect_local_with, fetch, install,
-        remove, scan, set_agents, update,
-    };
+    use super::fetch;
     use crate::integrations::GitEnv;
     use crate::test_support::{TestRepo, file_url, short_temp_path};
 
-    use SkillAgent::*;
+    // The tests past `fetch` check symlinks (Windows installs copies), Unix
+    // permissions and `sh`-run remote commands, so they're Unix-only; so is
+    // what only they use, or Windows clippy fails on unused items.
+    #[cfg(unix)]
+    use {
+        super::{
+            Host, UpdateState, check_updates, collect_files, connect_local_with, install, remove,
+            scan, set_agents, update,
+        },
+        muxel_core::RemoteOs,
+        muxel_core::skills::{Scope, SkillAgent, SkillAgent::*, SkillHome},
+        std::collections::BTreeSet,
+        std::path::Path,
+    };
 
     struct TmpDir(PathBuf);
     impl Drop for TmpDir {
@@ -1317,6 +1323,7 @@ mod tests {
     }
 
     /// A fake home with Claude, opencode and pi set up (by their folders).
+    #[cfg(unix)]
     fn host(home: &Path) -> Host {
         for d in [".claude", ".config/opencode", ".pi/agent"] {
             std::fs::create_dir_all(home.join(d)).unwrap();
@@ -1342,6 +1349,7 @@ mod tests {
         r
     }
 
+    #[cfg(unix)]
     fn agents(a: &[SkillAgent]) -> BTreeSet<SkillAgent> {
         a.iter().copied().collect()
     }
