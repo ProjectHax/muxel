@@ -22,6 +22,7 @@ pub enum SkillAgent {
     Opencode,
     Amp,
     Grok,
+    Antigravity,
     Pi,
     Hermes,
     Gemini,
@@ -33,12 +34,13 @@ pub enum SkillAgent {
 impl SkillAgent {
     /// Every agent, in the order the UI lists them (and the planner prefers
     /// their folders).
-    pub const ALL: [SkillAgent; 11] = [
+    pub const ALL: [SkillAgent; 12] = [
         SkillAgent::Claude,
         SkillAgent::Codex,
         SkillAgent::Opencode,
         SkillAgent::Amp,
         SkillAgent::Grok,
+        SkillAgent::Antigravity,
         SkillAgent::Pi,
         SkillAgent::Hermes,
         SkillAgent::Gemini,
@@ -55,6 +57,7 @@ impl SkillAgent {
             SkillAgent::Opencode => "opencode",
             SkillAgent::Amp => "Amp",
             SkillAgent::Grok => "Grok",
+            SkillAgent::Antigravity => "Antigravity",
             SkillAgent::Pi => "pi",
             SkillAgent::Hermes => "Hermes",
             SkillAgent::Gemini => "Gemini CLI",
@@ -72,6 +75,7 @@ impl SkillAgent {
             SkillAgent::Opencode => "opencode",
             SkillAgent::Amp => "amp",
             SkillAgent::Grok => "grok",
+            SkillAgent::Antigravity => "agy",
             SkillAgent::Pi => "pi",
             SkillAgent::Hermes => "hermes",
             SkillAgent::Gemini => "gemini",
@@ -184,6 +188,7 @@ impl SkillHome {
             SkillAgent::Opencode => join(&self.config_home(), "opencode"),
             SkillAgent::Amp => join(&self.config_home(), "amp"),
             SkillAgent::Grok => self.grok_home(),
+            SkillAgent::Antigravity => self.home_join(".gemini/antigravity-cli"),
             SkillAgent::Pi => self.pi_home(),
             SkillAgent::Hermes => self.hermes_home(),
             SkillAgent::Gemini => self.home_join(".gemini"),
@@ -236,6 +241,7 @@ impl SkillHome {
                         claude_compat,
                         self.home_join(".cursor/skills"),
                     ],
+                    SkillAgent::Antigravity => vec![self.home_join(".gemini/config/skills")],
                     SkillAgent::Pi => vec![join(&self.pi_home(), "skills"), shared],
                     SkillAgent::Hermes => vec![join(&self.hermes_home(), "skills")],
                     SkillAgent::Gemini => vec![self.home_join(".gemini/skills"), shared],
@@ -262,6 +268,7 @@ impl SkillHome {
                         p(".claude/skills"),
                         p(".cursor/skills"),
                     ],
+                    SkillAgent::Antigravity => vec![shared, p(".agent/skills")],
                     SkillAgent::Pi => vec![p(".pi/skills"), shared],
                     SkillAgent::Hermes => Vec::new(),
                     SkillAgent::Gemini => vec![p(".gemini/skills"), shared],
@@ -295,6 +302,9 @@ impl SkillHome {
         match agent {
             SkillAgent::Codex => vec![join(&self.codex_home(), "skills/.system")],
             SkillAgent::Grok => vec![join(&self.grok_home(), "bundled/skills")],
+            SkillAgent::Antigravity => {
+                vec![self.home_join(".gemini/antigravity-cli/builtin/skills")]
+            }
             _ => Vec::new(),
         }
     }
@@ -341,7 +351,7 @@ impl SkillHome {
         if is_within(skill_path, &claude_synced) {
             return Some(Protection::Synced);
         }
-        for agent in [SkillAgent::Codex, SkillAgent::Grok] {
+        for agent in [SkillAgent::Codex, SkillAgent::Grok, SkillAgent::Antigravity] {
             for dir in self.bundled_dirs(agent, &Scope::User) {
                 if is_within(skill_path, &dir) {
                     return Some(Protection::Bundled(agent));
@@ -487,6 +497,42 @@ mod tests {
         assert_eq!(shared, 1);
         assert!(dirs.contains(&"/h/.grok/bundled/skills".to_string()));
         assert!(dirs.contains(&"/h/.codex/skills/.system".to_string()));
+        assert!(dirs.contains(&"/h/.gemini/antigravity-cli/builtin/skills".to_string()));
+    }
+
+    #[test]
+    fn antigravity_skill_folders_and_bundled_protection() {
+        let h = home();
+        let p = Scope::Project("/p".into());
+        assert_eq!(
+            h.agent_home(SkillAgent::Antigravity),
+            "/h/.gemini/antigravity-cli"
+        );
+        assert_eq!(
+            h.read_dirs(SkillAgent::Antigravity, &Scope::User),
+            ["/h/.gemini/config/skills"]
+        );
+        assert_eq!(
+            h.read_dirs(SkillAgent::Antigravity, &p),
+            ["/p/.agents/skills", "/p/.agent/skills"]
+        );
+        assert_eq!(
+            h.own_dir(SkillAgent::Antigravity, &p).unwrap(),
+            "/p/.agents/skills"
+        );
+        assert!(!h.reads(SkillAgent::Antigravity, &Scope::User, "/h/.agents/skills"));
+        assert_eq!(
+            h.protection("/h/.gemini/antigravity-cli/builtin/skills/swarm", &[]),
+            Some(Protection::Bundled(SkillAgent::Antigravity))
+        );
+        assert_eq!(
+            SkillAgent::from_program("/Users/me/.local/bin/agy"),
+            Some(SkillAgent::Antigravity)
+        );
+        assert_eq!(
+            SkillAgent::from_program("agy.exe"),
+            Some(SkillAgent::Antigravity)
+        );
     }
 
     #[test]

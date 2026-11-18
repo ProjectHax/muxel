@@ -3434,7 +3434,9 @@ impl Settings {
 /// v17: Grok preset gains a runner startup delay (its output never goes quiet).
 /// v18: added the Muse Code preset.
 /// v19: refreshed the built-in Review and Security Review runner prompts.
-pub const PRESET_SEED_VERSION: u32 = 19;
+/// v20: added the Antigravity (agy) preset.
+/// v21: added the Gemini CLI (gemini) preset.
+pub const PRESET_SEED_VERSION: u32 = 21;
 
 /// Current version of the Terms of Service / Privacy notice. Bump this when the
 /// terms change so users are asked to accept again on next launch (see
@@ -3453,9 +3455,10 @@ impl Settings {
     }
 
     /// Apply pending built-in migrations, matching presets by name. The v18
-    /// migration only adds Muse and v19 only refreshes unedited built-in runner
-    /// prompts; older catch-up migrations must not replay over choices saved at
-    /// v17. Returns whether settings should be persisted.
+    /// migration only adds Muse, v19 only refreshes unedited built-in runner
+    /// prompts, v20 only adds Antigravity, and v21 only adds Gemini CLI; older
+    /// catch-up migrations must not replay over choices saved at v17. Returns
+    /// whether settings should be persisted.
     pub fn seed_builtin_presets(&mut self) -> bool {
         if self.preset_seed_version >= PRESET_SEED_VERSION {
             return false;
@@ -3463,10 +3466,9 @@ impl Settings {
         // Preserve the historical catch-up for installs that have not reached
         // v17. Later additions have their own migration below.
         if self.preset_seed_version < 17 {
-            for builtin in AgentPreset::defaults()
-                .into_iter()
-                .filter(|p| p.name != "Muse Code")
-            {
+            for builtin in AgentPreset::defaults().into_iter().filter(|p| {
+                p.name != "Muse Code" && p.name != "Antigravity" && p.name != "Gemini CLI"
+            }) {
                 if !self.presets.iter().any(|p| p.name == builtin.name) {
                     self.presets.push(builtin);
                 }
@@ -3563,6 +3565,18 @@ impl Settings {
                 }
             }
         }
+        if self.preset_seed_version < 20 {
+            let agy = AgentPreset::agy();
+            if !self.presets.iter().any(|preset| preset.name == agy.name) {
+                self.presets.push(agy);
+            }
+        }
+        if self.preset_seed_version < 21 {
+            let gemini = AgentPreset::gemini();
+            if !self.presets.iter().any(|preset| preset.name == gemini.name) {
+                self.presets.push(gemini);
+            }
+        }
         self.preset_seed_version = PRESET_SEED_VERSION;
         true
     }
@@ -3590,6 +3604,8 @@ mod settings_tests {
         assert!(s.presets.iter().any(|p| p.name == "Ollama"));
         assert!(s.presets.iter().any(|p| p.name == "Pi"));
         assert!(s.presets.iter().any(|p| p.name == "Muse Code"));
+        assert!(s.presets.iter().any(|p| p.name == "Antigravity"));
+        assert!(s.presets.iter().any(|p| p.name == "Gemini CLI"));
         // Built-in runners are seeded too.
         assert!(s.runners.iter().any(|r| r.name == "Review"));
         assert!(s.runners.iter().any(|r| r.name == "Security Review"));
@@ -3732,6 +3748,170 @@ mod settings_tests {
         settings.runners[0].prompt = legacy("Review");
         assert!(!settings.seed_builtin_presets());
         assert_eq!(settings.runners[0].prompt, legacy("Review"));
+    }
+
+    #[test]
+    fn agy_preset_is_seeded_only_once() {
+        let mut settings = Settings {
+            preset_seed_version: 19,
+            presets: vec![AgentPreset::shell()],
+            ..Settings::default()
+        };
+        assert!(settings.seed_builtin_presets());
+        assert_eq!(
+            settings
+                .presets
+                .iter()
+                .filter(|preset| preset.name == "Antigravity")
+                .count(),
+            1
+        );
+        settings
+            .presets
+            .retain(|preset| preset.name != "Antigravity");
+        assert!(
+            !settings.seed_builtin_presets(),
+            "a deliberate deletion stays deleted"
+        );
+        assert!(
+            !settings
+                .presets
+                .iter()
+                .any(|preset| preset.name == "Antigravity")
+        );
+    }
+
+    #[test]
+    fn agy_upgrade_preserves_v19_settings_except_addition_and_version() {
+        for existing_agy in [false, true] {
+            let mut settings = Settings {
+                preset_seed_version: 19,
+                ..Settings::default()
+            };
+            settings
+                .presets
+                .retain(|preset| preset.name != "Antigravity" && preset.name != "Ollama");
+            settings.runners.retain(|runner| runner.name != "Review");
+            settings.runners[0].prompt = "custom review task".to_string();
+            for preset in &mut settings.presets {
+                preset.session_id_flag = None;
+                preset.resume_flag = None;
+                preset.startup_delay_ms = 0;
+                preset.working_markers.clear();
+            }
+            if existing_agy {
+                let mut custom = AgentPreset::agy();
+                custom.program = Some("custom-agy".to_string());
+                custom.effort = Some("medium".to_string());
+                custom.injection = InjectionMode::TypeIn;
+                settings.presets.push(custom);
+            }
+            let before = serde_json::to_value(&settings).unwrap();
+            assert!(settings.seed_builtin_presets());
+            assert_eq!(settings.preset_seed_version, PRESET_SEED_VERSION);
+            assert_eq!(
+                settings
+                    .presets
+                    .iter()
+                    .filter(|preset| preset.name == "Antigravity")
+                    .count(),
+                1
+            );
+            if !existing_agy {
+                let added = settings.presets.pop().unwrap();
+                assert_eq!(added.name, "Antigravity");
+                assert_eq!(added.program.as_deref(), Some("agy"));
+                assert_eq!(added.injection, InjectionMode::None);
+            }
+            settings.preset_seed_version = 19;
+            assert_eq!(
+                serde_json::to_value(&settings).unwrap(),
+                before,
+                "no old preset/runner resurrection or replay of saved defaults"
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_preset_is_seeded_only_once() {
+        let mut settings = Settings {
+            preset_seed_version: 20,
+            presets: vec![AgentPreset::shell()],
+            ..Settings::default()
+        };
+        assert!(settings.seed_builtin_presets());
+        assert_eq!(
+            settings
+                .presets
+                .iter()
+                .filter(|preset| preset.name == "Gemini CLI")
+                .count(),
+            1
+        );
+        settings
+            .presets
+            .retain(|preset| preset.name != "Gemini CLI");
+        assert!(
+            !settings.seed_builtin_presets(),
+            "a deliberate deletion stays deleted"
+        );
+        assert!(
+            !settings
+                .presets
+                .iter()
+                .any(|preset| preset.name == "Gemini CLI")
+        );
+    }
+
+    #[test]
+    fn gemini_upgrade_preserves_v20_settings_except_addition_and_version() {
+        for existing_gemini in [false, true] {
+            let mut settings = Settings {
+                preset_seed_version: 20,
+                ..Settings::default()
+            };
+            settings
+                .presets
+                .retain(|preset| preset.name != "Gemini CLI" && preset.name != "Ollama");
+            settings.runners.retain(|runner| runner.name != "Review");
+            settings.runners[0].prompt = "custom review task".to_string();
+            for preset in &mut settings.presets {
+                preset.session_id_flag = None;
+                preset.resume_flag = None;
+                preset.startup_delay_ms = 0;
+                preset.working_markers.clear();
+            }
+            if existing_gemini {
+                let mut custom = AgentPreset::gemini();
+                custom.program = Some("custom-gemini".to_string());
+                custom.model = Some("flash".to_string());
+                custom.injection = InjectionMode::TypeIn;
+                settings.presets.push(custom);
+            }
+            let before = serde_json::to_value(&settings).unwrap();
+            assert!(settings.seed_builtin_presets());
+            assert_eq!(settings.preset_seed_version, PRESET_SEED_VERSION);
+            assert_eq!(
+                settings
+                    .presets
+                    .iter()
+                    .filter(|preset| preset.name == "Gemini CLI")
+                    .count(),
+                1
+            );
+            if !existing_gemini {
+                let added = settings.presets.pop().unwrap();
+                assert_eq!(added.name, "Gemini CLI");
+                assert_eq!(added.program.as_deref(), Some("gemini"));
+                assert_eq!(added.injection, InjectionMode::None);
+            }
+            settings.preset_seed_version = 20;
+            assert_eq!(
+                serde_json::to_value(&settings).unwrap(),
+                before,
+                "no old preset/runner resurrection or replay of saved defaults"
+            );
+        }
     }
 
     #[test]

@@ -227,8 +227,10 @@ feature is added or changed, update the matching entry here in the same change**
 ## Agents
 
 - **Built-in agent presets** — Shell, Claude, opencode, Amp (ampcode), Grok
-  (x.ai), Muse Code (Meta), Hermes, Ollama, **Ollama Code**, Pi, and a **Browser**
-  preset. On Windows the default shell is **PowerShell**, with **Cmd** and
+  (x.ai), Muse Code (Meta), Antigravity (Google `agy`), Gemini CLI (`gemini`),
+  Hermes, Ollama, **Ollama Code**, Pi, and a **Browser** preset, each with its
+  own icon. On Windows the default shell is
+  **PowerShell**, with **Cmd** and
   **Git Bash** offered as additional presets (instead of the single "Shell"). A
   preset is either a terminal agent or a **Browser** (opens a browser pane at its
   homepage) — switch the type and edit the fields in Settings → Agents.
@@ -264,6 +266,18 @@ feature is added or changed, update the matching entry here in the same change**
   Positional input after `--` is preserved when configuring hooks.
   Reattaching to a surviving local tmux pane retains its hook binding; a new
   process rotates it. Closing a pane removes its generated hook metadata.
+- **Antigravity** — launches Google's installed `agy` CLI, with optional model
+  (`--model`) and reasoning-effort (`--effort`) overrides. It leaves `agy`'s
+  configured defaults in effect otherwise. Startup instruction injection is
+  disabled so panes never submit an automatic turn. Resume through `agy`'s own
+  `/resume` or `agy --continue` / `--conversation`; automatic conversation
+  capture on pane restart is not yet integrated.
+- **Gemini CLI** — launches Google's installed `gemini` CLI, with an optional
+  model (`--model`) override. It leaves Gemini CLI's configured defaults in
+  effect otherwise. Startup instruction injection is disabled so panes never
+  submit an automatic turn. Resume through Gemini CLI's own `/resume` or
+  `gemini --resume`; automatic conversation capture on pane restart is not yet
+  integrated.
 - **Configurable launch** — per agent: program, model + model flag, effort +
   effort flag, extra args (shell-style quoting: `--append-system-prompt "be terse"`
   stays one argument, matching the iOS companion's parser; an unbalanced quote
@@ -573,10 +587,11 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **One skill manager for every agent** — Settings → Skills lists the Agent
   Skills (`SKILL.md` folders) that each installed agent can use: Claude Code,
-  Codex, opencode, Amp, Grok, pi, Hermes, Gemini CLI, Cursor, Copilot CLI and
-  Factory Droid. Agents count as installed when their program is on `PATH` or
-  their config folder exists. Each skill shows the icons of the agents that load
-  it, its description, source, license and every folder it's installed in.
+  Codex, opencode, Amp, Grok, Antigravity (`agy`), pi, Hermes, Gemini CLI,
+  Cursor, Copilot CLI and Factory Droid. Agents count as installed when their
+  program is on `PATH` or their config folder exists. Each skill shows the icons
+  of the agents that load it, its description, source, license and every folder
+  it's installed in.
 - **This computer, SSH hosts, user or project** — the Machine picker switches to
   any saved SSH host (one connection over its existing ControlMaster; Windows
   hosts included), and the Scope picker switches between user-level skills and
@@ -601,9 +616,9 @@ feature is added or changed, update the matching entry here in the same change**
 - **Updates and removal** — **Check for updates** compares each skill's git tree
   with its repository (one clone per source) and marks changed ones; **Update**
   rewrites it in place. **Remove…** deletes a skill from every agent's folder.
-  Skills synced from claude.ai and those bundled with Codex, Grok or Hermes are
-  never changed; they're hidden from the list until you click **Show
-  built-in**.
+  Skills synced from claude.ai and those bundled with Codex, Grok, Antigravity
+  or Hermes are never changed; they're hidden from the list until you click
+  **Show built-in**.
 - **Works with the `skills` CLI** — muxel reads and writes the CLI's
   `~/.agents/.skill-lock.json`, so skills installed by either tool show their
   source and update in both; muxel also keeps a `.muxel-skill.json` record in
@@ -1054,9 +1069,10 @@ feature is added or changed, update the matching entry here in the same change**
   the separate **Outside terminal creation** policy in Settings → Outside control.
   It defaults to **Off**. **Ask** requires a click for each request; **Allow**
   opens only presets whose program is a known agent provider (the built-in agent
-  presets' programs — Claude, Codex, Grok, opencode, Amp, Muse, Hermes, Ollama,
-  pi — by executable name, ignoring case and a `.exe`, `.cmd` or `.bat` suffix,
-  so npm's `codex.cmd` shim is Codex) without a click, when it is given as an absolute
+  presets' programs — Claude, Codex, Grok, opencode, Amp, Muse, Antigravity,
+  Gemini CLI, Hermes, Ollama, pi — by executable name, ignoring case and a
+  `.exe`, `.cmd` or `.bat` suffix, so npm's `codex.cmd` shim is Codex) without a
+  click, when it is given as an absolute
   path or found through absolute `PATH` entries. Any other program, such as
   `ssh host`, `wsl.exe`, `python` or `node`, and a relative path or `PATH`
   entry, which the caller's `--cwd` could supply, still Asks under Allow.

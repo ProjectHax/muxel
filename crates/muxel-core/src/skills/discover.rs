@@ -24,6 +24,7 @@ const SEARCH_DIRS: &[&str] = &[
     "skills/.experimental",
     "skills/.system",
     ".agents/skills",
+    ".agent/skills",
     ".claude/skills",
     ".opencode/skills",
     ".opencode/skill",

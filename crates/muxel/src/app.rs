@@ -2563,13 +2563,27 @@ mod activity_label_tests {
 
 /// Asset path for an agent's icon, chosen from its program name.
 fn agent_icon_path(program: Option<&str>) -> SharedString {
-    let base = program.map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p));
-    match base {
+    let base = program.map(|p| {
+        p.rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(p)
+            .to_ascii_lowercase()
+    });
+    let stem = base.as_deref().map(|leaf| {
+        [".exe", ".cmd", ".bat"]
+            .iter()
+            .find_map(|suffix| leaf.strip_suffix(suffix))
+            .unwrap_or(leaf)
+    });
+    match stem {
         Some(p) if p.contains("claude") => "icons/agent-claude.svg",
         Some(p) if p.contains("opencode") => "icons/agent-opencode.svg",
         Some(p) if p == "amp" || p.contains("ampcode") => "icons/agent-ampcode.svg",
         Some(p) if p.contains("grok") => "icons/agent-grok.svg",
-        Some(p) if p.contains("codex") => "icons/agent-generic.svg",
+        Some(p) if p.contains("codex") => "icons/agent-codex.svg",
+        Some(p) if p == "muse" || p.starts_with("muse-") => "icons/agent-muse.svg",
+        Some(p) if p == "agy" || p.contains("antigravity") => "icons/agent-antigravity.svg",
+        Some(p) if p.contains("gemini") => "icons/agent-gemini.svg",
         Some(p) if p.contains("hermes") => "icons/agent-hermes.svg",
         Some(p) if p.contains("ollama") => "icons/agent-ollama.svg",
         Some(p) if p == "pi" || p.contains("pi.dev") || p.contains("pidev") => "icons/agent-pi.svg",
@@ -2592,7 +2606,29 @@ fn instance_icon_path(kind: InstanceKind, program: Option<&str>) -> SharedString
 
 #[cfg(test)]
 mod page_icon_tests {
-    use super::{InstanceKind, instance_icon_path};
+    use super::{InstanceKind, agent_icon_path, instance_icon_path};
+
+    #[test]
+    fn agent_programs_map_to_their_own_icons() {
+        for (program, expected) in [
+            ("agy", "icons/agent-antigravity.svg"),
+            ("/Users/me/.local/bin/agy", "icons/agent-antigravity.svg"),
+            ("AGY.EXE", "icons/agent-antigravity.svg"),
+            ("codex", "icons/agent-codex.svg"),
+            ("codex.cmd", "icons/agent-codex.svg"),
+            ("muse", "icons/agent-muse.svg"),
+            ("muse-bin-1.4.8.exe", "icons/agent-muse.svg"),
+            ("gemini", "icons/agent-gemini.svg"),
+            ("gemini.cmd", "icons/agent-gemini.svg"),
+            ("hermes", "icons/agent-hermes.svg"),
+        ] {
+            assert_eq!(
+                agent_icon_path(Some(program)).as_ref(),
+                expected,
+                "{program}"
+            );
+        }
+    }
 
     #[test]
     fn only_a_terminal_without_a_program_shows_the_shell_icon() {
@@ -3078,6 +3114,50 @@ mod launch_instruction_transport_tests {
         let instructions = control.startup_input.expect("TypeIn positive control");
         assert!(instructions.contains("MEMORY.md"));
         assert!(instructions.contains("file:"));
+    }
+
+    #[test]
+    fn agy_launch_assembly_sends_no_automatic_input_or_instructions() {
+        let mut project = Project::new("repo", "/tmp/repo");
+        project.memory_enabled = true;
+        let instance = Instance::from_preset(project.id, &AgentPreset::agy());
+        assert!(
+            instance.auto_submit,
+            "exercise the normal new-pane submit default"
+        );
+        assert_eq!(instance.system_prompt, None);
+
+        let launch = resolve_agent_launch(&instance, Some(&project), false);
+        assert_eq!(launch.program.as_deref(), Some("agy"));
+        assert!(
+            launch.args.is_empty(),
+            "no file-link or memory instruction flag"
+        );
+        assert_eq!(launch.startup_input, None);
+        assert_eq!(launch.session_context, None);
+        assert_eq!(launch.auto_mode_presses, 0);
+    }
+
+    #[test]
+    fn gemini_launch_assembly_sends_no_automatic_input_or_instructions() {
+        let mut project = Project::new("repo", "/tmp/repo");
+        project.memory_enabled = true;
+        let instance = Instance::from_preset(project.id, &AgentPreset::gemini());
+        assert!(
+            instance.auto_submit,
+            "exercise the normal new-pane submit default"
+        );
+        assert_eq!(instance.system_prompt, None);
+
+        let launch = resolve_agent_launch(&instance, Some(&project), false);
+        assert_eq!(launch.program.as_deref(), Some("gemini"));
+        assert!(
+            launch.args.is_empty(),
+            "no file-link or memory instruction flag"
+        );
+        assert_eq!(launch.startup_input, None);
+        assert_eq!(launch.session_context, None);
+        assert_eq!(launch.auto_mode_presses, 0);
     }
 
     #[test]

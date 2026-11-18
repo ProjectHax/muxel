@@ -481,6 +481,60 @@ impl AgentPreset {
         }
     }
 
+    /// Google's Antigravity CLI (https://antigravity.google/docs/cli/reference) —
+    /// the `agy` command.
+    pub fn agy() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            kind: PresetKind::Terminal,
+            url: String::new(),
+            name: "Antigravity".to_string(),
+            program: Some("agy".to_string()),
+            model: None,
+            model_flag: default_model_flag(),
+            effort: None,
+            effort_flag: Some("--effort".to_string()),
+            args: Vec::new(),
+            system_prompt: None,
+            // No verified hidden instruction transport; never type into a live prompt.
+            injection: InjectionMode::None,
+            env: Vec::new(),
+            working_markers: Vec::new(),
+            blocked_markers: Vec::new(),
+            startup_delay_ms: 0,
+            // agy can resume via `--conversation <id>`, but muxel does not capture its id.
+            session_id_flag: None,
+            resume_flag: None,
+        }
+    }
+
+    /// Google's Gemini CLI (https://github.com/google-gemini/gemini-cli) —
+    /// the `gemini` command.
+    pub fn gemini() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            kind: PresetKind::Terminal,
+            url: String::new(),
+            name: "Gemini CLI".to_string(),
+            program: Some("gemini".to_string()),
+            model: None,
+            model_flag: default_model_flag(),
+            effort: None,
+            effort_flag: None,
+            args: Vec::new(),
+            system_prompt: None,
+            // No verified hidden instruction transport; never type into a live prompt.
+            injection: InjectionMode::None,
+            env: Vec::new(),
+            working_markers: Vec::new(),
+            blocked_markers: Vec::new(),
+            startup_delay_ms: 0,
+            // gemini can resume via `--resume <id|latest>`, but muxel does not capture its id.
+            session_id_flag: None,
+            resume_flag: None,
+        }
+    }
+
     /// A built-in web-browser preset. Picked like an agent; opens a browser pane
     /// (embedded on macOS/Windows, a separate window on Linux) at `url`.
     pub fn browser() -> Self {
@@ -522,7 +576,7 @@ impl AgentPreset {
     /// The built-in agent presets: every default terminal preset that runs an
     /// agent rather than a shell. Their programs are the agent providers muxel
     /// knows (see [`is_known_agent_program`]).
-    pub fn builtin_agents() -> [AgentPreset; 10] {
+    pub fn builtin_agents() -> [AgentPreset; 12] {
         [
             Self::claude(),
             Self::opencode(),
@@ -530,6 +584,8 @@ impl AgentPreset {
             Self::grok(),
             Self::codex(),
             Self::muse(),
+            Self::agy(),
+            Self::gemini(),
             Self::hermes(),
             Self::ollama(),
             Self::ollama_code(),
@@ -1446,14 +1502,20 @@ mod tests {
             "opencode",
             "amp",
             "muse",
+            "agy",
+            "gemini",
             "hermes",
             "ollama",
             "pi",
             "/usr/local/bin/codex",
+            "/Users/me/.local/bin/agy",
+            "/usr/local/bin/gemini",
             r"C:\Users\me\AppData\Roaming\npm\Claude.EXE",
             "  GROK  ",
             // npm's shims, which a bare `codex` already finds through PATH.
             "codex.cmd",
+            "agy.cmd",
+            "gemini.cmd",
             r"C:\Users\me\AppData\Roaming\npm\claude.cmd",
             "AMP.BAT",
         ] {
@@ -1697,6 +1759,51 @@ mod tests {
             launch.session_context.as_deref(),
             Some("Project instructions\nwith details")
         );
+        assert_eq!(session_resume_args(&preset, &inst), None);
+    }
+
+    #[test]
+    fn agy_preset_resolves_supported_arguments_without_startup_input() {
+        let mut preset = AgentPreset::agy();
+        let launch = resolve_launch(&instance(&preset, None));
+        assert_eq!(launch.program.as_deref(), Some("agy"));
+        assert!(
+            launch.args.is_empty(),
+            "leave agy's configured defaults in effect"
+        );
+
+        preset.model = Some("configured-model".to_string());
+        preset.effort = Some("high".to_string());
+        let inst = instance(&preset, Some("Project instructions\nwith details"));
+        let launch = resolve_launch(&inst);
+        assert_eq!(
+            launch.args,
+            ["--model", "configured-model", "--effort", "high"]
+        );
+        assert_eq!(launch.startup_input, None);
+        assert_eq!(launch.session_context, None);
+        assert_eq!(preset.injection, InjectionMode::None);
+        assert_eq!(session_resume_args(&preset, &inst), None);
+    }
+
+    #[test]
+    fn gemini_preset_resolves_supported_arguments_without_startup_input() {
+        let mut preset = AgentPreset::gemini();
+        let launch = resolve_launch(&instance(&preset, None));
+        assert_eq!(launch.program.as_deref(), Some("gemini"));
+        assert!(
+            launch.args.is_empty(),
+            "leave Gemini CLI's configured defaults in effect"
+        );
+
+        preset.model = Some("gemini-2.5-pro".to_string());
+        preset.effort = Some("high".to_string());
+        let inst = instance(&preset, Some("Project instructions\nwith details"));
+        let launch = resolve_launch(&inst);
+        assert_eq!(launch.args, ["--model", "gemini-2.5-pro"]);
+        assert_eq!(launch.startup_input, None);
+        assert_eq!(launch.session_context, None);
+        assert_eq!(preset.injection, InjectionMode::None);
         assert_eq!(session_resume_args(&preset, &inst), None);
     }
 
