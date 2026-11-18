@@ -37,11 +37,15 @@ use uuid::Uuid;
 const MAX_REQUEST_BYTES: u64 = 1 << 20;
 /// Connections served at once; more are answered `busy` rather than queued.
 const MAX_CONNECTIONS: usize = 16;
-/// How long the accept thread spends on each read or write of a connection
+/// How long the accept thread waits to write the `busy` answer to a connection
 /// over [`MAX_CONNECTIONS`].
 const BUSY_IO: Duration = Duration::from_millis(100);
-/// How long, at most, the accept thread reads a refused connection's request.
+/// How long a refused connection's request is read, on a thread of its own,
+/// unless its caller hangs up first.
 const BUSY_DRAIN: Duration = Duration::from_millis(300);
+/// Refused connections drained at once. Past this many, a refused connection
+/// is closed as soon as its `busy` answer is written.
+const MAX_DRAINS: usize = 4;
 /// How long a connection waits for the app to answer.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(90);
 /// Socket read/write timeout, so a stalled peer can't hold a thread.
@@ -108,28 +112,13 @@ impl Server {
         std::thread::Builder::new()
             .name("muxel-control".into())
             .spawn(move || {
-                let active = Arc::new(AtomicUsize::new(0));
-                for stream in listener.incoming() {
-                    if accept_stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let Ok(stream) = stream else { continue };
-                    if active.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
-                        refuse_busy(stream);
-                        continue;
-                    }
-                    active.fetch_add(1, Ordering::Relaxed);
-                    let (tx, token, done) = (tx.clone(), accept_token.clone(), active.clone());
-                    let spawned = std::thread::Builder::new()
-                        .name("muxel-control-conn".into())
-                        .spawn(move || {
-                            serve(stream, &token, &tx);
-                            done.fetch_sub(1, Ordering::Relaxed);
-                        });
-                    if spawned.is_err() {
-                        active.fetch_sub(1, Ordering::Relaxed);
-                    }
-                }
+                accept(
+                    &listener,
+                    &accept_stop,
+                    &Places::new(MAX_CONNECTIONS, MAX_DRAINS),
+                    move |stream| serve(stream, &accept_token, &tx),
+                    |stream| drain_request(&stream, BUSY_DRAIN),
+                );
             })
             .context("starting the control thread")?;
         Ok(Self {
@@ -203,6 +192,89 @@ impl Drop for Server {
     }
 }
 
+/// The accept loop's places: connections being served and refused ones being
+/// drained, each against its limit.
+struct Places {
+    serving: Arc<AtomicUsize>,
+    max_serving: usize,
+    draining: Arc<AtomicUsize>,
+    max_draining: usize,
+}
+
+impl Places {
+    fn new(max_serving: usize, max_draining: usize) -> Self {
+        Self {
+            serving: Arc::default(),
+            max_serving,
+            draining: Arc::default(),
+            max_draining,
+        }
+    }
+}
+
+/// Serve each connection on a thread of its own, or answer it `busy` when
+/// every serving place is taken. A refused connection's request is drained on
+/// another thread, so the loop accepts again at once and a place that opens
+/// meanwhile goes to the next connection. With every drain place taken too, a
+/// refused connection is closed once its answer is written.
+fn accept(
+    listener: &TcpListener,
+    stop: &AtomicBool,
+    places: &Places,
+    serve: impl Fn(TcpStream) + Clone + Send + 'static,
+    drain: impl Fn(TcpStream) + Clone + Send + 'static,
+) {
+    for stream in listener.incoming() {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let Ok(stream) = stream else { continue };
+        if places.serving.load(Ordering::Relaxed) >= places.max_serving {
+            if write_busy(&stream) && places.draining.load(Ordering::Relaxed) < places.max_draining
+            {
+                let drain = drain.clone();
+                spawn_in_slot(&places.draining, "muxel-control-drain", move || {
+                    drain(stream)
+                });
+            }
+            continue;
+        }
+        let serve = serve.clone();
+        spawn_in_slot(&places.serving, "muxel-control-conn", move || serve(stream));
+    }
+}
+
+/// A place held by a connection being served or drained. Dropping it gives
+/// the place back, so a connection whose thread panics doesn't keep its
+/// place: enough kept places would answer every later request `busy`.
+struct Slot(Arc<AtomicUsize>);
+
+impl Slot {
+    fn take(active: &Arc<AtomicUsize>) -> Self {
+        active.fetch_add(1, Ordering::Relaxed);
+        Self(active.clone())
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Run `work` on its own thread in one of `active`'s places. The place goes
+/// back when the thread ends, however it ends, or at once if the thread can't
+/// start (the closure holding it is dropped then).
+fn spawn_in_slot(active: &Arc<AtomicUsize>, name: &str, work: impl FnOnce() + Send + 'static) {
+    let slot = Slot::take(active);
+    let _ = std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let _slot = slot;
+            work();
+        });
+}
+
 /// Answer one connection: one request line in, one response line out.
 fn serve(stream: TcpStream, token: &str, tx: &async_channel::Sender<Incoming>) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
@@ -218,13 +290,10 @@ fn serve(stream: TcpStream, token: &str, tx: &async_channel::Sender<Incoming>) {
 }
 
 /// Answer a connection over [`MAX_CONNECTIONS`] `busy` without reading its
-/// request, so its caller knows nothing was done. The request is then read and
-/// dropped, briefly: closing a socket with input unread resets the connection,
-/// and a TCP stack may discard an answer its caller hasn't read yet when the
-/// reset arrives.
-fn refuse_busy(stream: TcpStream) {
+/// request, so its caller knows nothing was done; false if the answer couldn't
+/// be written.
+fn write_busy(stream: &TcpStream) -> bool {
     let _ = stream.set_write_timeout(Some(BUSY_IO));
-    let _ = stream.set_read_timeout(Some(BUSY_IO));
     let busy = control::Error::new(
         ErrorCode::Busy,
         format!(
@@ -235,16 +304,41 @@ fn refuse_busy(stream: TcpStream) {
     let mut line = serde_json::to_string(&Response::err(busy))
         .expect("control errors have a JSON representation");
     line.push('\n');
-    if (&stream).write_all(line.as_bytes()).is_err() {
-        return;
+    let mut stream = stream;
+    if stream.write_all(line.as_bytes()).is_err() {
+        return false;
     }
     let _ = stream.shutdown(std::net::Shutdown::Write);
-    let deadline = Instant::now() + BUSY_DRAIN;
+    true
+}
+
+/// Read and drop a refused connection's request for up to `drain`, or until
+/// its caller hangs up: closing a socket with input unread resets the
+/// connection, and a TCP stack may discard an answer its caller hasn't read
+/// yet when the reset arrives.
+fn drain_request(stream: &TcpStream, drain: Duration) {
+    // A pause doesn't end the drain: a caller slowed by a loaded machine, as
+    // it may well be when muxel is this busy, can send its request late.
+    let deadline = Instant::now() + drain;
     let mut sink = [0u8; 4096];
-    while Instant::now() < deadline {
-        // Done when the caller hangs up, or sends nothing for a while.
-        if !matches!((&stream).read(&mut sink), Ok(read) if read > 0) {
+    let mut stream = stream;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
             break;
+        }
+        match stream.read(&mut sink) {
+            // The caller hung up.
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(_) => break,
         }
     }
 }
@@ -955,9 +1049,10 @@ fn wait(agent: &str, timeout: Duration, full: bool, turn: bool) -> Result<Value,
 #[cfg(test)]
 mod tests {
     use super::{
-        DELIVERY_WAIT, MAX_CONNECTIONS, Server, Task, choose_endpoint, create, dispatch,
-        failure_body, process_alive, read_endpoint, request_at, same_secret, task_of,
-        wait_creation_with, wait_prompt_delivery_with, write_endpoint,
+        BUSY_IO, DELIVERY_WAIT, MAX_CONNECTIONS, Places, Server, Task, accept, choose_endpoint,
+        create, dispatch, drain_request, failure_body, process_alive, read_endpoint, request_at,
+        same_secret, spawn_in_slot, task_of, wait_creation_with, wait_prompt_delivery_with,
+        write_busy, write_endpoint,
     };
     use muxel_core::control::{
         self, CliCommand, Command, Endpoint, ErrorCode, PROTOCOL_VERSION, Response,
@@ -1274,6 +1369,144 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A refused caller slow to send its request still reads `busy`. A pause
+    /// doesn't end the drain, so the late request is read instead of meeting
+    /// a closed socket, whose reset would discard the answer before it's read.
+    #[test]
+    fn a_refused_caller_that_writes_late_still_reads_busy() {
+        use std::time::Duration;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let caller = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (refused, _) = listener.accept().unwrap();
+        // A drain long enough that the late request lands well inside it.
+        let server = std::thread::spawn(move || {
+            assert!(write_busy(&refused));
+            drain_request(&refused, Duration::from_secs(3));
+        });
+        // Later than one read timeout: the pause that used to end the drain.
+        std::thread::sleep(BUSY_IO * 4);
+        (&caller).write_all(b"{\"late\":true}\n").unwrap();
+        // Time for a reset to come back, had the request met a closed socket.
+        std::thread::sleep(BUSY_IO * 2);
+        let mut answer = String::new();
+        let read = BufReader::new(&caller).read_line(&mut answer);
+        assert!(
+            read.is_ok() && answer.contains(r#""code":"busy""#),
+            "{read:?}: {answer:?}"
+        );
+        drop(caller);
+        server.join().unwrap();
+    }
+
+    /// A connection whose thread panics gives its place back; enough kept
+    /// places would answer every later request `busy`.
+    #[test]
+    fn a_connection_that_panics_gives_its_place_back() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let active = Arc::new(AtomicUsize::new(0));
+        // Unwinds as a panic does, without printing one.
+        spawn_in_slot(&active, "muxel-control-conn", || {
+            std::panic::resume_unwind(Box::new("serve failed"))
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while active.load(Ordering::Relaxed) != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            active.load(Ordering::Relaxed),
+            0,
+            "the connection that panicked kept its place"
+        );
+    }
+
+    /// A refused caller's drain doesn't hold up the accept loop: a place that
+    /// opens while it drains goes to the next connection at once. With every
+    /// drain place taken, a refused caller is answered and not drained.
+    /// The drain is held open by the test, so no step depends on a timing
+    /// margin; the waits only bound a failure.
+    #[test]
+    fn a_connection_is_served_while_a_refused_one_drains() {
+        use std::io::Read as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::time::Duration;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let places = Arc::new(Places::new(1, 1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (served_tx, served) = mpsc::channel();
+        let (draining_tx, draining) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let released = Arc::new(Mutex::new(released));
+        let accepting = {
+            let (places, stop) = (places.clone(), stop.clone());
+            std::thread::spawn(move || {
+                accept(
+                    &listener,
+                    &stop,
+                    &places,
+                    // Holds its place until its caller hangs up.
+                    move |stream| {
+                        served_tx.send(()).unwrap();
+                        let _ = (&stream).read(&mut [0; 1]);
+                    },
+                    move |_stream| {
+                        draining_tx.send(()).unwrap();
+                        let _ = released.lock().unwrap().recv();
+                    },
+                );
+            })
+        };
+        let bound = Duration::from_secs(10);
+        let reads_busy = |caller: &TcpStream| {
+            caller.set_read_timeout(Some(bound)).unwrap();
+            let mut answer = String::new();
+            let read = BufReader::new(caller).read_line(&mut answer);
+            assert!(
+                read.is_ok() && answer.contains(r#""code":"busy""#),
+                "{read:?}: {answer:?}"
+            );
+        };
+
+        // Every serving place is taken: the caller is refused, and its drain
+        // stays open until the test releases it.
+        places.serving.store(1, Ordering::Relaxed);
+        let refused = TcpStream::connect(address).unwrap();
+        reads_busy(&refused);
+        draining
+            .recv_timeout(bound)
+            .expect("the refused caller drains");
+
+        // A place opens during the drain, and the next caller gets it.
+        places.serving.store(0, Ordering::Relaxed);
+        let next = TcpStream::connect(address).unwrap();
+        served
+            .recv_timeout(bound)
+            .expect("a caller arriving during a drain is served");
+
+        // Its place and the one drain place are taken: the caller is answered
+        // and not drained. The loop takes one connection at a time, so once a
+        // later caller has its answer, any drain place for this one is taken.
+        let undrained = TcpStream::connect(address).unwrap();
+        reads_busy(&undrained);
+        let later = TcpStream::connect(address).unwrap();
+        reads_busy(&later);
+        assert_eq!(
+            places.draining.load(Ordering::Relaxed),
+            1,
+            "a refused caller was drained past the limit"
+        );
+
+        release.send(()).unwrap();
+        drop((refused, next, undrained, later));
+        stop.store(true, Ordering::Relaxed);
+        // Wake the loop so it notices `stop`.
+        let _ = TcpStream::connect(address);
+        accepting.join().unwrap();
+    }
+
     #[test]
     fn a_closing_refusal_keeps_its_deadline_through_socket_and_cli_json() {
         let dir = scratch("closing");
@@ -1317,7 +1550,7 @@ mod tests {
     #[test]
     fn cli_failures_without_an_undo_deadline_omit_the_field() {
         for error in [
-            control::Error::new(ErrorCode::Working, "busy"),
+            control::Error::new(ErrorCode::Working, "the agent is working"),
             control::Error::from("no match"),
         ] {
             let reply = failure_body(error, Task::Unsent);
@@ -1328,16 +1561,16 @@ mod tests {
 
     #[test]
     fn cli_failure_body_keeps_reason_and_pasted() {
-        let busy = failure_body(
+        let working = failure_body(
             control::Error::new(ErrorCode::Working, "prior turn is open")
                 .with_reason("just_submitted"),
             Task::Unsent,
         );
-        assert_eq!(busy["ok"], false);
-        assert_eq!(busy["code"], "working");
-        assert_eq!(busy["reason"], "just_submitted");
-        assert!(busy.get("pasted").is_none());
-        assert!(busy["host"].is_string());
+        assert_eq!(working["ok"], false);
+        assert_eq!(working["code"], "working");
+        assert_eq!(working["reason"], "just_submitted");
+        assert!(working.get("pasted").is_none());
+        assert!(working["host"].is_string());
 
         let pasted = failure_body(
             control::Error::new(ErrorCode::InputChanged, "Enter withheld").after_paste(),
@@ -1559,8 +1792,8 @@ mod tests {
                 &first.command,
                 Command::Send { launch_id: Some(launch), .. } if *launch == uuid::Uuid::from_u128(42)
             ));
-            let busy = control::Error::new(ErrorCode::Working, "the agent is working");
-            first.reply.send(Response::err(busy)).unwrap();
+            let working = control::Error::new(ErrorCode::Working, "the agent is working");
+            first.reply.send(Response::err(working)).unwrap();
             let second = rx.recv_blocking().unwrap();
             let receipt =
                 control::pasted_prompt_receipt(uuid::Uuid::from_u128(7), uuid::Uuid::from_u128(42));
