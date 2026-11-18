@@ -896,7 +896,52 @@ fn ssh_run(
         cmd = command("ssh");
         cmd.args(&argv);
     }
-    cmd.output().map_err(|e| ssh_spawn_error(host.auth, e))
+    ssh_output(host.auth, &mut cmd).map_err(|e| ssh_spawn_error(host.auth, e))
+}
+
+/// Pauses before each rerun of an `sshpass` that couldn't open its local pty —
+/// see [`ssh_output`]. About 1.5s in all, well inside a connect's timeout.
+const SSHPASS_PTY_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(100),
+    Duration::from_millis(400),
+    Duration::from_millis(1000),
+];
+
+/// `cmd.output()` for an ssh run built for `auth`. A password run goes through
+/// `sshpass`, which first opens a local pty to type the password into; macOS
+/// occasionally refuses that for a moment ("Failed to get a pseudo terminal:
+/// Unknown error: -6") with ptys to spare, and a manual retry then works. sshpass
+/// gives up before it starts ssh, so nothing reached the host and rerunning is
+/// always safe: it's retried a few times, and the last output returned as-is.
+fn ssh_output(auth: SshAuth, cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    let mut out = cmd.output()?;
+    if auth != SshAuth::Password {
+        return Ok(out);
+    }
+    for delay in SSHPASS_PTY_RETRY_DELAYS {
+        if !is_sshpass_pty_failure(out.status.code(), &out.stderr) {
+            break;
+        }
+        std::thread::sleep(delay);
+        out = cmd.output()?;
+    }
+    Ok(out)
+}
+
+/// Whether an `sshpass` run failed setting up its local pty, before it ran ssh:
+/// its runtime-error exit (3) after one of the lines it prints when
+/// `posix_openpt`, `grantpt` or `unlockpt` fails.
+fn is_sshpass_pty_failure(code: Option<i32>, stderr: &[u8]) -> bool {
+    const PTY_SETUP: [&str; 3] = [
+        "Failed to get a pseudo terminal",
+        "Failed to change pseudo terminal's permission",
+        "Failed to unlock pseudo terminal",
+    ];
+    code == Some(3) && {
+        let err = String::from_utf8_lossy(stderr);
+        let err = err.trim_start();
+        PTY_SETUP.iter().any(|line| err.starts_with(line))
+    }
 }
 
 /// A human message for an ssh transport/auth failure: ssh's stderr, or a generic
@@ -1028,7 +1073,7 @@ pub fn ssh_verify(host: &RemoteHost, password: Option<&str>) -> Result<()> {
         cmd = command("ssh");
         cmd.args(&argv);
     }
-    let out = cmd.output().map_err(|e| ssh_spawn_error(host.auth, e))?;
+    let out = ssh_output(host.auth, &mut cmd).map_err(|e| ssh_spawn_error(host.auth, e))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let msg = err.trim();
@@ -6341,6 +6386,72 @@ mod tests {
         assert!(!is_ssh_transport_failure(SshAuth::Password, Some(1)));
         // sshpass codes 2..=6 only apply to password auth, not key/agent.
         assert!(!is_ssh_transport_failure(SshAuth::Key, Some(5)));
+    }
+
+    #[test]
+    fn sshpass_pty_failure_is_recognized() {
+        // What macOS sshpass printed when `posix_openpt` failed transiently.
+        let seen = b"Failed to get a pseudo terminal: Unknown error: -6\n";
+        assert!(is_sshpass_pty_failure(Some(3), seen));
+        assert!(is_sshpass_pty_failure(
+            Some(3),
+            b"Failed to unlock pseudo terminal: Device not configured\n"
+        ));
+        assert!(is_sshpass_pty_failure(
+            Some(3),
+            b"Failed to change pseudo terminal's permission: Permission denied\n"
+        ));
+        // Another exit code is something else (e.g. a remote command's own status).
+        assert!(!is_sshpass_pty_failure(Some(1), seen));
+        assert!(!is_sshpass_pty_failure(None, seen));
+        // A real connection/auth failure is not retried.
+        assert!(!is_sshpass_pty_failure(
+            Some(3),
+            b"ssh: connect to host h port 22: Connection refused\n"
+        ));
+        assert!(!is_sshpass_pty_failure(Some(5), b""));
+    }
+
+    /// A stand-in for sshpass that fails to get its pty on the first two runs.
+    #[cfg(unix)]
+    fn flaky_pty_command(dir: &Path) -> Command {
+        let script = "n=$(cat runs 2>/dev/null || echo 0); n=$((n+1)); echo $n > runs; \
+                      if [ $n -lt 3 ]; then \
+                      echo 'Failed to get a pseudo terminal: Unknown error: -6' >&2; exit 3; \
+                      fi; echo ok";
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", script]).current_dir(dir);
+        cmd
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sshpass_pty_failure_is_retried_for_password_auth() {
+        let fresh_dir = |label: &str| {
+            let dir = std::env::temp_dir().join(format!(
+                "muxel-sshpass-retry-{}-{label}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+
+        let dir = fresh_dir("password");
+        let out = ssh_output(SshAuth::Password, &mut flaky_pty_command(&dir)).unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+        let runs = std::fs::read_to_string(dir.join("runs")).unwrap();
+        assert_eq!(runs.trim(), "3");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Key/agent auth runs plain ssh, never sshpass: its output stands.
+        let dir = fresh_dir("key");
+        let out = ssh_output(SshAuth::Key, &mut flaky_pty_command(&dir)).unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        let runs = std::fs::read_to_string(dir.join("runs")).unwrap();
+        assert_eq!(runs.trim(), "1");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
