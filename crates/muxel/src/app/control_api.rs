@@ -36,7 +36,7 @@ fn control_program_writable(
     inst: &Instance,
     allow_shells: bool,
     fallback_shell: bool,
-) -> Result<(), String> {
+) -> CtlResult<()> {
     // Existing panes may run remotely. Match the provider name without
     // resolving local executables on the UI thread.
     if !allow_shells
@@ -45,12 +45,30 @@ fn control_program_writable(
             || !muxel_core::is_known_agent_program(inst.program.as_deref()))
     {
         let name = inst.display_name();
-        return Err(format!(
-            "typing into '{name}' requires command execution permission in Settings > \
-             Outside control > \"Also allow typing into shell panes\""
-        ));
+        let grant = "requires command execution permission in Settings > Outside control > \
+                     \"Also allow typing into shell panes\"";
+        // An agent whose launch failed runs a shell in its place: the agent
+        // asked for isn't running.
+        return Err(if fallback_shell {
+            ctl::Error::new(
+                ErrorCode::NotRunning,
+                format!(
+                    "'{name}' failed to start, and a shell runs in its place: typing into it {grant}"
+                ),
+            )
+        } else {
+            ctl::Error::new(
+                ErrorCode::CommandPermissionRequired,
+                format!("typing into '{name}' {grant}"),
+            )
+        });
     }
     Ok(())
+}
+
+/// The error for a pane that closed after its request was taken in.
+fn just_closed() -> ctl::Error {
+    ctl::Error::new(ErrorCode::Exited, "that agent has just closed")
 }
 
 /// A task queued by outside creation, or a prompt/answer typed through `ctl`.
@@ -1189,10 +1207,7 @@ impl MuxelApp {
     }
 
     fn control_info_of(&self, iid: Uuid, now: i64, cx: &App) -> CtlResult<AgentInfo> {
-        let inst = self
-            .workspace
-            .instance(iid)
-            .ok_or("that agent has just closed")?;
+        let inst = self.workspace.instance(iid).ok_or_else(just_closed)?;
         Ok(self.control_info(inst, now, cx))
     }
 
@@ -1443,10 +1458,7 @@ impl MuxelApp {
         if !self.settings.control_enabled {
             return Err(ctl::creation_refusal(ErrorCode::ControlDisabled));
         }
-        let inst = self
-            .workspace
-            .instance(iid)
-            .ok_or("that agent has just closed")?;
+        let inst = self.workspace.instance(iid).ok_or_else(just_closed)?;
         let name = inst.display_name();
         if inst.kind != InstanceKind::Terminal {
             return Err(format!(
@@ -1525,10 +1537,7 @@ impl MuxelApp {
         reply: Value,
         cx: &App,
     ) -> CtlResult<Typing> {
-        let inst = self
-            .workspace
-            .instance(iid)
-            .ok_or("that agent has just closed")?;
+        let inst = self.workspace.instance(iid).ok_or_else(just_closed)?;
         let admitted = self.control_writable(iid, cx)?;
         Ok(Typing {
             iid,
@@ -1923,7 +1932,10 @@ impl MuxelApp {
                             .update(cx, |app, cx| -> CtlResult<ControlWrite> {
                                 let current_session = app.control_writable(iid, cx)?;
                                 if !Arc::ptr_eq(&session, &current_session) {
-                                    return Err("the pane restarted".into());
+                                    return Err(ctl::Error::new(
+                                        ErrorCode::LaunchMismatch,
+                                        "the pane restarted",
+                                    ));
                                 }
                                 if !session.accepts_input_epoch(input_epoch) {
                                     return Err(ctl::Error::new(
@@ -3434,6 +3446,137 @@ mod prompt_submission_tests {
             let sent = sent.try_recv().expect("the send finished");
             assert!(sent.is_ok(), "{sent:?}");
             assert!(SendInFlight::begin(pane, false).is_ok());
+        });
+    }
+
+    /// A refusal made before anything was typed carries a code, so a `send`
+    /// that met one reads `not_delivered`, not `unconfirmed`.
+    #[cfg(windows)]
+    #[test]
+    fn refusals_before_any_input_carry_a_code() {
+        use crate::control::{Task, failure_body};
+        use gpui::AppContext as _;
+        use muxel_core::{AgentPreset, Instance, Project};
+        use muxel_terminal::{TerminalLaunch, TerminalView};
+        use std::os::windows::process::ExitStatusExt as _;
+        use std::time::Instant;
+
+        let args: Vec<String> = vec!["/D".into(), "/Q".into(), "/K".into()];
+        let cmd = || CommandSpec::program("cmd.exe", args.clone());
+        super::super::popout_lifecycle_tests::with_app(|cx, window| {
+            let (refused, later) = window
+                .update(cx, |app, window, cx| {
+                    let root = muxel_store::data_dir().unwrap().join("control-refusals");
+                    std::fs::create_dir_all(&root).unwrap();
+                    let project = app.workspace.add_project(Project::new("control", root));
+                    app.settings.control_enabled = true;
+                    app.settings.control_allow_shells = false;
+                    let cmd_pane = || {
+                        let mut instance = Instance::shell(project);
+                        instance.program = Some("cmd.exe".into());
+                        instance.args = args.clone();
+                        instance
+                    };
+                    let mut show = |instance: Instance, launch: TerminalLaunch| {
+                        let pane = instance.id;
+                        app.workspace.add_instance(instance);
+                        let view = cx
+                            .new(|cx| TerminalView::new(launch, pane, Instant::now(), window, cx));
+                        app.terminals.insert(pane, view);
+                        pane
+                    };
+                    let shell = show(cmd_pane(), TerminalLaunch::spawn(cmd(), (80, 24)).unwrap());
+                    // An agent whose program is missing: a shell runs instead.
+                    let agent = Instance::from_preset(project, &AgentPreset::codex());
+                    let missing = std::env::temp_dir()
+                        .join(format!("muxel-missing-agent-{}", Uuid::new_v4()))
+                        .join("codex.exe");
+                    let spec = super::control_launch_spec(
+                        Some(&agent),
+                        None,
+                        None,
+                        CommandSpec::program(missing.to_string_lossy().into_owned(), vec![]),
+                    );
+                    let launch =
+                        TerminalLaunch::spawn_for_instance(spec, (80, 24), agent.id).unwrap();
+                    let fallback = show(agent, launch);
+                    // A shell whose keys go through tmux, which reports
+                    // whether they went in.
+                    let route = muxel_terminal::TmuxInputRoute::new(
+                        "muxel_p_1",
+                        true,
+                        |command: &[String], _: Option<&[u8]>| {
+                            let stdout = match command[0].as_str() {
+                                "list-panes" => "muxel_p_1:%7:1::3.4\n",
+                                "display-message" => "%7\n",
+                                _ => "",
+                            };
+                            Ok(std::process::Output {
+                                status: std::process::ExitStatus::from_raw(0),
+                                stdout: stdout.as_bytes().to_vec(),
+                                stderr: Vec::new(),
+                            })
+                        },
+                    );
+                    let tmux = show(
+                        cmd_pane(),
+                        TerminalLaunch::spawn(cmd().with_tmux_input(route), (80, 24)).unwrap(),
+                    );
+
+                    let refused = [shell, fallback].map(|pane| {
+                        app.control_send(pane, "dir".into(), true, None, cx)
+                            .err()
+                            .expect("typing refused")
+                    });
+
+                    app.settings.control_allow_shells = true;
+                    // The pane closes after the send is taken in, before
+                    // its paste.
+                    let typing = app
+                        .control_send(shell, "dir".into(), true, None, cx)
+                        .expect("the send is taken in");
+                    app.workspace.remove_instance_meta(shell);
+                    let closed = app.control_press(typing, None, None, cx);
+                    // The pane restarts after the keys are taken in, before
+                    // the first is pressed.
+                    let typing = app
+                        .control_keys(tmux, &["x".into()], cx)
+                        .expect("the keys are taken in");
+                    let restarted = app.control_press(typing, None, None, cx);
+                    let view = cx.new(|cx| {
+                        let launch = TerminalLaunch::spawn(cmd(), (80, 24)).unwrap();
+                        TerminalView::new(launch, tmux, Instant::now(), window, cx)
+                    });
+                    if let Some(old) = app.terminals.insert(tmux, view) {
+                        old.read(cx).session().kill();
+                    }
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    cx.spawn(async move |_, _| {
+                        tx.send((closed.await, restarted.await)).unwrap();
+                    })
+                    .detach();
+                    (refused, rx)
+                })
+                .unwrap();
+            cx.run_until_parked();
+            let (closed, restarted) = later.try_recv().expect("both finished");
+            let [shell, fallback] = refused;
+            let closed = closed.expect_err("a closed pane takes no input");
+            let restarted = restarted.expect_err("a restarted pane takes no queued keys");
+            assert_eq!(
+                [&shell, &fallback, &closed, &restarted].map(|error| error.code),
+                [
+                    Some(ErrorCode::CommandPermissionRequired),
+                    Some(ErrorCode::NotRunning),
+                    Some(ErrorCode::Exited),
+                    Some(ErrorCode::LaunchMismatch),
+                ],
+                "{shell} | {fallback} | {closed} | {restarted}"
+            );
+            for refusal in [shell, fallback, closed] {
+                let reply = failure_body(refusal, Task::Unsent);
+                assert_eq!(reply["outcome"], "not_delivered", "{reply}");
+            }
         });
     }
 

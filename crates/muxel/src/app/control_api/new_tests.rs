@@ -710,13 +710,14 @@ fn control_new_policy_raw_write_revocation() {
         let error = control_program_writable(&instance, app.settings.control_allow_shells, false)
             .expect_err("raw-command write permission revoked");
         assert!(
-            error.contains(COMMAND_SETTING),
+            error.message.contains(COMMAND_SETTING),
             "unexpected refusal: {error}"
         );
         assert!(
-            !error.contains("is a shell"),
+            !error.message.contains("is a shell"),
             "raw program mislabeled: {error}"
         );
+        assert_eq!(error.code, Some(ErrorCode::CommandPermissionRequired));
         assert_eq!(serde_json::to_value(&instance).unwrap(), before);
     }
 }
@@ -778,7 +779,8 @@ fn control_fallback_shell_permission_tracks_restored_and_relaunched_agent() {
                 assert!(result.is_ok());
             } else {
                 let error = result.expect_err("saved agent metadata must not authorize its shell");
-                assert!(error.contains(COMMAND_SETTING));
+                assert!(error.message.contains(COMMAND_SETTING));
+                assert_eq!(error.code, Some(ErrorCode::NotRunning));
             }
         }
         drop(fallback);
@@ -831,7 +833,10 @@ fn control_write_policy_recognizes_known_agent_names_without_local_resolution() 
         let result = control_program_writable(&instance, false, false);
         assert_eq!(result.is_ok(), known, "{program}: {result:?}");
         if let Err(error) = result {
-            assert!(error.contains(COMMAND_SETTING), "{program}: {error}");
+            assert!(
+                error.message.contains(COMMAND_SETTING),
+                "{program}: {error}"
+            );
         }
         assert!(
             control_program_writable(&instance, true, false).is_ok(),
@@ -979,7 +984,7 @@ fn control_new_policy_shell_classification_refuses_writes_after_opt_out() {
             let error = control_program_writable(&instance, false, false)
                 .expect_err("shell permission revoked");
             assert!(
-                error.contains(COMMAND_SETTING),
+                error.message.contains(COMMAND_SETTING),
                 "unexpected refusal: {error}"
             );
         }

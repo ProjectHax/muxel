@@ -285,7 +285,8 @@ pub enum ErrorCode {
     ControlDisabled,
     /// Outside terminal creation is Off.
     CreationDisabled,
-    /// Literal argv or a shell launch needs the shell/command grant.
+    /// Literal argv, a shell launch, or typing into a shell or literal-argv pane
+    /// needs the shell/command grant.
     CommandPermissionRequired,
     /// The user denied this creation request.
     ApprovalDenied,
@@ -2073,7 +2074,7 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
   read nothing of this request; nothing was done. Try again shortly.
 - `control_disabled` - outside control was turned off before the mutation.
 - `creation_disabled` - Outside terminal creation is Off; the user must choose Ask or Allow.
-- `command_permission_required` - literal argv or a shell launch needs the shell/command grant.
+- `command_permission_required` - literal argv, a shell launch, or typing into a shell or literal-argv pane needs the shell/command grant.
 - `approval_denied` - the user clicked Deny; nothing was created.
 - `approval_timeout` - no approval arrived within 120 seconds; nothing was created.
 - `prompt_unsupported` - prompts require a configured non-shell terminal preset.

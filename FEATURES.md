@@ -1216,12 +1216,15 @@ feature is added or changed, update the matching entry here in the same change**
   Enter; never paste the task again after uncertain delivery. Startup pending
   proof preserves exact whitespace; ambiguous layout stays unconfirmed. A failed
   `send` or `new --prompt` is `not_delivered` only when a coded refusal came
-  before any input; other commands' failures carry no outcome. muxel serves 16
-  ctl connections at once; one more is answered `busy` before its request is
-  read, so a task sent on it is `not_delivered`. A send watches
-  for its receipt for ten seconds, a second longer for each thousand characters
-  past the first, up to a minute. Agent IDs also accept the `pane<ID>`
-  spelling when no agent has that name.
+  before any input; other commands' failures carry no outcome. Typing into a
+  shell or literal-argv pane without the shell grant is refused
+  `command_permission_required`, into an agent whose launch fell back to a
+  shell `not_running`, and into a pane that closed before its input went in
+  `exited`. muxel serves 16 ctl connections at once; one more is answered
+  `busy` before its request is read, so a task sent on it is `not_delivered`.
+  A send watches for its receipt for ten seconds, a second longer for each
+  thousand characters past the first, up to a minute. Agent IDs also accept the
+  `pane<ID>` spelling when no agent has that name.
 - **Startup input waits for the provider** — a `new --prompt` task waits for a
   real editable composer and provider acceptance. The reply comes once the pane
   exists, with the task submitted, refused, or `prompt_pending` and a `status`
