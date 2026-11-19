@@ -47,6 +47,83 @@ pub use input_hold::ShellCloseReading;
 pub struct ShellCloseCheck {
     #[cfg(windows)]
     processes: std::cell::OnceCell<Option<crate::shell_process::Snapshot>>,
+    #[cfg(windows)]
+    expiry: Option<ExpiryShellReadings>,
+}
+
+#[cfg(windows)]
+struct ExpiryShellReadings {
+    started: Option<Instant>,
+    readings: std::collections::HashMap<Uuid, ShellCloseReading>,
+}
+
+#[cfg(windows)]
+const MAX_EXPIRY_SNAPSHOT_AGE: Duration = Duration::from_millis(100);
+
+#[cfg(windows)]
+impl ExpiryShellReadings {
+    fn certifies(&self, id: Uuid, current: ShellCloseReading, now: Instant) -> bool {
+        // A child can start without a mark. Bound the age from the beginning
+        // of the walk, including time spent waiting to return to the UI.
+        current.idle
+            && self.started.is_some_and(|started| {
+                now.saturating_duration_since(started) <= MAX_EXPIRY_SNAPSHOT_AGE
+            })
+            && self.readings.get(&id) == Some(&current)
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn expiry_reading_requires_a_fresh_snapshot_of_the_same_launch_and_prompt() {
+    let id = Uuid::new_v4();
+    let started = Instant::now();
+    let prompt = ShellCloseReading {
+        idle: true,
+        marks: 2,
+        observed: Some(started),
+    };
+    let mut expiry = ExpiryShellReadings {
+        started: Some(started),
+        readings: [(id, prompt)].into(),
+    };
+    assert!(expiry.certifies(id, prompt, started + Duration::from_millis(100)));
+    assert!(!expiry.certifies(id, prompt, started + Duration::from_millis(101)));
+    assert!(!expiry.certifies(Uuid::new_v4(), prompt, started));
+    assert!(!expiry.certifies(id, ShellCloseReading { marks: 3, ..prompt }, started,));
+    expiry.started = None;
+    assert!(!expiry.certifies(id, prompt, started));
+}
+
+impl ShellCloseCheck {
+    /// Collect Windows process and identity evidence on the background executor.
+    /// Returned expiry checks cannot start a walk, even for an unsampled pane.
+    /// An empty batch performs no I/O.
+    pub fn at_expiry(
+        #[cfg_attr(not(windows), allow(unused_variables))] sessions: &[Arc<TerminalSession>],
+    ) -> Self {
+        #[cfg(windows)]
+        {
+            let check = Self::default();
+            let readings = sessions
+                .iter()
+                .map(|session| (session.id, session.shell_close_reading_in(&check)))
+                .collect();
+            let started = check
+                .processes
+                .into_inner()
+                .flatten()
+                .map(|snapshot| snapshot.started());
+            Self {
+                expiry: Some(ExpiryShellReadings { started, readings }),
+                ..Self::default()
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            Self::default()
+        }
+    }
 }
 use input_hold::{ShellMarks, ShellPrompt};
 
@@ -2627,6 +2704,18 @@ impl TerminalSession {
         )
     }
 
+    /// Whether expiry can need a Windows process read for this session.
+    pub fn needs_expiry_snapshot(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.shell_prompt.reading().idle
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
     pub fn shell_close_reading_in(
         &self,
         #[cfg_attr(not(windows), allow(unused_variables))] check: &ShellCloseCheck,
@@ -2634,6 +2723,10 @@ impl TerminalSession {
         #[cfg(windows)]
         {
             let mut reading = self.shell_prompt.reading();
+            if let Some(expiry) = &check.expiry {
+                reading.idle = expiry.certifies(self.id, reading, Instant::now());
+                return reading;
+            }
             if reading.idle {
                 let childless = self
                     .child_pid

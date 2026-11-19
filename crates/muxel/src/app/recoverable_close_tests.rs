@@ -161,12 +161,85 @@ fn powershell_snapshot_failure_after_quiet_read_asks_at_admission() {
     powershell_close_evidence(ShellCloseScenario::UnreadableAtAdmission);
 }
 
+#[test]
+fn powershell_quiet_expiry_checks_in_background_and_closes() {
+    powershell_close_evidence(ShellCloseScenario::QuietAtExpiry);
+}
+
+#[test]
+fn powershell_undo_wins_over_pending_expiry() {
+    powershell_close_evidence(ShellCloseScenario::UndoPendingExpiry);
+}
+
+#[test]
+fn expiry_checks_later_members_after_the_previous_close() {
+    use super::recoverable_close::CloseAdmission;
+    use muxel_core::control::AgentState;
+    use muxel_core::recoverable_close::CloseEvidence;
+
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (first, _, first_child) = terminal(cx, window, pid);
+        let (changed, _, changed_child) = terminal(cx, window, pid);
+        let (last, _, last_child) = terminal(cx, window, pid);
+        window
+            .update(cx, |app, _, cx| {
+                app.admit_close_with_facts(
+                    vec![first, changed, last],
+                    CloseAdmission::Requested,
+                    cx,
+                    |app, iid, cx| {
+                        let mut facts = app.close_facts(iid, cx);
+                        facts.status = AgentState::Idle;
+                        facts.evidence = CloseEvidence::ShellPrompt;
+                        facts.attributable = true;
+                        facts.shell_marks = 2;
+                        facts
+                    },
+                );
+                let group = app.close_groups.last_mut().unwrap();
+                let gid = group.id;
+                assert_eq!(group.members, [first, changed, last]);
+                group.checking = true;
+                app.finish_close_expiry_with_facts(gid, cx, |app, iid, _| {
+                    let mut current = app.closing[&iid].facts;
+                    // Model a new prompt mark arriving while the first member
+                    // closes. The other panes retain their certified facts.
+                    if iid == changed && app.workspace.instance(first).is_none() {
+                        current.shell_marks = 3;
+                    }
+                    current
+                });
+                assert!(app.workspace.instance(first).is_none());
+                assert!(
+                    app.workspace.instance(changed).is_some(),
+                    "expiry closed the later pane on its old prompt mark"
+                );
+                assert!(app.workspace.instance(last).is_none());
+                let group = app
+                    .close_groups
+                    .iter()
+                    .find(|group| group.id == gid)
+                    .unwrap();
+                assert!(group.needs_decision);
+                assert!(!group.checking);
+                assert_eq!(group.members, [changed]);
+                assert!(!changed_child.exited());
+            })
+            .unwrap();
+        wait_for_exit(cx, &first_child);
+        wait_for_exit(cx, &last_child);
+    });
+}
+
 #[derive(Clone, Copy)]
 enum ShellCloseScenario {
     RedrawDuringUndo,
     ChildDuringUndo,
     ChildBeforeAdmission,
     UnreadableAtAdmission,
+    QuietAtExpiry,
+    UndoPendingExpiry,
 }
 
 fn powershell_close_evidence(scenario: ShellCloseScenario) {
@@ -290,6 +363,39 @@ fn powershell_close_evidence(scenario: ShellCloseScenario) {
                 (group.id, group.deadline, app.closing[&iid].facts)
             })
             .unwrap();
+        if matches!(scenario, QuietAtExpiry | UndoPendingExpiry) {
+            window
+                .update(cx, |app, window, cx| {
+                    app.expire_closes(deadline + Duration::from_secs(1), cx);
+                    assert!(
+                        app.close_groups
+                            .iter()
+                            .any(|group| group.id == gid && group.checking),
+                        "expiry finished in the UI callback"
+                    );
+                    assert!(!child.exited());
+                    if matches!(scenario, UndoPendingExpiry) {
+                        app.undo_close(gid, window, cx);
+                    }
+                })
+                .unwrap();
+            cx.run_until_parked();
+            window
+                .read_with(cx, |app, _| {
+                    assert!(!app.close_groups.iter().any(|group| group.id == gid));
+                    assert_eq!(
+                        app.workspace.instance(iid).is_some(),
+                        matches!(scenario, UndoPendingExpiry),
+                    );
+                })
+                .unwrap();
+            if matches!(scenario, UndoPendingExpiry) {
+                assert!(!child.exited(), "expiry closed a restored shell");
+            } else {
+                wait_for_exit(cx, &child);
+            }
+            return;
+        }
         std::fs::remove_file(&hold.0).unwrap();
         wait_prompt(
             cx,
@@ -304,6 +410,11 @@ fn powershell_close_evidence(scenario: ShellCloseScenario) {
                 let now = app.close_facts(iid, cx);
                 assert_eq!(before.input_rev, now.input_rev, "no new pane input");
                 app.expire_closes(deadline + Duration::from_secs(1), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .read_with(cx, |app, _| {
                 assert!(app.is_closing(iid), "new shell activity finalized silently");
                 assert!(
                     app.close_groups

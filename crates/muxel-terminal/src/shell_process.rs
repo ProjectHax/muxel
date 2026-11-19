@@ -212,6 +212,10 @@ pub(super) struct Snapshot {
 }
 
 impl Snapshot {
+    pub(super) fn started(&self) -> Instant {
+        self.started
+    }
+
     pub(super) fn read() -> Option<Self> {
         let started = Instant::now();
         // SAFETY: snapshot creation takes no pointers; the guard closes it.
