@@ -6,8 +6,8 @@
 use super::hotbar::MainView;
 use super::popout_lifecycle_tests::{with_app, with_app_drawing};
 use super::{
-    AgentPreset, Instance, MuxelApp, OpenFocus, PaneNode, Project, ResourceOrigin, SecondaryWindow,
-    WorkspaceWindow,
+    AgentPreset, Instance, MuxelApp, OpenFocus, PaneNode, PaneView, Project, ResourceOrigin,
+    SecondaryWindow, WorkspaceWindow,
 };
 use gpui::{
     AnyWindowHandle, AppContext, Context, Entity, FocusHandle, Focusable, TestAppContext, Window,
@@ -793,6 +793,296 @@ fn reopening_a_file_or_diff_shown_in_another_window_focuses_it_there() {
         assert_eq!(
             focused(cx, secondary),
             Some(editor_focus(cx, main, todo_editor))
+        );
+    });
+}
+
+/// A popped-out file or diff has left the layout but is still open: opening it
+/// again focuses it in its own window, which comes to the front, rather than
+/// docking a second copy. A link to a line of a changed file reloads it and
+/// moves its cursor there, in its own window: the caller keeps its focus.
+#[test]
+fn reopening_a_popped_out_file_or_diff_focuses_its_window_instead_of_docking_a_copy() {
+    with_app(|cx, main| {
+        let pid = project(cx, main, "repo");
+        let (caller, notes, root) = main
+            .update(cx, |app, _, _| {
+                let root = app.workspace.project(pid).unwrap().root_path.clone();
+                (pane(app, pid, None), text_file(app, pid, "notes.txt"), root)
+            })
+            .unwrap();
+        let near = ResourceOrigin::Pane(caller);
+        let file = open_file(cx, main, main, pid, &notes, near);
+        let diff = main
+            .update(cx, |app, window, cx| {
+                app.open_diff_for_dir(pid, root.clone(), near, window, cx);
+                app.active_instance.unwrap()
+            })
+            .unwrap();
+        main.update(cx, |app, window, cx| {
+            app.pop_out_instance(file, window, cx);
+            app.pop_out_instance(diff, window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let popped = |cx: &mut TestAppContext, iid: Uuid| {
+            main.read_with(cx, |app, cx| {
+                let popout = &app.popouts[&iid];
+                (popout.window, popout.view.focus_handle(cx))
+            })
+            .unwrap()
+        };
+        let (file_window, file_focus) = popped(cx, file);
+        let (diff_window, diff_focus) = popped(cx, diff);
+        for window in [file_window, diff_window] {
+            window.update(cx, |_, window, _| window.blur()).unwrap();
+        }
+        let main_focus = focused(cx, main);
+        let still_one_of_each = |cx: &mut TestAppContext, what: &str| {
+            main.read_with(cx, |app, _| {
+                assert!(app.editors.is_empty(), "the {what} was docked again");
+                assert_eq!(app.popouts.len(), 2);
+                let docked = app.workspace.project(pid).unwrap().instances();
+                assert_eq!(docked, [caller], "the {what} was docked again");
+            })
+            .unwrap();
+        };
+
+        let activate_main = |cx: &mut TestAppContext| {
+            main.update(cx, |_, window, _| window.activate_window())
+                .unwrap();
+        };
+        let active = |cx: &mut TestAppContext| cx.update(|cx| cx.active_window());
+
+        std::fs::write(&notes, "first\nsecond\n").unwrap();
+        activate_main(cx);
+        main.update(cx, |app, window, cx| {
+            let link = muxel_terminal::OpenLink {
+                url: format!("{}#L2", muxel_terminal::file_uri(&notes)),
+                pane: caller,
+            };
+            app.on_open_link(&link, window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        still_one_of_each(cx, "file");
+        main.read_with(cx, |app, cx| {
+            let editor = app.open_editor_view(file).unwrap();
+            assert_eq!(editor.read(cx).text(cx), "first\nsecond\n");
+            assert_eq!(editor.read(cx).cursor(cx).line, 1, "the line jump");
+        })
+        .unwrap();
+        assert_eq!(
+            focused(cx, main),
+            main_focus,
+            "the main window was handed the popped-out file"
+        );
+        assert_eq!(focused(cx, file_window), Some(file_focus));
+        assert_eq!(active(cx), Some(file_window.into()));
+
+        activate_main(cx);
+        main.update(cx, |app, window, cx| {
+            app.open_diff_for_dir(pid, root.clone(), near, window, cx)
+        })
+        .unwrap();
+        cx.run_until_parked();
+        still_one_of_each(cx, "diff");
+        assert_eq!(focused(cx, diff_window), Some(diff_focus));
+        assert_eq!(focused(cx, main), main_focus);
+        assert_eq!(active(cx), Some(diff_window.into()));
+    });
+}
+
+/// A popped-out page is found by the page it shows now: opening that page
+/// again focuses the pop-out, whose window comes to the front, rather than
+/// docking a copy.
+#[test]
+fn reopening_the_page_a_popped_out_browser_went_to_focuses_it() {
+    with_app(|cx, main| {
+        let pid = project(cx, main, "repo");
+        let caller = main.update(cx, |app, _, _| pane(app, pid, None)).unwrap();
+        let near = ResourceOrigin::Pane(caller);
+        let open = |cx: &mut TestAppContext, url: &str| {
+            main.update(cx, |app, window, cx| {
+                let url = url.to_string();
+                app.open_browser_in_project(pid, url, near, None, OpenFocus::Focus, window, cx)
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let page = open(cx, "https://example.test/first");
+        main.update(cx, |app, window, cx| app.pop_out_instance(page, window, cx))
+            .unwrap();
+        cx.run_until_parked();
+        let (page_window, view) = main
+            .read_with(cx, |app, _| {
+                let popout = &app.popouts[&page];
+                let PaneView::Browser(view) = &popout.view else {
+                    panic!("the pop-out isn't a browser");
+                };
+                (popout.window, view.clone())
+            })
+            .unwrap();
+        // As its address bar does: the page moves on, and its instance's URL
+        // stays behind until a tick syncs it.
+        view.update(cx, |view, cx| {
+            view.navigate("https://example.test/second", cx)
+        });
+        page_window
+            .update(cx, |_, window, _| window.blur())
+            .unwrap();
+        let main_focus = focused(cx, main);
+        main.update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+
+        let reopened = open(cx, "https://example.test/second");
+        cx.run_until_parked();
+        main.read_with(cx, |app, _| {
+            assert_eq!(reopened, page, "the page was docked again");
+            assert!(app.browsers.is_empty(), "the page was docked again");
+            assert_eq!(app.popouts.len(), 1);
+            let docked = app.workspace.project(pid).unwrap().instances();
+            assert_eq!(docked, [caller], "the page was docked again");
+        })
+        .unwrap();
+        let page_focus = main
+            .read_with(cx, |app, cx| app.popouts[&page].view.focus_handle(cx))
+            .unwrap();
+        assert_eq!(focused(cx, page_window), Some(page_focus));
+        assert_eq!(focused(cx, main), main_focus);
+        assert_eq!(cx.update(|cx| cx.active_window()), Some(page_window.into()));
+    });
+}
+
+/// A link clicked in a page, or a redirect, moves it before the tick syncs
+/// that to its instance: a popped-out page is found at the page its webview is
+/// on, not the one it left. An address-bar navigation that hasn't committed
+/// counts as where it's going. The tick then syncs the page in its own window.
+#[test]
+fn a_popped_out_page_is_found_where_its_webview_is_before_the_tick() {
+    with_app(|cx, main| {
+        let pid = project(cx, main, "repo");
+        let caller = main.update(cx, |app, _, _| pane(app, pid, None)).unwrap();
+        let near = ResourceOrigin::Pane(caller);
+        let open = |cx: &mut TestAppContext, url: &str| {
+            main.update(cx, |app, window, cx| {
+                let url = url.to_string();
+                app.open_browser_in_project(pid, url, near, None, OpenFocus::Focus, window, cx)
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let page = open(cx, "https://example.test/first");
+        main.update(cx, |app, window, cx| app.pop_out_instance(page, window, cx))
+            .unwrap();
+        cx.run_until_parked();
+        let view = main
+            .read_with(cx, |app, _| match &app.popouts[&page].view {
+                PaneView::Browser(view) => view.clone(),
+                _ => panic!("the pop-out isn't a browser"),
+            })
+            .unwrap();
+        let docked = |cx: &mut TestAppContext| {
+            main.read_with(cx, |app, _| app.workspace.project(pid).unwrap().instances())
+                .unwrap()
+        };
+
+        view.update(cx, |view, _| {
+            view.commit_for_test("https://example.test/second")
+        });
+        assert_eq!(
+            open(cx, "https://example.test/second"),
+            page,
+            "the page it went to was docked again"
+        );
+        assert_eq!(docked(cx), [caller], "the page it went to was docked again");
+        assert_ne!(
+            open(cx, "https://example.test/first"),
+            page,
+            "the page it left reopened the page it went to"
+        );
+
+        view.update(cx, |view, cx| {
+            view.navigate("https://example.test/third", cx)
+        });
+        assert_eq!(
+            open(cx, "https://example.test/third"),
+            page,
+            "an address-bar navigation that hasn't committed was lost"
+        );
+
+        view.update(cx, |view, _| {
+            view.commit_for_test("https://example.test/fourth")
+        });
+        main.update(cx, |app, window, cx| app.tick(window, cx))
+            .unwrap();
+        cx.run_until_parked();
+        main.read_with(cx, |app, cx| {
+            let synced = app.workspace.instance(page).unwrap().browser_url.as_deref();
+            assert_eq!(
+                synced,
+                Some("https://example.test/fourth"),
+                "the tick didn't sync the popped-out page"
+            );
+            assert_eq!(view.read(cx).url(), "https://example.test/fourth");
+        })
+        .unwrap();
+    });
+}
+
+/// A path names the same file only on the same machine. A remote file or diff
+/// popped out of one host's project isn't reused for the same path on another
+/// host, while its own host still finds it past the other's docked copy.
+#[test]
+fn a_remote_file_or_diff_is_reused_only_on_its_own_host() {
+    with_app(|cx, main| {
+        let (a, b) = (project(cx, main, "a"), project(cx, main, "b"));
+        let root = PathBuf::from("/srv/app");
+        let file = root.join("main.rs");
+        main.update(cx, |app, _, _| {
+            for pid in [a, b] {
+                app.workspace.project_mut(pid).unwrap().remote = Some(muxel_core::RemoteRef {
+                    host_id: Uuid::new_v4(),
+                    remote_root: "/srv/app".into(),
+                });
+            }
+        })
+        .unwrap();
+        let chrome = ResourceOrigin::Chrome { near: None };
+        let diffs = |cx: &mut TestAppContext| {
+            main.read_with(cx, |app, cx| {
+                app.editor_views()
+                    .filter(|(_, editor)| editor.read(cx).is_diff())
+                    .count()
+            })
+            .unwrap()
+        };
+        let file_a = open_file(cx, main, main, a, &file, chrome);
+        let diff_a = main
+            .update(cx, |app, window, cx| {
+                app.open_diff_for_dir(a, root.clone(), chrome, window, cx);
+                app.active_instance.unwrap()
+            })
+            .unwrap();
+        main.update(cx, |app, window, cx| {
+            app.pop_out_instance(file_a, window, cx);
+            app.pop_out_instance(diff_a, window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        let file_b = open_file(cx, main, main, b, &file, chrome);
+        assert_ne!(file_b, file_a, "host b's path opened host a's file");
+        main.update(cx, |app, window, cx| {
+            app.open_diff_for_dir(b, root.clone(), chrome, window, cx)
+        })
+        .unwrap();
+        assert_eq!(diffs(cx), 2, "host b's directory opened host a's diff");
+
+        assert_eq!(
+            open_file(cx, main, main, a, &file, chrome),
+            file_a,
+            "host a's path didn't find its own popped-out file"
         );
     });
 }

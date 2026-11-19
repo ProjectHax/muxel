@@ -357,6 +357,10 @@ mod imp {
         /// Previous URL while a requested navigation has not committed yet.
         /// WebView2 reports the old page during that gap; do not sync it back.
         pending_navigation_from: Option<String>,
+        /// Stands in for the webview's committed URL, which a test has no
+        /// webview to report.
+        #[cfg(test)]
+        committed_for_test: Option<String>,
         /// What the app last asked of the native child (dedupes plaform calls).
         native_visible: bool,
         #[cfg(target_os = "windows")]
@@ -438,9 +442,17 @@ mod imp {
             // `HasWindowHandle::window_handle` is spelled out because gpui's
             // inherent `Window::window_handle` otherwise wins and yields gpui's
             // own `AnyWindowHandle`.
-            let parent = HasWindowHandle::window_handle(&*window)
-                .ok()
-                .map(|h| ParentWindow(h.as_raw()));
+            //
+            // gpui's test windows have no native window to host one (asking
+            // panics), so a pane built in a test is the one a failed webview
+            // leaves: its address bar and URL, with no page.
+            let parent = if cfg!(test) {
+                None
+            } else {
+                HasWindowHandle::window_handle(&*window)
+                    .ok()
+                    .map(|h| ParentWindow(h.as_raw()))
+            };
             let requested = url.clone();
             let (focus_tx, focus_events) = std::sync::mpsc::channel();
             let (new_window_tx, new_window_events) = std::sync::mpsc::channel();
@@ -593,6 +605,8 @@ mod imp {
                 address,
                 url,
                 pending_navigation_from: None,
+                #[cfg(test)]
+                committed_for_test: None,
                 native_visible: true,
                 #[cfg(target_os = "windows")]
                 profile_project_active: true,
@@ -717,22 +731,50 @@ mod imp {
             cx.notify();
         }
 
+        /// The URL the webview has committed, read from the native view now.
+        fn committed(&self, cx: &App) -> Option<String> {
+            #[cfg(test)]
+            if let Some(url) = &self.committed_for_test {
+                return Some(url.clone());
+            }
+            committed_url(self.webview.as_ref()?.read(cx).raw())
+        }
+
+        /// Whether the webview's committed URL `current` says where the pane
+        /// is. It doesn't while it's the bootstrap document a new WebView2
+        /// reports before the requested navigation commits: persisting that
+        /// loses the resource identity and lets a fast second click create a
+        /// duplicate pane. Nor while a requested navigation hasn't committed
+        /// and the webview still reports the page it's leaving.
+        fn says_where(&self, current: &str) -> bool {
+            let bootstrap = current == "about:blank" && self.url != "about:blank";
+            let leaving = self.pending_navigation_from.as_deref() == Some(current);
+            !bootstrap && !leaving
+        }
+
+        /// The page the pane is on now: the webview's committed page, read
+        /// directly rather than as of the last [`Self::sync`], or the page it
+        /// was asked for while that navigation hasn't committed.
+        pub fn current_url(&self, cx: &App) -> String {
+            match self.committed(cx) {
+                Some(current) if !current.is_empty() && self.says_where(&current) => current,
+                _ => self.url.clone(),
+            }
+        }
+
+        /// As a link clicked inside the page does: the webview commits `url`,
+        /// and the app's tick hasn't synced it yet.
+        #[cfg(all(test, windows))]
+        pub(crate) fn commit_for_test(&mut self, url: &str) {
+            self.committed_for_test = Some(url.to_string());
+        }
+
         /// Pull the webview's current URL (the user may have clicked links);
         /// returns it when it changed since the last sync. Called from the app's
         /// tick so `Instance.browser_url` and the address bar stay fresh.
         pub fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<String> {
-            let wv = self.webview.as_ref()?;
-            let current = committed_url(wv.read(cx).raw())?;
-            // A newly created WebView2 reports its bootstrap document before
-            // the requested navigation commits. Persisting that transient URL
-            // loses the resource identity and lets a fast second click create
-            // a duplicate pane.
-            if current == "about:blank" && self.url != "about:blank" {
-                return None;
-            }
-            // A requested navigation hasn't committed yet: the webview still
-            // reports the page we're leaving, so don't sync it back.
-            if self.pending_navigation_from.as_deref() == Some(current.as_str()) {
+            let current = self.committed(cx)?;
+            if !self.says_where(&current) {
                 return None;
             }
             let navigation_committed = self.pending_navigation_from.is_some();

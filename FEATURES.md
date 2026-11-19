@@ -136,7 +136,8 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Detach a pane** — pop a pane out into its own OS window without terminating it.
   Terminals and editors move across; a browser pane is re-created in the new window
-  at the same URL (a native webview belongs to the window that built it).
+  at the same URL (a native webview belongs to the window that built it), and its
+  URL follows its navigation there as a docked one's does.
 - **Independent refresh** — popouts follow their own pane's title, status and
   content, theme changes, and their own close state. Unrelated app updates,
   including sidebar and other panes' activity, do not request a popout render.
@@ -1627,9 +1628,11 @@ feature is added or changed, update the matching entry here in the same change**
   open in the window showing the terminal's project. A middle-click or **Open in
   new tab** places the resource the same way and leaves focus where it is in
   every window, even when the file jumps to a line or reloads. A file already
-  open anywhere, or a page already open in the same project, is refreshed and
-  focused where it is: the window showing its project comes to the front, or the
-  main window switches to that project. When that's another window, the one the
+  open anywhere (a remote one, on the same SSH host), or a page already showing
+  in the same project, is refreshed and
+  focused where it is: a popped-out one's own window comes to the front;
+  otherwise the window showing its project does, or the main window switches to
+  that project. When that's another window, the one the
   link was clicked in keeps its own focus. A resource focused in the main window is
   shown even when the Dashboard or another hotbar view covered the panes. Explicit New
   Tab and New Pane commands still use the requested placement. Opening a
