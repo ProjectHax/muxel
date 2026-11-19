@@ -6725,6 +6725,8 @@ pub struct MuxelApp {
     /// Cached branch names for the active project (the "Merge into…" picker),
     /// refreshed off the UI thread so the menu doesn't run `git branch` per frame.
     git_diff_branches: Vec<String>,
+    /// The project `git_diff_branches` was read for, as `git_diff_files_from`.
+    git_diff_branches_from: Option<(Uuid, PathBuf)>,
     /// Remote projects whose last connect attempt failed (pid → error). Drives
     /// the pane-area "Reconnect / Scan for projects" state; cleared on retry
     /// and on a successful connect.
@@ -9348,6 +9350,7 @@ impl MuxelApp {
             git_diff_worktree_files: HashMap::new(),
             git_diff_worktrees_expanded: std::collections::HashSet::new(),
             git_diff_branches: Vec::new(),
+            git_diff_branches_from: None,
             git_diff_loading: false,
             git_diff_worktrees_loading: false,
             git_diff_commit_input,
@@ -14108,22 +14111,75 @@ impl MuxelApp {
         .detach();
     }
 
+    /// The folder git reads a project's Changes in: on its host for a remote
+    /// project (its `root_path` is only a label there), else its root.
+    fn changes_folder(project: &Project) -> &Path {
+        match &project.remote {
+            Some(remote) => Path::new(&remote.remote_root),
+            None => &project.root_path,
+        }
+    }
+
+    /// The file at `rel` in a Changes list, and its project: under the folder
+    /// the list was read in. A remote project's path is the host's, so it
+    /// joins with `/` whatever this machine's separator, as git lists it.
+    fn changes_file(&self, src: GitSource, rel: &str) -> Option<(Uuid, PathBuf)> {
+        match src {
+            GitSource::Project(pid) => {
+                let project = self.workspace.project(pid)?;
+                let folder = Self::changes_folder(project);
+                let path = if project.remote.is_some() {
+                    let folder = folder.to_string_lossy();
+                    PathBuf::from(format!("{}/{rel}", folder.trim_end_matches('/')))
+                } else {
+                    folder.join(rel)
+                };
+                Some((pid, path))
+            }
+            GitSource::Worktree(wid) => self
+                .workspace
+                .worktree(wid)
+                .map(|w| (w.project_id, w.path.join(rel))),
+        }
+    }
+
     /// The active project and its folder: what the Changes view lists.
     fn changes_source(&self) -> Option<(Uuid, PathBuf)> {
         let pid = self.workspace.active_project?;
-        Some((pid, self.workspace.project(pid)?.root_path.clone()))
+        let project = self.workspace.project(pid)?;
+        Some((pid, Self::changes_folder(project).to_path_buf()))
+    }
+
+    /// Whether a list read for `from` is the panel's to show: it was read for
+    /// the active project in the folder it's in now. One rule for each of the
+    /// panel's lists.
+    fn changes_shown_from(&self, from: Option<&(Uuid, PathBuf)>) -> bool {
+        let Some((pid, folder)) = from else {
+            return false;
+        };
+        self.workspace.active_project == Some(*pid)
+            && self
+                .workspace
+                .project(*pid)
+                .is_some_and(|project| Self::changes_folder(project) == folder.as_path())
     }
 
     /// The changed files the panel shows: the list read for the active
     /// project in its current folder, or `None` until that one is read.
     fn shown_git_diff_files(&self) -> Option<&[integrations::GitChange]> {
-        let (pid, root) = self.git_diff_files_from.as_ref()?;
-        if self.workspace.active_project != Some(*pid)
-            || self.workspace.project(*pid)?.root_path != *root
-        {
+        if !self.changes_shown_from(self.git_diff_files_from.as_ref()) {
             return None;
         }
         self.git_diff_files.as_deref()
+    }
+
+    /// The branches the Worktrees tab offers under "Merge into…": those read
+    /// for the active project in its current folder, or none until then.
+    fn shown_git_diff_branches(&self) -> &[String] {
+        if !self.changes_shown_from(self.git_diff_branches_from.as_ref()) {
+            return &[];
+        }
+        &self.git_diff_branches
     }
 
     fn set_git_diff_panel_width(&mut self, width: f32) {
@@ -14362,6 +14418,7 @@ impl MuxelApp {
                 if this.changes_source() == source {
                     this.git_diff_worktree_files = results.into_iter().collect();
                     this.git_diff_branches = branches;
+                    this.git_diff_branches_from = source;
                 }
                 cx.notify();
             });
@@ -28917,17 +28974,7 @@ impl MuxelApp {
                     PopupMenuItem::new(t("Open file"))
                         .icon(IconName::File)
                         .on_click(window.listener_for(&entity, move |this, _, window, cx| {
-                            let target = match src {
-                                GitSource::Project(pid) => this
-                                    .workspace
-                                    .project(pid)
-                                    .map(|p| (pid, p.root_path.join(&open_p))),
-                                GitSource::Worktree(wid) => this
-                                    .workspace
-                                    .worktree(wid)
-                                    .map(|w| (w.project_id, w.path.join(&open_p))),
-                            };
-                            if let Some((pid, full)) = target {
+                            if let Some((pid, full)) = this.changes_file(src, &open_p) {
                                 let origin = ResourceOrigin::Chrome {
                                     near: this.active_instance,
                                 };
@@ -28987,7 +29034,7 @@ impl MuxelApp {
         let files = self.git_diff_worktree_files.get(&wid);
         let count = files.map(|f| f.len()).unwrap_or(0);
         let hover_bg = cx.theme().sidebar_accent;
-        let branches = self.git_diff_branches.clone();
+        let branches = self.shown_git_diff_branches().to_vec();
         let chevron = if expanded {
             IconName::ChevronDown
         } else {

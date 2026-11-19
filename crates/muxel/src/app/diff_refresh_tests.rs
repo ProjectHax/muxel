@@ -3,7 +3,7 @@
 //! gpui-component `Root`, as muxel opens it, since an editor needs one to
 //! paint; on macOS that `Root` asks gpui's test window for an NSView it can't
 //! give, so these run on Windows and Linux.
-use super::{MuxelApp, Project, ResourceOrigin, SecondaryWindow, WorkspaceWindow};
+use super::{GitSource, MuxelApp, Project, ResourceOrigin, SecondaryWindow, WorkspaceWindow};
 use crate::editor::TEST_RENDERS;
 use crate::file_watch::FileWatch;
 use crate::file_watch::test_backend::TestBackend;
@@ -802,6 +802,112 @@ fn worktree_lists_read_for_one_project_dont_land_in_the_next() {
                 app.git_diff_branches
             );
             assert!(app.git_diff_worktree_files.is_empty());
+        });
+    });
+}
+
+/// The Worktrees tab's "Merge into…" offers the branches read for the project
+/// it shows: until B's own read lands, B offers none of A's.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn switching_projects_stops_offering_the_last_ones_branches() {
+    with_app(|cx, main, fx| {
+        fx.a.git(&["branch", "only-in-a"]);
+        let b = project_on_b(cx, main, fx);
+        main.update(cx, |app, _, cx| {
+            for (pid, repo) in [(fx.pid, &fx.a), (b, &fx.b)] {
+                app.workspace.add_worktree(muxel_core::Worktree {
+                    id: Uuid::new_v4(),
+                    project_id: pid,
+                    name: "fixture".into(),
+                    path: repo.path().to_path_buf(),
+                    branch: "main".into(),
+                    color: 0,
+                    detached: false,
+                });
+            }
+            app.refresh_git_diff_worktrees(cx);
+        });
+        cx.run_until_parked();
+        let offered = |cx: &mut TestAppContext| {
+            main.update(cx, |app, _, _| app.shown_git_diff_branches().to_vec())
+        };
+        assert!(
+            offered(cx).iter().any(|branch| branch == "only-in-a"),
+            "A's read offers its branches: {:?}",
+            offered(cx)
+        );
+        main.update(cx, |app, window, cx| app.select_project(b, window, cx));
+        assert_eq!(offered(cx), Vec::<String>::new(), "B offers A's branches");
+    });
+}
+
+/// A remote project's Changes are read in its folder on the host, so they go
+/// when that folder changes, and stay when only its local label does.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn a_remote_projects_changes_follow_its_folder_on_the_host() {
+    with_app(|cx, main, fx| {
+        main.update(cx, |app, _, _| {
+            app.workspace.project_mut(fx.pid).unwrap().remote = Some(muxel_core::RemoteRef {
+                host_id: Uuid::new_v4(),
+                remote_root: "/srv/one".into(),
+            });
+            let remote_root = |app: &mut MuxelApp, root: &str| {
+                let project = app.workspace.project_mut(fx.pid).unwrap();
+                project.remote.as_mut().unwrap().remote_root = root.into();
+            };
+            // As a read for the project landing.
+            app.git_diff_files = Some(Vec::new());
+            app.git_diff_files_from = app.changes_source();
+            assert!(app.shown_git_diff_files().is_some());
+            remote_root(app, "/srv/two");
+            assert!(
+                app.shown_git_diff_files().is_none(),
+                "the old folder's changes still show"
+            );
+            remote_root(app, "/srv/one");
+            app.workspace.project_mut(fx.pid).unwrap().root_path = fx.b.path().to_path_buf();
+            assert!(
+                app.shown_git_diff_files().is_some(),
+                "a new label hid the changes of a folder that didn't move"
+            );
+        });
+    });
+}
+
+/// A Changes row's Open file opens the listed file where git listed it: on
+/// the host for a remote project, whatever its local label, with the host's
+/// `/` between the folder and the path.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn a_remote_projects_changed_file_opens_on_the_host() {
+    with_app(|cx, main, fx| {
+        main.update(cx, |app, _, _| {
+            let project = app.workspace.project_mut(fx.pid).unwrap();
+            project.remote = Some(muxel_core::RemoteRef {
+                host_id: Uuid::new_v4(),
+                remote_root: "/srv/app".into(),
+            });
+            let opened = |app: &MuxelApp| {
+                app.changes_file(GitSource::Project(fx.pid), "src/main.rs")
+                    .map(|(pid, path)| (pid, path.to_string_lossy().into_owned()))
+            };
+            let on_the_host = Some((fx.pid, "/srv/app/src/main.rs".to_string()));
+            // As created, the label is the host's folder.
+            app.workspace.project_mut(fx.pid).unwrap().root_path = PathBuf::from("/srv/app");
+            assert_eq!(opened(app), on_the_host);
+            app.workspace.project_mut(fx.pid).unwrap().root_path = fx.b.path().to_path_buf();
+            assert_eq!(opened(app), on_the_host, "it opened the label's folder");
         });
     });
 }
