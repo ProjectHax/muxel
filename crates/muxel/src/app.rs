@@ -3724,6 +3724,24 @@ fn window_focus(window: &Window, cx: &mut App) -> Vec<(AnyWindowHandle, Option<F
     kept
 }
 
+/// Run `f` in `target`, or in `window` when there is none or it is `window`.
+/// A popped-out editor is drawn only in its own window, and moving its cursor
+/// focuses its input in whichever window the move runs in. Run from another
+/// window, that window would be left focused on a handle it doesn't draw.
+fn in_window(
+    target: Option<AnyWindowHandle>,
+    window: &mut Window,
+    cx: &mut App,
+    f: impl FnOnce(&mut Window, &mut App),
+) {
+    match target {
+        Some(target) if target.window_id() != window.window_handle().window_id() => {
+            let _ = target.update(cx, |_, window, cx| f(window, cx));
+        }
+        _ => f(window, cx),
+    }
+}
+
 /// Render a terminal pane. In `RightClickMenu` mouse mode it wraps the view in a
 /// right-click Copy/Paste context menu (the menu component lives in this crate, not
 /// in muxel-terminal); the other modes handle the mouse inside the terminal element
@@ -15318,6 +15336,30 @@ impl MuxelApp {
                 self.persist();
             }
         }
+        // A popped-out page navigates too, and its address bar lives in its own
+        // window, so it syncs there: reopening the page it is on finds it, and a
+        // re-dock or restart returns to where it ended up.
+        let popped_out: Vec<_> = self
+            .popouts
+            .iter()
+            .filter_map(|(iid, popout)| match &popout.view {
+                PaneView::Browser(view) => Some((*iid, popout.window, view.clone())),
+                _ => None,
+            })
+            .collect();
+        let mut changed = false;
+        for (iid, target, view) in popped_out {
+            if let Ok(Some(url)) = target.update(cx, |_, window, cx| {
+                view.update(cx, |v, cx| v.sync(window, cx))
+            }) && let Some(inst) = self.workspace.instance_mut(iid)
+            {
+                inst.browser_url = Some(url);
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist();
+        }
         // Program availability (installed agents / gh / sshpass) + git status are
         // refreshed off the UI thread so they don't stutter the render loop.
         self.refresh_status(cx);
@@ -17392,15 +17434,13 @@ impl MuxelApp {
                     self.open_editor_at(pid, Some(target.path.clone()), origin, focus, window, cx)
             {
                 if let Some(line) = target.line
-                    && let Some(editor) = self.editors.get(&iid)
+                    && let Some(editor) = self.open_editor_view(iid)
                 {
-                    editor.update(cx, |editor, cx| {
-                        editor.goto_position(
-                            line.saturating_sub(1),
-                            target.column.unwrap_or(1).saturating_sub(1),
-                            window,
-                            cx,
-                        );
+                    let column = target.column.unwrap_or(1).saturating_sub(1);
+                    in_window(self.popout_window(iid), window, cx, |window, cx| {
+                        editor.update(cx, |editor, cx| {
+                            editor.goto_position(line.saturating_sub(1), column, window, cx);
+                        });
                     });
                 }
                 return;
@@ -17450,26 +17490,38 @@ impl MuxelApp {
     ) -> Option<Uuid> {
         // Web resources require an exact URL match. Local files reuse by decoded
         // path so raw/file URI spellings and source fragments share one pane.
+        // A popped-out page has left the layout but is still open. A page is
+        // matched by the page it's on now, as its webview reports it, which a
+        // link clicked in it or a redirect changes before the tick syncs the
+        // instance's URL; an address-bar navigation that hasn't committed
+        // counts as where it is going.
         if let Some(iid) = self
             .workspace
             .project(pid)
             .map(|p| p.instances())
             .unwrap_or_default()
             .into_iter()
+            .chain(self.popouts.keys().copied())
             .find(|iid| {
                 self.workspace.instance(*iid).is_some_and(|instance| {
                     instance.kind == InstanceKind::Browser
-                        && instance
-                            .browser_url
-                            .as_deref()
-                            .is_some_and(|existing| same_browser_resource(existing, &url))
+                        && instance.project_id == pid
+                        && match self.browser_view(*iid) {
+                            Some(view) => {
+                                same_browser_resource(&view.read(cx).current_url(cx), &url)
+                            }
+                            None => instance
+                                .browser_url
+                                .as_deref()
+                                .is_some_and(|existing| same_browser_resource(existing, &url)),
+                        }
                 })
             })
         {
             if let Some(instance) = self.workspace.instance_mut(iid) {
                 instance.browser_url = Some(url.clone());
             }
-            if let Some(view) = self.browsers.get(&iid).cloned() {
+            if let Some(view) = self.browser_view(iid).cloned() {
                 view.update(cx, |v, cx| {
                     if v.url() == url {
                         v.reload(cx);
@@ -17762,15 +17814,20 @@ impl MuxelApp {
         } else {
             path.map(|path| std::fs::canonicalize(&path).unwrap_or(path))
         };
-        // Reuse an already-open editor for this exact path.
-        if let Some(p) = &path
-            && let Some(iid) = self
-                .editors
-                .iter()
-                .find_map(|(iid, ed)| (ed.read(cx).path() == Some(p.as_path())).then_some(*iid))
-        {
-            if let Some(editor) = self.editors.get(&iid).cloned() {
-                editor.update(cx, |editor, cx| editor.reload_if_clean(window, cx));
+        // Reuse an already-open editor for this exact path on the same machine,
+        // docked or popped out.
+        let host = self.files_host(pid);
+        let open = path.as_ref().and_then(|p| {
+            self.editor_views().find_map(|(iid, ed)| {
+                (ed.read(cx).path() == Some(p.as_path()) && self.shows_files_of(iid, host))
+                    .then_some(iid)
+            })
+        });
+        if let Some(iid) = open {
+            if let Some(editor) = self.open_editor_view(iid) {
+                in_window(self.popout_window(iid), window, cx, |window, cx| {
+                    editor.update(cx, |editor, cx| editor.reload_if_clean(window, cx));
+                });
             }
             self.focus_resource(iid, focus, window, cx);
             return Some(iid);
@@ -17881,12 +17938,14 @@ impl MuxelApp {
         if dir.as_os_str().is_empty() {
             return;
         }
-        // Reuse an already-open diff pane for the same directory: refresh + focus.
-        if let Some(iid) = self
-            .editors
-            .iter()
-            .find_map(|(iid, ed)| (ed.read(cx).diff_dir() == Some(dir.as_path())).then_some(*iid))
-        {
+        // Reuse an already-open diff pane for the same directory on the same
+        // machine, docked or popped out: refresh + focus.
+        let host = self.files_host(pid);
+        let open = self.editor_views().find_map(|(iid, ed)| {
+            (ed.read(cx).diff_dir() == Some(dir.as_path()) && self.shows_files_of(iid, host))
+                .then_some(iid)
+        });
+        if let Some(iid) = open {
             self.focus_resource(iid, OpenFocus::Focus, window, cx);
             self.request_diff(iid, cx);
             return;
@@ -17923,6 +17982,22 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A popped-out resource is shown only in its own window: focus it there,
+        // bringing that window to the front.
+        if let Some(popout) = self.popouts.get(&iid) {
+            if focus != OpenFocus::Background {
+                let target = popout.window;
+                let handle = popout.view.focus_handle(cx);
+                // Deferred: the open may come from that window itself.
+                cx.defer(move |cx| {
+                    let _ = target.update(cx, |_, window, cx| {
+                        window.focus(&handle, cx);
+                        window.activate_window();
+                    });
+                });
+            }
+            return;
+        }
         let Some(pid) = self.workspace.instance(iid).map(|i| i.project_id) else {
             return;
         };
@@ -18077,6 +18152,46 @@ impl MuxelApp {
             self.workspace.add_instance(instance);
         }
         placed
+    }
+
+    /// Editor `iid`'s view, docked or popped out.
+    fn open_editor_view(&self, iid: Uuid) -> Option<Entity<EditorView>> {
+        self.editor_views()
+            .find(|(open, _)| *open == iid)
+            .map(|(_, editor)| editor.clone())
+    }
+
+    /// Browser `iid`'s view, docked or popped out.
+    #[cfg(not(target_os = "linux"))]
+    fn browser_view(&self, iid: Uuid) -> Option<&Entity<crate::browser::BrowserView>> {
+        self.browsers
+            .get(&iid)
+            .or_else(|| match &self.popouts.get(&iid)?.view {
+                PaneView::Browser(view) => Some(view),
+                _ => None,
+            })
+    }
+
+    /// The pop-out window showing pane `iid`, if it is popped out.
+    fn popout_window(&self, iid: Uuid) -> Option<AnyWindowHandle> {
+        self.popouts.get(&iid).map(|popout| popout.window.into())
+    }
+
+    /// The machine project `pid`'s files are on: its SSH host, or `None` for
+    /// this one. A path names the same file only on the same machine.
+    fn files_host(&self, pid: Uuid) -> Option<Uuid> {
+        self.workspace
+            .project(pid)?
+            .remote
+            .as_ref()
+            .map(|r| r.host_id)
+    }
+
+    /// Whether pane `iid` belongs to a project whose files are on `host`.
+    fn shows_files_of(&self, iid: Uuid, host: Option<Uuid>) -> bool {
+        self.workspace
+            .instance(iid)
+            .is_some_and(|instance| self.files_host(instance.project_id) == host)
     }
 
     /// Every editor view, docked or popped out.
@@ -18625,9 +18740,11 @@ impl MuxelApp {
         };
         let path = Some(hit.path.clone());
         if let Some(iid) = self.open_editor_at(pid, path, origin, OpenFocus::Focus, window, cx)
-            && let Some(ed) = self.editors.get(&iid).cloned()
+            && let Some(ed) = self.open_editor_view(iid)
         {
-            ed.update(cx, |e, cx| e.goto_line(hit.line, window, cx));
+            in_window(self.popout_window(iid), window, cx, |window, cx| {
+                ed.update(cx, |e, cx| e.goto_line(hit.line, window, cx));
+            });
         }
         cx.notify();
     }
