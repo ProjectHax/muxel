@@ -540,6 +540,12 @@ pub(crate) struct ProgramStatusSnapshot {
     pub working_to_idle_revision: u64,
     pub idle_completions: u64,
     pub explicit_completions: u64,
+    /// The [`Self::revision`] of the root report that began the latest Working
+    /// turn. A Working report within a turn already running, through a block
+    /// too, doesn't move it; it is kept after the turn ends, and by
+    /// [`Self::launch_facts`]. One newer than a read taken as Enter went in
+    /// shows a turn began after that Enter, even one over before it's sampled.
+    pub working_revision: u64,
     /// Whether this launch's program has sent any root report, `clear`
     /// included. Nothing retires it before the launch ends: a reporter stays
     /// one through `/clear`, RIS and binding switches.
@@ -550,10 +556,13 @@ pub(crate) struct ProgramStatusSnapshot {
 
 impl ProgramStatusSnapshot {
     /// The launch facts alone, for a read that can't use this binding's
-    /// reports yet.
+    /// reports yet. `working_revision` is one: revisions only climb for the
+    /// launch's life, so a sample taken in that window still compares with
+    /// later reads instead of making every earlier turn look new.
     pub fn launch_facts(&self) -> Self {
         Self {
             reported: self.reported,
+            working_revision: self.working_revision,
             ..Self::default()
         }
     }
@@ -615,7 +624,12 @@ impl ProgramStatusSnapshot {
             self.explicit_completions = self.explicit_completions.wrapping_add(1);
         }
         match report.state {
-            ProgramState::Working => self.working_active = true,
+            ProgramState::Working => {
+                if !self.working_active {
+                    self.working_revision = self.revision;
+                }
+                self.working_active = true;
+            }
             ProgramState::Blocked => {}
             ProgramState::Idle | ProgramState::Done | ProgramState::Error | ProgramState::Clear => {
                 self.working_active = false;
@@ -1030,6 +1044,37 @@ mod tests {
         assert!(early.reported);
         assert_eq!(early.root, None);
         assert_eq!(early.binding_revision, 0);
+    }
+
+    /// `working_revision` marks where a turn began. A turn reporting Working
+    /// again, before or after a block, leaves it; the next turn moves it, and
+    /// the turn's end and a read that can't use the binding yet keep it.
+    #[test]
+    fn working_revision_moves_only_when_a_turn_begins() {
+        let mut status = ProgramStatusSnapshot::default();
+        let report = |status: &mut ProgramStatusSnapshot, state: &str| {
+            for event in events(format!("\x1b]7501;state={state}\x07").as_bytes()) {
+                if let Event::Report(report) = event {
+                    status.apply(report);
+                }
+            }
+            status.working_revision
+        };
+        let began = report(&mut status, "working");
+        assert_ne!(began, 0);
+        assert_eq!(
+            [
+                report(&mut status, "working"),
+                report(&mut status, "blocked"),
+                report(&mut status, "working"),
+                report(&mut status, "idle"),
+            ],
+            [began; 4]
+        );
+        let next = report(&mut status, "working");
+        assert!(next > began);
+        assert_eq!(report(&mut status, "done"), next);
+        assert_eq!(status.launch_facts().working_revision, next);
     }
 
     #[test]

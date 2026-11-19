@@ -2434,6 +2434,10 @@ pub struct PromptSubmission {
     input: String,
     expected_input: String,
     before_title: u64,
+    /// The program's latest Working turn as Enter went in
+    /// ([`ProgramStatusSnapshot::working_revision`]), from
+    /// [`Self::enter_pressed`]. Until then no report confirms the prompt.
+    before_report: Option<u64>,
     allow_working_title: bool,
     before_prompt: Option<String>,
     origin: Option<PromptOriginProof>,
@@ -2445,6 +2449,17 @@ impl PromptSubmission {
     /// one, waiting for confirmation only delays the caller.
     pub fn observable(&self) -> bool {
         self.observable
+    }
+
+    /// Take the status report sample as Enter goes in. Call it in the UI
+    /// update that presses Enter: output is parsed on the UI thread, so no
+    /// report lands between the two. A turn that began before, even between
+    /// the paste and the Enter, then can't confirm this prompt.
+    pub fn enter_pressed(&mut self) {
+        self.before_report = self
+            .session
+            .upgrade()
+            .map(|session| session.program_status_snapshot().working_revision);
     }
 }
 
@@ -2591,8 +2606,13 @@ struct StartupAttempt<'a> {
     input: &'a str,
     expected_input: String,
     before_title: u64,
+    /// The program's latest Working turn as Enter went in
+    /// ([`ProgramStatusSnapshot::working_revision`]). `None`: no report
+    /// confirms the prompt.
+    before_report: Option<u64>,
     // ctl sends begun during an existing turn need matching transcript proof.
-    // Startup attempts keep their existing title-based confirmation.
+    // Startup attempts keep their existing title-based confirmation. Either
+    // way, the working-title and working-report receipts share this gate.
     allow_working_title: bool,
     before_prompt: Option<String>,
     instance_id: Uuid,
@@ -2636,6 +2656,26 @@ fn startup_provider_accepted(
             && startup_title_working(attempt.provider, title))
 }
 
+/// Where a turn can confirm the prompt, a root report that began a Working turn
+/// after the Enter (`working_report` is the program's latest) is a receipt
+/// too, unless the prompt still sits in the composer; a turn already running at
+/// the Enter is not one, however often it reports. A program that reports its
+/// turns through OSC 7501 drops its title's status glyph (Claude does), so for
+/// a prompt with a blank line, which no transcript row can match, it is the
+/// only receipt.
+fn startup_report_accepted(
+    attempt: &StartupAttempt<'_>,
+    screen: &crate::startup::Screen,
+    working_report: u64,
+) -> bool {
+    attempt.allow_working_title
+        && attempt.provider.reports_program_status()
+        && attempt
+            .before_report
+            .is_some_and(|before| working_report > before)
+        && !startup_draft_matches(attempt.provider, screen, attempt.input)
+}
+
 /// The provider title a controller task's startup judges, with its change
 /// generation: a tmux-wrapped pane's title read through tmux, else the PTY's own.
 fn startup_title(
@@ -2665,22 +2705,26 @@ fn ctl_title_can_confirm(
         )
 }
 
-/// A ctl receipt is either a working title after an idle one, which needs a
-/// provider status title muxel can read (tmux hides OSC titles), or a fresh
-/// transcript row beside an empty composer. Those readers stop at the first
-/// blank line, so only a prompt without one can match; a row repeating the
-/// previous prompt is never fresh; and Grok's composer is never known empty.
+/// A ctl receipt is either a turn starting after an idle pane, which needs a
+/// provider status title muxel can read (tmux hides OSC titles) or a launch
+/// that reports its turns through OSC 7501 (`reports`; tmux drops those too),
+/// or a fresh transcript row beside an empty composer. Those readers stop at
+/// the first blank line, so only a prompt without one can match; a row
+/// repeating the previous prompt is never fresh; and Grok's composer is never
+/// known empty.
 fn ctl_acceptance_observable(
     provider: TitleProvider,
     title: Option<&str>,
+    reports: bool,
     allow_working_title: bool,
     input: &str,
     before_prompt: Option<&str>,
 ) -> bool {
     let title_receipt = allow_working_title
-        && parse_agent_title(provider, title)
-            .and_then(|frame| frame.status)
-            .is_some();
+        && (reports
+            || parse_agent_title(provider, title)
+                .and_then(|frame| frame.status)
+                .is_some());
     let transcript_receipt = matches!(provider, TitleProvider::Claude | TitleProvider::Codex)
         && !input.trim().lines().any(|line| line.trim().is_empty())
         && before_prompt != Some(crate::startup::normalized(input).as_str());
@@ -2805,6 +2849,7 @@ async fn confirm_startup_submission(
         let (accepted, retryable) = with_startup_view(view, session, cx, |view| {
             guard.check(armed_at.elapsed(), session.input_rev())?;
             let (generation, title) = startup_title(session, probe);
+            let working_report = session.program_status_snapshot().working_revision;
             let screen = session.startup_screen();
             let history = session.recent_text(500);
             let prompt = muxel_core::readaloud::prompt_from_screen(&history);
@@ -2814,7 +2859,7 @@ async fn confirm_startup_submission(
                 title.as_deref(),
                 generation,
                 prompt.as_deref(),
-            );
+            ) || startup_report_accepted(attempt, &screen, working_report);
             // Grok can restore a previously stashed draft after accepting a
             // task. Its retained text is not a safe Enter-retry predicate.
             let retryable = startup_retry_allowed(
@@ -3646,6 +3691,12 @@ impl TerminalView {
                                 input: &input,
                                 expected_input: crate::startup::normalized(&input),
                                 before_title: startup_title(&session, probe).0,
+                                // Taken in the poll that writes the Enter below:
+                                // output is parsed on this thread, so no report
+                                // lands between.
+                                before_report: Some(
+                                    session.program_status_snapshot().working_revision,
+                                ),
                                 allow_working_title: true,
                                 before_prompt: muxel_core::readaloud::prompt_from_screen(
                                     &session.recent_text(500),
@@ -3965,6 +4016,7 @@ impl TerminalView {
         let binding_revision = self.session.binding_revision();
         let resize_revision = self.session.resize_revision();
         let (before_title, title) = self.session.title_snapshot();
+        let report = self.session.program_status_snapshot();
         let screen = self.session.startup_screen();
         // A turn held for its background work is over, so a new turn's title can
         // confirm this prompt.
@@ -4007,6 +4059,7 @@ impl TerminalView {
             || ctl_acceptance_observable(
                 self.title_provider,
                 title.as_deref(),
+                report.reported,
                 allow_working_title,
                 text,
                 before_prompt.as_deref(),
@@ -4022,6 +4075,7 @@ impl TerminalView {
             input: text.to_owned(),
             expected_input: crate::startup::normalized(text),
             before_title,
+            before_report: None,
             allow_working_title,
             before_prompt,
             origin,
@@ -4046,6 +4100,7 @@ impl TerminalView {
         }
         let resize_revision = self.session.resize_revision();
         let (generation, title) = self.session.title_snapshot();
+        let working_report = self.session.program_status_snapshot().working_revision;
         if snapshot.binding_revision == 0
             && self.session.binding_revision() == 1
             && let Some(proof) = &snapshot.origin
@@ -4062,22 +4117,27 @@ impl TerminalView {
             input: &snapshot.input,
             expected_input: snapshot.expected_input.clone(),
             before_title: snapshot.before_title,
+            before_report: snapshot.before_report,
             allow_working_title: snapshot.allow_working_title,
             before_prompt: snapshot.before_prompt.clone(),
             instance_id: snapshot.instance_id,
         };
-        let observed = prompt_submission_state(
-            &attempt,
-            &screen,
-            title.as_deref(),
-            generation,
-            prompt.as_deref(),
-            [&self.working_markers, &self.blocked_markers],
-            snapshot
-                .origin
-                .as_ref()
-                .filter(|proof| proof.resize_revision == resize_revision),
-        );
+        let observed = if startup_report_accepted(&attempt, &screen, working_report) {
+            PromptSubmissionState::Accepted
+        } else {
+            prompt_submission_state(
+                &attempt,
+                &screen,
+                title.as_deref(),
+                generation,
+                prompt.as_deref(),
+                [&self.working_markers, &self.blocked_markers],
+                snapshot
+                    .origin
+                    .as_ref()
+                    .filter(|proof| proof.resize_revision == resize_revision),
+            )
+        };
         if current()
             && observed == PromptSubmissionState::Retryable
             && (resize_revision != self.session.resize_revision()
@@ -5055,6 +5115,86 @@ sleep 30
 }
 
 #[cfg(test)]
+mod working_report_receipt_tests {
+    use super::{PromptSubmissionState, TerminalLaunch, TerminalView};
+    use crate::session::CommandSpec;
+    use gpui::TestAppContext;
+    use std::time::Instant;
+
+    /// A Claude that reports its turns through OSC 7501 drops its title's
+    /// status glyph, so a ctl prompt with a blank line, which no transcript row
+    /// can match, has the report as its only receipt: a Working turn begun
+    /// after the Enter, even one over before the next poll. A turn begun
+    /// between the paste and the Enter is not one, however often it reports.
+    #[test]
+    fn a_reporting_claude_confirms_a_ctl_prompt_with_a_turn_begun_after_its_enter() {
+        use PromptSubmissionState::{Accepted, Unconfirmed};
+        #[cfg(windows)]
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        let launch =
+            TerminalLaunch::spawn(spec.with_status_program(Some("claude".into())), (80, 24))
+                .expect("spawn fixture");
+        let mut cx = TestAppContext::single();
+        cx.skip_drawing();
+        let window = cx.add_window(|window, cx| {
+            TerminalView::new(launch, uuid::Uuid::new_v4(), Instant::now(), window, cx)
+        });
+        // Claude's empty input box, with no title.
+        let idle_box = "\x1b[2J\x1b[H\x1b[?2004h────────────────\r\n❯ \r\n────────────────\r\n  ? for shortcuts\x1b[2;3H\x1b[?25h";
+        let report = |state: &str| format!("\x1b]7501;state={state}\x07");
+        let seen = window
+            .update(&mut cx, |view, _, cx| {
+                let session = view.session().clone();
+                session.process_output(format!("{}{idle_box}", report("idle")).as_bytes());
+                view.update_runtime(cx);
+                let mut submission = view
+                    .begin_prompt_submission("first paragraph\n\nsecond paragraph")
+                    .expect("Claude takes ctl prompts");
+                // The paste is in; a turn begins before the Enter.
+                session.process_output(report("working").as_bytes());
+                let pasted = view.observe_prompt_submission(&submission);
+                submission.enter_pressed();
+                let entered = view.observe_prompt_submission(&submission);
+                // That turn reports Working again, then ends.
+                session.process_output(report("working").as_bytes());
+                let repeated = view.observe_prompt_submission(&submission);
+                session.process_output(report("idle").as_bytes());
+                let ended = view.observe_prompt_submission(&submission);
+                // The next turn began after the Enter.
+                session.process_output(report("working").as_bytes());
+                let began = view.observe_prompt_submission(&submission);
+                session.process_output(report("idle").as_bytes());
+                let over = view.observe_prompt_submission(&submission);
+                session.kill();
+                (
+                    submission.observable(),
+                    [pasted, entered, repeated, ended, began, over],
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            seen,
+            (
+                true,
+                [
+                    Unconfirmed,
+                    Unconfirmed,
+                    Unconfirmed,
+                    Unconfirmed,
+                    Accepted,
+                    Accepted
+                ]
+            )
+        );
+    }
+}
+
+#[cfg(test)]
 mod startup_readiness_tests {
     use super::{
         PromptOriginProof, PromptSubmissionState, QuietStartup, QuietStartupTarget, SHIFT_TAB,
@@ -5486,6 +5626,7 @@ mod startup_readiness_tests {
                 input: "task",
                 expected_input: "task".into(),
                 before_title: 8,
+                before_report: None,
                 allow_working_title: false,
                 before_prompt: None,
                 instance_id: uuid::Uuid::new_v4(),
@@ -5557,6 +5698,7 @@ mod startup_readiness_tests {
             assert!(ctl_acceptance_observable(
                 provider,
                 Some(idle),
+                false,
                 true,
                 multi,
                 Some("first paragraph")
@@ -5565,16 +5707,24 @@ mod startup_readiness_tests {
             // only a fresh transcript row the readers return whole can confirm.
             for (title, allow) in [(None, true), (Some(idle), false)] {
                 assert!(!ctl_acceptance_observable(
-                    provider, title, allow, multi, None
+                    provider, title, false, allow, multi, None
                 ));
                 assert_eq!(
-                    ctl_acceptance_observable(provider, title, allow, "one\nparagraph\n", None),
+                    ctl_acceptance_observable(
+                        provider,
+                        title,
+                        false,
+                        allow,
+                        "one\nparagraph\n",
+                        None
+                    ),
                     provider != TitleProvider::Grok
                 );
                 // The same prompt again leaves the newest row unchanged.
                 assert!(!ctl_acceptance_observable(
                     provider,
                     title,
+                    false,
                     allow,
                     "continue ",
                     Some("continue")
@@ -5585,6 +5735,7 @@ mod startup_readiness_tests {
         assert!(!ctl_acceptance_observable(
             TitleProvider::Codex,
             Some("scratch"),
+            false,
             true,
             multi,
             None
@@ -5604,6 +5755,7 @@ mod startup_readiness_tests {
                 input: "task",
                 expected_input: "task".into(),
                 before_title: 8,
+                before_report: None,
                 allow_working_title: true,
                 before_prompt: None,
                 instance_id: uuid::Uuid::new_v4(),
@@ -5622,6 +5774,7 @@ mod startup_readiness_tests {
             input: "task",
             expected_input: "task".into(),
             before_title: 8,
+            before_report: None,
             allow_working_title: true,
             before_prompt: None,
             instance_id: uuid::Uuid::new_v4(),
@@ -5709,6 +5862,7 @@ mod startup_readiness_tests {
             input: "task",
             expected_input: "task".into(),
             before_title: 8,
+            before_report: None,
             allow_working_title: true,
             before_prompt: None,
             instance_id: uuid::Uuid::new_v4(),
@@ -5752,6 +5906,7 @@ mod startup_readiness_tests {
                 input: "task",
                 expected_input: "task".into(),
                 before_title: 8,
+                before_report: None,
                 allow_working_title: true,
                 before_prompt: None,
                 instance_id: uuid::Uuid::new_v4(),
@@ -5856,6 +6011,7 @@ mod startup_readiness_tests {
             input: &task,
             expected_input: task.clone(),
             before_title: 8,
+            before_report: None,
             allow_working_title: true,
             before_prompt: None,
             instance_id: uuid::Uuid::new_v4(),
@@ -5947,6 +6103,7 @@ mod startup_readiness_tests {
             input: &task,
             expected_input: task.clone(),
             before_title: 8,
+            before_report: None,
             allow_working_title: true,
             before_prompt: None,
             instance_id: uuid::Uuid::new_v4(),
@@ -5985,6 +6142,7 @@ mod startup_readiness_tests {
             input: "task",
             expected_input: "task".into(),
             before_title: 8,
+            before_report: None,
             allow_working_title: true,
             before_prompt: None,
             instance_id: uuid::Uuid::new_v4(),
@@ -6010,6 +6168,7 @@ mod startup_readiness_tests {
             input: "task",
             expected_input: "task".into(),
             before_title: 8,
+            before_report: None,
             allow_working_title: true,
             before_prompt: None,
             instance_id: uuid::Uuid::new_v4(),
@@ -6139,6 +6298,7 @@ mod startup_readiness_tests {
             input: "a  b",
             expected_input: "a b".into(),
             before_title: 2,
+            before_report: None,
             allow_working_title: true,
             before_prompt: None,
             instance_id: uuid::Uuid::new_v4(),

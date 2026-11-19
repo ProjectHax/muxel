@@ -1948,8 +1948,9 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   retry Enter, so it may have arrived). Once Enter is in, the reply is this
   receipt, never an error.
   It is null, without waiting, when the pane can't show a receipt: an
-  unsupported provider, or no readable idle status title (tmux hides titles)
-  with a Grok, multi-paragraph or repeated prompt.
+  unsupported provider, or neither a readable idle status title nor OSC 7501
+  status reports (tmux hides both) with a Grok, multi-paragraph or repeated
+  prompt.
   `enter_retries` reports zero or one additional Enter. Windows Codex alone may
   receive that retry after five seconds while its exact, fully visible ASCII
   prose remains in the idle composer and no local input intervened. Clipped,

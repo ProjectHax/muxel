@@ -946,6 +946,13 @@ fn control_new_policy_write_entry_points_recheck_permission() {
             )
         };
         assert!(timer < update && update < gate && gate < same_session && same_session < write);
+        if index == 0 {
+            // A turn begun between the paste and the Enter is no receipt.
+            let sampled = callback
+                .find("attempt.enter_pressed()")
+                .expect("the Enter takes the status report sample");
+            assert!(same_session < sampled && sampled < write);
+        }
     }
 }
 
