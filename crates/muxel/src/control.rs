@@ -1005,6 +1005,7 @@ fn wait(agent: &str, timeout: Duration, full: bool, turn: bool) -> Result<Value,
     // Pin the agent by uuid: its name follows its title, which can change mid-turn.
     let mut target = agent.to_string();
     let mut background: Value;
+    let mut seen_turn = false;
     let outcome = loop {
         let info = request(Command::Status {
             agent: Some(target.clone()),
@@ -1012,19 +1013,11 @@ fn wait(agent: &str, timeout: Duration, full: bool, turn: bool) -> Result<Value,
         if let Some(uuid) = info["uuid"].as_str() {
             target = uuid.to_string();
         }
-        let state: Option<AgentState> = serde_json::from_value(info["status"].clone()).ok();
-        if state.is_none() {
+        let Ok(state) = serde_json::from_value::<AgentState>(info["status"].clone()) else {
             return Err(format!("'{agent}' is not a terminal pane").into());
-        }
-        let awaiting = info["awaiting_reply"].as_bool().unwrap_or(false);
+        };
         background = info["background"].clone();
-        if info["startup_error"].is_string() {
-            break WaitOutcome::SubmissionFailed;
-        }
-        if turn && info["turn_over"].as_bool().unwrap_or(false) {
-            break WaitOutcome::Finished;
-        }
-        if let Some(outcome) = control::wait_outcome(state, awaiting) {
+        if let Some(outcome) = wait_poll(&info, state, turn, &mut seen_turn) {
             break outcome;
         }
         if started.elapsed() >= timeout {
@@ -1046,13 +1039,46 @@ fn wait(agent: &str, timeout: Duration, full: bool, turn: bool) -> Result<Value,
     Ok(shown)
 }
 
+/// What one of `wait`'s status replies (`info`, the pane in `state`) settles,
+/// or `None` to keep waiting. A startup task that failed ends the wait, except
+/// one whose Enter went in without a receipt (`prompt_delivery.outcome`
+/// `unconfirmed` with `enter_admitted`) once this wait has seen the pane
+/// working or blocked beside the failure (`seen_turn`): that turn may be the
+/// task, so the wait follows it. A turn seen while the task was pending
+/// doesn't count, since it didn't confirm the task. The client can't date the
+/// failure, so a turn it follows may be another one (the reply still carries
+/// `startup_error`), and a pane idle when the wait sees the failure still
+/// reads `submission_failed`.
+fn wait_poll(
+    info: &Value,
+    state: AgentState,
+    turn: bool,
+    seen_turn: &mut bool,
+) -> Option<WaitOutcome> {
+    if info["startup_error"].is_string() {
+        let delivery = &info["prompt_delivery"];
+        let entered = delivery["outcome"] == "unconfirmed" && delivery["enter_admitted"] == true;
+        *seen_turn |= entered && matches!(state, AgentState::Working | AgentState::Blocked);
+        if !*seen_turn {
+            return Some(WaitOutcome::SubmissionFailed);
+        }
+    }
+    if turn && info["turn_over"].as_bool().unwrap_or(false) {
+        return Some(WaitOutcome::Finished);
+    }
+    control::wait_outcome(
+        Some(state),
+        info["awaiting_reply"].as_bool().unwrap_or(false),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         BUSY_IO, DELIVERY_WAIT, MAX_CONNECTIONS, Places, Server, Task, accept, choose_endpoint,
         create, dispatch, drain_request, failure_body, process_alive, read_endpoint, request_at,
-        same_secret, spawn_in_slot, task_of, wait_creation_with, wait_prompt_delivery_with,
-        write_busy, write_endpoint,
+        same_secret, spawn_in_slot, task_of, wait_creation_with, wait_poll,
+        wait_prompt_delivery_with, write_busy, write_endpoint,
     };
     use muxel_core::control::{
         self, CliCommand, Command, Endpoint, ErrorCode, PROTOCOL_VERSION, Response,
@@ -1086,6 +1112,93 @@ mod tests {
     fn first_request_failure(args: &[&str], error: control::Error) -> serde_json::Value {
         let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
         failure_body(error, task_of(&control::parse_cli(&args).unwrap()))
+    }
+
+    /// A startup task whose Enter went in without a receipt may be the turn the
+    /// pane then runs: once `wait --turn` sees the pane working or blocked
+    /// beside the failure, it waits for that turn rather than calling the task
+    /// failed. A turn seen while the task was pending didn't confirm it, so it
+    /// doesn't count; a pane idle at the failure, a paste whose Enter never went
+    /// in and a task never typed still end the wait as `submission_failed`. The
+    /// replies come from the host's own startup tracking.
+    #[test]
+    fn wait_follows_a_turn_an_unconfirmed_startup_task_may_have_started() {
+        use control::WaitOutcome::{Blocked, Finished, SubmissionFailed};
+        use control::{StartupFailure, StartupTurn};
+        /// A startup task, as far as it got.
+        #[derive(Clone, Copy, Debug)]
+        enum Stage {
+            /// Pasted and its Enter in, with no receipt yet.
+            Pending,
+            /// Failed after its Enter went in.
+            Entered,
+            /// Failed after its paste, before an Enter.
+            Pasted,
+            /// Failed before anything was typed.
+            NotTyped,
+        }
+        use Stage::{Entered, NotTyped, Pasted, Pending};
+        let reply = |state: &str, task: Stage| {
+            let turn = StartupTurn::default();
+            let owner = turn.claim().expect("a new task is unclaimed");
+            if !matches!(task, NotTyped) {
+                owner.record_paste(true);
+            }
+            if matches!(task, Pending | Entered) {
+                owner.enter_admitted(1);
+            }
+            match task {
+                Pending => {}
+                Entered => owner.fail(StartupFailure::NotAccepted),
+                Pasted | NotTyped => owner.fail(StartupFailure::NotReady),
+            }
+            serde_json::json!({
+                "status": state,
+                "awaiting_reply": false,
+                "startup_error": turn.startup_error(),
+                "prompt_delivery": turn.delivery("abcd", false),
+            })
+        };
+        let wait = |polls: &[(&str, Stage)]| {
+            let mut seen_turn = false;
+            polls.iter().find_map(|&(state, task)| {
+                let info = reply(state, task);
+                let state = serde_json::from_value(info["status"].clone()).unwrap();
+                wait_poll(&info, state, true, &mut seen_turn)
+            })
+        };
+        let cases = [
+            (
+                &[
+                    ("working", Entered),
+                    ("working", Entered),
+                    ("done", Entered),
+                ][..],
+                Some(Finished),
+            ),
+            (&[("working", Entered), ("idle", Entered)], Some(Finished)),
+            (&[("blocked", Entered)], Some(Blocked)),
+            (&[("working", Entered)], None),
+            (&[("idle", Entered)], Some(SubmissionFailed)),
+            // Working while pending, then failed with the pane idle.
+            (
+                &[("working", Pending), ("idle", Entered)],
+                Some(SubmissionFailed),
+            ),
+            (
+                &[("working", Pasted), ("idle", Pasted)],
+                Some(SubmissionFailed),
+            ),
+            (&[("working", NotTyped)], Some(SubmissionFailed)),
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .filter_map(|(polls, expected)| {
+                let got = wait(polls);
+                (got != *expected).then(|| format!("{polls:?}: {got:?}, not {expected:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]

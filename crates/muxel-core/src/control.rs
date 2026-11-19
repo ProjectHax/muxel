@@ -1985,7 +1985,12 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   or ambiguous drafts get no retry; task text is never pasted again. A missing acceptance
   within sixty seconds, failed readiness or unsupported provider sets
   `agent.startup_error` in show (or `startup_error` in status). Inspect the pane
-  before sending another task; do not repeat creation. Muse and other providers
+  before sending another task; do not repeat creation. When the task's Enter
+  went in without a receipt (`prompt_delivery.outcome` `unconfirmed` with
+  `enter_admitted: true`), a wait that then sees the pane working or blocked
+  follows that turn instead of returning submission_failed, since the task may
+  have started it. The turn may also be another, so inspect the pane after a
+  `finished` wait that still shows `startup_error`. Muse and other providers
   without a verified startup protocol receive no task input.
   The `wait.outcome` values are finished, blocked, exited, not_running,
   submission_failed or timed_out. Default

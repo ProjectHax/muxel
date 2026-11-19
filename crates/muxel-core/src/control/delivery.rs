@@ -37,6 +37,10 @@ pub struct PromptDelivery {
     pub blocked_by: Option<StartupBlockerKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screen_excerpt: Option<String>,
+    /// A startup task's Enter went in: muxel's writer admitted it, which is
+    /// not the provider accepting the task. Only a startup task reports it.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub enter_admitted: bool,
 }
 
 impl PromptDelivery {
@@ -76,6 +80,9 @@ impl PromptDelivery {
         }
         if let Some(excerpt) = self.screen_excerpt {
             reply["screen_excerpt"] = json!(excerpt);
+        }
+        if self.enter_admitted {
+            reply["enter_admitted"] = json!(true);
         }
     }
 }
