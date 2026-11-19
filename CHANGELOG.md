@@ -5,6 +5,91 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-11-19
+
+### Added
+- **Antigravity and Gemini CLI presets** — Google's Antigravity CLI (`agy`)
+  and Gemini CLI (`gemini`) are now built-in presets, each with an optional
+  model override, plus a reasoning-effort override for Antigravity. Both start
+  with the tool's own configured defaults and never submit an automatic first
+  turn; pick a past conversation back up with the tool's own `/resume`. An
+  existing install gains the two presets on upgrade without touching presets
+  you've edited or deleted. Antigravity also joins Settings → **Skills**, with
+  its user and project skills folders, and the skills bundled with it are shown
+  but never changed. Antigravity, Gemini CLI, Codex, Muse Code and Hermes now
+  have icons of their own.
+
+### Fixed
+- **A remote project offers the agents its host has installed** — the
+  new-agent menus hide presets whose program isn't installed, but for a remote
+  project they checked this computer rather than the host the agents run on.
+  An agent installed only on the host, like pi, Amp or Codex, was hidden, while
+  one that happened to be installed locally was offered. Each time muxel
+  connects to a host it now asks which agents the host can launch, using the
+  same login-shell `PATH` remote panes start with, so npm, nvm and other
+  per-user installs count. Until a host has answered, every agent is offered.
+- **Reopening a popped-out page brings its window forward** — a file, diff or
+  browser page popped out into its own window was invisible to muxel's check
+  for one already open. Clicking a link to that file, opening the same diff
+  again or opening the same URL docked a second copy while the first sat in its
+  window. muxel now finds the popped-out one, reloads it as before, jumps to the
+  linked line, and brings its window to the front. A browser page is matched by
+  the page it's on now rather than the one it was popped out on, and a
+  popped-out page you've navigated re-docks and restores at the page it ended
+  on. In remote projects a file is reused only from a project on the same host,
+  so two hosts with the same path no longer share an editor. Thanks to
+  [@railapex](https://github.com/railapex) ([#171](https://github.com/ProjectHax/muxel/pull/171)).
+- **Discarding a worktree says when its folder was left behind** — on Windows,
+  git can't delete a worktree's folder while a running program has it open or
+  as its current folder. Discarding the worktree, or closing the last pane of
+  one whose work had landed, then dropped the worktree and its branch from git
+  but left the folder on disk without a word, and nothing would ever try again.
+  muxel now checks what's actually left and says so in the notifications feed:
+  a folder you can delete once the program using it has exited, a worktree git
+  refused to remove (a locked one, say) with git's own error, or a branch git
+  kept. Thanks to [@railapex](https://github.com/railapex)
+  ([#172](https://github.com/ProjectHax/muxel/pull/172)).
+- **Codex no longer gets a task typed over its update menu** — when a newer
+  Codex is out, Codex starts on its update prompt, and a Run task, a loop or a
+  `muxel ctl new --prompt` task was typed straight into that menu, Enter
+  included. ctl tasks were meant to skip the menu already, but didn't. Every
+  Codex launch muxel types a task into now starts with Codex's update check
+  off; a launch with nothing to type, or a resumed one, still checks. This needs
+  Codex 0.64.0 or later, and a Codex started through a wrapper such as
+  `wsl.exe -e codex` isn't covered. Thanks to
+  [@railapex](https://github.com/railapex) ([#173](https://github.com/ProjectHax/muxel/pull/173)).
+- **Merge into offers only the project's own branches** — once one project's
+  Worktrees tab had loaded, another project's worktree rows offered the first
+  project's branches under **Merge into…** until their own arrived. 0.3.9 listed
+  this as fixed too early; it's fixed now. In a remote project on Windows,
+  **Open file** in Changes built a path with a backslash the host couldn't read
+  and opened an empty editor; it now opens the file on the host. And renaming a
+  remote project no longer hides its Changes list, while moving it to another
+  folder no longer leaves the old folder's list up. Thanks to
+  [@railapex](https://github.com/railapex) ([#174](https://github.com/ProjectHax/muxel/pull/174)).
+- **Saved-password SSH connects on macOS ride out a refused terminal** —
+  connecting with a saved password could fail with "Failed to get a pseudo
+  terminal" while a manual Reconnect a moment later worked: macOS occasionally
+  refuses, for a moment, the local terminal muxel's password helper types into.
+  Nothing has reached the host at that point, so muxel now retries up to three
+  times over about a second and a half. Real connection and password failures
+  are reported as before.
+- **No typing hitch when Undo runs out on Windows** — when a closed shell's
+  Undo countdown ended, muxel looked at what the shell was running on the UI
+  thread, a pause of 20–40 ms that could land while you typed in another pane.
+  That check now runs in the background and Undo stays available while it
+  does. A pane whose shell changed during the check asks you to Close or Keep it
+  instead of closing. Thanks to [@railapex](https://github.com/railapex)
+  ([#170](https://github.com/ProjectHax/muxel/pull/170)).
+- **`muxel ctl` keeps "busy" apart from a working agent** — since 0.3.9, `busy`
+  also means muxel is already serving all the ctl connections it takes, but the
+  help for `muxel ctl send` still said `--force` overrides "busy", which can't
+  help there. The help now names, by code, each refusal `--force` gets past. A
+  caller refused as busy now reads that answer even when it's slow to send its
+  request, including on Windows, and refused callers no longer hold up the
+  connections being served. Thanks to [@railapex](https://github.com/railapex)
+  ([#169](https://github.com/ProjectHax/muxel/pull/169)).
+
 ## [0.3.9] — 2026-11-18
 
 ### Added
