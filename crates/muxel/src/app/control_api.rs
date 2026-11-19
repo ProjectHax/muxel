@@ -2014,6 +2014,25 @@ impl MuxelApp {
             .claim()
     }
 
+    /// Whether the launch `command_for` builds for `iid` will own its ctl task,
+    /// asked before the command exists and without claiming: its reservation's
+    /// pending owner, else one a claim would give now. The same owner
+    /// [`control_launch_spec`] later receives, so a task this says no to is
+    /// never typed and its launch is built without it.
+    pub(super) fn control_startup_will_own(&self, iid: Uuid) -> bool {
+        match self.terminal_launching.get(&iid) {
+            Some(ticket) => ticket
+                .startup
+                .as_ref()
+                .is_some_and(ctl::StartupTurnOwner::is_pending),
+            None => self
+                .control_turns
+                .get(&iid)
+                .and_then(|turn| turn.startup.as_ref())
+                .is_some_and(ctl::StartupTurn::claimable),
+        }
+    }
+
     /// Continue a discovery reservation without replacing its generation or
     /// claiming a second startup owner for an already prepared launch.
     pub(super) fn claim_reserved_control_startup(&mut self, iid: Uuid, token: u64) {

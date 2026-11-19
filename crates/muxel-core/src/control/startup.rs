@@ -108,6 +108,14 @@ impl StartupTurn {
         Some(StartupTurnOwner(Arc::new(Lease(self.clone()))))
     }
 
+    /// Whether [`Self::claim`] would hand out a lease now, asked without
+    /// claiming or cancelling: a launch decides from it, before its command is
+    /// built, whether the task it carries will be typed.
+    pub fn claimable(&self) -> bool {
+        let tracked = self.lock();
+        !tracked.claimed && tracked.state == StartupTurnState::Pending
+    }
+
     pub fn awaiting_reply(
         &self,
         state: Option<AgentState>,

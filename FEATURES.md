@@ -1298,7 +1298,13 @@ feature is added or changed, update the matching entry here in the same change**
   they appear, with `blocked_by` and a short `screen_excerpt`; trust prompts are
   never answered automatically. `--no-wait` returns before approval with a
   polling command. Status exposes the same delivery facts.
-  Codex launches carrying a startup task suppress its startup update menu.
+  A newly started Codex that muxel recognises by its program name and will
+  type a startup task into (this one, a Run task's or a loop's) launches with
+  its update check off, so its update menu never takes the task. A resumed
+  Codex, one with no task to type and one run through a wrapper such as
+  `wsl.exe -e codex` keep the check; a preset that sets
+  `check_for_update_on_startup` keeps its own value; Codex before 0.64.0
+  ignores the setting.
 - **Windows Codex multiline control** — native presets disable heuristic paste
   bursts only after a version probe verifies the matching input codec. The
   probe runs once per Codex executable (again after it changes) on its own

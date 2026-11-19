@@ -116,3 +116,79 @@ fn tmux_preparation_failure_cancels_a_task_before_or_after_claiming_it() {
         .unwrap();
     });
 }
+
+/// A ctl task's Codex launch skips the update check exactly when that launch
+/// will type the task: through `command_for`, the final spec, where the
+/// owner decides. One whose owner a restart lost, a cancelled one and one
+/// another launch already claimed type nothing and keep the check.
+#[test]
+fn a_ctl_task_reaches_codex_argv_only_through_its_owner() {
+    with_app(|cx, main| {
+        main.update(cx, |app, _, _| {
+            let pid = app
+                .workspace
+                .add_project(Project::new("ctl task", muxel_store::data_dir().unwrap()));
+            let project = app.workspace.project(pid).unwrap().clone();
+            const TASK: &str = "Fix the flaky test";
+            const SKIP: &[&str] = &["check_for_update_on_startup=false"];
+            let mut pane = || {
+                let mut instance = muxel_core::control::NewOptions {
+                    prompt: Some(TASK.into()),
+                    ..Default::default()
+                }
+                .instance(&project, &[AgentPreset::codex()], 0)
+                .unwrap();
+                instance.use_tmux = false;
+                let iid = instance.id;
+                app.workspace.add_instance(instance);
+                iid
+            };
+            let (owned, lost, cancelled, taken, reserved) =
+                (pane(), pane(), pane(), pane(), pane());
+            for iid in [owned, cancelled, taken, reserved] {
+                app.control_turns
+                    .insert(iid, ControlTurn::startup(TASK.into()));
+            }
+            let signal = |app: &crate::app::MuxelApp, iid| {
+                app.control_turns[&iid].startup.as_ref().unwrap().clone()
+            };
+            signal(&*app, cancelled).cancel();
+            let elsewhere = signal(&*app, taken).claim().unwrap();
+            let owner = signal(&*app, reserved).claim();
+            app.terminal_launching.insert(
+                reserved,
+                LaunchTicket {
+                    token: 1,
+                    reason: TerminalLaunchReason::NewPane,
+                    since: Instant::now(),
+                    startup: owner,
+                },
+            );
+            let cases: [(&str, Uuid, Option<&str>, &[&str]); 5] = [
+                ("owned", owned, Some(TASK), SKIP),
+                ("its owner lost to a restart", lost, None, &[]),
+                ("cancelled", cancelled, None, &[]),
+                ("claimed by another launch", taken, None, &[]),
+                ("owned by its reservation", reserved, Some(TASK), SKIP),
+            ];
+            for (case, iid, typed, settings) in cases {
+                let spec = app.command_for(iid, None).unwrap();
+                assert_eq!(
+                    spec.startup_input.as_deref(),
+                    typed,
+                    "{case}: the task typed"
+                );
+                assert_eq!(spec.submit, typed.is_some(), "{case}: its Enter");
+                let set: Vec<&str> = spec
+                    .args
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|arg| arg.contains("check_for_update_on_startup"))
+                    .collect();
+                assert_eq!(set, settings, "{case}: the update check's settings in argv");
+            }
+            drop(elsewhere);
+        })
+        .unwrap();
+    });
+}
