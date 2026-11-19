@@ -3475,6 +3475,145 @@ fn git_notify_detail(out: &str) -> String {
         .join("\n")
 }
 
+/// What to tell the user, as (title, detail), after removing the worktree at
+/// `path` (`left`) and deleting its branch (`branch`: its name and whether it
+/// is gone, `None` when it stays by design), or `None` when all of it went.
+/// Only a folder git no longer lists is the user's to delete; one it still
+/// lists is a working checkout. When git can't be asked, the report claims
+/// neither a removal nor a refusal.
+fn worktree_removal_report(
+    path: &str,
+    left: Result<(), &integrations::WorktreeLeft>,
+    branch: Option<(&str, bool)>,
+) -> Option<(SharedString, String)> {
+    let left = match left {
+        Ok(()) => {
+            let (branch, false) = branch? else {
+                return None;
+            };
+            return Some((
+                t("Worktree branch kept"),
+                tf(
+                    "The worktree at {path} was removed, but git kept its branch {branch}.",
+                    &[("path", path), ("branch", branch)],
+                ),
+            ));
+        }
+        Err(left) => left,
+    };
+    let error = left.error.as_str();
+    Some(match (left.registered, branch) {
+        (None, Some((branch, false))) => (
+            t("Worktree removal not confirmed"),
+            tf(
+                "muxel could not tell whether git removed the worktree at {path} or its branch {branch}: {error}",
+                &[("path", path), ("branch", branch), ("error", error)],
+            ),
+        ),
+        (None, _) => (
+            t("Worktree removal not confirmed"),
+            tf(
+                "muxel could not tell whether git removed the worktree at {path}: {error}",
+                &[("path", path), ("error", error)],
+            ),
+        ),
+        (Some(true), Some((branch, false))) => (
+            t("Worktree not removed"),
+            tf(
+                "Git could not remove the worktree at {path}, so it and its branch {branch} are still there: {error}",
+                &[("path", path), ("branch", branch), ("error", error)],
+            ),
+        ),
+        (Some(true), _) => (
+            t("Worktree not removed"),
+            tf(
+                "Git could not remove the worktree at {path}, so it is still there: {error}",
+                &[("path", path), ("error", error)],
+            ),
+        ),
+        (Some(false), Some((_, true))) => (
+            t("Worktree folder left on disk"),
+            tf(
+                "The worktree and its branch were removed, but {path} could not be deleted, usually because a program is still using it. Delete the folder once that program has exited.",
+                &[("path", path)],
+            ),
+        ),
+        (Some(false), Some((branch, false))) => (
+            t("Worktree folder left on disk"),
+            tf(
+                "The worktree was removed, but git kept its branch {branch}, and {path} could not be deleted, usually because a program is still using it. Delete the folder once that program has exited.",
+                &[("branch", branch), ("path", path)],
+            ),
+        ),
+        (Some(false), None) => (
+            t("Worktree folder left on disk"),
+            tf(
+                "The worktree was removed, but {path} could not be deleted, usually because a program is still using it. Delete the folder once that program has exited.",
+                &[("path", path)],
+            ),
+        ),
+    })
+}
+
+#[cfg(test)]
+mod worktree_removal_report_tests {
+    use super::worktree_removal_report;
+    use crate::integrations;
+
+    /// When git can't be asked whether it still lists the worktree, here
+    /// because the repository folder is gone, the report claims neither a
+    /// removal nor a refusal, of the worktree or its branch, and gives no
+    /// delete advice.
+    #[test]
+    fn a_removal_git_cant_be_asked_about_claims_neither_outcome() {
+        let base =
+            std::env::temp_dir().join(format!("muxel-unknown-removal-{}", uuid::Uuid::new_v4()));
+        let folder = base.join("worktree");
+        std::fs::create_dir_all(&folder).unwrap();
+        let left = integrations::remove_worktree(&base.join("no-repository"), &folder);
+        let shown = folder.display().to_string();
+        let report = left.as_ref().err().and_then(|left| {
+            worktree_removal_report(&shown, Err(left), Some(("muxel/fixture", false)))
+        });
+        let _ = std::fs::remove_dir_all(&base);
+        let (title, detail) = report.expect("a worktree folder still on disk is reported");
+        assert_eq!(title.as_ref(), "Worktree removal not confirmed");
+        for claim in [
+            "could not remove",
+            "was removed",
+            "were removed",
+            "still there",
+            "kept",
+            "Delete the folder",
+        ] {
+            assert!(!detail.contains(claim), "it says {claim:?}: {detail}");
+        }
+        assert!(
+            detail.contains(&shown) && detail.contains("muxel/fixture"),
+            "what it couldn't tell: {detail}"
+        );
+    }
+
+    /// A worktree that went while git kept its branch is reported on its own;
+    /// one that went with its branch, or without one to delete, is not.
+    #[test]
+    fn a_branch_git_kept_after_its_worktree_went_is_reported() {
+        let (title, detail) =
+            worktree_removal_report("/srv/wt", Ok(()), Some(("muxel/fixture", false)))
+                .expect("a kept branch is reported");
+        assert_eq!(title.as_ref(), "Worktree branch kept");
+        assert_eq!(
+            detail,
+            "The worktree at /srv/wt was removed, but git kept its branch muxel/fixture."
+        );
+        assert_eq!(
+            worktree_removal_report("/srv/wt", Ok(()), Some(("muxel/fixture", true))),
+            None
+        );
+        assert_eq!(worktree_removal_report("/srv/wt", Ok(()), None), None);
+    }
+}
+
 /// Full-window backdrop for centered modal dialogs: dims the workspace and
 /// occludes it, so clicks/scroll/hover can't fall through to the terminals and
 /// sidebar painted behind the modal.
@@ -19424,7 +19563,8 @@ impl MuxelApp {
                             path.display()
                         ));
                     } else {
-                        integrations::remove_worktree(&root, &path);
+                        let left = integrations::remove_worktree(&root, &path);
+                        self.report_worktree_removal(&path, left, None);
                     }
                 }
             }
@@ -20146,8 +20286,9 @@ impl MuxelApp {
         });
         if changed == 0 && unmerged == 0 {
             // Fully landed: remove the worktree and its (empty) branch.
-            integrations::remove_worktree(&root, &path);
-            integrations::delete_branch(&root, &branch);
+            let left = integrations::remove_worktree(&root, &path);
+            let branch_gone = integrations::delete_branch(&root, &branch);
+            self.report_worktree_removal(&path, left, Some((&branch, branch_gone)));
             self.workspace.remove_worktree_meta(wid);
             self.persist();
             return;
@@ -20201,8 +20342,9 @@ impl MuxelApp {
             integrations::worktree_unmerged_count(&path, &base)
         });
         if changed == 0 && unmerged == 0 {
-            integrations::remove_worktree(&root, &path);
-            integrations::delete_branch(&root, &branch);
+            let left = integrations::remove_worktree(&root, &path);
+            let branch_gone = integrations::delete_branch(&root, &branch);
+            self.report_worktree_removal(&path, left, Some((&branch, branch_gone)));
             self.workspace.remove_worktree_meta(wid);
             self.persist();
             cx.notify();
@@ -20426,17 +20568,42 @@ impl MuxelApp {
                 w.detached = true;
             }
         } else {
-            integrations::remove_worktree(&d.root, &d.path);
-            if matches!(
+            let left = integrations::remove_worktree(&d.root, &d.path);
+            let branch_gone = matches!(
                 action,
                 WorktreeDisposeAction::Discard | WorktreeDisposeAction::Merge(_)
-            ) {
-                integrations::delete_branch(&d.root, &d.branch);
-            }
+            )
+            .then(|| integrations::delete_branch(&d.root, &d.branch));
+            let branch = branch_gone.map(|gone| (d.branch.as_str(), gone));
+            self.report_worktree_removal(&d.path, left, branch);
             self.workspace.remove_worktree_meta(d.wid);
         }
         self.persist();
         cx.notify();
+    }
+
+    /// Say what removing the worktree at `path` (`left`) and its branch
+    /// (`branch`: its name and whether it is gone, `None` when it stays by
+    /// design) didn't do, as git tells it afterwards.
+    fn report_worktree_removal(
+        &mut self,
+        path: &Path,
+        left: Result<(), integrations::WorktreeLeft>,
+        branch: Option<(&str, bool)>,
+    ) {
+        if let Err(left) = &left {
+            log::warn!(
+                "removing the worktree at {} left something (git still lists it: {:?}): {}",
+                path.display(),
+                left.registered,
+                left.error
+            );
+        }
+        if let Some((title, detail)) =
+            worktree_removal_report(&path.display().to_string(), left.as_ref().copied(), branch)
+        {
+            self.add_event(NotifKind::Error, title, detail);
+        }
     }
 
     /// Commit the front pending worktree (message = the input, or its name), then
@@ -22241,8 +22408,9 @@ impl MuxelApp {
         // An answer waiting on these panes has nothing left to act on.
         self.take_deferred_worktree_dispose(pid, wid);
         self.workspace.remove_worktree_meta(wid);
-        integrations::remove_worktree(&root, &path);
-        integrations::delete_branch(&root, &branch);
+        let left = integrations::remove_worktree(&root, &path);
+        let branch_gone = integrations::delete_branch(&root, &branch);
+        self.report_worktree_removal(&path, left, Some((&branch, branch_gone)));
         self.worktree_changes.remove(&wid);
         self.persist();
         cx.notify();
