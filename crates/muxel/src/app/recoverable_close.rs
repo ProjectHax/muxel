@@ -1108,16 +1108,33 @@ impl MuxelApp {
                     Some((iid, loc, target))
                 })
                 .collect();
-            if jobs.is_empty() {
-                self.finish_close_expiry(gid, cx);
+            let Some(group) = self.close_groups.iter().find(|group| group.id == gid) else {
+                continue;
+            };
+            let shells: Vec<_> = group
+                .members
+                .iter()
+                .filter_map(|&iid| {
+                    let inst = self.workspace.instance(iid)?;
+                    if muxel_core::is_known_agent_program(inst.program.as_deref()) {
+                        return None;
+                    }
+                    let view = self.terminal_view(iid)?.read(cx);
+                    let session = view.session();
+                    (!view.exited() && session.needs_expiry_snapshot()).then(|| session.clone())
+                })
+                .collect();
+            if jobs.is_empty() && shells.is_empty() {
+                self.finish_close_expiry(gid, &ShellCloseCheck::at_expiry(&[]), cx);
                 continue;
             }
             if let Some(group) = self.close_groups.iter_mut().find(|g| g.id == gid) {
                 group.checking = true;
             }
             cx.spawn(async move |this, cx| {
+                let executor = cx.background_executor().clone();
                 let counts = close_probes::collect(
-                    cx.background_executor().clone(),
+                    executor.clone(),
                     jobs,
                     |(iid, loc, target)| async move {
                         let count = integrations::attached_tmux_clients(&loc, &target).ok();
@@ -1125,12 +1142,28 @@ impl MuxelApp {
                     },
                 )
                 .await;
+                let shell_check = if shells.is_empty() {
+                    ShellCloseCheck::at_expiry(&[])
+                } else {
+                    close_probes::collect(executor, vec![shells], |shells| async move {
+                        ShellCloseCheck::at_expiry(&shells)
+                    })
+                    .await
+                    .pop()
+                    .unwrap_or_else(|| ShellCloseCheck::at_expiry(&[]))
+                };
                 let _ = this.update(cx, |this, cx| {
-                    if !this.close_groups.iter().any(|g| g.id == gid) {
+                    if !this.close_groups.iter().any(|g| {
+                        g.id == gid
+                            && g.checking
+                            && !g.undoing
+                            && !g.finalizing
+                            && !g.needs_decision
+                    }) {
                         return;
                     }
                     this.close_client_counts.extend(counts);
-                    this.finish_close_expiry(gid, cx);
+                    this.finish_close_expiry(gid, &shell_check, cx);
                 });
             })
             .detach();
@@ -1207,28 +1240,41 @@ impl MuxelApp {
         }
     }
 
-    fn finish_close_expiry(&mut self, gid: Uuid, cx: &mut Context<Self>) {
+    fn finish_close_expiry(
+        &mut self,
+        gid: Uuid,
+        shell_check: &ShellCloseCheck,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_close_expiry_with_facts(gid, cx, |app, iid, cx| {
+            app.close_facts_in(iid, cx, shell_check)
+        });
+    }
+
+    pub(super) fn finish_close_expiry_with_facts(
+        &mut self,
+        gid: Uuid,
+        cx: &mut Context<Self>,
+        mut read: impl FnMut(&Self, Uuid, &App) -> CloseFacts,
+    ) {
         let Some(group) = self.close_groups.iter().find(|g| g.id == gid) else {
             return;
         };
         if group.undoing {
             return;
         }
-        let shell_check = ShellCloseCheck::default();
-        let ready: Vec<_> = group
-            .members
-            .iter()
-            .copied()
-            .filter(|&iid| {
-                self.workspace.instance(iid).is_none()
-                    || self.closing.get(&iid).is_none_or(|held| {
-                        // Includes fresh shell marks and child-process evidence.
-                        let now = self.close_facts_in(iid, cx, &shell_check);
-                        exit_proves_closed(now) || may_finalize(held.facts, now, held.forced)
-                    })
-            })
-            .collect();
-        for iid in ready {
+        // Closing a member prunes this list and saves the workspace. That save
+        // can outlast another member's snapshot or overlap a new shell mark.
+        for iid in group.members.clone() {
+            let Some(held) = self.closing.get(&iid).filter(|held| held.group == gid) else {
+                continue;
+            };
+            if self.workspace.instance(iid).is_some() {
+                let now = read(self, iid, cx);
+                if !exit_proves_closed(now) && !may_finalize(held.facts, now, held.forced) {
+                    continue;
+                }
+            }
             self.close_instance_inner(iid, "close (countdown)", cx);
         }
         if let Some(group) = self.close_groups.iter_mut().find(|g| g.id == gid) {
