@@ -502,7 +502,7 @@ impl AgentPreset {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
-            // agy can resume via `--conversation <id>`, but muxel does not capture its id.
+            // `effective_resume_flag` also supports existing saved presets.
             session_id_flag: None,
             resume_flag: None,
         }
@@ -623,7 +623,61 @@ impl AgentPreset {
         self.resume_flag
             .as_deref()
             .or_else(|| crate::muse::is_program(self.program.as_deref()).then_some("resume"))
+            .or_else(|| {
+                self.builtin_antigravity_resume()
+                    .then_some("--conversation")
+            })
     }
+
+    /// Explicit conversation flags belong to the preset's own launch policy.
+    pub fn builtin_antigravity_resume(&self) -> bool {
+        cfg!(windows)
+            && is_antigravity_program(self.program.as_deref())
+            && self.session_id_flag.is_none()
+            && self.resume_flag.is_none()
+            && !antigravity_has_conversation_arg(&self.args)
+    }
+
+    pub fn builtin_antigravity_resume_for(&self, instance: &Instance) -> bool {
+        self.builtin_antigravity_resume()
+            && is_antigravity_program(instance.program.as_deref())
+            && !instance.literal_argv
+            && !instance.use_tmux
+            && instance.tmux_session.is_none()
+            && !antigravity_has_conversation_arg(&instance.args)
+    }
+}
+
+pub fn is_antigravity_program(program: Option<&str>) -> bool {
+    matches!(
+        program.and_then(program_stem).as_deref(),
+        Some("agy" | "antigravity")
+    )
+}
+
+pub fn antigravity_has_conversation_arg(args: &[String]) -> bool {
+    args.iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| {
+            matches!(
+                arg.split('=').next(),
+                Some("--conversation" | "--continue" | "-c")
+            )
+        })
+}
+
+fn program_stem(program: &str) -> Option<String> {
+    let program = program.trim();
+    let leaf = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    let stem = [".exe", ".cmd", ".bat"]
+        .iter()
+        .find_map(|suffix| leaf.strip_suffix(suffix))
+        .unwrap_or(&leaf);
+    (!stem.is_empty()).then(|| stem.to_string())
 }
 
 /// Whether `program` runs one of muxel's built-in agent providers — the program
@@ -633,25 +687,12 @@ impl AgentPreset {
 /// `PATH`). Anything else (`ssh`, `wsl.exe`, `python`, a wrapper script with its
 /// own name, a shell) is not, even if a user preset runs it.
 pub fn is_known_agent_program(program: Option<&str>) -> bool {
-    fn stem(program: &str) -> Option<String> {
-        let program = program.trim();
-        let leaf = program
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(program)
-            .to_ascii_lowercase();
-        let stem = [".exe", ".cmd", ".bat"]
-            .iter()
-            .find_map(|suffix| leaf.strip_suffix(suffix))
-            .unwrap_or(&leaf);
-        (!stem.is_empty()).then(|| stem.to_string())
-    }
-    let Some(name) = program.and_then(stem) else {
+    let Some(name) = program.and_then(program_stem) else {
         return false;
     };
     AgentPreset::builtin_agents()
         .iter()
-        .filter_map(|preset| preset.program.as_deref().and_then(stem))
+        .filter_map(|preset| preset.program.as_deref().and_then(program_stem))
         .any(|known| known == name)
 }
 
@@ -813,6 +854,17 @@ pub fn session_resume_args(preset: &AgentPreset, instance: &Instance) -> Option<
         return None;
     }
     let resume_flag = preset.effective_resume_flag()?;
+    if preset.builtin_antigravity_resume() {
+        let uuid = Uuid::parse_str(instance.session_id.as_deref()?).ok()?;
+        let path = instance.session_path.as_deref()?;
+        if !preset.builtin_antigravity_resume_for(instance)
+            || !path.ends_with(
+                Path::new(".gemini/antigravity-cli/conversations").join(format!("{uuid}.db")),
+            )
+        {
+            return None;
+        }
+    }
     if instance.session_started {
         let id = instance.session_id.as_deref()?;
         return Some(vec![resume_flag.to_string(), id.to_string()]);
@@ -821,6 +873,50 @@ pub fn session_resume_args(preset: &AgentPreset, instance: &Instance) -> Option<
     let id_flag = preset.session_id_flag.as_deref()?;
     let id = instance.session_id.as_deref()?;
     Some(vec![id_flag.to_string(), id.to_string()])
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn antigravity_resume_requires_an_observed_conversation() {
+    let preset = AgentPreset::agy();
+    let mut pane = Instance::from_preset(Uuid::new_v4(), &preset);
+    let id = "3294a881-6a79-4595-902f-4d26da32b718";
+    pane.session_started = true;
+    pane.session_id = Some(id.into());
+    assert_eq!(session_resume_args(&preset, &pane), None);
+
+    pane.session_path =
+        Some(Path::new("profile/.gemini/antigravity-cli/conversations").join(format!("{id}.db")));
+    assert_eq!(
+        session_resume_args(&preset, &pane),
+        Some(vec!["--conversation".into(), id.into()])
+    );
+
+    pane.args.push("--continue".into());
+    assert_eq!(session_resume_args(&preset, &pane), None);
+    pane.args.clear();
+    pane.session_path = Some(Path::new("unverified").join("another.db"));
+    assert_eq!(session_resume_args(&preset, &pane), None);
+}
+
+#[cfg(test)]
+#[test]
+fn antigravity_custom_flags_keep_the_preset_launch_policy() {
+    let mut preset = AgentPreset::agy();
+    preset.session_id_flag = Some("--new-id".into());
+    preset.resume_flag = Some("--reopen".into());
+    let mut pane = Instance::from_preset(Uuid::new_v4(), &preset);
+    pane.use_tmux = true;
+    pane.session_id = Some("configured-id".into());
+    assert_eq!(
+        session_resume_args(&preset, &pane).unwrap(),
+        ["--new-id", "configured-id"]
+    );
+    pane.session_started = true;
+    assert_eq!(
+        session_resume_args(&preset, &pane).unwrap(),
+        ["--reopen", "configured-id"]
+    );
 }
 
 /// Path to Claude's on-disk session transcript for an agent running in `cwd`:

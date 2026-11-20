@@ -3565,6 +3565,20 @@ impl TerminalSession {
         self.child_pid
     }
 
+    /// Whether Windows still associates this PID with the exact child we launched.
+    pub fn owns_windows_child_pid(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.child_pid
+                .zip(self.child_started)
+                .is_some_and(|(pid, started)| crate::shell_process::started(pid) == Some(started))
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
     /// The per-process memory limit, in bytes, this pane's local processes
     /// actually run under. `None` when the pane has none: none was asked for,
     /// or Windows couldn't apply it (logged at launch), or not on Windows.

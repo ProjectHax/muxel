@@ -50,12 +50,13 @@ pub use agent::{
     ACCOMPLISHMENTS_FILE, AgentPreset, ClaudeSession, ClaudeSessionRequest, CodexHintMiss,
     CodexResumePath, CodexSession, CodexSessionNames, EnvVar, InjectionMode, MEMORY_DIR,
     MEMORY_FILE, PresetKind, REMINDERS_FILE, ResolvedLaunch, accomplishments_header,
-    accomplishments_instruction, append_agent_instruction, claude_session_cwd,
-    claude_session_cwd_with_len, claude_session_path, codex_developer_instructions_override,
-    codex_latest_session_id, codex_latest_sessions, codex_resume_path, codex_rollout_by_walk,
-    codex_session_from_hint, codex_session_hint_from_title, codex_session_id_from_hint,
-    codex_session_names, codex_terminal_title_override, discover_claude_sessions,
-    file_link_instruction, find_claude_session_path, git_bash_program, is_known_agent_program,
+    accomplishments_instruction, antigravity_has_conversation_arg, append_agent_instruction,
+    claude_session_cwd, claude_session_cwd_with_len, claude_session_path,
+    codex_developer_instructions_override, codex_latest_session_id, codex_latest_sessions,
+    codex_resume_path, codex_rollout_by_walk, codex_session_from_hint,
+    codex_session_hint_from_title, codex_session_id_from_hint, codex_session_names,
+    codex_terminal_title_override, discover_claude_sessions, file_link_instruction,
+    find_claude_session_path, git_bash_program, is_antigravity_program, is_known_agent_program,
     launches_known_agent, memory_header, memory_instruction, memory_reference,
     muxel_file_reference, reminders_header, reminders_instruction, resolve_launch,
     resolve_launch_for_session, resolved_git_bash_program, session_resume_args,
@@ -1573,7 +1574,7 @@ pub struct RemoteLayout {
     pub reminders_enabled: Option<bool>,
 }
 
-// Local Workspace persistence keeps receipts; only the shared document omits them.
+// Local Workspace persistence keeps these fields; the shared document omits them.
 fn serialize_shared_instances<S: serde::Serializer>(
     instances: &[Instance],
     serializer: S,
@@ -1582,9 +1583,15 @@ fn serialize_shared_instances<S: serde::Serializer>(
 
     let mut sequence = serializer.serialize_seq(Some(instances.len()))?;
     for instance in instances {
-        if instance.claude_hook_record.is_some() {
+        let antigravity = is_antigravity_program(instance.program.as_deref());
+        if instance.claude_hook_record.is_some() || antigravity {
             let mut shared = instance.clone();
             shared.claude_hook_record = None;
+            if antigravity {
+                shared.session_id = None;
+                shared.session_path = None;
+                shared.session_started = false;
+            }
             sequence.serialize_element(&shared)?;
         } else {
             sequence.serialize_element(instance)?;
@@ -1711,10 +1718,12 @@ impl RemoteLayout {
                 if edits_only {
                     instance.tmux_session = None;
                     instance.tmux_socket = None;
+                    instance.auto_submit = false;
+                }
+                if edits_only || is_antigravity_program(instance.program.as_deref()) {
                     instance.session_id = None;
                     instance.session_path = None;
                     instance.session_started = false;
-                    instance.auto_submit = false;
                 }
                 instance
             })
@@ -1914,7 +1923,18 @@ pub fn merge_peer_instances(
             // A peer's consumed receipt says nothing about this machine, even
             // when this is the first time it has seen the pane.
             instance.claude_hook_record = None;
-            if let Some(mine) = local.iter().find(|l| l.id == instance.id) {
+            let mine = local.iter().find(|l| l.id == instance.id);
+            let antigravity = is_antigravity_program(instance.program.as_deref());
+            let local_antigravity =
+                mine.filter(|local| is_antigravity_program(local.program.as_deref()));
+            if antigravity {
+                instance.session_id = local_antigravity.and_then(|local| local.session_id.clone());
+                instance.session_path =
+                    local_antigravity.and_then(|local| local.session_path.clone());
+                instance.session_started =
+                    local_antigravity.is_some_and(|local| local.session_started);
+            }
+            if let Some(mine) = mine {
                 instance.auto_name = mine.auto_name.clone();
                 instance.claude_hook_record = mine.claude_hook_record.clone();
                 instance.grid = mine.grid;
@@ -1930,7 +1950,11 @@ pub fn merge_peer_instances(
                 } else if moved_off_default(&instance, mine) {
                     instance.tmux_socket = mine.tmux_socket.clone();
                 }
-                if instance.session_id.is_some() && instance.session_id == mine.session_id {
+                if !antigravity
+                    && local_antigravity.is_none()
+                    && instance.session_id.is_some()
+                    && instance.session_id == mine.session_id
+                {
                     instance.session_path =
                         mine.session_path.clone().or(instance.session_path.take());
                 }
@@ -5169,6 +5193,57 @@ mod remote_layout_tests {
 
         let a = merged.iter().find(|i| i.id == added.id).unwrap();
         assert_eq!(a.tmux_session, added.tmux_session);
+    }
+
+    #[test]
+    fn antigravity_peer_rows_cannot_supply_or_erase_a_local_binding() {
+        let project = Uuid::new_v4();
+        let preset = AgentPreset::agy();
+        let mut local = Instance::from_preset(project, &preset);
+        local.session_id = Some("owned".into());
+        local.session_path = Some(PathBuf::from("owned.db"));
+        local.session_started = true;
+        let binding = |instance: &Instance| {
+            (
+                instance.session_id.clone(),
+                instance.session_path.clone(),
+                instance.session_started,
+            )
+        };
+        let mut peer = local.clone();
+        for remote_id in [Some("peer"), None] {
+            peer.session_id = remote_id.map(str::to_owned);
+            peer.session_path = remote_id.map(|id| PathBuf::from(format!("{id}.db")));
+            peer.session_started = remote_id.is_some();
+            let merged =
+                merge_peer_instances(std::slice::from_ref(&local), vec![peer.clone()], project);
+            assert_eq!(binding(&merged[0]), binding(&local));
+        }
+        let imported = merge_peer_instances(&[], vec![local.clone()], project);
+        assert_eq!(binding(&imported[0]), (None, None, false));
+
+        for preset in [AgentPreset::claude(), AgentPreset::codex()] {
+            let mut other = Instance::from_preset(project, &preset);
+            other.id = local.id;
+            other.session_started = true;
+            other.session_path = Some(PathBuf::from("peer.jsonl"));
+            // Equal IDs still cannot transfer the local Antigravity path.
+            for id in ["peer", "owned"] {
+                other.session_id = Some(id.into());
+                let from_antigravity = merge_peer_instances(
+                    std::slice::from_ref(&local),
+                    vec![other.clone()],
+                    project,
+                );
+                let to_antigravity = merge_peer_instances(
+                    std::slice::from_ref(&other),
+                    vec![local.clone()],
+                    project,
+                );
+                assert_eq!(binding(&from_antigravity[0]), binding(&other));
+                assert_eq!(binding(&to_antigravity[0]), (None, None, false));
+            }
+        }
     }
 
     /// A pane this machine moved off Default (saved, not yet pushed) against a

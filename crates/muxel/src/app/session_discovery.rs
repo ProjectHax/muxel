@@ -287,7 +287,7 @@ pub(super) enum CodexRestoreFound {
     Skip,
 }
 
-fn restore_preset<'a>(
+pub(super) fn restore_preset<'a>(
     presets: &'a [AgentPreset],
     instance: &muxel_core::Instance,
 ) -> Option<&'a AgentPreset> {
@@ -810,6 +810,10 @@ impl MuxelApp {
             && view.child_pid().is_some()
         {
             (SessionProvider::Grok, None, None)
+        } else if preset.is_some_and(|preset| preset.builtin_antigravity_resume_for(instance))
+            && view.session().owns_windows_child_pid()
+        {
+            (SessionProvider::Antigravity, None, None)
         } else {
             return None;
         };
@@ -867,13 +871,14 @@ impl MuxelApp {
             .into_iter()
             .filter_map(|key| self.session_discoveries.begin(key, now))
             .collect();
-        let mut groups: [Vec<SessionDiscoveryRequest>; 4] = Default::default();
+        let mut groups: [Vec<SessionDiscoveryRequest>; 5] = Default::default();
         for request in requests {
             let index = match request.key.provider {
                 SessionProvider::Codex => 0,
                 SessionProvider::Claude => 1,
                 SessionProvider::Grok => 2,
                 SessionProvider::Muse => 3,
+                SessionProvider::Antigravity => 4,
             };
             groups[index].push(request);
         }
@@ -1425,6 +1430,19 @@ fn discover_sessions(
         .filter(|request| request.key.provider == SessionProvider::Grok)
         .filter_map(|request| request.key.child_pid.map(|pid| (pid, request.key.launch)))
         .collect();
+    #[cfg(windows)]
+    let antigravity = super::antigravity::active_conversations(
+        home,
+        &requests
+            .iter()
+            .filter(|request| request.key.provider == SessionProvider::Antigravity)
+            .filter_map(|request| request.key.child_pid)
+            .collect(),
+    )
+    .unwrap_or_else(|error| {
+        log::debug!("Antigravity presence unavailable: {error}");
+        Default::default()
+    });
     let results = requests
         .into_iter()
         .map(|request| {
@@ -1433,6 +1451,25 @@ fn discover_sessions(
             let mut miss = None;
             let mut observed_hint = None;
             let candidate = match key.provider {
+                SessionProvider::Antigravity => {
+                    #[cfg(windows)]
+                    {
+                        key.child_pid.and_then(|pid| antigravity.get(&pid)).map_or(
+                            DiscoveryCandidate::Unresolved,
+                            |(id, path)| DiscoveryCandidate::Session {
+                                candidate: SessionCandidate {
+                                    id: id.to_string(),
+                                    path: Some(path.clone()),
+                                },
+                                switched: None,
+                            },
+                        )
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        DiscoveryCandidate::Unresolved
+                    }
+                }
                 SessionProvider::Codex => {
                     let hint = key.hint.clone().or_else(|| {
                         key.tmux_session
@@ -1692,6 +1729,211 @@ mod binding_regressions {
                     assert_eq!(app.workspace.instance(id).unwrap().auto_name, None);
                 })
                 .unwrap();
+        });
+    }
+}
+
+#[cfg(all(test, windows))]
+mod antigravity_retention_tests {
+    use super::{MuxelApp, discover_sessions};
+    use crate::app::{claude_test_home, restart_completion_tests::with_app};
+    use gpui::{AppContext as _, Context, Window};
+    use muxel_core::{AgentPreset, Instance, Project};
+    use muxel_terminal::{CommandSpec, TerminalLaunch, TerminalView};
+    use std::{fs, path::Path, time::Instant};
+    use uuid::Uuid;
+
+    fn with_pair(
+        run: impl FnOnce(&mut MuxelApp, &mut Window, &mut Context<MuxelApp>, &Path, [(Uuid, Uuid); 2]),
+    ) {
+        with_app(|cx, handle| {
+            let home = muxel_store::data_dir().unwrap().join("antigravity-home");
+            let _profile = claude_test_home(Some(home.clone()));
+            let result = handle
+                .update(cx, |app, window, cx| {
+                    app.current_workspace = Some(Uuid::new_v4());
+                    let mut preset = AgentPreset::agy();
+                    // Restart can build its real command without starting a real agent.
+                    preset.program = Some(home.join("agy.exe").to_string_lossy().into_owned());
+                    let project = app
+                        .workspace
+                        .add_project(Project::new("Same folder", home.clone()));
+                    let panes = std::array::from_fn(|_| {
+                        let mut instance = Instance::from_preset(project, &preset);
+                        let pane = instance.id;
+                        let id = Uuid::new_v4();
+                        let db = super::super::antigravity::conversation_path(&home, id);
+                        fs::create_dir_all(db.parent().unwrap()).unwrap();
+                        fs::write(&db, b"probe conversation").unwrap();
+                        instance.session_id = Some(id.to_string());
+                        instance.session_path = Some(db);
+                        instance.session_started = true;
+                        instance.control_created = true;
+                        instance.use_tmux = false;
+                        app.workspace.add_instance(instance);
+                        let spec = CommandSpec::program(
+                            "cmd.exe",
+                            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+                        );
+                        let launch = TerminalLaunch::spawn(spec, (80, 24)).unwrap();
+                        let view = cx
+                            .new(|cx| TerminalView::new(launch, pane, Instant::now(), window, cx));
+                        app.terminals.insert(pane, view);
+                        app.terminal_launches.insert(pane, (Instant::now(), true));
+                        (pane, id)
+                    });
+                    app.presets.push(preset);
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run(app, window, cx, &home, panes)
+                    }))
+                })
+                .unwrap();
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        });
+    }
+
+    #[test]
+    fn antigravity_second_restart_without_a_new_turn_keeps_both_bindings() {
+        with_pair(|app, window, cx, _, panes| {
+            for (pane, id) in panes {
+                app.restart_agent(pane, window, cx);
+                let instance = app.workspace.instance(pane).unwrap();
+                assert_eq!(
+                    instance.session_id.as_deref(),
+                    Some(id.to_string().as_str()),
+                    "restart lost the last observed Antigravity conversation"
+                );
+                let (args, _) = app.session_resume_for(pane).unwrap().unwrap();
+                assert_eq!(args, ["--conversation", id.to_string().as_str()]);
+            }
+        });
+    }
+
+    #[test]
+    fn antigravity_early_exit_after_preset_deletion_keeps_the_binding() {
+        use muxel_core::TerminalLaunchReason;
+        use std::time::Duration;
+
+        with_app(|cx, handle| {
+            let home = muxel_store::data_dir().unwrap();
+            fs::create_dir_all(&home).unwrap();
+            let program = home.join("agy.exe");
+            // A real PTY exit without starting the installed Antigravity CLI.
+            fs::copy(std::env::var_os("ComSpec").unwrap(), &program).unwrap();
+            let owned_id = Uuid::new_v4();
+            let db = super::super::antigravity::conversation_path(&home, owned_id);
+            let id = owned_id.to_string();
+            fs::create_dir_all(db.parent().unwrap()).unwrap();
+            fs::write(&db, b"probe conversation").unwrap();
+            let pane = handle
+                .update(cx, |app, window, cx| {
+                    app._status_timer = gpui::Task::ready(());
+                    app.current_workspace = Some(Uuid::new_v4());
+                    let mut preset = AgentPreset::agy();
+                    preset.name = "Antigravity deletion fixture".into();
+                    preset.program = Some(program.to_string_lossy().into_owned());
+                    preset.args = vec!["/d".into(), "/c".into(), "exit 37".into()];
+                    let project = app.workspace.add_project(Project::new("Exit probe", &home));
+                    let mut instance = Instance::from_preset(project, &preset);
+                    let pane = instance.id;
+                    instance.session_id = Some(id.clone());
+                    instance.session_path = Some(db.clone());
+                    instance.session_started = true;
+                    instance.control_created = true;
+                    instance.use_tmux = false;
+                    app.workspace.add_instance(instance);
+                    app.presets.push(preset);
+                    app.delete_preset(app.presets.len() - 1, cx);
+                    app.spawn_terminal_for(pane, TerminalLaunchReason::Restart, window, cx);
+                    pane
+                })
+                .unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let exit = loop {
+                cx.executor().advance_clock(Duration::from_millis(10));
+                cx.run_until_parked();
+                if let Some(exit) = handle
+                    .read_with(cx, |app, cx| app.terminals[&pane].read(cx).exit_code())
+                    .unwrap()
+                {
+                    break exit;
+                }
+                assert!(Instant::now() < deadline, "the fixture child did not exit");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert_eq!(exit, 37);
+            let (binding, was_resume, would_recover) = handle
+                .update(cx, |app, window, cx| {
+                    let (_, was_resume) = app.terminal_launches[&pane];
+                    // Keep the exit inside the recovery window on a slow host.
+                    app.terminal_launches
+                        .insert(pane, (Instant::now(), was_resume));
+                    let would_recover = app.should_recover_expired_resume(pane, false, true);
+                    app.tick(window, cx);
+                    let inst = app.workspace.instance(pane).unwrap();
+                    (
+                        (
+                            inst.session_id.clone(),
+                            inst.session_path.clone(),
+                            inst.session_started,
+                        ),
+                        was_resume,
+                        would_recover,
+                    )
+                })
+                .unwrap();
+            assert_eq!(binding, (Some(id), Some(db), true));
+            assert!(!was_resume, "the launch issued no resume argument");
+            assert!(
+                !would_recover,
+                "a bound Antigravity pane cannot remint on exit"
+            );
+        });
+    }
+
+    #[test]
+    fn antigravity_inconclusive_and_failed_scans_preserve_both_bindings() {
+        with_pair(|app, _, cx, home, panes| {
+            for unreadable in [false, true] {
+                if unreadable {
+                    fs::write(
+                        home.join(".gemini/antigravity-cli/presence"),
+                        b"not a directory",
+                    )
+                    .unwrap();
+                    assert!(
+                        super::super::antigravity::active_conversations(
+                            home,
+                            &std::collections::HashSet::from([1])
+                        )
+                        .is_err()
+                    );
+                }
+                let requests = panes
+                    .iter()
+                    .map(|(pane, _)| {
+                        let key = app.session_discovery_key(*pane, cx).unwrap();
+                        app.session_discoveries
+                            .begin(key, Instant::now() + std::time::Duration::from_secs(60))
+                            .unwrap()
+                    })
+                    .collect();
+                app.apply_discovery_batch(
+                    discover_sessions(requests, home, None, Default::default()),
+                    None,
+                    cx,
+                );
+                for (pane, id) in panes {
+                    assert_eq!(
+                        app.workspace.instance(pane).unwrap().session_id.as_deref(),
+                        Some(id.to_string().as_str()),
+                        "an unseen Antigravity lock erased a verified conversation"
+                    );
+                }
+            }
         });
     }
 }
