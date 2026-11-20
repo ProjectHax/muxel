@@ -8,6 +8,8 @@
 //! - **Blocked** — the same bright B5 + E6 knocked twice: "come here".
 //! - **Reminder** — an arpeggio up E5–G#5–B5–E6, an alarm-clock "it's time" that
 //!   still reads clearly when it repeats.
+//! - **Task** — a soft doorbell down a major third, A5 then F5 over F4: "something
+//!   arrived", lower and gentler than the agent chimes.
 //!
 //! All are normalized to the same peak, so the volume setting treats them alike.
 
@@ -77,12 +79,20 @@ const REMINDER: [Strike; 5] = [
     strike(0.36, 659.25, 0.25, 0.4, 0.0), // E5, underneath
 ];
 
+const TASK_SECS: f64 = 1.5;
+const TASK: [Strike; 3] = [
+    strike(0.0, 880.0, 0.9, 0.3, 0.8),     // A5
+    strike(0.16, 698.46, 1.0, 0.45, 0.8),  // F5
+    strike(0.16, 349.23, 0.25, 0.45, 0.0), // F4, underneath
+];
+
 /// `sound`'s built-in chime: mono samples at [`RATE`].
 pub fn render(sound: AlertSound) -> Vec<f32> {
     let (secs, strikes): (f64, &[Strike]) = match sound {
         AlertSound::Done => (DONE_SECS, &DONE),
         AlertSound::Blocked => (BLOCKED_SECS, &BLOCKED),
         AlertSound::Reminder => (REMINDER_SECS, &REMINDER),
+        AlertSound::Task => (TASK_SECS, &TASK),
     };
     let rate = f64::from(RATE);
     let len = (secs * rate) as usize;
@@ -121,7 +131,7 @@ pub fn render(sound: AlertSound) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BLOCKED_SECS, DONE_SECS, PEAK, RATE, REMINDER_SECS, render};
+    use super::{BLOCKED_SECS, DONE_SECS, PEAK, RATE, REMINDER_SECS, TASK_SECS, render};
     use crate::sound_alert::AlertSound;
 
     fn peak(samples: &[f32]) -> f32 {
@@ -134,6 +144,7 @@ mod tests {
             (AlertSound::Done, DONE_SECS),
             (AlertSound::Blocked, BLOCKED_SECS),
             (AlertSound::Reminder, REMINDER_SECS),
+            (AlertSound::Task, TASK_SECS),
         ] {
             let samples = render(sound);
             assert_eq!(samples.len(), (secs * f64::from(RATE)) as usize);
@@ -165,5 +176,18 @@ mod tests {
         let after = peak(&blocked[rate * 17 / 100..rate * 19 / 100]);
         assert!(after > before * 1.5, "{before} → {after}");
         assert_ne!(render(AlertSound::Done)[..4800], blocked[..4800]);
+    }
+
+    #[test]
+    fn every_chime_sounds_different() {
+        let heads: Vec<Vec<f32>> = AlertSound::ALL
+            .iter()
+            .map(|s| render(*s)[..9600].to_vec())
+            .collect();
+        for (i, a) in heads.iter().enumerate() {
+            for b in &heads[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
     }
 }

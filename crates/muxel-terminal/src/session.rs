@@ -3526,6 +3526,19 @@ impl TerminalSession {
         }
     }
 
+    /// The program's latest root OSC 7501 report as `(revision, progress,
+    /// msg)`: the revision changes with every report, so a caller can tell a
+    /// new report from one it has seen.
+    pub fn program_progress(&self) -> Option<(u64, Option<u8>, Option<String>)> {
+        let snapshot = self.program_status_snapshot();
+        let root = snapshot.root?;
+        Some((
+            snapshot.revision,
+            root.progress,
+            root.msg.as_deref().map(str::to_string),
+        ))
+    }
+
     pub(crate) fn program_status_snapshot(&self) -> ProgramStatusSnapshot {
         self.flush_expired_program_status_sync();
         // A synchronized update may have supplied a new UUID title while VTE

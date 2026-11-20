@@ -1,0 +1,27 @@
+[package]
+name = "muxel-cloud"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "muxel Cloud client: end-to-end encryption, the sync API client and the sync engine."
+
+[dependencies]
+muxel-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+log.workspace = true
+base64 = "0.22"
+# End-to-end encryption (docs/cloud-sync-protocol.md §3). RustCrypto / dalek.
+chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+ed25519-dalek = { version = "2", features = ["zeroize"] }
+hkdf = "0.12"
+sha2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+getrandom = "0.2"
+# Blocking HTTP, run on the background executor (same as the update check).
+ureq = { version = "2", features = ["json", "tls"] }

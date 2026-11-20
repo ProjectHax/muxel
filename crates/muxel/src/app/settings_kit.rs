@@ -494,7 +494,7 @@ impl Form {
     pub(super) fn choice_row(
         &self,
         label: impl Into<SharedString>,
-        id: &'static str,
+        id: &str,
         options: Vec<Seg>,
     ) -> Row {
         if self.segmented_w(&options) <= self.control_w() {
@@ -505,7 +505,7 @@ impl Form {
     }
 
     /// One-of-a-few choices drawn as a single control.
-    pub(super) fn segmented(&self, id: &'static str, options: Vec<Seg>) -> Div {
+    pub(super) fn segmented(&self, id: &str, options: Vec<Seg>) -> Div {
         let pal = self.pal;
         let mut track = div()
             .flex()

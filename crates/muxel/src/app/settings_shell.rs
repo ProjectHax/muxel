@@ -1160,6 +1160,7 @@ impl MuxelApp {
             SettingsSection::Remotes => self.render_settings_remotes(form, cx),
             SettingsSection::Identities => self.render_settings_identities(form, cx),
             SettingsSection::Keybindings => self.render_settings_keybindings(form, cx),
+            SettingsSection::Cloud => self.render_settings_cloud(form, cx),
             section => {
                 let mut blocks = self.settings_blocks(section, form, false, cx);
                 if section == SettingsSection::Projects {

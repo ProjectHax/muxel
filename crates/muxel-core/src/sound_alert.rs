@@ -43,11 +43,15 @@ pub enum AlertSound {
     /// A reminder came due (see `reminders`). Never chosen by [`AlertGate`]; it
     /// rings on its own, repeating until silenced.
     Reminder,
+    /// A task arrived through muxel Cloud (from another computer or a
+    /// teammate). Never chosen by [`AlertGate`]; the sync rings it once per
+    /// cycle that brings new tasks.
+    Task,
 }
 
 impl AlertSound {
     /// Every alert, in Settings order.
-    pub const ALL: [AlertSound; 3] = [Self::Done, Self::Blocked, Self::Reminder];
+    pub const ALL: [AlertSound; 4] = [Self::Done, Self::Blocked, Self::Reminder, Self::Task];
 
     /// Whether the user wants this alert to play.
     pub fn enabled(self, settings: &Settings) -> bool {
@@ -55,6 +59,7 @@ impl AlertSound {
             Self::Done => settings.sound_on_done,
             Self::Blocked => settings.sound_on_blocked,
             Self::Reminder => settings.reminder_sound,
+            Self::Task => settings.task_sound,
         }
     }
 
@@ -64,6 +69,7 @@ impl AlertSound {
             Self::Done => settings.sound_done_file.as_deref(),
             Self::Blocked => settings.sound_blocked_file.as_deref(),
             Self::Reminder => settings.reminder_sound_file.as_deref(),
+            Self::Task => settings.task_sound_file.as_deref(),
         }
     }
 }

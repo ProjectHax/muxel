@@ -146,6 +146,54 @@ pub fn delete_stt_api_key() -> Result<()> {
     }
 }
 
+// --- muxel Cloud ---------------------------------------------------------------
+// `cloud:token` is the device token; `cloud:auk` is the base64 Account Unlock
+// Key that decrypts the account's private keys. Neither is ever written to a
+// file. Under `--user-data-dir` they live in that profile's own service.
+
+fn cloud_entry(name: &str) -> Result<keyring::Entry> {
+    keyring::Entry::new(service(), &format!("cloud:{name}")).context("open keychain entry")
+}
+
+pub fn set_cloud_secret(name: &str, value: &str) -> Result<()> {
+    cloud_entry(name)?
+        .set_password(value)
+        .context("save to keychain")
+}
+
+/// A Cloud secret. Tells "not there" (`Ok(None)`) from "the
+/// keychain couldn't be read" (`Err`, e.g. a locked login keyring), which
+/// must never be mistaken for being signed out.
+pub fn read_cloud_secret(name: &str) -> Result<Option<String>> {
+    match cloud_entry(name)?.get_password() {
+        Ok(v) if v.is_empty() => Ok(None),
+        Ok(v) => Ok(Some(v)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(e).context("read from keychain"),
+    }
+}
+
+/// Check the keychain can store and return a secret, before creating
+/// anything that depends on it.
+pub fn probe_cloud_keychain() -> Result<()> {
+    let value = uuid::Uuid::new_v4().to_string();
+    set_cloud_secret("probe", &value)?;
+    let back = read_cloud_secret("probe")?;
+    let _ = delete_cloud_secret("probe");
+    anyhow::ensure!(
+        back.as_deref() == Some(value.as_str()),
+        "the keychain didn't return what was saved"
+    );
+    Ok(())
+}
+
+pub fn delete_cloud_secret(name: &str) -> Result<()> {
+    match cloud_entry(name)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(e).context("delete from keychain"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{SERVICE, fnv1a, service_for};

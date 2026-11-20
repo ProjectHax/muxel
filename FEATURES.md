@@ -941,6 +941,97 @@ feature is added or changed, update the matching entry here in the same change**
   and the parts of a library file quoted in messages, have control characters
   (except newlines and tabs) and invisible formatting characters removed.
 
+## Cloud sync & teams
+
+- **muxel Cloud sign-in** — Settings → muxel Cloud signs in to an optional paid
+  account at cloud.muxel.sh. You can confirm the computer in your browser with a
+  short code, or paste an API key from the panel. The first sign-in creates the
+  account's encryption keys and shows a Recovery Key once. Another computer
+  unlocks with that key, and you can replace the key later. The token and the
+  unlock key live in the OS keychain. A locked keychain is reported and never
+  treated as being signed out. Each `--user-data-dir` profile has its own
+  keychain entries.
+- **End-to-end encrypted settings sync** — runners, loops, snippets, hosts and
+  identities (never passwords or SSH keys), appearance, keybindings and tasks
+  sync between your computers. Each category can be Off, Upload, Download or
+  Both. Items are encrypted and signed on the computer before they're sent, so
+  the server stores only ciphertext. Presets travel by name and loops by
+  project (git remote). A loop that arrives from another computer starts
+  switched off.
+- **Multi-window safe** — one window per profile runs the sync (Sync now; the
+  check interval is adjustable). Every window saves settings through a
+  per-item three-way merge with `config.toml`, and reloads when another window
+  saves. A stale window can't revert pulled changes, and pausing sync in any
+  window pauses it everywhere.
+- **Teams** — the Cloud page lists your teams and your role in each. It says
+  when you're waiting for a team admin's muxel to share the team's keys. When a
+  member loses a role's access, the next admin sync rotates that key, so they
+  can't read anything shared afterwards, and their muxel drops the team's
+  shared settings. What they shared stays with the team: the muxel of a
+  teammate who may edit it signs it again under the current key, so new
+  devices and later joiners can still read it.
+- **Team or private workspaces** — under "This workspace", a workspace works
+  for one of your teams or stays private. Only a team's workspaces show its
+  shared runners, snippets and loops, its tasks (with a switch to hide them),
+  and its activity. Your own settings sync in every workspace.
+- **Shared runners, snippets and loops** — a team's shared items appear as a
+  section of the Run task, Snippets and Loops drop-downs, just like a team
+  library. A shared loop arrives switched off. Running a shared runner or
+  turning on a shared loop asks first, and asks again whenever the team
+  changes it. "Make a local copy" works too. With permission to edit team
+  settings, a personal runner, snippet or loop's editor offers "Share with
+  team", "Update team copy" and "Stop sharing".
+- **Team activity** — "Share what I'm working on" (off by default) lets
+  teammates see each agent's project, status and branch. They also see the
+  task it was started on, if that's a team task. Prompts and terminal output
+  are never shared, and each project can opt out. The Tasks panel's Team view
+  shows what everyone is working on, and dims entries that are out of date.
+- **Export your data** — Settings → muxel Cloud → Export my data… saves
+  everything the account can read as one JSON file: your synced settings and
+  tasks, and your teams' shared items and tasks. It's decrypted on this
+  computer, since the server can't read it. It works even after a plan has
+  ended, so your data is never locked in. The file isn't encrypted.
+
+## Tasks
+
+- **Tasks panel** — tasks are a muxel Cloud feature. Signed in and unlocked,
+  on a plan that includes sync, the list-checks button at the right of the
+  toolbar opens a Tasks panel in the right-hand slot it shares with Git diff.
+  Without a plan, the button, the panel and `muxel ctl task` are hidden. Saved
+  tasks aren't deleted, and come back with the plan. The panel's width is
+  remembered per workspace. The button shows how many open tasks are yours.
+  The panel groups tasks into Mine, In progress, Not started and Done. Click a
+  task to see its notes, add a note, take it, mark it blocked or done, close it
+  without finishing it, or reopen it. Personal tasks sync between your
+  computers. In a workspace bound to a team, the team's tasks appear as your
+  role allows: an Assignee sees only their own. Buttons your role can't use
+  are hidden.
+- **Assigning and deleting tasks** — with permission to assign tasks
+  (Manager, Admin, Owner), "Assign…" picks any teammate whose role can see
+  tasks, or Unassigned. With permission to delete tasks (Manager, Admin, Owner;
+  always for your own personal tasks), "Delete" removes a task for good, after
+  confirming, on every computer and for every teammate. That includes an
+  Assignee who only sees their own tasks. A task that's merely hidden from
+  you, such as one reassigned away, is never deleted.
+- **New-task alerts** — when muxel Cloud brings in a task from your other
+  computers or a teammate, muxel plays its own chime and shows a desktop
+  notification with the new tasks' titles. Settings → Notifications → New tasks
+  turns each one on or off and can swap in your own sound. A new device's first
+  sync, and a team's backlog when a workspace is first bound to it, stay quiet.
+- **Start with agent** — opens the toolbar's agent beside the active pane, in
+  the task's project, with the task as its prompt. The task is taken, and the
+  pane is linked to it. The link closes with the pane.
+- **Automatic progress** — a linked pane's status changes become notes: working
+  moves the task to In progress, and waiting for input moves it to Blocked.
+  So do its OSC 7501 progress reports. Nothing marks a task done
+  automatically.
+- **`muxel ctl task`** — `list`, `show`, `take` and
+  `progress TASK TEXT [--percent N] [--status in_progress|blocked|done]`. TASK
+  is an id or its first characters. An agent started on a task is told to
+  report progress this way, and it may do so on its own task even with
+  outside control off: the control server then runs only for task commands.
+  Everything else still needs outside control.
+
 ## Built-in browser
 
 - **System webview, not bundled Chromium** — preview links agents print (or a

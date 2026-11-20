@@ -309,6 +309,37 @@ impl MuxelApp {
                     ),
                 ],
             )),
+            Block::Group(Group::new(
+                t("New tasks"),
+                vec![
+                    Row::narrow(
+                        t("Chime when a new task arrives"),
+                        self.setting_switch(form, "task-sound", settings.task_sound, cx, |s, on| {
+                            s.task_sound = on
+                        }),
+                    )
+                    .desc(t(
+                        "When muxel Cloud brings in a task from your other computers or your team. Uses the volume above.",
+                    ))
+                    .keywords("task sound alert cloud"),
+                    Row::stacked(
+                        t("New task sound"),
+                        self.alert_sound_control(AlertSound::Task, form, cx),
+                    ),
+                    Row::narrow(
+                        t("Desktop notification for new tasks"),
+                        self.setting_switch(
+                            form,
+                            "task-notify",
+                            settings.task_notify,
+                            cx,
+                            |s, on| s.task_notify = on,
+                        ),
+                    )
+                    .desc(t("Shows the new tasks' titles."))
+                    .keywords("task notification cloud"),
+                ],
+            )),
             Block::Note(t(
                 "Your own sound can be WAV, AIFF, MP3, OGG, FLAC or M4A. Anything longer than 10 seconds is cut short.",
             )),
@@ -326,6 +357,7 @@ impl MuxelApp {
             AlertSound::Done => "done",
             AlertSound::Blocked => "blocked",
             AlertSound::Reminder => "reminder",
+            AlertSound::Task => "task",
         };
         let file = sound.file(&self.settings);
         let name: SharedString = match file {
@@ -400,6 +432,7 @@ fn set_alert_file(settings: &mut muxel_core::Settings, sound: AlertSound, file: 
         AlertSound::Done => settings.sound_done_file = file,
         AlertSound::Blocked => settings.sound_blocked_file = file,
         AlertSound::Reminder => settings.reminder_sound_file = file,
+        AlertSound::Task => settings.task_sound_file = file,
     }
 }
 

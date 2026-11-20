@@ -8064,6 +8064,8 @@ mod provider_switch_tests {
                 state: crate::program_status::ProgramState::Blocked,
                 kind: Some(crate::program_status::ProgramStatusKind::Permission),
                 title: None,
+                progress: None,
+                msg: None,
             })
         );
         let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);

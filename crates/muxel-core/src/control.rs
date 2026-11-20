@@ -167,6 +167,36 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "is_false")]
         force: bool,
     },
+    /// The Tasks panel's open tasks.
+    TaskList,
+    /// One task with its progress notes. `task` is its id or an id prefix.
+    TaskShow { task: String },
+    /// Take a task: assign it to this user and start it.
+    TaskTake { task: String },
+    /// Report progress on a task, optionally with a percentage or a new
+    /// status (`in_progress`, `blocked`, `done`).
+    TaskProgress {
+        task: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        percent: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+}
+
+impl Command {
+    /// The task commands, which a pane started on a task may use even with
+    /// outside control off.
+    pub fn is_task(&self) -> bool {
+        matches!(
+            self,
+            Command::TaskList
+                | Command::TaskShow { .. }
+                | Command::TaskTake { .. }
+                | Command::TaskProgress { .. }
+        )
+    }
 }
 
 fn is_false(value: &bool) -> bool {
@@ -1382,6 +1412,11 @@ usage: muxel ctl <command> [args]
   answer AGENT OPTION [--force]  pick a numbered option of a pending question
   keys AGENT KEY... [--force]    press keys: enter esc tab shift-tab up down
                                  left right backspace space ctrl-c, or a character
+  task list                      open tasks in the Tasks panel
+  task show TASK                 one task and its notes
+  task take TASK                 assign a task to yourself and start it
+  task progress TASK TEXT [--percent N] [--status in_progress|blocked|done]
+                                 note progress on a task
   skill                          instructions for an orchestrating agent
   help [COMMAND]                 show general or command-specific help
 
@@ -1419,7 +1454,8 @@ Raw argv panes restore stopped; only Run again replays their saved command.
 `new` launch directories are never owned, registered or deleted by muxel.
 On Windows, raw argv requires a native executable; use --preset for batch wrappers.
 `new` opens terminal panes; browser presets (including a browser default) are not supported yet.
-muxel must be running with Settings > Outside control > \"Allow outside tools to control muxel\" on.
+muxel must be running with Settings > Outside control > \"Allow outside tools to control muxel\" on
+(`task` commands excepted: a pane started on a task may use them on its own task).
 To reach a muxel started with --user-data-dir DIR, run `muxel --user-data-dir DIR ctl ...`;
 its own panes reach it without the flag.
 
@@ -1460,6 +1496,9 @@ pub fn command_help(command: &str) -> Option<&'static str> {
         "keys" => {
             "usage: muxel ctl keys AGENT KEY... [--force]\nPress keys such as enter, esc, tab, arrows, backspace and ctrl-c. --force permits your own pane."
         }
+        "task" => {
+            "usage: muxel ctl task list | show TASK | take TASK | progress TASK TEXT [--percent N] [--status in_progress|blocked|done]\nWork with the Tasks panel. TASK is a task id or the start of one. An agent started on a task (Start with agent) may use these on its own task even with outside control off; anything else needs outside control. progress adds a note; agents should report every meaningful step, and --status done when the task is finished."
+        }
         "skill" => "usage: muxel ctl skill\nPrint instructions for an orchestrating agent.",
         "help" => {
             "usage: muxel ctl help [COMMAND]\nShow general or command-specific help. Use `--` before literal prompt text that starts with -."
@@ -1484,6 +1523,7 @@ fn unknown_command_error(command: &str) -> String {
             "wait",
             "answer",
             "keys",
+            "task",
             "skill",
             "help",
         ];
@@ -1543,6 +1583,9 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
     }
     if cmd == "new" {
         return new::parse(rest);
+    }
+    if cmd == "task" {
+        return parse_task(rest);
     }
     if cmd == "new-status" {
         return match rest {
@@ -1678,6 +1721,77 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
         }
         "skill" => return Ok(CliCommand::Skill),
         other => return Err(unknown_command_error(other)),
+    };
+    Ok(CliCommand::Request(command))
+}
+
+/// `muxel ctl task …`.
+fn parse_task(args: &[String]) -> Result<CliCommand, String> {
+    const USAGE_TASK: &str = "usage: muxel ctl task list | show TASK | take TASK | progress TASK TEXT [--percent N] [--status in_progress|blocked|done]";
+    let Some((sub, rest)) = args.split_first() else {
+        return Err(USAGE_TASK.into());
+    };
+    let mut words: Vec<String> = Vec::new();
+    let mut percent: Option<u8> = None;
+    let mut status: Option<String> = None;
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--" => {
+                words.extend(it.by_ref().cloned());
+                break;
+            }
+            "--percent" => {
+                let n: u8 = number(it.next(), "--percent")?;
+                if n > 100 {
+                    return Err("--percent is 0 to 100".into());
+                }
+                percent = Some(n);
+            }
+            "--status" => {
+                let value = it.next().ok_or("--status needs a value")?;
+                if !matches!(value.as_str(), "in_progress" | "blocked" | "done") {
+                    return Err("--status is in_progress, blocked or done".into());
+                }
+                status = Some(value.clone());
+            }
+            flag if flag.starts_with("--") && flag.len() > 2 => {
+                return Err(format!("unknown option {flag}"));
+            }
+            _ => words.push(arg.clone()),
+        }
+    }
+    if (percent.is_some() || status.is_some()) && sub != "progress" {
+        return Err("--percent and --status are only valid with `task progress`".into());
+    }
+    let task = |words: &[String]| -> Result<String, String> {
+        words
+            .first()
+            .cloned()
+            .ok_or_else(|| format!("`task {sub}` needs a TASK id (see `muxel ctl task list`)"))
+    };
+    let command = match sub.as_str() {
+        "list" if words.is_empty() => Command::TaskList,
+        "show" if words.len() == 1 => Command::TaskShow {
+            task: task(&words)?,
+        },
+        "take" if words.len() == 1 => Command::TaskTake {
+            task: task(&words)?,
+        },
+        "progress" => {
+            let id = task(&words)?;
+            let text = words[1..].join(" ");
+            if text.trim().is_empty() && status.is_none() && percent.is_none() {
+                return Err("`task progress` needs TEXT, --percent or --status".into());
+            }
+            Command::TaskProgress {
+                task: id,
+                text,
+                percent,
+                status,
+            }
+        }
+        _ => return Err(USAGE_TASK.into()),
     };
     Ok(CliCommand::Request(command))
 }
@@ -2159,6 +2273,58 @@ mod tests {
 
     fn words(s: &[&str]) -> Vec<String> {
         s.iter().map(|w| w.to_string()).collect()
+    }
+
+    #[test]
+    fn task_commands_parse() {
+        let req = |a: &[&str]| match parse_cli(&words(a)) {
+            Ok(CliCommand::Request(c)) => c,
+            other => panic!("{a:?}: {other:?}"),
+        };
+        assert_eq!(req(&["task", "list"]), Command::TaskList);
+        assert_eq!(
+            req(&["task", "take", "ab12"]),
+            Command::TaskTake {
+                task: "ab12".into()
+            }
+        );
+        let c = req(&[
+            "task",
+            "progress",
+            "ab12",
+            "wrote",
+            "the",
+            "parser",
+            "--percent",
+            "40",
+        ]);
+        assert_eq!(
+            c,
+            Command::TaskProgress {
+                task: "ab12".into(),
+                text: "wrote the parser".into(),
+                percent: Some(40),
+                status: None,
+            }
+        );
+        assert!(c.is_task());
+        assert!(!Command::Projects.is_task());
+        let c = req(&["task", "progress", "ab12", "--status", "done"]);
+        assert!(matches!(c, Command::TaskProgress { status: Some(ref s), .. } if s == "done"));
+        // The wire form round-trips.
+        let wire = serde_json::to_string(&c).unwrap();
+        assert!(wire.contains("\"cmd\":\"task_progress\""), "{wire}");
+        assert_eq!(serde_json::from_str::<Command>(&wire).unwrap(), c);
+        for bad in [
+            &["task"][..],
+            &["task", "show"],
+            &["task", "progress", "ab12"],
+            &["task", "progress", "ab12", "x", "--percent", "101"],
+            &["task", "progress", "ab12", "x", "--status", "cancelled"],
+            &["task", "take", "ab12", "--percent", "3"],
+        ] {
+            assert!(parse_cli(&words(bad)).is_err(), "{bad:?}");
+        }
     }
 
     fn id(n: u128) -> Uuid {

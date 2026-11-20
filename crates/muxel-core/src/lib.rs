@@ -9,6 +9,7 @@ pub mod audio;
 pub mod autopilot;
 pub mod child_env;
 pub mod chime;
+pub mod cloud;
 pub mod control;
 pub mod diff;
 pub mod diff_schedule;
@@ -1146,6 +1147,10 @@ pub struct Project {
     /// bookkeeping, never part of the synced layout doc.
     #[serde(default)]
     pub layout_synced: Option<String>,
+    /// muxel Cloud overrides of the workspace's team binding (activity sharing,
+    /// team tasks). Local preference; never part of the synced layout doc.
+    #[serde(default, skip_serializing_if = "cloud::ProjectCloud::is_default")]
+    pub cloud: cloud::ProjectCloud,
 }
 
 /// One agent in a project's saved startup set.
@@ -1176,6 +1181,7 @@ impl Project {
             layout_updated_at: None,
             closed_sessions: Vec::new(),
             layout_synced: None,
+            cloud: cloud::ProjectCloud::default(),
         }
     }
 
@@ -1335,6 +1341,16 @@ pub struct Workspace {
     /// monitor leaves the project in the main window (pin kept).
     #[serde(default)]
     pub project_windows: std::collections::HashMap<Uuid, ProjectWindow>,
+    /// muxel Cloud team binding; `None` = a private workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<cloud::WorkspaceCloud>,
+    /// Panes started on a task (instance id → task id). Kept here rather than
+    /// on `Instance`, whose serialization is shared with remote peers.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub task_links: std::collections::HashMap<Uuid, Uuid>,
+    /// Persisted Tasks panel width in pixels (None = default).
+    #[serde(default)]
+    pub tasks_panel_width: Option<f32>,
 }
 
 #[cfg(test)]
@@ -2858,6 +2874,9 @@ pub struct Settings {
     /// Which transcription engine dictation uses.
     #[serde(default)]
     pub stt_engine: SttEngine,
+    /// muxel Cloud preferences (`[cloud]`). Credentials live in the keychain.
+    #[serde(default)]
+    pub cloud: cloud::CloudSettings,
     /// whisper.cpp model for the local engine (`tiny` | `base` | `small` | …).
     #[serde(default = "default_stt_model")]
     pub stt_model: String,
@@ -2972,6 +2991,17 @@ pub struct Settings {
     /// The user's own sound for reminders; `None` plays the built-in chime.
     #[serde(default)]
     pub reminder_sound_file: Option<PathBuf>,
+    // --- New tasks from muxel Cloud ---
+    /// Chime when a sync brings a task you didn't have (from another computer
+    /// or a teammate).
+    #[serde(default = "default_true")]
+    pub task_sound: bool,
+    /// The user's own sound for new tasks; `None` plays the built-in chime.
+    #[serde(default)]
+    pub task_sound_file: Option<PathBuf>,
+    /// Show a desktop notification for new tasks.
+    #[serde(default = "default_true")]
+    pub task_notify: bool,
     // --- Outside control (`muxel ctl`; see `control`) ---
     /// Let other programs on this computer (an orchestrating agent such as Grok
     /// Bot) list and drive the agents through `muxel ctl`. Off by default.
@@ -3351,6 +3381,7 @@ impl Default for Settings {
             editor_line_numbers: true,
             editor_indent_guides: true,
             stt_engine: SttEngine::default(),
+            cloud: cloud::CloudSettings::default(),
             stt_model: default_stt_model(),
             stt_language: String::new(),
             stt_provider_url: default_stt_provider_url(),
@@ -3383,6 +3414,9 @@ impl Default for Settings {
             reminder_alert: default_reminder_alert(),
             reminder_sound: true,
             reminder_sound_file: None,
+            task_sound: true,
+            task_sound_file: None,
+            task_notify: true,
             control_enabled: false,
             control_allow_new: control::CreationPolicy::Off,
             control_allow_shells: false,

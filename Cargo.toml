@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/muxel", "crates/muxel-core", "crates/muxel-store", "crates/muxel-terminal", "crates/muxel-tray"]
+members = ["crates/muxel", "crates/muxel-cloud", "crates/muxel-core", "crates/muxel-store", "crates/muxel-terminal", "crates/muxel-tray"]
 exclude = ["vendor/portable-pty"]
 
 [patch.crates-io]
@@ -35,6 +35,7 @@ gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "26cc9366abb27ccedce386ac99a615a8fa7018da", package = "gpui-component-assets" }
 
 # --- workspace-internal crates (added in later phases) ---
+muxel-cloud = { path = "crates/muxel-cloud" }
 muxel-core = { path = "crates/muxel-core" }
 muxel-terminal = { path = "crates/muxel-terminal" }
 muxel-store = { path = "crates/muxel-store" }

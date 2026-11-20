@@ -20,6 +20,7 @@ gpui-component-assets.workspace = true
 muxel-core.workspace = true
 muxel-terminal.workspace = true
 muxel-store.workspace = true
+muxel-cloud.workspace = true
 muxel-tray.workspace = true
 anyhow.workspace = true
 log.workspace = true

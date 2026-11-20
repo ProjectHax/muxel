@@ -66,6 +66,7 @@ mod claude_launch;
 #[cfg(all(test, windows))]
 mod claude_loop_tests;
 mod close_probes;
+mod cloud_ui;
 #[cfg(all(test, windows))]
 mod codex_capture_tests;
 #[cfg(all(test, windows))]
@@ -116,6 +117,7 @@ mod settings_shell;
 mod skills_ui;
 mod sound_alerts;
 mod strip_button;
+mod tasks_ui;
 #[cfg(test)]
 mod transcript_read_tests;
 use claude_launch::TerminalPreparation;
@@ -6848,6 +6850,9 @@ pub struct MuxelApp {
     fullscreen_sidebar_revealed: bool,
     /// Whether the right-side git-diff panel is shown.
     show_git_diff: bool,
+    /// The Tasks panel is open (shares the right-hand slot with Git diff).
+    show_tasks: bool,
+    tasks_ui: tasks_ui::TasksUi,
     /// Which tab of the git-diff panel is active (Files vs Worktrees).
     git_diff_tab: GitDiffTab,
     /// Cached changed-file list for the active project's git-diff panel
@@ -7304,6 +7309,8 @@ pub struct MuxelApp {
     find_contents: Vec<(PathBuf, String)>,
     /// The `muxel ctl` server, while outside control is on (see `control_api`).
     control: Option<crate::control::Server>,
+    /// muxel Cloud: sign-in state, sync coordination, tasks and teams.
+    cloud: cloud_ui::CloudRuntime,
     /// Answers the control server's requests on the UI thread.
     control_task: Option<Task<()>>,
     /// The control server couldn't start; not retried each tick until the
@@ -8869,6 +8876,11 @@ impl MuxelApp {
         // `spawn_in` so the closure has a window: `tick` updates agent status, and
         // a clicked desktop notification (`handle_notification_click`) has to focus
         // a pane and raise the window.
+        //
+        // These window-bound timers stop only when the view is gone. An update can also fail while the
+        // window is alive — gpui takes a window out of its table while it's being updated, so a timer
+        // that fires during a nested update gets "window not found" — and stopping on that would
+        // silently end status, Loops, cloud sync and file polling for the rest of the session.
         let status_timer = cx.spawn_in(window, async move |view: WeakEntity<Self>, cx| {
             loop {
                 cx.background_executor()
@@ -8881,8 +8893,11 @@ impl MuxelApp {
                         this.handle_notification_click(window, cx);
                         this.pump_tray(window, cx);
                         this.sync_control(cx);
+                        this.tick_cloud(cx);
+                        this.tick_task_links(cx);
                     })
                     .is_err()
+                    && view.upgrade().is_none()
                 {
                     break;
                 }
@@ -8899,6 +8914,7 @@ impl MuxelApp {
                 if view
                     .update_in(cx, |this, window, cx| this.tick_loops(window, cx))
                     .is_err()
+                    && view.upgrade().is_none()
                 {
                     break;
                 }
@@ -8913,7 +8929,10 @@ impl MuxelApp {
                     .timer(Duration::from_millis(500))
                     .await;
                 let Ok(jobs) = view.update(cx, |this, cx| this.resource_poll_jobs(cx)) else {
-                    break;
+                    if view.upgrade().is_none() {
+                        break;
+                    }
+                    continue;
                 };
                 if jobs.is_empty() {
                     continue;
@@ -8932,11 +8951,13 @@ impl MuxelApp {
                 if changes.is_empty() {
                     continue;
                 }
+                // A missed apply is found again next poll (the known revision didn't move).
                 if view
                     .update_in(cx, |this, window, cx| {
                         this.apply_resource_changes(changes, window, cx)
                     })
                     .is_err()
+                    && view.upgrade().is_none()
                 {
                     break;
                 }
@@ -9483,6 +9504,8 @@ impl MuxelApp {
             git_modal: None,
             git_action_input,
             show_git_diff: false,
+            show_tasks: false,
+            tasks_ui: tasks_ui::TasksUi::new(window, cx),
             git_diff_tab: GitDiffTab::Files,
             git_diff_files: None,
             git_diff_files_from: None,
@@ -9582,6 +9605,7 @@ impl MuxelApp {
             find_results: Vec::new(),
             find_contents: Vec::new(),
             control: None,
+            cloud: cloud_ui::CloudRuntime::new(),
             control_task: None,
             control_failed: false,
             control_turns: HashMap::new(),
@@ -14206,6 +14230,7 @@ impl MuxelApp {
     fn toggle_git_diff(&mut self, cx: &mut Context<Self>) {
         self.show_git_diff = !self.show_git_diff;
         if self.show_git_diff {
+            self.show_tasks = false;
             self.refresh_git_diff_panel(cx);
         }
         cx.notify();
@@ -14695,8 +14720,11 @@ impl MuxelApp {
 
     /// Save the settings including the team library state.
     fn persist_settings_checked(&mut self) -> anyhow::Result<()> {
+        self.cloud_merge_before_save();
         let settings = libraries_ui::settings_for_save(self.settings_base(), &self.library_hub);
-        muxel_store::save_settings(&settings)
+        muxel_store::save_settings(&settings)?;
+        self.cloud_after_save();
+        Ok(())
     }
 
     /// The settings to save, without the team library state.
@@ -30429,6 +30457,20 @@ impl MuxelApp {
             })
             // Spacer pushes the git-diff toggle to the far right of the toolbar.
             .child(div().flex_1())
+            .children(self.tasks_available().then(|| {
+                let open_tasks = self.tasks_badge();
+                let button = Button::new("toggle-tasks")
+                    .ghost()
+                    .icon(Icon::empty().path("icons/list-checks.svg"))
+                    .selected(self.show_tasks)
+                    .tooltip(t("Tasks"))
+                    .on_click(cx.listener(|this, _ev, _w, cx| this.toggle_tasks(cx)));
+                if open_tasks > 0 {
+                    button.label(SharedString::from(open_tasks.to_string()))
+                } else {
+                    button
+                }
+            }))
             .child(
                 Button::new("toggle-git-diff")
                     .ghost()
@@ -34738,19 +34780,28 @@ impl Render for MuxelApp {
         };
 
         // Optional right-side git-diff panel, wrapping everything to its left.
-        let outer: AnyElement = if self.show_git_diff && !full_view {
+        let show_tasks = self.show_tasks && self.tasks_available();
+        let outer: AnyElement = if (self.show_git_diff || show_tasks) && !full_view {
+            let tasks = show_tasks;
             let gd_half = (f32::from(window.viewport_size().width) * 0.4).max(220.0);
-            let gd_saved = self
-                .workspace
-                .gitdiff_panel_width
-                .unwrap_or(300.0)
-                .clamp(200.0, gd_half);
+            let gd_saved = if tasks {
+                self.workspace.tasks_panel_width.unwrap_or(320.0)
+            } else {
+                self.workspace.gitdiff_panel_width.unwrap_or(300.0)
+            }
+            .clamp(200.0, gd_half);
             let gd_key = SharedString::from(format!(
-                "gitdiff-split-{}",
+                "{}-split-{}",
+                if tasks { "tasks" } else { "gitdiff" },
                 self.current_workspace
                     .map(|p| p.simple().to_string())
                     .unwrap_or_default()
             ));
+            let panel = if tasks {
+                self.render_tasks_panel(cx)
+            } else {
+                self.render_git_diff_panel(cx).into_any_element()
+            };
             h_resizable(gd_key)
                 .child(
                     resizable_panel()
@@ -34761,15 +34812,21 @@ impl Render for MuxelApp {
                     resizable_panel()
                         .fixed_size(px(gd_saved))
                         .size_range(px(200.0)..px(gd_half))
-                        .child(self.render_git_diff_panel(cx)),
+                        .child(panel),
                 )
-                .on_resize(|state, _window, cx| {
+                .on_resize(move |state, _window, cx| {
                     let width = state.read(cx).sizes().last().map(|p| f32::from(*p));
                     if let Some(width) = width
                         && let Some(app) =
                             cx.try_global::<MuxelHandle>().and_then(|h| h.0.upgrade())
                     {
-                        app.update(cx, |app, _cx| app.set_git_diff_panel_width(width));
+                        app.update(cx, |app, _cx| {
+                            if tasks {
+                                app.set_tasks_panel_width(width)
+                            } else {
+                                app.set_git_diff_panel_width(width)
+                            }
+                        });
                     }
                 })
                 .into_any_element()

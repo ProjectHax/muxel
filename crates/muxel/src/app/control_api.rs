@@ -484,7 +484,14 @@ impl MuxelApp {
     /// each tick (so a settings Cancel is honored too) and by the checkbox.
     pub(super) fn sync_control(&mut self, cx: &mut Context<Self>) {
         self.sync_control_approvals(cx);
-        let want = self.settings.control_enabled;
+        let live: HashSet<Uuid> = self.workspace.instances.iter().map(|i| i.id).collect();
+        let task_panes = self.tasks_available()
+            && self
+                .workspace
+                .task_links
+                .keys()
+                .any(|iid| live.contains(iid));
+        let want = self.settings.control_enabled || task_panes;
         if want && self.control.is_none() && !self.control_failed {
             let (tx, rx) = async_channel::unbounded();
             match crate::control::Server::start(tx) {
@@ -543,7 +550,7 @@ impl MuxelApp {
         let (success, danger, well) = (theme.success, theme.danger, theme.muted);
         let mono = theme.mono_font_family.clone();
         let enabled = self.settings.control_enabled;
-        let listening = self.control.is_some();
+        let listening = self.control.is_some() && enabled;
         let exe = crate::control::exe_path();
 
         let text = |s: SharedString| div().w_full().text_sm().child(s);
@@ -1016,14 +1023,9 @@ impl MuxelApp {
         if let Command::NewStatus { request_id } = &command {
             return Answer::Now(self.control_approvals.status(*request_id));
         }
-        if matches!(
-            &command,
-            Command::New { .. }
-                | Command::Send { .. }
-                | Command::Answer { .. }
-                | Command::Keys { .. }
-        ) && !self.settings.control_enabled
-        {
+        // The server also runs (with outside control off) while a pane works
+        // on a task; then it answers task commands only.
+        if !self.settings.control_enabled && !command.is_task() {
             return Answer::Now(Err(ctl::creation_refusal(ErrorCode::ControlDisabled)));
         }
         if matches!(&command, Command::New { .. })
@@ -1088,6 +1090,12 @@ impl MuxelApp {
                 self.control_resolve_for_typing(&agent, caller_instance_id, force)
                     .and_then(|iid| self.control_keys(iid, &keys, cx)),
             ),
+            command @ (Command::TaskList
+            | Command::TaskShow { .. }
+            | Command::TaskTake { .. }
+            | Command::TaskProgress { .. }) => {
+                Answer::Now(self.control_task(command, caller_instance_id, cx))
+            }
         }
     }
 

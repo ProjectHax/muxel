@@ -40,3 +40,6 @@
 # Python bytecode (scripts/)
 __pycache__/
 .muxel/
+
+# muxel Cloud backend (closed source; its own private repository)
+/cloud/

@@ -188,6 +188,11 @@ pub struct LibraryHub {
     pub runner_confirmations: Vec<SharedRunnerConfirmation>,
     runtime: HashMap<Uuid, LibRuntime>,
     startup_hold: bool,
+    /// Libraries whose items come from muxel Cloud (a team's shared runners,
+    /// snippets and loops) rather than git. Runtime only: never saved, never
+    /// pulled, not listed in Settings → Libraries. Their shared-loop and
+    /// runner confirmations are kept like any library's.
+    cloud: Vec<LibraryConfig>,
 }
 
 impl LibraryHub {
@@ -201,6 +206,7 @@ impl LibraryHub {
             runner_confirmations: std::mem::take(&mut settings.shared_runner_confirmations),
             runtime: HashMap::new(),
             startup_hold: false,
+            cloud: Vec::new(),
         }
     }
 
@@ -213,7 +219,53 @@ impl LibraryHub {
     // --- Queries ---
 
     pub fn config(&self, id: Uuid) -> Option<&LibraryConfig> {
+        self.configs.iter().chain(&self.cloud).find(|c| c.id == id)
+    }
+
+    /// A git library's config (not a muxel Cloud one): what jobs and the
+    /// Settings → Libraries actions work on.
+    fn git_config(&self, id: Uuid) -> Option<&LibraryConfig> {
         self.configs.iter().find(|c| c.id == id)
+    }
+
+    /// Whether library `id` comes from muxel Cloud.
+    pub fn is_cloud(&self, id: Uuid) -> bool {
+        self.cloud.iter().any(|c| c.id == id)
+    }
+
+    /// Show (`Some`) or hide (`None`) a muxel Cloud library. Showing new items
+    /// reconciles its shared loops like a pull: a changed loop switches off.
+    /// Hiding keeps their state, since another window may still show it.
+    pub fn set_cloud_library(
+        &mut self,
+        id: Uuid,
+        name: &str,
+        items: Option<ParsedLibrary>,
+    ) -> Effects {
+        let Some(parsed) = items else {
+            if self.is_cloud(id) {
+                self.cloud.retain(|c| c.id != id);
+                self.runtime.remove(&id);
+            }
+            return Effects::default();
+        };
+        match self.cloud.iter_mut().find(|c| c.id == id) {
+            Some(c) => c.name = name.to_string(),
+            None => self.cloud.push(LibraryConfig {
+                id,
+                url: String::new(),
+                branch: String::new(),
+                name: name.to_string(),
+                last_pull_ok: None,
+            }),
+        }
+        let rt = self.runtime.entry(id).or_default();
+        if rt.items.as_ref() == Some(&parsed) {
+            return Effects::default();
+        }
+        let switched_off = reconcile_loops(id, &parsed, &mut self.shared_loops);
+        rt.items = Some(parsed);
+        Effects { switched_off }
     }
 
     pub fn runtime(&self, id: Uuid) -> Option<&LibRuntime> {
@@ -264,6 +316,7 @@ impl LibraryHub {
     pub fn library_menu_sections(&self, kind: LibKind) -> Vec<MenuSection<'_>> {
         self.configs
             .iter()
+            .chain(&self.cloud)
             .filter_map(|config| {
                 let items = self.items(config.id)?;
                 let has_items = match kind {
@@ -278,7 +331,7 @@ impl LibraryHub {
 
     /// Enabled actions of library `id`'s row; all disabled while busy.
     pub fn actions(&self, id: Uuid) -> LibActions {
-        if self.config(id).is_none() {
+        if self.git_config(id).is_none() {
             return LibActions::default();
         }
         let free = !self.is_busy(id);
@@ -384,7 +437,7 @@ impl LibraryHub {
         if kind == JobKind::Check || self.is_busy(id) {
             return None;
         }
-        let config = self.config(id)?;
+        let config = self.git_config(id)?;
         let spec = JobSpec {
             id,
             kind,
@@ -400,7 +453,7 @@ impl LibraryHub {
     /// Ask for a re-sync: a free library becomes busy with the local-changes
     /// check. Does not touch `last_attempt`.
     pub fn request_resync(&mut self, id: Uuid) -> ResyncRequest {
-        if self.is_busy(id) || self.config(id).is_none() {
+        if self.is_busy(id) || self.git_config(id).is_none() {
             return ResyncRequest::Ignored;
         }
         self.runtime.entry(id).or_default().busy = Some(JobKind::Check);
@@ -411,7 +464,7 @@ impl LibraryHub {
     /// the re-sync begins at once; otherwise the library is freed, unchanged,
     /// to ask for confirmation.
     pub fn finish_check(&mut self, id: Uuid, changes: LocalChanges, now: u64) -> CheckDecision {
-        let checking = self.config(id).is_some()
+        let checking = self.git_config(id).is_some()
             && self
                 .runtime
                 .get(&id)
@@ -1826,5 +1879,77 @@ post_run = "exit"
         );
         assert_eq!(stale_lib_dir_entries(&names, &[]), names);
         assert!(stale_lib_dir_entries(&[], &[a]).is_empty());
+    }
+
+    // --- muxel Cloud libraries ---
+
+    #[test]
+    fn a_cloud_library_shows_like_a_library_but_is_never_saved() {
+        let mut hub = LibraryHub::default();
+        let team = Uuid::from_u128(0x7EA);
+        assert!(
+            hub.set_cloud_library(team, "Acme", Some(parsed(LIB_FILE)))
+                .switched_off
+                .is_empty()
+        );
+        assert!(hub.is_cloud(team));
+        let sections = hub.library_menu_sections(LibKind::Loop);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].config.name, "Acme");
+        assert!(
+            hub.loaded_runner(&key(team, LibKind::Runner, "R"))
+                .is_some()
+        );
+        // Not a git library: no jobs, no Settings → Libraries row, not saved.
+        assert!(hub.due_updates(T0).is_empty());
+        assert!(hub.begin(team, JobKind::Update, T0).is_none());
+        assert_eq!(hub.actions(team), LibActions::default());
+        let mut settings = Settings::default();
+        hub.write_into(&mut settings);
+        assert!(settings.libraries.is_empty());
+        // Nor do its items reach the lists personal sync uploads.
+        let defaults = Settings::default();
+        let names = |s: &Settings| {
+            (
+                s.runners.iter().map(|r| r.name.clone()).collect::<Vec<_>>(),
+                s.snippets
+                    .iter()
+                    .map(|r| r.name.clone())
+                    .collect::<Vec<_>>(),
+                s.loops.iter().map(|r| r.name.clone()).collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(names(&settings), names(&defaults));
+
+        // A turned-on loop switches off when the team changes it…
+        hub.shared_loops.push(SharedLoopState {
+            library: team,
+            name: "L".to_string(),
+            run_id: Uuid::from_u128(0xF00),
+            project_id: PROJECT,
+            last_run: None,
+            approved: approved_l(),
+            pinned_preset_id: None,
+        });
+        let changed = LIB_FILE.replace("prompt = \"go\"", "prompt = \"rm -rf ~\"");
+        let fx = hub.set_cloud_library(team, "Acme", Some(parsed(&changed)));
+        assert_eq!(fx.switched_off, vec!["L".to_string()]);
+        assert!(hub.shared_loops.is_empty());
+
+        // …and hiding the team (another workspace) keeps loop state for the
+        // windows that still show it.
+        hub.shared_loops.push(SharedLoopState {
+            library: team,
+            name: "L".to_string(),
+            run_id: Uuid::from_u128(0xF00),
+            project_id: PROJECT,
+            last_run: None,
+            approved: approved_l(),
+            pinned_preset_id: None,
+        });
+        hub.set_cloud_library(team, "Acme", None);
+        assert!(!hub.is_cloud(team));
+        assert!(hub.library_menu_sections(LibKind::Loop).is_empty());
+        assert_eq!(hub.shared_loops.len(), 1);
     }
 }

@@ -136,6 +136,8 @@ pub enum SettingsSection {
     Identities,
     Projects,
     Keybindings,
+    /// muxel Cloud: account, sync and teams.
+    Cloud,
 }
 
 /// Editable widgets + selection state for the settings page.
@@ -262,6 +264,8 @@ pub struct SettingsUi {
     // Behavior.
     /// What a pane's Auto toggle types to resume a stalled agent.
     pub auto_continue_message: Entity<InputState>,
+    pub cloud_api_key: Entity<InputState>,
+    pub cloud_recovery: Entity<InputState>,
 
     // Editor.
     pub editor_font_family: Entity<InputState>,
@@ -326,7 +330,7 @@ pub enum SectionIcon {
 
 impl SettingsSection {
     /// The sections in the order and groups the Settings list shows them.
-    pub fn groups() -> [(SharedString, &'static [SettingsSection]); 5] {
+    pub fn groups() -> [(SharedString, &'static [SettingsSection]); 6] {
         use SettingsSection::*;
         [
             (
@@ -348,6 +352,7 @@ impl SettingsSection {
             ),
             (t("Remote"), &[Remotes, Identities]),
             (t("Workspace"), &[Projects]),
+            (t("Cloud"), &[Cloud]),
         ]
     }
 
@@ -378,6 +383,7 @@ impl SettingsSection {
             Self::Identities => t("Identities"),
             Self::Projects => t("Projects"),
             Self::Keybindings => t("Keybindings"),
+            Self::Cloud => t("muxel Cloud"),
         }
     }
 
@@ -405,6 +411,9 @@ impl SettingsSection {
             Self::Identities => t("Logins that several hosts can share."),
             Self::Projects => t("Defaults for new projects, and each project's own settings."),
             Self::Keybindings => t("Click a shortcut, then press the keys you want instead."),
+            Self::Cloud => {
+                t("Sync between your computers and work with your team, end-to-end encrypted.")
+            }
         }
     }
 
@@ -428,6 +437,7 @@ impl SettingsSection {
             Self::Identities => SectionIcon::Named(IconName::CircleUser),
             Self::Projects => SectionIcon::Named(IconName::Folder),
             Self::Keybindings => SectionIcon::Path("icons/keyboard.svg"),
+            Self::Cloud => SectionIcon::Named(IconName::Globe),
         }
     }
 }
@@ -575,6 +585,13 @@ impl SettingsUi {
             proj_name: cx.new(|cx| InputState::new(window, cx).placeholder(t("Project name"))),
             font_family: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t("DejaVu Sans Mono"))),
+            cloud_api_key: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .masked(true)
+                    .placeholder("mxk_…".to_string())
+            }),
+            cloud_recovery: cx
+                .new(|cx| InputState::new(window, cx).placeholder("MXL-XXXX-XXXX-…".to_string())),
             auto_continue_message: cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder(muxel_core::autopilot::AUTO_CONTINUE_MESSAGE.to_string())

@@ -7,6 +7,7 @@ use super::settings_kit::{
 };
 use super::settings_shell::unnamed_or;
 use super::*;
+use muxel_core::cloud::items::Collection;
 
 impl MuxelApp {
     /// A list entry that opens its editor when clicked.
@@ -28,6 +29,20 @@ impl MuxelApp {
             dim: false,
             on_click: Box::new(on_click),
         }
+    }
+
+    /// An editor's title actions with "Share with team" first, when the
+    /// workspace works for a team this user may share settings with.
+    fn with_share(
+        &self,
+        collection: Collection,
+        item: Option<Uuid>,
+        actions: Vec<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let mut out = item.map_or_else(Vec::new, |id| self.share_actions(collection, id, cx));
+        out.extend(actions);
+        out
     }
 
     /// The Delete button of an editor: asks first.
@@ -390,7 +405,16 @@ impl MuxelApp {
         v_flex()
             .w(form.w)
             .gap(form.rem)
-            .child(form.editor_title(None, name, vec![delete]))
+            .child(form.editor_title(
+                None,
+                name,
+                self.with_share(
+                    Collection::Snippets,
+                    self.snippets.get(idx).map(|x| x.id),
+                    vec![delete],
+                    cx,
+                ),
+            ))
             .child(form.group(
                 Group::new(
                     "",
@@ -520,7 +544,16 @@ impl MuxelApp {
         v_flex()
             .w(form.w)
             .gap(form.rem)
-            .child(form.editor_title(None, name, vec![delete]))
+            .child(form.editor_title(
+                None,
+                name,
+                self.with_share(
+                    Collection::Runners,
+                    self.runners.get(idx).map(|x| x.id),
+                    vec![delete],
+                    cx,
+                ),
+            ))
             .child(form.group(
                 Group::new(
                     "",
@@ -681,7 +714,16 @@ impl MuxelApp {
         v_flex()
             .w(form.w)
             .gap(form.rem)
-            .child(form.editor_title(None, name, actions))
+            .child(form.editor_title(
+                None,
+                name,
+                self.with_share(
+                    Collection::Loops,
+                    self.loops.get(idx).map(|x| x.id),
+                    actions,
+                    cx,
+                ),
+            ))
             .child(form.group(
                 Group::new(
                     "",
