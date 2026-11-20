@@ -587,6 +587,7 @@ impl RuntimeStatusState {
             && match title_provider {
                 TitleProvider::Other => true,
                 TitleProvider::Muse => self.semantic_title_status.is_none(),
+                TitleProvider::Antigravity => !program_status.reported,
                 _ => false,
             };
         let base = classify_facts(
@@ -945,6 +946,8 @@ impl RuntimeStatusState {
         let completion_ready = self.provider_settled || submitted_turn;
         let coverage = if program_root.is_some() {
             TerminalStatusCoverage::ProgramStatus
+        } else if title_provider == TitleProvider::Antigravity && program_status.reported {
+            TerminalStatusCoverage::ProviderVisible
         } else {
             self.fallback_coverage
         };
@@ -1012,6 +1015,7 @@ enum TitleProvider {
     Codex,
     Grok,
     Muse,
+    Antigravity,
     Other,
 }
 
@@ -1033,7 +1037,10 @@ impl TitleProvider {
     /// pane prints can carry one, `cat` of a file included, and a report's
     /// origin can't be checked.
     fn reports_program_status(self) -> bool {
-        matches!(self, Self::Claude | Self::Codex | Self::Grok | Self::Muse)
+        matches!(
+            self,
+            Self::Claude | Self::Codex | Self::Grok | Self::Muse | Self::Antigravity
+        )
     }
 
     fn from_program(program: &str) -> Self {
@@ -1053,6 +1060,7 @@ impl TitleProvider {
             "codex" => Self::Codex,
             "grok" => Self::Grok,
             "muse" => Self::Muse,
+            "agy" | "antigravity" => Self::Antigravity,
             _ => Self::Other,
         }
     }
@@ -1166,7 +1174,7 @@ fn parse_agent_title(provider: TitleProvider, title: Option<&str>) -> Option<Age
                 name: Some(name.to_string()),
             })
         }
-        TitleProvider::Other => None,
+        TitleProvider::Antigravity | TitleProvider::Other => None,
     }
 }
 
@@ -2211,7 +2219,7 @@ fn status_coverage(
     working_markers: &[String],
     blocked_markers: &[String],
 ) -> TerminalStatusCoverage {
-    if provider != TitleProvider::Other {
+    if !matches!(provider, TitleProvider::Other | TitleProvider::Antigravity) {
         TerminalStatusCoverage::ProviderVisible
     } else if !working_markers.is_empty() || !blocked_markers.is_empty() {
         TerminalStatusCoverage::VisibleMarkers
@@ -2826,10 +2834,10 @@ fn ctl_transcript_prompt(
     screen: &crate::startup::Screen,
     history: impl FnOnce() -> String,
 ) -> Option<String> {
-    if provider == TitleProvider::Codex {
-        screen.codex_ctl_transcript_prompt()
-    } else {
-        muxel_core::readaloud::prompt_from_screen(&history())
+    match provider {
+        TitleProvider::Antigravity => None,
+        TitleProvider::Codex => screen.codex_ctl_transcript_prompt(),
+        _ => muxel_core::readaloud::prompt_from_screen(&history()),
     }
 }
 
@@ -4007,7 +4015,10 @@ impl TerminalView {
         if self.exited
             || !matches!(
                 self.title_provider,
-                TitleProvider::Codex | TitleProvider::Claude | TitleProvider::Grok
+                TitleProvider::Codex
+                    | TitleProvider::Claude
+                    | TitleProvider::Grok
+                    | TitleProvider::Antigravity
             )
             || text.trim().is_empty()
         {
@@ -5120,6 +5131,54 @@ mod working_report_receipt_tests {
     use crate::session::CommandSpec;
     use gpui::TestAppContext;
     use std::time::Instant;
+
+    #[test]
+    fn antigravity_working_report_confirms_the_enter() {
+        #[cfg(windows)]
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        let launch = TerminalLaunch::spawn(spec.with_status_program(Some("agy".into())), (80, 24))
+            .expect("spawn fixture");
+        let mut cx = TestAppContext::single();
+        cx.skip_drawing();
+        let window = cx.add_window(|window, cx| {
+            TerminalView::new(launch, uuid::Uuid::new_v4(), Instant::now(), window, cx)
+        });
+        window
+            .update(&mut cx, |view, _, cx| {
+                let mut wire = include_bytes!("fixtures/agy-1.5.13-7501.osc")
+                    .split_inclusive(|byte| *byte == b'\x07')
+                    .skip(1);
+                let session = view.session().clone();
+                session.process_output(wire.next().unwrap());
+                view.update_runtime(cx);
+                let mut submission = view
+                    .begin_prompt_submission("Reply exactly OK. Do not use tools or write files.")
+                    .expect("Antigravity takes ctl prompts");
+                assert!(submission.observable());
+                submission.enter_pressed();
+                assert_eq!(
+                    view.observe_prompt_submission(&submission),
+                    PromptSubmissionState::Unconfirmed
+                );
+                session.process_output(wire.next().unwrap());
+                assert_eq!(
+                    view.observe_prompt_submission(&submission),
+                    PromptSubmissionState::Accepted
+                );
+                session.process_output(wire.next().unwrap());
+                assert_eq!(
+                    view.observe_prompt_submission(&submission),
+                    PromptSubmissionState::Accepted
+                );
+                session.kill();
+            })
+            .unwrap();
+    }
 
     /// A Claude that reports its turns through OSC 7501 drops its title's
     /// status glyph, so a ctl prompt with a blank line, which no transcript row
@@ -7813,6 +7872,55 @@ mod provider_switch_tests {
         #[cfg(unix)]
         let spec = CommandSpec::program("/bin/cat", vec![]);
         TerminalSession::spawn(spec, 80, 24).expect("spawn fixture")
+    }
+
+    #[test]
+    fn antigravity_reports_drive_status_and_completion() {
+        let (session, _receiver) = fixture();
+        let provider = TitleProvider::from_program("antigravity.exe");
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        let mut samples = include_bytes!("fixtures/agy-1.5.13-7501.osc")
+            .split_inclusive(|byte| *byte == b'\x07')
+            .skip(1)
+            .map(|frame| {
+                session.test_program_status(frame);
+                runtime.reconcile(&session, provider, &[], &[], false, Instant::now());
+                runtime.snapshot(&session)
+            });
+        let idle = samples.next().unwrap();
+        assert_eq!(idle.status, AgentStatus::Idle);
+        assert_eq!(idle.reason, TerminalStatusReason::ProgramStatus(None));
+        assert!(idle.completion_ready);
+        assert_eq!(samples.next().unwrap().status, AgentStatus::Working);
+        let done = samples.next().unwrap();
+        assert_eq!(done.status, AgentStatus::Done);
+        assert_eq!(done.completion_revision, idle.completion_revision + 1);
+        for kind in [ProgramStatusKind::Permission, ProgramStatusKind::Question] {
+            let blocked = samples.next().unwrap();
+            assert_eq!(blocked.status, AgentStatus::Blocked);
+            assert_eq!(
+                blocked.reason,
+                TerminalStatusReason::ProgramStatus(Some(kind))
+            );
+        }
+        assert_eq!(samples.next().unwrap().status, AgentStatus::Idle);
+        assert_eq!(samples.next(), None);
+        session.kill();
+    }
+
+    #[test]
+    fn antigravity_without_reports_keeps_activity_only_coverage() {
+        let (session, _receiver) = fixture();
+        let provider = TitleProvider::from_program("agy");
+        let mut runtime = RuntimeStatusState::new(super::status_coverage(provider, &[], &[]));
+        session.process_probe_output(b"Recent Antigravity output.");
+        let (_, deadline) = runtime.reconcile(&session, provider, &[], &[], false, Instant::now());
+        let status = runtime.snapshot(&session);
+        assert_eq!(status.status, AgentStatus::Working);
+        assert_eq!(status.reason, TerminalStatusReason::RecentOutput);
+        assert_eq!(status.coverage, TerminalStatusCoverage::ActivityOnly);
+        assert!(deadline.is_some());
+        session.kill();
     }
 
     mod program_name_tests {
