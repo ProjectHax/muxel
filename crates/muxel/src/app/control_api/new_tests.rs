@@ -1348,3 +1348,31 @@ fn control_new_policy_approved_request_still_honors_revoked_creation_and_command
     assert_eq!(app.launches, 0);
     assert_eq!(app.persists, 0);
 }
+
+#[test]
+fn antigravity_startup_task_leaves_the_typed_input_path() {
+    let task = "--one literal task\nwith \"quotes\" and & | ^ %";
+    let mut instance = Instance::from_preset(Uuid::new_v4(), &AgentPreset::agy());
+    instance.control_created = true;
+    instance.control_prompt = true;
+    instance.system_prompt = Some(task.into());
+    let turn = ControlTurn::startup(task.into());
+    let owner = turn.startup.as_ref().unwrap().claim().unwrap();
+    let spec =
+        CommandSpec::program("agy", vec!["--mode".into(), "plan".into()]).with_startup_input(task);
+    let installed = control_launch_spec(Some(&instance), Some(&turn), Some(owner), spec);
+    assert!(
+        installed.startup_input.is_none(),
+        "an admitted Antigravity task must use one argv argument"
+    );
+    assert_eq!(installed.startup_argument.as_deref(), Some(task));
+    assert_eq!(installed.args, ["--mode", "plan"]);
+    assert_eq!(
+        turn.startup.as_ref().unwrap().state(),
+        ctl::StartupTurnState::Pending
+    );
+
+    let restored = CommandSpec::program("agy", Vec::new()).with_startup_input(task);
+    let unowned = control_launch_spec(Some(&instance), None, None, restored);
+    assert!(unowned.startup_input.is_none() && unowned.startup_argument.is_none());
+}

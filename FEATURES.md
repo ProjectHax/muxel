@@ -270,7 +270,10 @@ feature is added or changed, update the matching entry here in the same change**
 - **Antigravity** — launches Google's installed `agy` CLI, with optional model
   (`--model`) and reasoning-effort (`--effort`) overrides. It leaves `agy`'s
   configured defaults in effect otherwise. Startup instruction injection is
-  disabled so panes never submit an automatic turn. On Windows, a local pane
+  disabled for ordinary launches. An admitted outside startup task runs once
+  as an interactive launch argument and is confirmed by Antigravity's Working
+  report. Antigravity keeps its folder trust prompt ahead of the task.
+  On Windows, a local pane
   keeps the conversation its own Antigravity process was last seen holding.
   On restart it opens that conversation with the same preset arguments.
 - **Gemini CLI** — launches Google's installed `gemini` CLI, with an optional
