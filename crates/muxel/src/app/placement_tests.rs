@@ -570,6 +570,71 @@ fn open_in_new_tab_from_a_terminals_menu_keeps_focus_where_the_menu_leaves_it() 
     });
 }
 
+/// A page in a project window keeps what the user is typing in its address
+/// bar. The tick that syncs the page runs in the main window, where that
+/// address bar never has focus, so a sync judged there replaced the typing.
+#[test]
+fn typing_in_a_project_windows_page_address_bar_survives_the_tick() {
+    with_app(|cx, main| {
+        project(cx, main, "main window");
+        let pid = project(cx, main, "second window");
+        let caller = main.update(cx, |app, _, _| pane(app, pid, None)).unwrap();
+        let secondary = secondary_window(cx, main, pid);
+        let app = main.entity(cx).unwrap();
+        let page = cx
+            .update_window(secondary.into(), |_, window, cx| {
+                app.update(cx, |app, cx| {
+                    let url = "https://example.test/first".to_string();
+                    let near = ResourceOrigin::Pane(caller);
+                    app.open_browser_in_project(
+                        pid,
+                        url,
+                        near,
+                        None,
+                        OpenFocus::Background,
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap()
+            .unwrap();
+        let view = main
+            .read_with(cx, |app, _| app.browsers[&page].clone())
+            .unwrap();
+
+        // The user starts typing an address while the page follows a link.
+        cx.update_window(secondary.into(), |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.type_address_for_test("example.test/sec", window, cx)
+            })
+        })
+        .unwrap();
+        view.update(cx, |view, _| {
+            view.commit_for_test("https://example.test/second")
+        });
+        main.update(cx, |app, window, cx| app.tick(window, cx))
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.address_for_test(cx)),
+            "example.test/sec",
+            "the tick replaced what the user was typing"
+        );
+        let synced = main
+            .read_with(cx, |app, _| {
+                app.workspace.instance(page).unwrap().browser_url.clone()
+            })
+            .unwrap();
+        assert_eq!(
+            synced.as_deref(),
+            Some("https://example.test/second"),
+            "the tick didn't sync the page"
+        );
+    });
+}
+
 #[test]
 fn a_link_in_a_popped_out_terminal_opens_in_its_projects_window() {
     with_app_drawing(true, |cx, main| {
