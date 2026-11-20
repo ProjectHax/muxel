@@ -1030,6 +1030,254 @@ fn a_popped_out_page_is_found_where_its_webview_is_before_the_tick() {
     });
 }
 
+/// Open `url` beside `caller` and pop it out: the page, its window and its view.
+fn popped_out_page(
+    cx: &mut TestAppContext,
+    main: WindowHandle<MuxelApp>,
+    pid: Uuid,
+    caller: Uuid,
+    url: &str,
+) -> (Uuid, AnyWindowHandle, Entity<crate::browser::BrowserView>) {
+    let page = main
+        .update(cx, |app, window, cx| {
+            let near = ResourceOrigin::Pane(caller);
+            let url = url.to_string();
+            app.open_browser_in_project(pid, url, near, None, OpenFocus::Focus, window, cx)
+        })
+        .unwrap()
+        .unwrap();
+    main.update(cx, |app, window, cx| app.pop_out_instance(page, window, cx))
+        .unwrap();
+    cx.run_until_parked();
+    main.read_with(cx, |app, _| {
+        let popout = &app.popouts[&page];
+        match &popout.view {
+            PaneView::Browser(view) => (page, popout.window.into(), view.clone()),
+            _ => panic!("the pop-out isn't a browser"),
+        }
+    })
+    .unwrap()
+}
+
+/// A link in a page that asks for a new window reaches the app as a request
+/// the tick takes. From a popped-out page it opens as a link clicked in a
+/// popped-out terminal does: docked in the page's project, whose window comes
+/// to the front.
+#[test]
+fn a_popped_out_pages_new_window_opens_in_its_projects_window() {
+    with_app(|cx, main| {
+        let pid = project(cx, main, "repo");
+        let caller = main.update(cx, |app, _, _| pane(app, pid, None)).unwrap();
+        let (page, page_window, view) =
+            popped_out_page(cx, main, pid, caller, "https://example.test/first");
+        cx.update_window(page_window, |_, window, _| window.activate_window())
+            .unwrap();
+        assert_eq!(cx.update(|cx| cx.active_window()), Some(page_window));
+
+        view.read_with(cx, |view, _| {
+            view.request_window_for_test("https://example.test/popup")
+        });
+        main.update(cx, |app, window, cx| app.tick(window, cx))
+            .unwrap();
+        cx.run_until_parked();
+
+        let opened = main
+            .read_with(cx, |app, _| {
+                let opened: Vec<Uuid> = app.browsers.keys().copied().collect();
+                assert_eq!(opened.len(), 1, "the page's new window opened nothing");
+                let url = app
+                    .workspace
+                    .instance(opened[0])
+                    .unwrap()
+                    .browser_url
+                    .clone();
+                assert_eq!(url.as_deref(), Some("https://example.test/popup"));
+                let docked = app.workspace.project(pid).unwrap().instances();
+                assert!(
+                    docked.contains(&opened[0]),
+                    "the new page isn't in the project"
+                );
+                assert!(app.popouts.contains_key(&page));
+                opened[0]
+            })
+            .unwrap();
+        let opened_focus = main
+            .read_with(cx, |app, cx| {
+                app.browsers[&opened].read(cx).focus_handle(cx)
+            })
+            .unwrap();
+        assert_eq!(focused(cx, main), Some(opened_focus));
+        assert_eq!(
+            cx.update(|cx| cx.active_window()),
+            Some(main.into()),
+            "the new page opened behind the pop-out"
+        );
+    });
+}
+
+/// A click into a page never reaches GPUI either. In a popped-out page the tick
+/// takes it in the page's window: an address bar that was typed in gives up
+/// GPUI's focus, and the main window's focus and active pane stay as they were.
+#[test]
+fn a_click_into_a_popped_out_page_blurs_its_address_bar() {
+    with_app(|cx, main| {
+        let pid = project(cx, main, "repo");
+        let caller = main.update(cx, |app, _, _| pane(app, pid, None)).unwrap();
+        let (_, page_window, view) =
+            popped_out_page(cx, main, pid, caller, "https://example.test/first");
+        let address_focused = |cx: &mut TestAppContext| {
+            cx.update_window(page_window, |_, window, cx| {
+                view.read(cx).address_focused(window, cx)
+            })
+            .unwrap()
+        };
+        cx.update_window(page_window, |_, window, cx| {
+            view.update(cx, |view, cx| view.focus_address_for_test(window, cx))
+        })
+        .unwrap();
+        assert!(address_focused(cx));
+        let main_focus = focused(cx, main);
+        let active = main.read_with(cx, |app, _| app.active_instance).unwrap();
+
+        view.read_with(cx, |view, _| view.click_page_for_test());
+        main.update(cx, |app, window, cx| app.tick(window, cx))
+            .unwrap();
+        cx.run_until_parked();
+
+        assert!(
+            !address_focused(cx),
+            "a click into the page left its address bar focused"
+        );
+        let page_focus = view.read_with(cx, |view, cx| view.focus_handle(cx));
+        assert_eq!(focused(cx, page_window), Some(page_focus));
+        assert_eq!(focused(cx, main), main_focus);
+        let after = main.read_with(cx, |app, _| app.active_instance).unwrap();
+        assert_eq!(
+            after, active,
+            "a click into the pop-out moved the active pane"
+        );
+    });
+}
+
+const POPUP: &str = "https://example.test/popup";
+/// A link wry is still handing over when the page moves: it lands in the old
+/// page's queue after the move, since wry sends from a thread of its own.
+const LATE: &str = "https://example.test/late";
+
+/// How many times `url` reached project `pid`: the pages it opened, and the
+/// reloads of them, which a second delivery of the same link makes.
+fn deliveries(
+    cx: &mut TestAppContext,
+    main: WindowHandle<MuxelApp>,
+    pid: Uuid,
+    url: &str,
+) -> usize {
+    main.read_with(cx, |app, cx| {
+        let instances = app.workspace.instances.iter();
+        instances
+            .filter(|i| i.project_id == pid && i.browser_url.as_deref() == Some(url))
+            .map(|i| {
+                let reloads = app
+                    .browsers
+                    .get(&i.id)
+                    .map(|v| v.read(cx).reloads_for_test());
+                1 + reloads.unwrap_or(0)
+            })
+            .sum()
+    })
+    .unwrap()
+}
+
+/// Two of the app's one-second ticks.
+fn two_ticks(cx: &mut TestAppContext, main: WindowHandle<MuxelApp>) {
+    for _ in 0..2 {
+        main.update(cx, |app, window, cx| app.tick(window, cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
+}
+
+/// A page's new-window link waits for the tick. A page popped out before then
+/// is rebuilt in its own window, and the link goes with it, as does one still on
+/// its way: each opens once.
+#[test]
+fn a_new_window_link_asked_for_just_before_a_page_pops_out_opens_once() {
+    with_app(|cx, main| {
+        let pid = project(cx, main, "repo");
+        let caller = main.update(cx, |app, _, _| pane(app, pid, None)).unwrap();
+        let page = main
+            .update(cx, |app, window, cx| {
+                let url = "https://example.test/first".to_string();
+                let near = ResourceOrigin::Pane(caller);
+                app.open_browser_in_project(pid, url, near, None, OpenFocus::Focus, window, cx)
+            })
+            .unwrap()
+            .unwrap();
+        let docked = main
+            .read_with(cx, |app, _| app.browsers[&page].clone())
+            .unwrap();
+        docked.read_with(cx, |view, _| view.request_window_for_test(POPUP));
+
+        main.update(cx, |app, window, cx| app.pop_out_instance(page, window, cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            main.read_with(cx, |app, _| app.popouts.contains_key(&page))
+                .unwrap()
+        );
+        docked.read_with(cx, |view, _| view.request_window_for_test(LATE));
+        two_ticks(cx, main);
+
+        let before = deliveries(cx, main, pid, POPUP);
+        assert_eq!(
+            before, 1,
+            "the link asked for before the pop-out arrived {before} times"
+        );
+        let late = deliveries(cx, main, pid, LATE);
+        assert_eq!(
+            late, 1,
+            "the link on its way at the pop-out arrived {late} times"
+        );
+    });
+}
+
+/// The same for a popped-out page docked back before the tick: it's rebuilt in
+/// the main window, and both links go with it.
+#[test]
+fn a_new_window_link_asked_for_just_before_a_page_docks_opens_once() {
+    with_app(|cx, main| {
+        let pid = project(cx, main, "repo");
+        let caller = main.update(cx, |app, _, _| pane(app, pid, None)).unwrap();
+        let (page, _, view) = popped_out_page(cx, main, pid, caller, "https://example.test/first");
+        view.read_with(cx, |view, _| view.request_window_for_test(POPUP));
+
+        // As the pop-out's Dock button does, then the main window's next frame.
+        main.update(cx, |app, window, cx| {
+            app.redock_popout(page, cx);
+            app.drain_browser_redocks(window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(
+            main.read_with(cx, |app, _| app.browsers.contains_key(&page))
+                .unwrap()
+        );
+        view.read_with(cx, |view, _| view.request_window_for_test(LATE));
+        two_ticks(cx, main);
+
+        let before = deliveries(cx, main, pid, POPUP);
+        assert_eq!(
+            before, 1,
+            "the link asked for before the re-dock arrived {before} times"
+        );
+        let late = deliveries(cx, main, pid, LATE);
+        assert_eq!(
+            late, 1,
+            "the link on its way at the re-dock arrived {late} times"
+        );
+    });
+}
+
 /// A path names the same file only on the same machine. A remote file or diff
 /// popped out of one host's project isn't reused for the same path on another
 /// host, while its own host still finds it past the other's docked copy.

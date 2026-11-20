@@ -136,8 +136,10 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Detach a pane** — pop a pane out into its own OS window without terminating it.
   Terminals and editors move across; a browser pane is re-created in the new window
-  at the same URL (a native webview belongs to the window that built it), and its
-  URL follows its navigation there as a docked one's does.
+  at the same URL (a native webview belongs to the window that built it). There it
+  works as a docked one does: its URL follows its navigation, its new-window links
+  open as tabs in its project's window, and a click into the page takes the focus
+  from its address bar.
 - **Independent refresh** — popouts follow their own pane's title, status and
   content, theme changes, and their own close state. Unrelated app updates,
   including sidebar and other panes' activity, do not request a popout render.
@@ -1527,7 +1529,7 @@ feature is added or changed, update the matching entry here in the same change**
 - **Links in new tabs** — middle-clicking a terminal link opens it without stealing
   focus in any window; browser target=_blank, window.open, Ctrl+click, and
   middle-click requests stay in the source project and open as Muxel tabs, a
-  popped-out terminal's in its project's window. Right-clicking a terminal link
+  popped-out terminal's or page's in its project's window. Right-clicking a terminal link
   opens link actions instead of copying or pasting through the PTY.
 - **Focus reporting** — forwards focus in/out to the PTY (DECSET 1004) so agents
   know when their pane is active.
@@ -1641,8 +1643,8 @@ feature is added or changed, update the matching entry here in the same change**
   A pane with no neighbour in its row splits once, and its later opens join that
   new column. Opens with no pane behind them (the file browser, palette, find
   panel, sidebar or git panel) join the nearest pane of the same type instead,
-  and so do links from a popped-out terminal, which has left the layout; those
-  open in the window showing the terminal's project. A middle-click or **Open in
+  and so do links from a popped-out terminal or page, which has left the layout;
+  those open in the window showing its project. A middle-click or **Open in
   new tab** places the resource the same way and leaves focus where it is in
   every window, even when the file jumps to a line or reloads. A file already
   open anywhere (a remote one, on the same SSH host), or a page already showing

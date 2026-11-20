@@ -115,6 +115,11 @@ fn tab_label(url: &str) -> String {
     }
 }
 
+/// The queues a page's new-window requests arrive on: those of the pages it
+/// replaced in moves between windows, then its own. Each queue's sender lives
+/// with the native handler that fills it.
+pub type NewWindowQueues = Vec<std::sync::mpsc::Receiver<String>>;
+
 #[cfg(any(test, target_os = "macos", target_os = "windows"))]
 fn should_publish_url(changed: bool, navigation_committed: bool) -> bool {
     changed || navigation_committed
@@ -361,6 +366,10 @@ mod imp {
         /// webview to report.
         #[cfg(test)]
         committed_for_test: Option<String>,
+        /// How often the page was reloaded. A link delivered twice reloads the
+        /// page its first delivery opened, which a test has no webview to see.
+        #[cfg(all(test, windows))]
+        reloads_for_test: usize,
         /// What the app last asked of the native child (dedupes plaform calls).
         native_visible: bool,
         #[cfg(target_os = "windows")]
@@ -376,7 +385,18 @@ mod imp {
         focus_events: std::sync::mpsc::Receiver<bool>,
         /// URLs requested through target=_blank, window.open, Ctrl+click, or
         /// middle-click. The app turns these into normal Muxel browser tabs.
-        new_window_events: std::sync::mpsc::Receiver<String>,
+        /// The last queue is this page's own. Any before it belonged to a page
+        /// this one replaced in a move between windows: wry hands a request over
+        /// from a thread of its own, so one still on its way at the move lands in
+        /// the old page's queue after it.
+        new_window_events: crate::browser::NewWindowQueues,
+        /// The native handlers' ends of those two queues, which a test has no
+        /// webview to fill.
+        #[cfg(all(test, windows))]
+        native_for_test: (
+            std::sync::mpsc::Sender<bool>,
+            std::sync::mpsc::Sender<String>,
+        ),
     }
 
     impl BrowserView {
@@ -456,6 +476,8 @@ mod imp {
             let requested = url.clone();
             let (focus_tx, focus_events) = std::sync::mpsc::channel();
             let (new_window_tx, new_window_events) = std::sync::mpsc::channel();
+            #[cfg(all(test, windows))]
+            let native_for_test = (focus_tx.clone(), new_window_tx.clone());
 
             cx.spawn_in(window, async move |this, cx| {
                 #[cfg(target_os = "windows")]
@@ -617,19 +639,44 @@ mod imp {
                 #[cfg(target_os = "windows")]
                 last_profile_bounds: None,
                 focus_events,
-                new_window_events,
+                new_window_events: vec![new_window_events],
+                #[cfg(all(test, windows))]
+                native_for_test,
+                #[cfg(all(test, windows))]
+                reloads_for_test: 0,
             }
         }
 
         /// Drain page requests for a separate browsing context. Keeping this at
         /// the app boundary gives all browser entry points the same dedupe and
-        /// tab-placement policy.
+        /// tab-placement policy. A queue nothing can send to any more, its page
+        /// gone, is dropped once it's empty.
         pub fn take_new_window_requests(&mut self) -> Vec<String> {
             let mut urls = Vec::new();
-            while let Ok(url) = self.new_window_events.try_recv() {
-                urls.push(url);
-            }
+            self.new_window_events.retain(|queue| {
+                loop {
+                    match queue.try_recv() {
+                        Ok(url) => urls.push(url),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break true,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break false,
+                    }
+                }
+            });
             urls
+        }
+
+        /// Give this page's request queues to the page rebuilt to replace it in
+        /// another window. The queues go, not what's in them now, since a request
+        /// still on its way lands in them after the move.
+        pub fn hand_over_new_window_requests(&mut self) -> crate::browser::NewWindowQueues {
+            std::mem::take(&mut self.new_window_events)
+        }
+
+        /// Take over the request queues of the page this one replaces, ahead of
+        /// its own, so the links that page was asked for open from here.
+        pub fn carry_new_window_requests(&mut self, mut queues: crate::browser::NewWindowQueues) {
+            queues.append(&mut self.new_window_events);
+            self.new_window_events = queues;
         }
 
         /// Whether the page was clicked since the last check (drains the queue).
@@ -673,6 +720,10 @@ mod imp {
         /// rebuild of the pane: the user may be several links deep, and refresh must
         /// reload where they actually are.
         pub fn reload(&mut self, cx: &mut Context<Self>) {
+            #[cfg(all(test, windows))]
+            {
+                self.reloads_for_test += 1;
+            }
             if let Some(wv) = &self.webview {
                 let _ = wv.read(cx).raw().reload();
             }
@@ -767,6 +818,31 @@ mod imp {
         #[cfg(all(test, windows))]
         pub(crate) fn commit_for_test(&mut self, url: &str) {
             self.committed_for_test = Some(url.to_string());
+        }
+
+        /// As a click into the page does: the webview takes the keyboard.
+        #[cfg(all(test, windows))]
+        pub(crate) fn click_page_for_test(&self) {
+            let _ = self.native_for_test.0.send(true);
+        }
+
+        /// As a link asking for a new window does: the webview denies the
+        /// native window and hands its URL to the app.
+        #[cfg(all(test, windows))]
+        pub(crate) fn request_window_for_test(&self, url: &str) {
+            let _ = self.native_for_test.1.send(url.to_string());
+        }
+
+        /// As a click into the address bar does.
+        #[cfg(all(test, windows))]
+        pub(crate) fn focus_address_for_test(&self, window: &mut Window, cx: &mut App) {
+            let address = self.address.read(cx).focus_handle(cx);
+            address.focus(window, cx);
+        }
+
+        #[cfg(all(test, windows))]
+        pub(crate) fn reloads_for_test(&self) -> usize {
+            self.reloads_for_test
         }
 
         /// Pull the webview's current URL (the user may have clicked links);
@@ -1026,6 +1102,13 @@ mod imp {
         pub fn take_new_window_requests(&mut self) -> Vec<String> {
             Vec::new()
         }
+
+        /// Nothing to hand over or carry: a page here has no request queues.
+        pub fn hand_over_new_window_requests(&mut self) -> crate::browser::NewWindowQueues {
+            Vec::new()
+        }
+
+        pub fn carry_new_window_requests(&mut self, _queues: crate::browser::NewWindowQueues) {}
 
         pub fn set_native_visible(
             &mut self,
