@@ -7161,6 +7161,9 @@ pub struct MuxelApp {
     popouts: HashMap<Uuid, PopOut>,
     /// Secondary (per-monitor) workspace windows, one per pinned project.
     secondary_windows: Vec<SecondaryWindow>,
+    /// Projects whose window is queued to open and not yet in
+    /// `secondary_windows`. The main window doesn't fall back to them.
+    opening_project_windows: HashSet<Uuid>,
     /// The main window (raise target for main-only chrome + window routing).
     main_window: Option<AnyWindowHandle>,
     /// Editors to rebuild bound to the main window after their project moved
@@ -9454,6 +9457,7 @@ impl MuxelApp {
             maximized: None,
             popouts: HashMap::new(),
             secondary_windows: Vec::new(),
+            opening_project_windows: HashSet::new(),
             main_window: Some(window.window_handle()),
             pending_editor_rebuild: Vec::new(),
             pending_editor_redock: Vec::new(),
@@ -12890,6 +12894,46 @@ impl MuxelApp {
     /// to focus a pane.
     fn project_window(&self, pid: Uuid) -> Option<AnyWindowHandle> {
         self.window_showing(pid).or(self.main_window)
+    }
+
+    /// Whether project `pid` has a window of its own, or one queued to open.
+    fn in_own_window(&self, pid: Uuid) -> bool {
+        self.opening_project_windows.contains(&pid)
+            || self.secondary_windows.iter().any(|s| s.pid == pid)
+    }
+
+    /// The project the main window shows once it gives up `leaving`: the first
+    /// without a window of its own, since a project shows in one window at a
+    /// time. None when every other project has its own window.
+    fn main_fallback_project(&self, leaving: Uuid) -> Option<Uuid> {
+        self.workspace
+            .projects
+            .iter()
+            .map(|p| p.id)
+            .find(|pid| *pid != leaving && !self.in_own_window(*pid))
+    }
+
+    /// When the main window shows `leaving`, it selects the fallback as its
+    /// sidebar would, without marking a pane attended. The caller may be in
+    /// another window, so that waits for this update to end and picks the
+    /// fallback then, past every project window queued meanwhile.
+    fn main_falls_back(&mut self, leaving: Uuid, cx: &mut Context<Self>) {
+        if self.workspace.active_project != Some(leaving) {
+            return;
+        }
+        self.workspace.active_project = None;
+        self.active_instance = None;
+        let Some(main) = self.main_window else { return };
+        let this = cx.weak_entity();
+        cx.defer(move |cx| {
+            Self::update_in_window(&this, main, cx, |this, window, cx| {
+                if this.workspace.active_project.is_none()
+                    && let Some(next) = this.main_fallback_project(leaving)
+                {
+                    this.select_project_with_attendance(next, false, window, cx);
+                }
+            });
+        });
     }
 
     /// The window showing project `pid` now, read without a window.
@@ -22531,6 +22575,10 @@ impl MuxelApp {
                 .update(cx, |_, window, _| window.activate_window());
             return;
         }
+        // A window already on its way for this project is the one it gets.
+        if self.opening_project_windows.contains(&pid) {
+            return;
+        }
         // Snapshot this project's editors; they're rebuilt inside the new window.
         let editor_snaps: Vec<(Uuid, EditorSnapshot)> = self
             .workspace
@@ -22544,19 +22592,10 @@ impl MuxelApp {
                     .map(|ed| (iid, EditorSnapshot::capture(&ed, cx)))
             })
             .collect();
-        // The main window falls back to another project when it was showing this one.
-        if self.workspace.active_project == Some(pid) {
-            self.workspace.active_project = self
-                .workspace
-                .projects
-                .iter()
-                .map(|p| p.id)
-                .find(|id| *id != pid);
-            self.active_instance = self.workspace.active().and_then(|p| p.preferred_instance());
-            if let Some(next) = self.workspace.active_project {
-                self.spawn_project_terminals_deferred(next, cx);
-            }
-        }
+        // Until its window opens, a fallback for the main window passes it over.
+        self.opening_project_windows.insert(pid);
+        self.main_falls_back(pid, cx);
+        let workspace = self.current_workspace;
 
         let window_bounds = self
             .workspace
@@ -22619,7 +22658,18 @@ impl MuxelApp {
                 },
             );
             let Some(app) = app.upgrade() else { return };
+            app.update(cx, |this, _| {
+                this.opening_project_windows.remove(&pid);
+            });
             app.update(cx, |this, cx| match opened {
+                // The project was removed, or another workspace opened, while
+                // its window was on its way: there's nothing for it to show.
+                Ok(handle)
+                    if this.workspace.project(pid).is_none()
+                        || this.current_workspace != workspace =>
+                {
+                    let _ = handle.update(cx, |_, window, _| window.remove_window());
+                }
                 Ok(handle) => {
                     let any: AnyWindowHandle = handle.into();
                     if let Some(view) = slot.borrow_mut().take() {
@@ -32445,9 +32495,7 @@ impl MuxelApp {
                 t("This project had tmux closes that never confirmed. Muxel tried once more and won't retry. Import lists any still running."));
         }
         self.workspace.projects.retain(|p| p.id != pid);
-        if self.workspace.active_project == Some(pid) {
-            self.workspace.active_project = self.workspace.projects.first().map(|p| p.id);
-        }
+        self.main_falls_back(pid, cx);
         self.settings_ui.selected_project = None;
         self.persist();
         cx.notify();
