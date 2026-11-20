@@ -325,7 +325,93 @@ struct CodexCtlDraft {
     end_row: usize,
 }
 
+fn antigravity_model_footer(row: &str) -> bool {
+    // The CLI separates the model from the left edge by a column gap.
+    let content = row.trim_start_matches(' ');
+    row.len() - content.len() >= 8
+        && content.rsplit_once(" · ").is_some_and(|(label, effort)| {
+            !label.trim().is_empty()
+                && matches!(effort, "low" | "medium" | "high" | "xhigh" | "max")
+        })
+}
+
+fn antigravity_option(row: &str) -> Option<(u8, bool, &str)> {
+    // An unindented continuation can itself begin with a number.
+    let body = row.strip_prefix("> ").or_else(|| row.strip_prefix("  "))?;
+    let (number, label) = body.split_once(". ")?;
+    let number = number.parse().ok()?;
+    (!label.is_empty()).then_some((number, row.starts_with('>'), label))
+}
+
+fn antigravity_numbered_card(screen: &str) -> Option<()> {
+    let mut rows = screen.trim_end().lines().rev().map(str::trim_end);
+    let footer = rows.next()?.trim_start().strip_prefix("esc to cancel")?;
+    (footer.is_empty() || antigravity_model_footer(footer)).then_some(())?;
+    let edit = (Some("Accept this file edit?"), "No, reject this change");
+    let (heading, mut last_label) = match rows.next()?.trim() {
+        "↑/↓ Navigate · enter Select · esc Skip" => (None, "Write-in..."),
+        "↑/↓ Navigate · tab Amend · ctrl+g edit/expand command" => {
+            (Some("Run this command?"), "No, cancel")
+        }
+        "↑/↓ Navigate · f full diff" => edit,
+        "f full diff" if rows.next()?.trim() == "↑/↓ Navigate" => edit,
+        _ => return None,
+    };
+    let mut rows = rows.skip_while(|row| row.is_empty());
+    let tail = rows.next()?;
+    // Permit a wrapped suffix of the card's own final choice.
+    let (last, mut selected, label) = antigravity_option(tail).or_else(|| {
+        last_label = last_label.strip_suffix(tail)?.strip_suffix(' ')?;
+        antigravity_option(rows.next()?)
+    })?;
+    (last >= 2 && label == last_label).then_some(())?;
+    for expected in (1..last).rev() {
+        let (number, marked, _) = rows
+            .by_ref()
+            .take_while(|row| !row.is_empty())
+            .find_map(antigravity_option)?;
+        (number == expected && !(selected && marked)).then_some(())?;
+        selected |= marked;
+    }
+    selected.then_some(())?;
+    let mut rows = rows.skip_while(|row| row.is_empty());
+    if let Some(heading) = heading {
+        return (rows.next()? == heading).then_some(());
+    }
+    let count = rows
+        .take(8)
+        .take_while(|row| !row.is_empty())
+        .find_map(|row| row.strip_prefix("Question "))?;
+    let (current, total) = count.split_once(':')?.0.split_once('/')?;
+    let current = current.parse::<u32>().ok()?;
+    (current > 0 && current <= total.parse().ok()?).then_some(())
+}
+
 impl Screen {
+    pub(crate) fn antigravity_waiting_for_answer(&self) -> bool {
+        self.antigravity_trust_card() || antigravity_numbered_card(&self.text).is_some()
+    }
+
+    pub(crate) fn antigravity_trust_card(&self) -> bool {
+        let mut rows = self.text.trim_end().lines().rev().map(str::trim_end);
+        let footer = rows.next().unwrap_or_default();
+        let controls = if antigravity_model_footer(footer) {
+            rows.next().unwrap_or_default()
+        } else {
+            footer
+        };
+        let mut rows = rows.map(str::trim_start).filter(|row| !row.is_empty());
+        controls.trim_start() == "↑/↓ Navigate · enter Confirm"
+            && matches!(
+                (rows.next(), rows.next()),
+                (Some("No, exit"), Some("> Yes, I trust this folder"))
+                    | (Some("> No, exit"), Some("Yes, I trust this folder"))
+            )
+            && rows
+                .take(6)
+                .any(|row| row == "Do you trust the contents of this project?")
+    }
+
     pub(crate) fn startup_blocker(&self) -> Option<muxel_core::control::StartupBlocker> {
         use muxel_core::control::{StartupBlocker, StartupBlockerKind};
         if self.claude_status_context().is_some()

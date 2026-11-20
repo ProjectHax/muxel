@@ -647,6 +647,8 @@ feature is added or changed, update the matching entry here in the same change**
   launch, its glyph-less title names the pane for the rest of that launch without
   supplying lifecycle status; a title in the current root report takes precedence.
   An Antigravity Working report after Enter can confirm `ctl send`.
+  With no reports, an Antigravity pane waiting at a trust, command, file-edit,
+  or question card reads blocked.
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
   icon, dashboard, and notification dots. A **done** you haven't looked at stays

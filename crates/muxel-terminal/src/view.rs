@@ -542,8 +542,13 @@ impl RuntimeStatusState {
         }
         let mut title = sticky_title_status(self.semantic_title_status, observed_title);
 
-        let needs_provider_screen_scan =
-            matches!(title_provider, TitleProvider::Claude | TitleProvider::Grok);
+        let antigravity_cards =
+            title_provider == TitleProvider::Antigravity && !program_status.reported;
+        if title_provider == TitleProvider::Antigravity && program_status.reported {
+            self.provider_screen = None;
+        }
+        let needs_provider_screen_scan = antigravity_cards
+            || matches!(title_provider, TitleProvider::Claude | TitleProvider::Grok);
         let content_generation = session.content_generation();
         let has_visible_sources = !working_markers.is_empty()
             || !blocked_markers.is_empty()
@@ -565,6 +570,9 @@ impl RuntimeStatusState {
                 self.blocked_marker = blocked_markers.iter().any(|marker| screen.contains(marker));
                 (self.provider_screen, self.provider_background) =
                     provider_screen_read(title_provider, &screen);
+                if antigravity_cards && captured.antigravity_waiting_for_answer() {
+                    self.provider_screen = Some(AgentStatus::Blocked);
+                }
             }
             StatusScreenCapture::At(deadline) => next_deadline = Some(deadline),
             StatusScreenCapture::None if !has_visible_sources => {
@@ -1328,6 +1336,23 @@ fn provider_screen_read(
         TitleProvider::Grok => grok_screen_read(screen),
         _ => (None, None),
     }
+}
+
+#[cfg(test)]
+fn antigravity_card_fixture(name: &str) -> String {
+    serde_json::from_str::<std::collections::HashMap<String, String>>(include_str!(
+        "fixtures/agy-1.5.13-screens.json"
+    ))
+    .unwrap()
+    .remove(name)
+    .unwrap()
+}
+
+#[cfg(test)]
+fn paint_antigravity_card(session: &TerminalSession, screen: &str) {
+    session
+        .process_probe_output(format!("\x1b[2J\x1b[H{}", screen.replace('\n', "\r\n")).as_bytes());
+    session.set_idle_for_test(Duration::from_secs(5));
 }
 
 /// A finished turn beside listed subagents reads Working. Shells and monitors
@@ -5155,6 +5180,10 @@ mod working_report_receipt_tests {
                     .skip(1);
                 let session = view.session().clone();
                 session.process_output(wire.next().unwrap());
+                super::paint_antigravity_card(
+                    &session,
+                    &super::antigravity_card_fixture("permission"),
+                );
                 view.update_runtime(cx);
                 let mut submission = view
                     .begin_prompt_submission("Reply exactly OK. Do not use tools or write files.")
@@ -7920,6 +7949,166 @@ mod provider_switch_tests {
         assert_eq!(status.reason, TerminalStatusReason::RecentOutput);
         assert_eq!(status.coverage, TerminalStatusCoverage::ActivityOnly);
         assert!(deadline.is_some());
+        session.kill();
+    }
+
+    fn antigravity_card_status(screen: &str) -> AgentStatus {
+        let (session, _receiver) = fixture();
+        let provider = TitleProvider::from_program("agy");
+        let mut runtime = RuntimeStatusState::new(super::status_coverage(provider, &[], &[]));
+        super::paint_antigravity_card(&session, screen);
+        runtime.reconcile(&session, provider, &[], &[], false, Instant::now());
+        let status = runtime.snapshot(&session).status;
+        session.kill();
+        status
+    }
+
+    #[test]
+    fn antigravity_card_reads_folder_trust() {
+        let trust = super::antigravity_card_fixture("trust");
+        assert_eq!(antigravity_card_status(&trust), AgentStatus::Blocked);
+    }
+
+    fn assert_antigravity_card_with_footer(footer: &str) {
+        let question = super::antigravity_card_fixture("question");
+        let (card, _) = question.rsplit_once('\n').unwrap();
+        assert_eq!(
+            antigravity_card_status(&format!("{card}\n{footer}")),
+            AgentStatus::Blocked
+        );
+        let trust = super::antigravity_card_fixture("trust");
+        let aligned_model = footer.replacen("esc to cancel", "             ", 1);
+        assert_eq!(
+            antigravity_card_status(&format!("{trust}\n{aligned_model}")),
+            AgentStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn antigravity_card_reads_plan_mode_footer() {
+        assert_antigravity_card_with_footer(&super::antigravity_card_fixture("plan_footer"));
+    }
+
+    #[test]
+    fn antigravity_card_reads_default_claude_footer() {
+        assert_antigravity_card_with_footer(&super::antigravity_card_fixture(
+            "default_claude_footer",
+        ));
+    }
+
+    #[test]
+    fn antigravity_card_reads_command_permission() {
+        let screen = super::antigravity_card_fixture("permission");
+        assert_eq!(antigravity_card_status(&screen), AgentStatus::Blocked);
+        let continued = screen.replace(
+            "\n'echo probe > delete-me.tmp'\n",
+            "\n1. Part of the label\n",
+        );
+        assert_ne!(screen, continued);
+        assert_eq!(antigravity_card_status(&continued), AgentStatus::Blocked);
+    }
+
+    #[test]
+    fn antigravity_card_reads_file_edit() {
+        for fixture in ["edit", "wrapped_edit_option"] {
+            assert_eq!(
+                antigravity_card_status(&super::antigravity_card_fixture(fixture)),
+                AgentStatus::Blocked
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_card_reads_wrapped_last_edit_option() {
+        let captured = super::antigravity_card_fixture("wrapped_edit_option");
+        let joined = captured.replace("↑/↓ Navigate\n  f full diff", "↑/↓ Navigate · f full diff");
+        assert_ne!(captured, joined);
+        assert_eq!(antigravity_card_status(&joined), AgentStatus::Blocked);
+    }
+
+    #[test]
+    fn antigravity_card_reads_split_edit_navigation() {
+        let captured = super::antigravity_card_fixture("wrapped_edit_option");
+        let joined = captured.replace("reject this\nchange", "reject this change");
+        assert_ne!(captured, joined);
+        assert_eq!(antigravity_card_status(&joined), AgentStatus::Blocked);
+    }
+
+    #[test]
+    fn antigravity_card_reads_questions_with_wrapped_headings() {
+        for fixture in ["question", "wrapped_question_heading"] {
+            assert_eq!(
+                antigravity_card_status(&super::antigravity_card_fixture(fixture)),
+                AgentStatus::Blocked
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_card_rejects_quoted_controls_and_trailing_output() {
+        let trust = super::antigravity_card_fixture("trust");
+        let question = super::antigravity_card_fixture("question");
+        let wrapped = super::antigravity_card_fixture("wrapped_question_heading");
+        let edit = super::antigravity_card_fixture("wrapped_edit_option");
+        let inactive = [
+            format!("{trust}\nPriority · high"),
+            format!(
+                "{}\nesc to cancel Priority · high",
+                question.rsplit_once('\n').unwrap().0
+            ),
+            question.replace("> 1.", "  1."),
+            question.replace("\n\n  ↑/↓ Navigate", "\nUnrelated output\n\n  ↑/↓ Navigate"),
+            wrapped.replacen('\n', "\n\n", 1),
+            edit.replace("reject this\nchange", "reject this\n1. change"),
+            "Requesting permission for:\nRun this command?\nAn example response\nesc to cancel"
+                .to_owned(),
+        ];
+        for screen in inactive {
+            assert_eq!(
+                antigravity_card_status(&screen),
+                AgentStatus::Idle,
+                "{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_card_yields_to_program_status_for_the_rest_of_the_launch() {
+        let (session, _receiver) = fixture();
+        let provider = TitleProvider::from_program("agy");
+        let mut runtime = RuntimeStatusState::new(super::status_coverage(provider, &[], &[]));
+        let screen = super::antigravity_card_fixture("permission");
+        let now = Instant::now();
+        super::paint_antigravity_card(&session, &screen);
+        runtime.reconcile(&session, provider, &[], &[], false, now);
+        assert_eq!(runtime.snapshot(&session).status, AgentStatus::Blocked);
+
+        session.test_program_status(b"\x1b]7501;state=working\x07");
+        runtime.reconcile(
+            &session,
+            provider,
+            &[],
+            &[],
+            false,
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
+
+        session.test_program_status(b"\x1b]7501;state=clear\x07");
+        super::paint_antigravity_card(&session, &screen);
+        runtime.reconcile(
+            &session,
+            provider,
+            &[],
+            &[],
+            false,
+            now + Duration::from_secs(2),
+        );
+        assert_eq!(runtime.snapshot(&session).status, AgentStatus::Idle);
+        assert_ne!(
+            runtime.last_screen_capture,
+            Some(now + Duration::from_secs(2))
+        );
         session.kill();
     }
 
