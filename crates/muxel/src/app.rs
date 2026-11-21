@@ -14260,6 +14260,26 @@ impl MuxelApp {
             .map(|s| s.pid)
     }
 
+    /// The project `window` shows: its own when it's a project window, else
+    /// the main window's active project.
+    fn window_pid(&self, window: &Window) -> Option<Uuid> {
+        self.secondary_pid_for(window)
+            .or(self.workspace.active_project)
+    }
+
+    /// The pane `window` is on within `project`: the app-wide active pane if it
+    /// belongs to `project`'s layout, else `project`'s last-focused pane.
+    fn window_active_instance(&self, project: &Project) -> Option<Uuid> {
+        self.active_instance
+            .filter(|iid| {
+                project
+                    .layout
+                    .as_ref()
+                    .is_some_and(|layout| layout.leaf_containing(*iid).is_some())
+            })
+            .or_else(|| project.preferred_instance())
+    }
+
     /// Whether the sidebar is hidden in the window showing `pid` (`None` = the
     /// main window) — either collapsed, or forced away by fullscreen until the
     /// user pulls it back for that stint.
@@ -17347,8 +17367,7 @@ impl MuxelApp {
         // focused pane may be in another window; then the new pane goes to
         // this window's project, at its last-focused pane.
         let Some(project) = self
-            .secondary_pid_for(window)
-            .or(self.workspace.active_project)
+            .window_pid(window)
             .and_then(|pid| self.workspace.project(pid))
         else {
             return;
@@ -17487,24 +17506,22 @@ impl MuxelApp {
 
     /// Cycle the active pane's tabs by `delta` (wrapping), focusing the result.
     fn cycle_tab(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(active) = self.active_instance else {
-            return;
-        };
-        let Some(pid) = self.workspace.active_project else {
-            return;
-        };
-        let next = self.workspace.project(pid).and_then(|p| {
-            let root = p.layout.as_ref()?;
-            let path = root.find_path(active)?;
-            let (tabs, _) = root.get_at_path(&path)?.tabs()?;
-            if tabs.len() < 2 {
-                return None;
-            }
-            let cur = tabs.iter().position(|&t| t == active)?;
-            let len = tabs.len() as isize;
-            let idx = (((cur as isize + delta) % len + len) % len) as usize;
-            Some(tabs[idx])
-        });
+        let next = self
+            .window_pid(window)
+            .and_then(|pid| self.workspace.project(pid))
+            .and_then(|p| {
+                let active = self.window_active_instance(p)?;
+                let root = p.layout.as_ref()?;
+                let path = root.find_path(active)?;
+                let (tabs, _) = root.get_at_path(&path)?.tabs()?;
+                if tabs.len() < 2 {
+                    return None;
+                }
+                let cur = tabs.iter().position(|&t| t == active)?;
+                let len = tabs.len() as isize;
+                let idx = (((cur as isize + delta) % len + len) % len) as usize;
+                Some(tabs[idx])
+            });
         if let Some(next) = next {
             self.focus_instance(next, window, cx);
         }
@@ -32664,24 +32681,25 @@ impl MuxelApp {
     }
 
     fn focus_sibling(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pid) = self.workspace.active_project else {
-            return;
-        };
-        let instances = self
-            .workspace
-            .project(pid)
-            .map(|p| p.instances())
-            .unwrap_or_default();
-        if instances.is_empty() {
-            return;
+        let next = self
+            .window_pid(window)
+            .and_then(|pid| self.workspace.project(pid))
+            .and_then(|p| {
+                let instances = p.instances();
+                if instances.is_empty() {
+                    return None;
+                }
+                let cur = self
+                    .window_active_instance(p)
+                    .and_then(|a| instances.iter().position(|&i| i == a))
+                    .unwrap_or(0);
+                let len = instances.len() as isize;
+                let idx = (((cur as isize + delta) % len + len) % len) as usize;
+                Some(instances[idx])
+            });
+        if let Some(next) = next {
+            self.focus_instance(next, window, cx);
         }
-        let cur = self
-            .active_instance
-            .and_then(|a| instances.iter().position(|&i| i == a))
-            .unwrap_or(0);
-        let len = instances.len() as isize;
-        let next = (((cur as isize + delta) % len + len) % len) as usize;
-        self.focus_instance(instances[next], window, cx);
     }
 
     fn adjust_zoom(&mut self, delta: f32, cx: &mut Context<Self>) {

@@ -1638,3 +1638,118 @@ fn reopening_a_file_no_window_shows_from_a_second_window_focuses_it_only_in_the_
         }
     });
 }
+
+#[test]
+fn next_tab_and_next_pane_stay_in_a_project_window() {
+    with_app(|cx, main| {
+        let shown = project(cx, main, "main window");
+        let other = project(cx, main, "second window");
+        let (main_first, tab_one, tab_two, neighbour) = main
+            .update(cx, |app, _, _| {
+                let main_first = pane(app, shown, None);
+                pane(app, shown, Some(main_first));
+
+                let tab_one = pane(app, other, None);
+                let mut second_tab = Instance::shell(other);
+                second_tab.program = Some("cmd.exe".into());
+                second_tab.args = WAIT.map(String::from).into();
+                let tab_two = second_tab.id;
+                app.workspace.add_instance(second_tab);
+                let layout = &mut app.workspace.project_mut(other).unwrap().layout;
+                assert!(add_tab(layout, tab_one, tab_two));
+                let neighbour = pane(app, other, Some(tab_one));
+                (main_first, tab_one, tab_two, neighbour)
+            })
+            .unwrap();
+        let secondary = secondary_window(cx, main, other);
+        let app = main.entity(cx).unwrap();
+        let in_secondary =
+            |cx: &mut TestAppContext,
+             run: fn(&mut MuxelApp, &mut Window, &mut Context<MuxelApp>)| {
+                secondary
+                    .update(cx, |_, window, cx| {
+                        app.update(cx, |app, cx| run(app, window, cx))
+                    })
+                    .unwrap();
+            };
+
+        secondary
+            .update(cx, |_, window, cx| {
+                app.update(cx, |app, cx| app.focus_instance(tab_one, window, cx))
+            })
+            .unwrap();
+
+        // Next Tab moves between the two tabs in the project window.
+        in_secondary(cx, |app, window, cx| app.cycle_tab(1, window, cx));
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.active_instance, Some(tab_two));
+            assert_eq!(front_tab(app, other, tab_one), tab_two);
+        })
+        .unwrap();
+
+        in_secondary(cx, |app, window, cx| app.cycle_tab(1, window, cx));
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.active_instance, Some(tab_one));
+            assert_eq!(front_tab(app, other, tab_one), tab_one);
+        })
+        .unwrap();
+
+        // From the second tab, Next Pane moves to the neighbour in the same window.
+        in_secondary(cx, |app, window, cx| app.cycle_tab(1, window, cx));
+        in_secondary(cx, |app, window, cx| app.focus_sibling(1, window, cx));
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.active_instance, Some(neighbour));
+            assert_eq!(
+                app.workspace
+                    .instance(app.active_instance.unwrap())
+                    .map(|i| i.project_id),
+                Some(other)
+            );
+        })
+        .unwrap();
+
+        // After focusing a main-window pane, returning to the project window
+        // without clicking a pane still cycles from the tab it was showing.
+        secondary
+            .update(cx, |_, window, cx| {
+                app.update(cx, |app, cx| app.focus_instance(tab_two, window, cx))
+            })
+            .unwrap();
+        main.update(cx, |app, window, cx| {
+            app.focus_instance(main_first, window, cx)
+        })
+        .unwrap();
+        in_secondary(cx, |app, window, cx| app.cycle_tab(1, window, cx));
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.active_instance, Some(tab_one));
+            assert_eq!(front_tab(app, other, tab_one), tab_one);
+        })
+        .unwrap();
+
+        in_secondary(cx, |app, window, cx| app.cycle_tab(1, window, cx));
+        main.update(cx, |app, window, cx| {
+            app.focus_instance(main_first, window, cx)
+        })
+        .unwrap();
+        in_secondary(cx, |app, window, cx| app.focus_sibling(1, window, cx));
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.active_instance, Some(neighbour));
+        })
+        .unwrap();
+
+        // Both still work in the project window when the main window shows no project.
+        main.update(cx, |app, _, _| app.workspace.active_project = None)
+            .unwrap();
+        in_secondary(cx, |app, window, cx| app.focus_sibling(1, window, cx));
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.active_instance, Some(tab_one));
+        })
+        .unwrap();
+        in_secondary(cx, |app, window, cx| app.cycle_tab(1, window, cx));
+        main.read_with(cx, |app, _| {
+            assert_eq!(app.active_instance, Some(tab_two));
+            assert_eq!(front_tab(app, other, tab_one), tab_two);
+        })
+        .unwrap();
+    });
+}
