@@ -1,5 +1,6 @@
 //! A NOTIFICATIONS row cuts its title and subtitle to one line each. Hovering
 //! the row shows both in full, in a tooltip.
+//! It skips macOS, where `Root` needs the native window a test window lacks.
 
 use super::{MuxelApp, NotifKind};
 use crate::theme;

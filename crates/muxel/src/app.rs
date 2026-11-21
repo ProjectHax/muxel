@@ -87,7 +87,7 @@ mod hotbar;
 mod libraries_ui;
 #[cfg(all(test, not(target_os = "macos")))]
 mod markdown_copy_tests;
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 mod notification_feed_tests;
 mod pane_grid;
 #[cfg(all(test, windows))]
