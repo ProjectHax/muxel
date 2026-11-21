@@ -183,6 +183,125 @@ fn secondary_window(
     secondary
 }
 
+/// A project shows in one window at a time. When the main window's project
+/// moves to its own window, the main window switches to a project no window
+/// shows, never to one a project window already has.
+#[test]
+fn the_main_window_falls_back_past_a_project_in_its_own_window_when_one_moves_out() {
+    with_app(|cx, main| {
+        let moving = project(cx, main, "moves to its own window");
+        let elsewhere = project(cx, main, "already in its own window");
+        let unshown = project(cx, main, "in no window");
+        secondary_window(cx, main, elsewhere);
+        // Selecting a project adopts its default agent.
+        let own_default = main
+            .update(cx, |app, _, _| {
+                let preset = AgentPreset::shell();
+                let id = preset.id;
+                app.presets.push(preset);
+                app.workspace.project_mut(unshown).unwrap().default_preset = Some(id);
+                id
+            })
+            .unwrap();
+
+        main.update(cx, |app, window, cx| {
+            let display = cx.displays().into_iter().next().expect("a test display");
+            app.open_project_on_monitor(moving, display.id(), display.uuid().unwrap(), window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        main.read_with(cx, |app, _| {
+            let active = app.workspace.active_project;
+            assert_ne!(active, Some(elsewhere), "two windows show one project");
+            assert_eq!(active, Some(unshown));
+            assert_eq!(
+                app.presets[app.current_preset].id, own_default,
+                "the main window showed the project without selecting it"
+            );
+        })
+        .unwrap();
+    });
+}
+
+/// The same when the main window's project is removed, and the project it
+/// takes starts its panes, as switching to it does.
+#[test]
+fn the_main_window_falls_back_past_a_project_in_its_own_window_when_one_is_removed() {
+    with_app(|cx, main| {
+        let removed = project(cx, main, "removed");
+        let elsewhere = project(cx, main, "already in its own window");
+        let unshown = project(cx, main, "in no window");
+        let waiting = main
+            .update(cx, |app, _, _| pane(app, unshown, None))
+            .unwrap();
+        secondary_window(cx, main, elsewhere);
+
+        main.update(cx, |app, _, cx| app.delete_project(removed, cx))
+            .unwrap();
+        cx.run_until_parked();
+
+        let active = main
+            .read_with(cx, |app, _| app.workspace.active_project)
+            .unwrap();
+        assert_ne!(active, Some(elsewhere), "two windows show one project");
+        assert_eq!(active, Some(unshown));
+        // Panes start in timed waves, so the clock has to move.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            cx.executor().advance_clock(Duration::from_millis(300));
+            cx.run_until_parked();
+            let started = main
+                .read_with(cx, |app, _| {
+                    app.terminals.contains_key(&waiting)
+                        || app.terminal_launching.contains_key(&waiting)
+                        || app.failed_launches.contains_key(&waiting)
+                })
+                .unwrap();
+            if started {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the project the main window took never started its pane"
+            );
+        }
+    });
+}
+
+/// Reopening a workspace queues a window for each pinned project before any
+/// of them opens. The main window ends on a project none of them shows.
+#[test]
+fn the_main_window_ends_on_an_unpinned_project_when_a_workspace_reopens() {
+    with_app(|cx, main| {
+        let first = project(cx, main, "pinned first");
+        let second = project(cx, main, "pinned second");
+        let unpinned = project(cx, main, "unpinned");
+
+        // As restore does: every pinned window queued in one pass.
+        main.update(cx, |app, window, cx| {
+            let display = cx.displays().into_iter().next().expect("a test display");
+            let uuid = display.uuid().unwrap();
+            app.open_project_on_monitor(first, display.id(), uuid, window, cx);
+            app.open_project_on_monitor(second, display.id(), uuid, window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        main.read_with(cx, |app, _| {
+            let windows: Vec<Uuid> = app.secondary_windows.iter().map(|s| s.pid).collect();
+            assert_eq!(windows.len(), 2, "the pinned windows didn't both open");
+            let active = app.workspace.active_project;
+            assert!(
+                active.is_none_or(|pid| !windows.contains(&pid)),
+                "two windows show one project"
+            );
+            assert_eq!(active, Some(unpinned));
+        })
+        .unwrap();
+    });
+}
+
 #[test]
 fn toolbar_and_shortcut_agents_open_in_the_window_they_came_from() {
     with_app(|cx, main| {
