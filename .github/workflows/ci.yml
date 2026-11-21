@@ -68,6 +68,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace
       - run: cargo test --workspace
+      - name: Test vendored portable-pty (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --manifest-path vendor/portable-pty/Cargo.toml --lib
       # `muxel ctl` (outside agents such as Grok Bot driving muxel) runs from
       # contexts with no display: it must start, print its usage, and report —
       # as JSON, exit 1 — that no muxel is running, without touching the GUI.

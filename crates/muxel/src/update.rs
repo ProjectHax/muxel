@@ -296,6 +296,16 @@ fn apply_windows(
 const CONSOLE_FOLDER: &str = "muxel-console";
 #[cfg(windows)]
 const CONSOLE_FILES: [&str; 3] = ["conpty.dll", "OpenConsole.exe", "CONPTY-LICENSE.txt"];
+/// Set to `1`, `true`, or `yes` to force Windows' built-in console host
+/// (`kernel32.dll`) instead of the bundled OpenConsole host.
+#[cfg(windows)]
+pub const SYSTEM_CONSOLE_ENV: &str = "MUXEL_SYSTEM_CONSOLE";
+
+#[cfg(windows)]
+fn is_truthy_env_value(value: &str) -> bool {
+    let value = value.trim();
+    value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+}
 
 #[cfg(windows)]
 fn stage_windows_console(zip: &Path, install: &Path, version: &str) -> Result<()> {
@@ -415,20 +425,31 @@ fn open_console_for_removal(directory: &Path) -> std::io::Result<std::fs::File> 
 
 #[cfg(windows)]
 pub fn prepare_windows_console() -> Option<std::fs::File> {
+    let force_system = std::env::var(SYSTEM_CONSOLE_ENV)
+        .map(|value| is_truthy_env_value(&value))
+        .unwrap_or(false);
+    if force_system {
+        muxel_terminal::set_force_system_console(true);
+    }
     let exe = std::env::current_exe().ok()?;
     let root = exe.parent()?.join(CONSOLE_FOLDER);
-    let directory = root.join(APP_VERSION);
-    let directory_handle = open_console_directory(&directory)
-        .inspect_err(|error| {
-            log::debug!(
-                "Skipping Windows console bundle at {}: {error}",
-                directory.display()
-            )
-        })
-        .ok();
-    if directory_handle.is_some() {
-        muxel_terminal::set_console_directory(directory);
-    }
+    let directory_handle = if force_system {
+        None
+    } else {
+        let directory = root.join(APP_VERSION);
+        let handle = open_console_directory(&directory)
+            .inspect_err(|error| {
+                log::debug!(
+                    "Skipping Windows console bundle at {}: {error}",
+                    directory.display()
+                )
+            })
+            .ok();
+        if handle.is_some() {
+            muxel_terminal::set_console_directory(directory);
+        }
+        handle
+    };
     prune_windows_consoles(&root, APP_VERSION);
     directory_handle
 }
@@ -608,8 +629,8 @@ mod tests {
     #[cfg(windows)]
     mod windows_console {
         use super::{
-            extract_windows_exe, open_console_directory, prune_windows_consoles,
-            stage_windows_console,
+            extract_windows_exe, is_truthy_env_value, open_console_directory,
+            prune_windows_consoles, stage_windows_console,
         };
         use std::fs;
         use std::io::Write as _;
@@ -799,6 +820,19 @@ mod tests {
             prune_windows_consoles(&fixture.0.join("muxel-console"), "2.0.0");
             assert!(!old.exists());
             assert_console(&fixture.console("2.0.0"));
+        }
+
+        #[test]
+        fn system_console_env_values_parse_truthy_only() {
+            for value in ["1", "true", "TRUE", "yes", " Yes "] {
+                assert!(is_truthy_env_value(value), "{value:?} should be truthy");
+            }
+            for value in ["", "0", "false", "no", "system"] {
+                assert!(
+                    !is_truthy_env_value(value),
+                    "{value:?} should not be truthy"
+                );
+            }
         }
     }
 

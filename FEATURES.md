@@ -655,7 +655,9 @@ feature is added or changed, update the matching entry here in the same change**
   With no reports, an Antigravity pane waiting at a trust, command, file-edit,
   or question card reads blocked.
   Windows installers, portable zips, and in-app updates include Microsoft's
-  OpenConsole host so direct panes can receive these reports.
+  OpenConsole host so direct panes can receive these reports. If Windows rejects
+  creation of the bundled console, muxel retries with the built-in host; set
+  `MUXEL_SYSTEM_CONSOLE=1` to force the system host from startup.
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
   icon, dashboard, and notification dots. A **done** you haven't looked at stays
