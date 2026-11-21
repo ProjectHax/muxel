@@ -4,7 +4,7 @@
 //! background executor. Pure inputs in, pure outputs out; the caller persists
 //! [`EngineState`] and applies [`Output`] to settings and the task store.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -56,6 +56,73 @@ pub struct EngineState {
     /// Not retried until the item moves past that version.
     #[serde(default)]
     pub reseal_refused: Vec<(Uuid, String, u64)>,
+    /// Whose account keys this device accepts, per team (see [`TeamTrust`]).
+    #[serde(default)]
+    pub trust: HashMap<Uuid, TeamTrust>,
+}
+
+/// A member's published account keys (base64, as the server lists them).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberKeys {
+    pub enc_pub: String,
+    pub sign_pub: String,
+}
+
+impl MemberKeys {
+    fn of(m: &Member) -> Option<Self> {
+        Some(Self {
+            enc_pub: m.enc_pub.clone()?,
+            sign_pub: m.sign_pub.clone()?,
+        })
+    }
+
+    /// What people compare out loud (§3.1), or `None` for malformed keys.
+    pub fn fingerprint(&self) -> Option<String> {
+        Some(crypto::fingerprint(
+            &pub32(&self.enc_pub, "enc_pub").ok()?,
+            &pub32(&self.sign_pub, "sign_pub").ok()?,
+        ))
+    }
+}
+
+/// Whose keys this device accepts in one team.
+///
+/// The server says who is in a team, and it can't be taken at its word: a
+/// compromised one could list an extra member, or swap a member's keys for its
+/// own, and so be handed the team's keys. So this device hands a scope key
+/// only to members in `approved`, and takes one only from them, each pinned to
+/// the keys they had when they were approved.
+///
+/// The first time a device sees a team it approves the members it finds there
+/// (trust on first use). Anyone who appears later, or whose keys change, waits
+/// for the user's decision ([`TeamView::approvals`], [`MemberDecision`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamTrust {
+    #[serde(default)]
+    pub approved: BTreeMap<Uuid, MemberKeys>,
+    /// Turned down by the user: not asked about again, unless their keys change.
+    #[serde(default)]
+    pub declined: BTreeMap<Uuid, MemberKeys>,
+    /// Already announced as waiting, so each is notified once.
+    #[serde(default)]
+    pub asked: BTreeMap<Uuid, MemberKeys>,
+}
+
+impl TeamTrust {
+    fn approves(&self, user: Uuid, keys: &MemberKeys) -> bool {
+        self.approved.get(&user) == Some(keys)
+    }
+}
+
+/// The user's answer about one member, queued by the UI. It names the keys
+/// the user was shown: if the member's keys are different by the time it is
+/// applied, it is dropped and the member is asked about again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberDecision {
+    pub team: Uuid,
+    pub user: Uuid,
+    pub keys: MemberKeys,
+    pub approve: bool,
 }
 
 /// A queued write of a team-shared setting (from "Share with team").
@@ -76,6 +143,8 @@ pub struct Input<'a> {
     pub personal_tasks: &'a [Task],
     pub team_tasks: &'a HashMap<Uuid, Vec<Task>>,
     pub team_setting_writes: &'a [TeamSettingWrite],
+    /// Members the user approved or declined since the last cycle.
+    pub member_decisions: &'a [MemberDecision],
     /// This device's presence per team-bound workspace (already privacy-filtered).
     pub presence: &'a [(Uuid, Presence)],
     /// Tasks deleted here, waiting to reach the server as tombstones.
@@ -117,6 +186,32 @@ pub struct TeamView {
     pub activity: Vec<ActivityView>,
     /// Some scope keys haven't been granted to this user yet.
     pub waiting_for_keys: bool,
+    /// Members waiting for this user's decision before this device shares the
+    /// team's keys with them, or accepts keys from them.
+    #[serde(default)]
+    pub approvals: Vec<ApprovalView>,
+}
+
+/// A member this device doesn't trust yet (see [`TeamTrust`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalView {
+    pub user_id: Uuid,
+    pub name: String,
+    pub email: String,
+    pub role: String,
+    pub fingerprint: String,
+    /// The keys the fingerprint stands for; sent back with the decision.
+    pub keys: MemberKeys,
+    /// They were approved or declined before, with different keys. Account
+    /// keys never change in normal use, so this deserves a second look.
+    #[serde(default)]
+    pub keys_changed: bool,
+    /// Declined earlier (listed so the choice can be undone).
+    #[serde(default)]
+    pub declined: bool,
+    /// Their role can hand out the team's keys (`members.manage`).
+    #[serde(default)]
+    pub manager: bool,
 }
 
 impl TeamView {
@@ -264,6 +359,9 @@ struct Ctx {
     keys: HashMap<(Uuid, u32), Key>,
     /// user → (sign_pub, enc_pub, grants per team)
     members: HashMap<Uuid, Vec<Member>>,
+    /// Who this device trusts, per team. `None` trusts everyone the server
+    /// lists (an export only reads).
+    trust: Option<HashMap<Uuid, TeamTrust>>,
 }
 
 impl Ctx {
@@ -287,6 +385,32 @@ impl Ctx {
             .map(|m| Grants::from_wire(&m.role, &m.permissions))
             .unwrap_or_default()
     }
+    /// Whether this device hands team keys to `m`, and takes them from `m`.
+    fn trusts(&self, team: Uuid, m: &Member, me: Uuid) -> bool {
+        if m.user_id == me {
+            return true;
+        }
+        let Some(trust) = &self.trust else {
+            return true;
+        };
+        match (trust.get(&team), MemberKeys::of(m)) {
+            (Some(t), Some(keys)) => t.approves(m.user_id, &keys),
+            _ => false,
+        }
+    }
+}
+
+fn manages(m: &Member) -> bool {
+    Grants::from_wire(&m.role, &m.permissions).has(Permission::MembersManage)
+}
+
+/// Whether a member's role entitles them to any of a team's scope keys.
+fn holds_team_keys(m: &Member) -> bool {
+    let g = Grants::from_wire(&m.role, &m.permissions);
+    let any = Uuid::nil(); // `entitled` looks only at the kind of scope
+    [Role::Settings(any), Role::Tasks(any), Role::Activity(any)]
+        .into_iter()
+        .any(|scope| entitled(scope, &g))
 }
 
 fn sign_pub_of(m: &Member) -> Option<[u8; 32]> {
@@ -331,7 +455,11 @@ impl<T: Transport> Engine<'_, T> {
         let me = self.client.me()?;
         let personal_ok = me.entitlements.personal_sync;
         let read_only = me.entitlements.read_only;
-        let mut ctx = self.load_context(&me, &mut out)?;
+        let mut ctx = self.load_context(
+            &me,
+            Some((input.member_decisions, &mut state.trust)),
+            &mut out,
+        )?;
         let mut reload = false;
         if personal_ok && ctx.scope(Role::Personal).is_none() {
             match self.create_personal(&mut ctx) {
@@ -342,7 +470,11 @@ impl<T: Transport> Engine<'_, T> {
         }
         reload |= self.bootstrap_team_scopes(&me, &mut ctx, &mut out);
         if reload {
-            ctx = self.load_context(&me, &mut out)?;
+            ctx = self.load_context(
+                &me,
+                Some((input.member_decisions, &mut state.trust)),
+                &mut out,
+            )?;
         }
         self.fulfil_and_rotate(&mut ctx, &mut out);
         let mut held: Vec<(Uuid, u32)> = ctx.keys.keys().copied().collect();
@@ -514,6 +646,9 @@ impl<T: Transport> Engine<'_, T> {
             out.teams
                 .push(self.team_view(t.id, &t.name, &t.role, &ctx, state));
         }
+        for view in &out.teams {
+            announce_approvals(view, &mut state.trust, &mut out.notes);
+        }
         if personal_tasks_changed {
             out.personal_tasks = Some(personal_tasks);
         }
@@ -526,7 +661,14 @@ impl<T: Transport> Engine<'_, T> {
         Ok(out)
     }
 
-    fn load_context(&self, me: &Me, out: &mut Output) -> Result<Ctx, CycleError> {
+    /// `trust` is the user's pending decisions and this device's trust state,
+    /// brought up to date here; `None` (an export) trusts every listed member.
+    fn load_context(
+        &self,
+        me: &Me,
+        trust: Option<(&[MemberDecision], &mut HashMap<Uuid, TeamTrust>)>,
+        out: &mut Output,
+    ) -> Result<Ctx, CycleError> {
         let mut members = HashMap::new();
         for t in &me.teams {
             match self.client.members(t.id) {
@@ -552,10 +694,18 @@ impl<T: Transport> Engine<'_, T> {
                 },
             })
             .collect::<Vec<_>>();
+        let trust = match trust {
+            Some((decisions, trust)) => {
+                self.settle_trust(&members, &scopes, decisions, trust, out);
+                Some(trust.clone())
+            }
+            None => None,
+        };
         let mut ctx = Ctx {
             scopes,
             keys: HashMap::new(),
             members,
+            trust,
         };
         for g in self.client.keys()? {
             let Some(scope) = ctx.by_id(g.scope_id) else {
@@ -569,12 +719,14 @@ impl<T: Transport> Engine<'_, T> {
                     if g.granter_user_id == self.session.user {
                         Some(self.me_pub())
                     } else {
-                        ctx.member(t, g.granter_user_id)
-                            .filter(|m| {
-                                Grants::from_wire(&m.role, &m.permissions)
-                                    .has(Permission::MembersManage)
-                            })
-                            .and_then(sign_pub_of)
+                        let granter = ctx.member(t, g.granter_user_id).filter(|m| manages(m));
+                        if granter.is_some_and(|m| !ctx.trusts(t, m, self.session.user)) {
+                            // A manager this user hasn't approved (yet): their
+                            // key isn't used until they are. They are listed
+                            // in the team's approvals, so this isn't an error.
+                            continue;
+                        }
+                        granter.and_then(sign_pub_of)
                     }
                 }
             };
@@ -607,6 +759,108 @@ impl<T: Transport> Engine<'_, T> {
             }
         }
         Ok(ctx)
+    }
+
+    /// Bring this device's trust up to date with the member lists: start it for
+    /// teams seen for the first time, forget members who left, and apply the
+    /// user's decisions.
+    ///
+    /// A team's trust is never dropped because the server stopped listing the
+    /// team: listing it again would then count as a first sight, and trust
+    /// whoever the server had added meanwhile.
+    fn settle_trust(
+        &self,
+        members: &HashMap<Uuid, Vec<Member>>,
+        scopes: &[ScopeInfo],
+        decisions: &[MemberDecision],
+        trust: &mut HashMap<Uuid, TeamTrust>,
+        out: &mut Output,
+    ) {
+        // Members still waiting for a key, per team. Only a manager is told
+        // (and only they hand keys out), and only a first sight needs it.
+        let mut waiting: Option<HashMap<Uuid, HashSet<Uuid>>> = None;
+        for (team, list) in members {
+            if trust.contains_key(team) {
+                continue;
+            }
+            // First sight of this team: trust the members found here, except
+            // those still waiting for a key (the user decides about them).
+            let i_manage = list
+                .iter()
+                .any(|m| m.user_id == self.session.user && manages(m));
+            if i_manage && waiting.is_none() {
+                let mut by_team: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
+                match self.client.pending_grants() {
+                    Ok(pending) => {
+                        for p in pending {
+                            let team = scopes.iter().find(|s| s.id == p.scope_id).and_then(|s| {
+                                match s.role {
+                                    Role::Settings(t) | Role::Tasks(t) | Role::Activity(t) => {
+                                        Some(t)
+                                    }
+                                    Role::Personal => None,
+                                }
+                            });
+                            if let Some(team) = team {
+                                by_team.entry(team).or_default().insert(p.user_id);
+                            }
+                        }
+                    }
+                    Err(ApiError::Forbidden) => {}
+                    Err(e) => {
+                        // Try again next cycle rather than trust blindly.
+                        out.errors.push(format!("pending grants: {e}"));
+                        continue;
+                    }
+                }
+                waiting = Some(by_team);
+            }
+            let unkeyed = waiting.as_ref().and_then(|w| w.get(team));
+            let mut t = TeamTrust::default();
+            for m in list {
+                if m.user_id == self.session.user
+                    || (i_manage && unkeyed.is_some_and(|w| w.contains(&m.user_id)))
+                {
+                    continue;
+                }
+                if let Some(keys) = MemberKeys::of(m) {
+                    t.approved.insert(m.user_id, keys);
+                }
+            }
+            trust.insert(*team, t);
+        }
+        for (team, t) in trust.iter_mut() {
+            // Someone who left and comes back is asked about again. (Skipped
+            // when the member list didn't load this cycle.)
+            let Some(list) = members.get(team) else {
+                continue;
+            };
+            let here = |user: &Uuid| list.iter().any(|m| m.user_id == *user);
+            t.approved.retain(|u, _| here(u));
+            t.declined.retain(|u, _| here(u));
+            t.asked.retain(|u, _| here(u));
+        }
+        for d in decisions {
+            let (Some(t), Some(m)) = (
+                trust.get_mut(&d.team),
+                members
+                    .get(&d.team)
+                    .and_then(|l| l.iter().find(|m| m.user_id == d.user)),
+            ) else {
+                continue;
+            };
+            // Only for the keys the user was shown.
+            if MemberKeys::of(m).as_ref() != Some(&d.keys) {
+                continue;
+            }
+            if d.approve {
+                t.declined.remove(&d.user);
+                t.approved.insert(d.user, d.keys.clone());
+            } else {
+                t.approved.remove(&d.user);
+                t.declined.insert(d.user, d.keys.clone());
+            }
+        }
     }
 
     fn self_grant(&self, scope: Uuid, generation: u32, key: &Key) -> Result<NewGrant, CycleError> {
@@ -685,7 +939,9 @@ impl<T: Transport> Engine<'_, T> {
         lost_race
     }
 
-    /// Grants of `key` for every entitled member with published keys.
+    /// Grants of `key` for every entitled member this device trusts. The rest
+    /// are left for the server to list as pending, until the user approves
+    /// them.
     fn grant_all(
         &self,
         ctx: &Ctx,
@@ -697,7 +953,9 @@ impl<T: Transport> Engine<'_, T> {
     ) -> Result<Vec<NewGrant>, CycleError> {
         let mut grants = Vec::new();
         for m in ctx.members.get(&team).into_iter().flatten() {
-            if !entitled(role, &Grants::from_wire(&m.role, &m.permissions)) {
+            if !entitled(role, &Grants::from_wire(&m.role, &m.permissions))
+                || !ctx.trusts(team, m, self.session.user)
+            {
                 continue;
             }
             let Some(enc) = enc_pub_of(m) else { continue };
@@ -779,12 +1037,15 @@ impl<T: Transport> Engine<'_, T> {
             let Some(key) = ctx.keys.get(&(p.scope_id, p.generation)) else {
                 continue;
             };
-            // Only to an actual, entitled member whose published key matches.
+            // Only to an actual, entitled member whose published key matches
+            // and whom this user approved (the others wait in the team's
+            // approvals).
             let Some(m) = ctx.member(team, p.user_id) else {
                 continue;
             };
             if !entitled(scope.role, &Grants::from_wire(&m.role, &m.permissions))
                 || m.enc_pub.as_deref() != Some(p.enc_pub.as_str())
+                || !ctx.trusts(team, m, self.session.user)
             {
                 continue;
             }
@@ -903,7 +1164,7 @@ impl<T: Transport> Engine<'_, T> {
     pub fn export(&self, now_ms: u64) -> Result<Export, CycleError> {
         let me = self.client.me()?;
         let mut scratch = Output::default();
-        let ctx = self.load_context(&me, &mut scratch)?;
+        let ctx = self.load_context(&me, None, &mut scratch)?;
         let mut personal: BTreeMap<String, Vec<Value>> = BTreeMap::new();
         let mut teams: BTreeMap<Uuid, BTreeMap<String, Vec<Value>>> = BTreeMap::new();
         let (mut items, mut skipped) = (0, 0);
@@ -1614,6 +1875,7 @@ impl<T: Transport> Engine<'_, T> {
         ]
         .into_iter()
         .any(|r| entitled(r, &grants) && ctx.current_key(r).is_none());
+        let approvals = self.approvals(team, &grants, ctx);
         TeamView {
             id: team,
             name: name.to_string(),
@@ -1639,7 +1901,83 @@ impl<T: Transport> Engine<'_, T> {
             items,
             activity,
             waiting_for_keys,
+            approvals,
         }
+    }
+
+    /// The members this user still has to decide about: for someone who
+    /// manages the team, everyone who would get a key from them or could give
+    /// them one; for anyone else, just the managers they take keys from.
+    fn approvals(&self, team: Uuid, mine: &Grants, ctx: &Ctx) -> Vec<ApprovalView> {
+        let Some(trust) = ctx.trust.as_ref().and_then(|t| t.get(&team)) else {
+            return Vec::new();
+        };
+        let i_manage = mine.has(Permission::MembersManage);
+        let mut out = Vec::new();
+        for m in ctx.members.get(&team).into_iter().flatten() {
+            if m.user_id == self.session.user || ctx.trusts(team, m, self.session.user) {
+                continue;
+            }
+            let manager = manages(m);
+            if !(manager || (i_manage && holds_team_keys(m))) {
+                continue;
+            }
+            let Some(keys) = MemberKeys::of(m) else {
+                continue; // no account keys yet: nothing to approve
+            };
+            let Some(fingerprint) = keys.fingerprint() else {
+                continue;
+            };
+            let known = trust
+                .approved
+                .get(&m.user_id)
+                .or_else(|| trust.declined.get(&m.user_id));
+            out.push(ApprovalView {
+                user_id: m.user_id,
+                name: m.display().to_string(),
+                email: m.email.clone(),
+                role: m.role.clone(),
+                fingerprint,
+                keys_changed: known.is_some_and(|k| *k != keys),
+                declined: trust.declined.get(&m.user_id) == Some(&keys),
+                manager,
+                keys,
+            });
+        }
+        out
+    }
+}
+
+/// One notification for each member who starts waiting for a decision.
+fn announce_approvals(
+    view: &TeamView,
+    trust: &mut HashMap<Uuid, TeamTrust>,
+    notes: &mut Vec<String>,
+) {
+    let Some(t) = trust.get_mut(&view.id) else {
+        return;
+    };
+    let i_manage = view.grants().has(Permission::MembersManage);
+    for a in &view.approvals {
+        if a.declined || t.asked.get(&a.user_id) == Some(&a.keys) {
+            continue;
+        }
+        t.asked.insert(a.user_id, a.keys.clone());
+        let team = &view.name;
+        let who = &a.name;
+        notes.push(if a.keys_changed {
+            format!(
+                "{who}'s encryption key in {team} changed. Check with them before you approve it in Settings → muxel Cloud."
+            )
+        } else if i_manage {
+            format!(
+                "{who} joined {team}. Approve them in Settings → muxel Cloud to share the team's keys with them."
+            )
+        } else {
+            format!(
+                "{who} now manages {team}'s keys. Approve them in Settings → muxel Cloud to keep syncing with the team."
+            )
+        });
     }
 }
 

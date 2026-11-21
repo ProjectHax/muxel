@@ -11,7 +11,8 @@ use super::*;
 use muxel_cloud::account::{self, AUK_SECRET, AccountFile, Setup, TOKEN_SECRET};
 use muxel_cloud::api::{ApiError, Client, DevicePoll, DeviceStart, Http, Me};
 use muxel_cloud::engine::{
-    self, CycleError, Engine, EngineState, Input, Output, Session, TeamSettingWrite, TeamView,
+    self, ApprovalView, CycleError, Engine, EngineState, Input, MemberDecision, Output, Session,
+    TeamSettingWrite, TeamView,
 };
 use muxel_cloud::store::{CloudDir, Op, TaskHome, TaskStore, WindowPresence};
 use muxel_core::cloud::activity::{self, AgentActivity, Presence, ProjectActivity};
@@ -906,7 +907,14 @@ impl MuxelApp {
             .iter()
             .filter_map(|(_, op)| match op {
                 Op::Share(w) => Some(w.clone()),
-                Op::Task { .. } | Op::SyncNow => None,
+                Op::Task { .. } | Op::SyncNow | Op::Trust(_) => None,
+            })
+            .collect();
+        let decisions: Vec<MemberDecision> = queued
+            .iter()
+            .filter_map(|(_, op)| match op {
+                Op::Trust(d) => Some(d.clone()),
+                Op::Task { .. } | Op::SyncNow | Op::Share(_) => None,
             })
             .collect();
         self.cloud.sent_ops = queued.into_iter().map(|(f, _)| f).collect();
@@ -932,6 +940,7 @@ impl MuxelApp {
                         account,
                         settings,
                         shares,
+                        decisions,
                         presence,
                     };
                     let out = run_cycle(&job, &tasks, &projects, &mut state);
@@ -1227,20 +1236,144 @@ impl MuxelApp {
                                 div().text_sm().child(role_label(&team.role)),
                             );
                             if team.waiting_for_keys {
-                                row = row.desc(t(
-                                    "Waiting for a team admin's muxel to come online and share the team's keys.",
-                                ));
+                                row = row.desc(if team.approvals.iter().any(|a| !a.declined) {
+                                    t("Waiting for you to approve a team admin below.")
+                                } else {
+                                    t("Waiting for a team admin to approve you in muxel, which then shares the team's keys.")
+                                });
                             }
                             row
                         })
                         .collect(),
                 )));
+                let approvals = self.cloud_approval_rows(cx);
+                if !approvals.is_empty() {
+                    blocks.push(Block::Group(Group::new(
+                        t("Team members to approve"),
+                        approvals,
+                    )));
+                    blocks.push(Block::Note(t(
+                        "muxel shares a team's keys only with members you approve, and uses keys only from admins you approve. Before you approve someone, check that the fingerprint here matches the one they see under Settings → muxel Cloud.",
+                    )));
+                }
             }
             if !self.cloud.teams.is_empty() || self.workspace.cloud.is_some() {
                 blocks.extend(self.cloud_workspace_blocks(form, cx));
             }
         }
         form.page(blocks).into_any_element()
+    }
+
+    // --- Approving team members ----------------------------------------------
+
+    /// One row per member waiting for this user's decision, across teams.
+    fn cloud_approval_rows(&self, cx: &mut Context<Self>) -> Vec<Row> {
+        let mut rows = Vec::new();
+        for team in &self.cloud.teams {
+            let i_manage = team.grants().has(Permission::MembersManage);
+            for a in &team.approvals {
+                let key = format!("{}-{}", team.id.simple(), a.user_id.simple());
+                let decide = |approve: bool| {
+                    let (team, approval) = (team.id, a.clone());
+                    cx.listener(move |this, _, _w, cx| {
+                        this.cloud_decide_member(team, &approval, approve, cx)
+                    })
+                };
+                let mut buttons = h_flex().gap_2().child(
+                    Button::new(SharedString::from(format!("cloud-approve-{key}")))
+                        .small()
+                        .primary()
+                        .label(t("Approve"))
+                        .on_click(decide(true)),
+                );
+                if !a.declined {
+                    buttons = buttons.child(
+                        Button::new(SharedString::from(format!("cloud-decline-{key}")))
+                            .small()
+                            .ghost()
+                            .label(t("Decline"))
+                            .on_click(decide(false)),
+                    );
+                }
+                let role = role_label(&a.role);
+                let args = [
+                    ("email", a.email.as_str()),
+                    ("role", role.as_ref()),
+                    ("team", team.name.as_str()),
+                    ("fp", a.fingerprint.as_str()),
+                ];
+                let desc = if a.declined {
+                    tf(
+                        "{email}, {role} in {team}. You declined them, so they get no keys from this computer. Fingerprint: {fp}",
+                        &args,
+                    )
+                } else if i_manage {
+                    tf(
+                        "{email}, {role} in {team}. Approving shares the team's keys with them. Fingerprint: {fp}",
+                        &args,
+                    )
+                } else {
+                    tf(
+                        "{email}, {role} in {team}. They can hand out the team's keys; approving lets muxel use keys from them. Fingerprint: {fp}",
+                        &args,
+                    )
+                };
+                rows.push(
+                    Row::new(a.name.clone(), buttons)
+                        .desc(desc)
+                        .warn(a.keys_changed.then(|| {
+                            t("Their encryption key is not the one you saw before. Keys don't change in normal use: check with them before you approve.")
+                        }))
+                        .keywords("approve member fingerprint keys trust team"),
+                );
+            }
+        }
+        rows
+    }
+
+    /// Queue the user's answer about a team member for the next sync, and
+    /// take the row out of the list straight away.
+    fn cloud_decide_member(
+        &mut self,
+        team: Uuid,
+        approval: &ApprovalView,
+        approve: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let op = Op::Trust(MemberDecision {
+            team,
+            user: approval.user_id,
+            keys: approval.keys.clone(),
+            approve,
+        });
+        let queued = self
+            .cloud
+            .dir
+            .as_ref()
+            .map(|dir| dir.enqueue(&op).map_err(|e| e.to_string()));
+        match queued {
+            Some(Ok(())) => {
+                if let Some(view) = self.cloud.teams.iter_mut().find(|t| t.id == team) {
+                    if approve {
+                        view.approvals.retain(|a| a.user_id != approval.user_id);
+                    } else if let Some(a) = view
+                        .approvals
+                        .iter_mut()
+                        .find(|a| a.user_id == approval.user_id)
+                    {
+                        a.declined = true;
+                    }
+                }
+                self.cloud.request_sync();
+            }
+            Some(Err(why)) => self.add_event(
+                NotifKind::Error,
+                t("muxel Cloud").to_string(),
+                tf("Couldn't save that: {error}", &[("error", &why)]),
+            ),
+            None => {}
+        }
+        cx.notify();
     }
 
     // --- Team-shared runners, snippets and loops -----------------------------
@@ -2058,6 +2191,7 @@ struct CycleJob {
     account: AccountFile,
     settings: muxel_core::Settings,
     shares: Vec<TeamSettingWrite>,
+    decisions: Vec<MemberDecision>,
     presence: Vec<(Uuid, Presence)>,
 }
 
@@ -2073,6 +2207,7 @@ fn run_cycle(
         account,
         settings,
         shares,
+        decisions,
         presence,
     } = job;
     let (client, session) = open_session(url, account)?;
@@ -2087,6 +2222,7 @@ fn run_cycle(
         personal_tasks: &tasks.personal,
         team_tasks: &tasks.teams,
         team_setting_writes: shares,
+        member_decisions: decisions,
         presence,
         task_deletions: &tasks.deleted,
         now_ms: now_ms(),

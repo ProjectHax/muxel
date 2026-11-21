@@ -108,6 +108,7 @@ fn cycle(d: &mut Dev, presence: &[(Uuid, Presence)]) -> Output {
         personal_tasks: &d.personal,
         team_tasks: &d.team,
         team_setting_writes: &[],
+        member_decisions: &[],
         presence,
         task_deletions: &[],
         now_ms: now,

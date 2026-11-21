@@ -972,12 +972,22 @@ feature is added or changed, update the matching entry here in the same change**
   saves. A stale window can't revert pulled changes, and pausing sync in any
   window pauses it everywhere.
 - **Teams** — the Cloud page lists your teams and your role in each. It says
-  when you're waiting for a team admin's muxel to share the team's keys. When a
-  member loses a role's access, the next admin sync rotates that key, so they
-  can't read anything shared afterwards, and their muxel drops the team's
-  shared settings. What they shared stays with the team: the muxel of a
+  when you're waiting for a team admin to approve you and share the team's
+  keys. When a member loses a role's access, the next admin sync rotates that
+  key, so they can't read anything shared afterwards, and their muxel drops
+  the team's shared settings. What they shared stays with the team: the muxel of a
   teammate who may edit it signs it again under the current key, so new
   devices and later joiners can still read it.
+- **Approving team members** — muxel doesn't take the server's word for who is
+  in a team. The first time a computer sees a team it trusts the members it
+  finds there. Anyone who joins later is listed under "Team members to
+  approve" on the Cloud page, with their key fingerprint, and a notification
+  says so once. An admin's muxel shares the team's keys with a member only
+  after the admin approves them, including when keys are replaced. Everyone's
+  muxel uses keys only from admins they approved. A member whose encryption
+  key changed is flagged and has to be approved again, and so is someone who
+  left and came back. Declining keeps them listed, so it can be undone. Each
+  computer keeps its own approvals.
 - **Team or private workspaces** — under "This workspace", a workspace works
   for one of your teams or stays private. Only a team's workspaces show its
   shared runners, snippets and loops, its tasks (with a switch to hide them),

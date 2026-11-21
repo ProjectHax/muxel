@@ -8,7 +8,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use muxel_cloud::api::{ApiError, Client, Transport};
 use muxel_cloud::crypto;
-use muxel_cloud::engine::{Engine, EngineState, Input, Session, TaskDeletion};
+use muxel_cloud::engine::{
+    Engine, EngineState, Input, MemberDecision, Output, Session, TaskDeletion,
+};
 use muxel_core::Settings;
 use muxel_core::cloud::CloudSettings;
 use muxel_core::cloud::activity::{AgentActivity, Presence, ProjectActivity};
@@ -385,6 +387,8 @@ struct Dev {
     personal_tasks: Vec<Task>,
     team_tasks: HashMap<Uuid, Vec<Task>>,
     deletions: Vec<TaskDeletion>,
+    /// The user's answers about members, sent with the next cycle.
+    decisions: Vec<MemberDecision>,
 }
 
 /// A user with a fresh account; returns what any of their devices needs to
@@ -430,7 +434,30 @@ fn device(fake: &Fake, acct: &Account) -> Dev {
         personal_tasks: Vec::new(),
         team_tasks: HashMap::new(),
         deletions: Vec::new(),
+        decisions: Vec::new(),
     }
+}
+
+/// Answer for everyone `out` lists as waiting, the way the app queues the
+/// user's clicks; the next cycle applies it.
+fn decide_all(d: &mut Dev, out: &Output, approve: bool) {
+    for t in &out.teams {
+        for a in &t.approvals {
+            d.decisions.push(MemberDecision {
+                team: t.id,
+                user: a.user_id,
+                keys: a.keys.clone(),
+                approve,
+            });
+        }
+    }
+}
+
+/// One cycle to see who is waiting, then approve them all and share keys.
+fn approve_waiting(d: &mut Dev) -> Output {
+    let out = cycle(d, &[]);
+    decide_all(d, &out, true);
+    cycle(d, &[])
 }
 
 fn cycle(d: &mut Dev, presence: &[(Uuid, Presence)]) -> muxel_cloud::engine::Output {
@@ -457,11 +484,13 @@ fn cycle_any(d: &mut Dev, presence: &[(Uuid, Presence)]) -> muxel_cloud::engine:
         personal_tasks: &d.personal_tasks,
         team_tasks: &d.team_tasks,
         team_setting_writes: &[],
+        member_decisions: &d.decisions,
         presence,
         task_deletions: &d.deletions,
         now_ms: 1_700_000_000_000,
     };
     let out = engine.cycle(&input, &mut d.state).expect("cycle");
+    d.decisions.clear();
     // Replay onto the live settings, as the app does on its UI thread.
     muxel_cloud::engine::apply_deltas(&mut d.settings, &out.settings_changes, &projects, &d.state);
     if let Some(t) = out.personal_tasks.clone() {
@@ -836,8 +865,39 @@ fn team_tasks_roles_grants_and_activity() {
     assert!(out.teams[0].activity.is_empty());
 }
 
+/// Add `acct` to `team` with `role`, as the server's member list.
+fn join(fake: &Fake, team: Uuid, acct: &Account, role: &str) {
+    fake.0
+        .lock()
+        .unwrap()
+        .teams
+        .get_mut(&team)
+        .unwrap()
+        .1
+        .push((acct.id, role.into()));
+}
+
+/// Mark every scope of `team` as needing a new key, as the server does when
+/// someone leaves.
+fn require_rotation(fake: &Fake, team: Uuid) {
+    let mut w = fake.0.lock().unwrap();
+    for s in w.scopes.iter_mut().filter(|s| s.2 == Some(team)) {
+        s.4 = true;
+    }
+}
+
+/// How many team key grants the server holds for `user` (their own personal
+/// scope's doesn't count).
+fn grants_for(fake: &Fake, user: Uuid) -> usize {
+    let w = fake.0.lock().unwrap();
+    w.grants
+        .iter()
+        .filter(|g| g.2 == user && w.scopes.iter().any(|s| s.0 == g.0 && s.2.is_some()))
+        .count()
+}
+
 #[test]
-fn late_joiner_gets_keys_from_an_online_admin() {
+fn a_late_joiner_gets_keys_once_an_admin_approves_them() {
     let fake = Fake::default();
     let oa = user(&fake);
     let owner = oa.id;
@@ -866,8 +926,32 @@ fn late_joiner_gets_keys_from_an_online_admin() {
     let out = cycle(&mut l, &[]);
     assert!(out.teams[0].waiting_for_keys, "no admin online yet");
 
+    // The admin's muxel doesn't hand keys to someone just because the server
+    // lists them: it asks first, once.
+    let out = cycle(&mut o, &[]);
+    assert!(!out.notes.iter().any(|n| n.starts_with("Shared team keys")));
+    assert_eq!(
+        out.notes.iter().filter(|n| n.contains("joined T")).count(),
+        1
+    );
+    let waiting = &out.teams[0].approvals;
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0].user_id, la.id);
+    assert_eq!(
+        waiting[0].fingerprint,
+        crypto::unlock(&la.bundle, &la.auk).unwrap().fingerprint(),
+        "the fingerprint the joiner sees on their own device"
+    );
+    assert!(!waiting[0].keys_changed && !waiting[0].declined);
+    assert_eq!(grants_for(&fake, la.id), 0);
+    let again = cycle(&mut o, &[]);
+    assert!(again.notes.is_empty(), "asked once: {:?}", again.notes);
+    assert_eq!(again.teams[0].approvals.len(), 1, "still listed");
+
+    decide_all(&mut o, &out, true);
     let out = cycle(&mut o, &[]);
     assert!(out.notes.iter().any(|n| n.starts_with("Shared team keys")));
+    assert!(out.teams[0].approvals.is_empty());
     // Keys arrive; items skipped before (no key yet) are fetched again.
     let out = cycle(&mut l, &[]);
     assert!(!out.teams[0].waiting_for_keys);
@@ -907,6 +991,7 @@ fn tampered_or_unauthorized_items_are_rejected() {
         personal_tasks: &[],
         team_tasks: &HashMap::new(),
         team_setting_writes: std::slice::from_ref(&w),
+        member_decisions: &[],
         presence: &[],
         task_deletions: &[],
         now_ms: 1,
@@ -933,6 +1018,7 @@ fn tampered_or_unauthorized_items_are_rejected() {
         personal_tasks: &[],
         team_tasks: &HashMap::new(),
         team_setting_writes: &[],
+        member_decisions: &[],
         presence: &[],
         task_deletions: &[],
         now_ms: 1,
@@ -1007,6 +1093,7 @@ fn an_edit_made_during_a_cycle_is_not_overwritten() {
         personal_tasks: &[],
         team_tasks: &HashMap::new(),
         team_setting_writes: &[],
+        member_decisions: &[],
         presence: &[],
         task_deletions: &[],
         now_ms: 1_700_000_000_000,
@@ -1041,6 +1128,7 @@ fn cycle_writing(
         personal_tasks: &d.personal_tasks,
         team_tasks: &d.team_tasks,
         team_setting_writes: writes,
+        member_decisions: &[],
         presence: &[],
         task_deletions: &[],
         now_ms: 1_700_000_000_000,
@@ -1349,12 +1437,259 @@ fn a_late_joiner_after_a_rotation_reads_items_from_before_it() {
         .push((la.id, "member".into()));
     let mut l = device(&fake, &la);
     cycle(&mut l, &[]);
-    cycle(&mut o, &[]); // grants the joiner's keys
+    approve_waiting(&mut o); // grants the joiner's keys
     let out = cycle(&mut l, &[]);
     assert_eq!(
         out.teams[0].items["snippets"].len(),
         1,
         "the older item is readable"
+    );
+}
+
+/// A team with an owner whose device has synced once, plus that device.
+fn team_with_owner(fake: &Fake) -> (Uuid, Account, Dev) {
+    let oa = user(fake);
+    let team = Uuid::new_v4();
+    fake.0
+        .lock()
+        .unwrap()
+        .teams
+        .insert(team, ("T".into(), vec![(oa.id, "owner".into())]));
+    let mut o = device(fake, &oa);
+    cycle(&mut o, &[]);
+    (team, oa, o)
+}
+
+#[test]
+fn a_member_the_server_slips_in_gets_no_key_even_through_a_rotation() {
+    let fake = Fake::default();
+    let (team, _oa, mut o) = team_with_owner(&fake);
+    cycle_writing(&mut o, &[share_snippet(team, "secret")]);
+
+    // A compromised server lists someone the owner never invited, then asks
+    // for new keys (the flag is the server's to set).
+    let ghost = user(&fake);
+    join(&fake, team, &ghost, "admin");
+    require_rotation(&fake, team);
+    let out = cycle(&mut o, &[]);
+    assert!(
+        out.notes
+            .iter()
+            .any(|n| n.starts_with("Rotated a team key"))
+    );
+    assert_eq!(
+        grants_for(&fake, ghost.id),
+        0,
+        "the new key went to nobody else"
+    );
+    assert_eq!(out.teams[0].approvals.len(), 1);
+    assert!(out.teams[0].approvals[0].manager);
+    let mut g = device(&fake, &ghost);
+    let seen = cycle(&mut g, &[]);
+    assert!(seen.teams[0].waiting_for_keys);
+    assert!(seen.teams[0].items.is_empty());
+
+    // Declining settles it: no key, and no more questions.
+    decide_all(&mut o, &out, false);
+    let out = cycle(&mut o, &[]);
+    assert_eq!(grants_for(&fake, ghost.id), 0);
+    assert!(out.notes.is_empty(), "{:?}", out.notes);
+    assert!(
+        out.teams[0].approvals[0].declined,
+        "listed, so it can be undone"
+    );
+    require_rotation(&fake, team);
+    cycle(&mut o, &[]);
+    assert_eq!(grants_for(&fake, ghost.id), 0);
+
+    // Changing one's mind later works.
+    let out = cycle(&mut o, &[]);
+    decide_all(&mut o, &out, true);
+    cycle(&mut o, &[]);
+    assert!(grants_for(&fake, ghost.id) > 0);
+}
+
+#[test]
+fn a_member_whose_keys_were_swapped_is_not_trusted() {
+    let fake = Fake::default();
+    let (team, _oa, mut o) = team_with_owner(&fake);
+    let ma = user(&fake);
+    join(&fake, team, &ma, "member");
+    let asked = cycle(&mut o, &[]);
+    decide_all(&mut o, &asked, true);
+    cycle(&mut o, &[]);
+    let had = grants_for(&fake, ma.id);
+    assert!(had > 0);
+
+    // The server swaps the member's published keys for ones it holds.
+    let theirs = crypto::create_account().unwrap();
+    fake.0.lock().unwrap().users.insert(
+        ma.id,
+        (
+            theirs.bundle.enc_pub.clone(),
+            theirs.bundle.sign_pub.clone(),
+        ),
+    );
+    require_rotation(&fake, team);
+    let out = cycle(&mut o, &[]);
+    assert_eq!(
+        grants_for(&fake, ma.id),
+        had,
+        "nothing wrapped to the new keys"
+    );
+    let a = &out.teams[0].approvals[0];
+    assert!(a.keys_changed);
+    assert_eq!(a.fingerprint, theirs.keys.fingerprint());
+    assert!(
+        out.notes
+            .iter()
+            .any(|n| n.contains("encryption key in T changed"))
+    );
+
+    // An answer given for the keys shown earlier doesn't cover the new ones.
+    decide_all(&mut o, &asked, true);
+    let out = cycle(&mut o, &[]);
+    assert_eq!(grants_for(&fake, ma.id), had);
+    assert_eq!(out.teams[0].approvals.len(), 1);
+}
+
+#[test]
+fn a_key_from_a_manager_nobody_approved_is_not_used() {
+    let fake = Fake::default();
+    let (team, _oa, mut o) = team_with_owner(&fake);
+    let ma = user(&fake);
+    join(&fake, team, &ma, "member");
+    approve_waiting(&mut o);
+    let mut m = device(&fake, &ma);
+    let task = Task::new("before", Some(ma.id), 1);
+    m.team_tasks.insert(team, vec![task.clone()]);
+    cycle(&mut m, &[]);
+    cycle(&mut o, &[]);
+    assert_eq!(o.team_tasks[&team].len(), 1);
+
+    // A compromised server adds an admin of its own, who replaces the team's
+    // keys with ones it knows and hands them to everyone.
+    let ghost = user(&fake);
+    join(&fake, team, &ghost, "admin");
+    require_rotation(&fake, team);
+    let mut g = device(&fake, &ghost);
+    let out = cycle(&mut g, &[]);
+    assert!(
+        out.notes
+            .iter()
+            .any(|n| n.starts_with("Rotated a team key"))
+    );
+    assert!(
+        grants_for(&fake, ma.id) > 3,
+        "the ghost granted its key to the member"
+    );
+
+    // Neither the member nor the owner takes that key, so nothing of theirs
+    // is written (or re-sealed) under it.
+    let puts = fake.0.lock().unwrap().puts;
+    m.team_tasks
+        .get_mut(&team)
+        .unwrap()
+        .push(Task::new("after", Some(ma.id), 2));
+    let out = cycle_any(&mut m, &[]);
+    assert!(out.teams[0].waiting_for_keys);
+    assert!(out.notes.iter().any(|n| n.contains("now manages T's keys")));
+    assert_eq!(out.teams[0].approvals.len(), 1);
+    assert!(out.teams[0].approvals[0].manager);
+    let out = cycle_any(&mut o, &[]);
+    assert!(out.teams[0].waiting_for_keys);
+    assert!(out.notes.iter().any(|n| n.contains("joined T")));
+    assert_eq!(
+        fake.0.lock().unwrap().puts,
+        puts,
+        "nothing written under the ghost's key"
+    );
+
+    // If the admin is real, approving them makes their key usable.
+    decide_all(&mut m, &out, true);
+    let out = cycle(&mut m, &[]);
+    assert!(!out.teams[0].waiting_for_keys);
+    assert!(fake.0.lock().unwrap().puts > puts);
+}
+
+#[test]
+fn a_new_device_trusts_the_members_it_finds_but_not_those_still_waiting() {
+    let fake = Fake::default();
+    let (team, oa, mut o) = team_with_owner(&fake);
+    let ma = user(&fake);
+    join(&fake, team, &ma, "member");
+    approve_waiting(&mut o);
+    // Someone joins while no admin is looking.
+    let la = user(&fake);
+    join(&fake, team, &la, "member");
+
+    // The owner's second computer: first sight of the team.
+    let mut o2 = device(&fake, &oa);
+    let out = cycle(&mut o2, &[]);
+    let waiting: Vec<Uuid> = out.teams[0].approvals.iter().map(|a| a.user_id).collect();
+    assert_eq!(
+        waiting,
+        vec![la.id],
+        "the keyed member is trusted, the newcomer isn't"
+    );
+    assert_eq!(grants_for(&fake, la.id), 0);
+
+    // A member's own first sight trusts the managers already there.
+    let mut m = device(&fake, &ma);
+    let out = cycle(&mut m, &[]);
+    assert!(out.teams[0].approvals.is_empty());
+    assert!(!out.teams[0].waiting_for_keys);
+}
+
+#[test]
+fn a_team_the_server_hides_for_a_while_does_not_start_trust_over() {
+    let fake = Fake::default();
+    let (team, oa, mut o) = team_with_owner(&fake);
+
+    // The server stops listing the team for this user, then lists it again
+    // with someone new in it. That mustn't count as a first sight.
+    let members = std::mem::take(&mut fake.0.lock().unwrap().teams.get_mut(&team).unwrap().1);
+    let out = cycle(&mut o, &[]);
+    assert!(out.teams.is_empty());
+    fake.0.lock().unwrap().teams.get_mut(&team).unwrap().1 = members;
+    let ghost = user(&fake);
+    join(&fake, team, &ghost, "member");
+    require_rotation(&fake, team);
+    let out = cycle(&mut o, &[]);
+    assert_eq!(out.teams[0].approvals.len(), 1);
+    assert_eq!(grants_for(&fake, ghost.id), 0);
+    assert!(
+        grants_for(&fake, oa.id) > 3,
+        "the owner still rotated for themselves"
+    );
+}
+
+#[test]
+fn someone_who_leaves_and_comes_back_is_asked_about_again() {
+    let fake = Fake::default();
+    let (team, _oa, mut o) = team_with_owner(&fake);
+    let ma = user(&fake);
+    join(&fake, team, &ma, "member");
+    approve_waiting(&mut o);
+    let had = grants_for(&fake, ma.id);
+
+    fake.0
+        .lock()
+        .unwrap()
+        .teams
+        .get_mut(&team)
+        .unwrap()
+        .1
+        .retain(|(u, _)| *u != ma.id);
+    require_rotation(&fake, team);
+    cycle(&mut o, &[]);
+    join(&fake, team, &ma, "member");
+    let out = cycle(&mut o, &[]);
+    assert_eq!(out.teams[0].approvals.len(), 1);
+    assert_eq!(
+        grants_for(&fake, ma.id),
+        had,
+        "no key for the new generation yet"
     );
 }
 

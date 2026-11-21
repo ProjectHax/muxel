@@ -135,7 +135,7 @@ grant.signature   = Ed25519(granter.sign_sk, "muxel-cloud/v1/grant-sig|" ‖ sco
 Readers verify `grant.signature` before trusting a scope key. A grant must be signed by one of these:
 - the member themselves (for the personal scope);
 - the team member who created the scope;
-- a member whose role carries `members.manage` according to `/teams/{id}/members`.
+- a member whose role carries `members.manage` according to `/teams/{id}/members`, and whom this device's user has approved (*Member approval* below).
 
 ```
 GET  /scopes   → [{"id", "kind": "personal"|"team_settings"|"team_tasks"|"team_activity",
@@ -162,9 +162,16 @@ POST /scopes/{id}/rotate {"generation": g+1, "grants": [{"user_id","wrapped_key"
 - A scope needs a plan to be created (402 otherwise). Rotation and `POST /grants` don't, because they keep removed members out.
 - Deleting an account never deletes a team's scopes, items or other members' grants. Grants the deleted user had signed are no longer served by `/keys`, because no client could verify them. A manager may replace such a grant with `POST /grants` at the same generation.
 
-**Pending grants.** When a member joins, or their role starts allowing a scope, the server adds a *pending grant*. Any online client whose user holds `members.manage` and has the scope key fulfils it in the background.
+**Pending grants.** When a member joins, or their role starts allowing a scope, the server adds a *pending grant*. Any online client whose user holds `members.manage`, has the scope key and has approved that member (below) fulfils it in the background.
 
-**Rotation.** When a member leaves, or their role stops allowing a scope, the server sets `rotation_required`. The next such client creates generation `g+1`, grants it to every remaining entitled member and calls `/rotate`. New writes use the newest generation. Rotation does not revoke data the departed member already saw.
+**Member approval.** The member list comes from the server, so a client doesn't act on it alone: a server that listed an extra member, or swapped a member's public keys for its own, would otherwise be handed the team's keys. Each device keeps, per team, the members its user has approved, each pinned to the `enc_pub` and `sign_pub` they had at the time.
+- The first time a device sees a team, it approves the members listed then (trust on first use). A device whose user holds `members.manage` leaves out members who still have a pending grant.
+- A member who appears later, whose keys differ from the pinned ones, or who left and came back, waits for the user's decision. The client shows their fingerprint (§3.1) to compare with the one the member sees.
+- A client grants a scope key only to approved members: when it creates a scope, rotates it, or fulfils a pending grant. Entitled members it leaves out stay pending on the server.
+- A client uses a grant only if its granter is approved. A grant from a manager who isn't approved yet is left unused, so nothing is written or re-sealed under a key from them.
+- Approvals are local to a device and are not synced.
+
+**Rotation.** When a member leaves, or their role stops allowing a scope, the server sets `rotation_required`. The next such client creates generation `g+1`, grants it to every remaining entitled member it has approved and calls `/rotate`. New writes use the newest generation. Rotation does not revoke data the departed member already saw.
 
 **Re-sealing.** Clients trust a grant only from a *current* member holding `members.manage`, and an item only from a *current* member allowed to write it. They don't keep scope keys between syncs, and pending grants and rotation only hand out the current generation. So an item sealed under an older generation, or written by someone who has since left or lost write permission, stops opening on new devices and for later joiners. To keep team data alive, every client whose user may write a team scope (`settings.write`, or `tasks.update`; deleted tasks also need `tasks.delete`) re-seals such items each sync. It writes its own synced copy again under the current generation, signed by itself, with `base_version` set to the version it last synced. It re-seals only a copy it verified (or wrote) and hasn't changed since, so the server can't get anything else signed this way. A 409 means someone else got there first, and a 403 (for example a sync policy) leaves the item to another writer. Clients record each item's author and generation to decide this. Data no writer's device had verified before its author left can't be recovered: that's the price of an untrusted server. A grant for an older generation from someone no longer trusted is skipped without an error.
 

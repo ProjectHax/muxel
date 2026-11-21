@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::api::Me;
-use crate::engine::{EngineState, TaskDeletion, TeamSettingWrite, TeamView};
+use crate::engine::{EngineState, MemberDecision, TaskDeletion, TeamSettingWrite, TeamView};
 
 /// Tasks for this profile: personal ones (work without an account) and each
 /// team's (synced only in a team-bound workspace).
@@ -191,6 +191,8 @@ pub enum Op {
     Task { home: TaskHome, task: Task },
     /// Share (or stop sharing) a setting with a team.
     Share(TeamSettingWrite),
+    /// The user approved or declined a team member's keys.
+    Trust(MemberDecision),
     /// Run a sync cycle now (e.g. after signing in or changing a toggle).
     SyncNow,
 }
@@ -257,9 +259,18 @@ impl CloudDir {
     }
 
     pub fn load_state(&self) -> EngineState {
-        self.read("state.json")
+        let mut state: EngineState = self.read("state.json");
+        if state.trust.is_empty() {
+            state.trust = self.read("trust.json");
+        }
+        state
     }
+    /// Whose keys the user approved is also kept in a file of its own, which
+    /// [`Self::clear`] leaves alone: signing out and in again (which a server
+    /// can force by refusing the token) must not start trust over, or members
+    /// the server added meanwhile would be trusted on sight.
     pub fn save_state(&self, s: &EngineState) -> std::io::Result<()> {
+        self.write("trust.json", &s.trust)?;
         self.write("state.json", s)
     }
 
@@ -314,7 +325,8 @@ impl CloudDir {
     }
 
     /// Forget everything this device knows about the account (sign out).
-    /// The lock file stays: another process may hold it.
+    /// The lock file stays: another process may hold it. So does `trust.json`
+    /// (see [`Self::save_state`]).
     pub fn clear(&self) {
         for name in [
             "account.json",
@@ -472,6 +484,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{CloudDir, Op, TaskHome, TaskStore, WindowPresence};
+    use crate::engine::{EngineState, MemberKeys, TeamTrust};
     use muxel_core::cloud::activity::{Presence, ProjectActivity};
     use muxel_core::cloud::tasks::Task;
     use uuid::Uuid;
@@ -480,6 +493,29 @@ mod tests {
         let d = std::env::temp_dir().join(format!("muxel-cloud-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn approvals_survive_signing_out() {
+        let d = tmp();
+        let dir = CloudDir::new(&d);
+        let (team, member) = (Uuid::new_v4(), Uuid::new_v4());
+        let keys = MemberKeys {
+            enc_pub: "e".into(),
+            sign_pub: "s".into(),
+        };
+        let mut state = EngineState::default();
+        state.sync.cursor = 7;
+        let mut trust = TeamTrust::default();
+        trust.approved.insert(member, keys.clone());
+        state.trust.insert(team, trust);
+        dir.save_state(&state).unwrap();
+
+        dir.clear();
+        let back = dir.load_state();
+        assert_eq!(back.sync.cursor, 0, "the sync state starts over");
+        assert_eq!(back.trust[&team].approved.get(&member), Some(&keys));
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]
