@@ -1105,7 +1105,9 @@ feature is added or changed, update the matching entry here in the same change**
   failures report once per cause, not on every autosave). Agent rows are
   click-to-navigate (jump to the pane + dismiss); all rows are individually
   dismissable, with a clear-all. Collected even when desktop notifications are off.
-  Click the NOTIFICATIONS header to collapse the section to one line showing how
+  Each row shows one line of title and one of detail; hovering it shows both in
+  full, so a long message (a path in an error) can be read without the developer
+  console. Click the NOTIFICATIONS header to collapse the section to one line showing how
   many notifications it holds, so incoming notifications stop pushing PROJECTS
   down; the choice is remembered per workspace.
 - **Controls** — an enable/disable toggle and a "send test notification" button.

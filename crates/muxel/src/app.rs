@@ -87,6 +87,8 @@ mod hotbar;
 mod libraries_ui;
 #[cfg(all(test, not(target_os = "macos")))]
 mod markdown_copy_tests;
+#[cfg(all(test, not(target_os = "macos")))]
+mod notification_feed_tests;
 mod pane_grid;
 #[cfg(all(test, windows))]
 mod paste_submission_tests;
@@ -29014,10 +29016,24 @@ impl MuxelApp {
                     .child(div().size(px(8.0)).rounded_full().flex_none().bg(dot))
                     .child(
                         div()
+                            .id(SharedString::from(format!("notif-text-{}", nid.simple())))
+                            .debug_selector(|| format!("notification {}", nid.simple()))
                             .flex_1()
                             .min_w_0()
                             .flex()
                             .flex_col()
+                            // The row cuts each line short; hovering it shows them whole.
+                            .tooltip({
+                                let (title, sub) = (title.clone(), sub.clone());
+                                move |window, cx| {
+                                    Self::notification_tooltip(
+                                        title.clone(),
+                                        sub.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                }
+                            })
                             .child(
                                 div()
                                     .text_xs()
@@ -29057,6 +29073,30 @@ impl MuxelApp {
             );
         }
         section
+    }
+
+    /// A NOTIFICATIONS row's title and subtitle in full, wrapped. A path in an
+    /// error's subtitle is usually what the one-line row cuts off.
+    fn notification_tooltip(
+        title: SharedString,
+        subtitle: SharedString,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyView {
+        gpui_component::tooltip::Tooltip::element(move |_, cx| {
+            div()
+                .debug_selector(|| format!("notification tooltip: {title}\n{subtitle}"))
+                .max_w(px(420.0))
+                .flex()
+                .flex_col()
+                .child(div().font_semibold().child(title.clone()))
+                .child(
+                    div()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(subtitle.clone()),
+                )
+        })
+        .build(window, cx)
     }
 
     /// A centered muted message for the git-diff panel's empty/loading states.
