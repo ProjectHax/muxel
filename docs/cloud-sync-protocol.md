@@ -32,7 +32,7 @@ implements it can be used by pointing muxel at it (`MUXEL_CLOUD_URL`).
   | 403 | `mfa_required` | The team requires 2FA and the caller hasn't turned it on (§5). |
   | 404 | `not_found` | |
   | 409 | `version_conflict` | The item changed since the client last read it (§4.2). |
-  | 413 | `too_large` | The item is over 256 KiB. |
+  | 413 | `too_large` | The item is over 256 KiB, an activity envelope is over 32 KiB, or the storage quota is full. |
   | 423 | `read_only` | Grace period after a failed payment: reads work, writes don't. |
   | 429 | `rate_limited` | A `Retry-After` header says when to retry. |
 
@@ -206,6 +206,8 @@ The **plaintext** is JSON in the form `{"hlc": "<HLC>", "kind": "<collection>", 
 
 Activity is per device and ephemeral. Its form is `secretbox(SK(activity, gen), "muxel-cloud/v1/activity|" ‖ team_id ‖ "|" ‖ user_id ‖ "|" ‖ device_id, json)` plus `gen` and an author signature over the same string ‖ the ciphertext hash, encoded like an item envelope without `wk`/`wa`. The `activity` scope key encrypts it directly.
 
+An activity envelope is at most 32 KiB (decoded); a larger one returns 413 `too_large`.
+
 ## 4. Items API
 
 ### 4.1 Pulling changes
@@ -219,6 +221,8 @@ GET /changes?cursor=<int>&limit=<≤500>
 ```
 
 `seq` is a server-wide monotonic sequence number. A client stores `cursor` and passes it back. Only items the caller may read are returned (§5). Pass `cursor=0` to resync from the start.
+
+**Page size.** A page holds at most `limit` items and about 8 MiB of envelopes (counted decoded, before base64), whichever comes first. A page always holds at least one item when any are left, even if that item alone is larger. `more: true` means items are left: the client keeps asking with the returned `cursor` until `more` is false. A short page with `more: true` is normal; it doesn't mean the end.
 
 **Export.** `GET /changes?cursor=<int>&limit=<≤500>&export=1` is the same read, except it also covers scopes whose plan has lapsed (§6). A client uses it to decrypt everything the account can read into a local file. Writes still need a plan.
 
@@ -234,7 +238,7 @@ PUT /scopes/{scope_id}/items/{collection}/{item_id}
 
 On 409 the client decrypts `current`, merges by HLC, and retries with the new `base_version`.
 
-**Limits:** 256 KiB per envelope, and a per-account storage quota.
+**Limits:** 256 KiB per envelope, and a per-account storage quota. The quota counts each item's envelope size plus a fixed per-item overhead (512 bytes), tombstones included, so many tiny items fill it too.
 
 ### 4.3 Plaintext metadata the server sees
 
@@ -272,6 +276,8 @@ GET /teams/{id}/members          → [{"user_id", "email", "name", "role", "perm
 PUT  /teams/{id}/activity        {"envelope"}             (this device's presence)
 GET  /teams/{id}/activity        → [{"user_id", "device_id", "envelope", "updated_at"}]
 ```
+
+An activity envelope is at most 32 KiB (§3.4). `GET /teams/{id}/activity` returns the freshest rows first, up to about 4 MiB of envelopes in total; older rows past that budget are left out.
 
 The panel at `cloud.muxel.sh` handles membership, invites, roles and billing.
 
