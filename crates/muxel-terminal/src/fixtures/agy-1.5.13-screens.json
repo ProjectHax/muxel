@@ -1,0 +1,10 @@
+{
+  "permission": "Requesting permission for:\n   echo probe > delete-me.tmp\n\nRun this command?\n> 1. Yes, run command\n  2. Yes, and always allow in this conversation for commands that start with\n'echo probe > delete-me.tmp'\n  3. Yes, and always allow for commands that start with 'echo probe > delete-\nme.tmp' (Persist to settings.json)\n  4. No, cancel\n\n  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command\nesc to cancel                                               Gemini 4 Neon · high",
+  "question": "Question 1/1: Please choose a color:\n\n> 1. Red\n  2. Blue\n  3. Write-in...\n\n  ↑/↓ Navigate · enter Select · esc Skip\nesc to cancel                                        auto · Gemini 4 Neon · high",
+  "edit": "Accept this file edit?\n> 1. Yes, accept this change\n  2. No, reject this change\n\n  ↑/↓ Navigate · f full diff\nesc to cancel                                               Gemini 4 Neon · high",
+  "trust": "Do you trust the contents of this project?\n\nAntigravity CLI requires permission to read, edit, and execute files here.\n\n> Yes, I trust this folder\n  No, exit\n\n  ↑/↓ Navigate · enter Confirm",
+  "wrapped_edit_option": "Accept this file edit?\n> 1. Yes, accept this\nchange\n  2. No, reject this\nchange\n\n  ↑/↓ Navigate\n  f full diff\nesc to cancel",
+  "wrapped_question_heading": "Question 1/1: Which color should be used for the sample heading when the page is\nshown in a narrow layout for the first time after opening the preview?\n\n> 1. Red\n  2. Blue\n  3. Write-in...\n\n  ↑/↓ Navigate · enter Select · esc Skip\nesc to cancel                                        auto · Gemini 4 Neon · high",
+  "plan_footer": "esc to cancel                                        plan · Gemini 4 Neon · high",
+  "default_claude_footer": "esc to cancel                                            Claude Sonnet 5.5 · low"
+}
