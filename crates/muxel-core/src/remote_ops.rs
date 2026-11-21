@@ -228,6 +228,19 @@ pub fn write_file(os: RemoteOs, abs_path: &str) -> String {
     }
 }
 
+/// A shell no-op that exits 0 on the remote host, used by the SSH login and
+/// connection checks.
+///
+/// On Windows, `exit 0` is valid in both `cmd.exe` and PowerShell and carries
+/// no quoting or metacharacters, so it survives either `DefaultShell` without
+/// paying a PowerShell process start on every check.
+pub fn noop(os: RemoteOs) -> &'static str {
+    match os {
+        RemoteOs::Unix => "true",
+        RemoteOs::Windows => "exit 0",
+    }
+}
+
 /// Whether a path exists and is a directory. Exit status carries the answer.
 pub fn test_dir(os: RemoteOs, dir: &str) -> String {
     match os {
@@ -1040,5 +1053,31 @@ mod tests {
             push_prep(WIN, "C:/p/", ".m", "a", "b", "i"),
             push_prep(WIN, "C:/p", ".m", "a", "b", "i")
         );
+    }
+
+    #[cfg(all(test, windows))]
+    #[test]
+    fn windows_noop_exits_zero_in_cmd_and_powershell() {
+        use std::os::windows::process::CommandExt as _;
+
+        let cmd = super::noop(WIN);
+        for (shell, args) in [
+            ("cmd.exe", vec!["/C", cmd]),
+            ("powershell", vec!["-NoProfile", "-Command", cmd]),
+        ] {
+            let out = std::process::Command::new(shell)
+                .args(&args)
+                .stdin(std::process::Stdio::null())
+                .creation_flags(0x0800_0000)
+                .output()
+                .unwrap_or_else(|e| panic!("failed to spawn {shell}: {e}"));
+            assert!(
+                out.status.success(),
+                "{shell} {args:?} exited {:?}: stdout={:?} stderr={:?}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).trim(),
+                String::from_utf8_lossy(&out.stderr).trim(),
+            );
+        }
     }
 }
