@@ -7176,8 +7176,9 @@ pub struct MuxelApp {
     /// has the main window — gpui-component input focus is window-bound).
     pending_editor_redock: Vec<(Uuid, EditorSnapshot, RedockAnchor)>,
     /// Browsers awaiting re-dock into the main window, carrying the URL to
-    /// rebuild from (a native webview child can't move between windows).
-    pending_browser_redock: Vec<(Uuid, String, RedockAnchor)>,
+    /// rebuild from (a native webview child can't move between windows) and
+    /// the queues the page's new-window links arrive on.
+    pending_browser_redock: Vec<(Uuid, String, crate::browser::NewWindowQueues, RedockAnchor)>,
     /// Whether the "Quit?" confirmation modal is shown (close was intercepted).
     show_quit_confirm: bool,
     /// Quit dialog: also kill muxel's LOCAL tmux sessions (off by default;
@@ -7459,8 +7460,30 @@ enum PopoutContent {
     Terminal(Entity<TerminalView>),
     Editor(EditorSnapshot),
     /// Just the URL: the native webview child belongs to the window that built
-    /// it, so the pane is re-created in its new window rather than moved.
-    Browser(String),
+    /// it, so the pane is re-created in its new window rather than moved. With
+    /// it go the queues the page's new-window links arrive on, shared by the
+    /// new window's build and the failure path, and taken by whichever builds.
+    Browser(
+        String,
+        std::rc::Rc<std::cell::RefCell<crate::browser::NewWindowQueues>>,
+    ),
+}
+
+/// Browser page `iid` built in `window` at `url`, to replace the one a move
+/// left behind, taking over the queues that one's new-window links arrive on.
+fn rebuilt_page(
+    iid: Uuid,
+    pid: Uuid,
+    url: String,
+    requested: crate::browser::NewWindowQueues,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<crate::browser::BrowserView> {
+    cx.new(|cx| {
+        let mut view = crate::browser::BrowserView::new(iid, pid, url, window, cx);
+        view.carry_new_window_requests(requested);
+        view
+    })
 }
 
 /// A pane popped out into its own window. Closing the window terminates the
@@ -15725,12 +15748,32 @@ impl MuxelApp {
             .collect();
         let mut changed = false;
         for (iid, target, view) in popped_out {
-            if let Ok(Some(url)) = target.update(cx, |_, window, cx| {
-                view.update(cx, |v, cx| v.sync(window, cx))
-            }) && let Some(inst) = self.workspace.instance_mut(iid)
+            let synced = target.update(cx, |_, window, cx| {
+                let url = view.update(cx, |v, cx| v.sync(window, cx));
+                // A click into the page. A pop-out shows one pane, so no active
+                // pane moves. An address bar that was typed in would keep GPUI's
+                // focus, so it's blurred once, as above.
+                if view.update(cx, |v, _| v.take_native_focus()) == Some(true)
+                    && view.read(cx).address_focused(window, cx)
+                {
+                    let handle = view.read(cx).focus_handle(cx);
+                    window.focus(&handle, cx);
+                    view.read(cx).focus_native(cx);
+                }
+                url
+            });
+            if let Ok(Some(url)) = synced
+                && let Some(inst) = self.workspace.instance_mut(iid)
             {
                 inst.browser_url = Some(url);
                 changed = true;
+            }
+            // A link asking for a new window opens as one clicked in a
+            // popped-out terminal does: in its project's window, raised.
+            for url in view.update(cx, |v, _| v.take_new_window_requests()) {
+                if browser_popup_url_allowed(&url) {
+                    cx.defer(move |cx| Self::open_popout_link(&url, iid, OpenFocus::Focus, cx));
+                }
             }
         }
         if changed {
@@ -23159,7 +23202,11 @@ impl MuxelApp {
         } else if let Some(ed) = self.editors.remove(&iid) {
             PopoutContent::Editor(EditorSnapshot::capture(&ed, cx))
         } else if let Some(bv) = self.browsers.remove(&iid) {
-            PopoutContent::Browser(bv.read(cx).url().to_string())
+            let requested = bv.update(cx, |v, _| v.hand_over_new_window_requests());
+            PopoutContent::Browser(
+                bv.read(cx).url().to_string(),
+                std::rc::Rc::new(std::cell::RefCell::new(requested)),
+            )
         } else {
             self.redock_into_layout(iid, pid, redock, cx);
             return;
@@ -23193,7 +23240,7 @@ impl MuxelApp {
                 let content = match &content {
                     PopoutContent::Terminal(v) => PopoutContent::Terminal(v.clone()),
                     PopoutContent::Editor(s) => PopoutContent::Editor(s.clone()),
-                    PopoutContent::Browser(u) => PopoutContent::Browser(u.clone()),
+                    PopoutContent::Browser(u, r) => PopoutContent::Browser(u.clone(), r.clone()),
                 };
                 move |window, cx| {
                     ui_profile::register_profile_window(
@@ -23207,9 +23254,9 @@ impl MuxelApp {
                             PopoutContent::Editor(snap) => {
                                 PaneView::Editor(snap.build(config, window, cx))
                             }
-                            PopoutContent::Browser(url) => PaneView::Browser(cx.new(|cx| {
-                                crate::browser::BrowserView::new(iid, pid, url, window, cx)
-                            })),
+                            PopoutContent::Browser(url, requested) => PaneView::Browser(
+                                rebuilt_page(iid, pid, url, requested.take(), window, cx),
+                            ),
                         };
                     let fh = pane.focus_handle(cx);
                     ui_profile::focus_action(
@@ -23252,9 +23299,8 @@ impl MuxelApp {
                         let ed = snap.build(config, window, cx);
                         self.editors.insert(iid, ed);
                     }
-                    PopoutContent::Browser(url) => {
-                        let bv = cx
-                            .new(|cx| crate::browser::BrowserView::new(iid, pid, url, window, cx));
+                    PopoutContent::Browser(url, requested) => {
+                        let bv = rebuilt_page(iid, pid, url, requested.take(), window, cx);
                         self.browsers.insert(iid, bv);
                     }
                 }
@@ -23302,7 +23348,9 @@ impl MuxelApp {
                 // owned by the pop-out window, so it dies with it and the pane is
                 // rebuilt against the main window in `render`.
                 let url = bv.read(cx).url().to_string();
-                self.pending_browser_redock.push((iid, url, popout.redock));
+                let requested = bv.update(cx, |v, _| v.hand_over_new_window_requests());
+                self.pending_browser_redock
+                    .push((iid, url, requested, popout.redock));
                 cx.notify();
             }
         }
@@ -23337,9 +23385,9 @@ impl MuxelApp {
         if self.pending_browser_redock.is_empty() {
             return;
         }
-        for (iid, url, redock) in std::mem::take(&mut self.pending_browser_redock) {
+        for (iid, url, requested, redock) in std::mem::take(&mut self.pending_browser_redock) {
             if let Some(pid) = self.workspace.instance(iid).map(|i| i.project_id) {
-                let bv = cx.new(|cx| crate::browser::BrowserView::new(iid, pid, url, window, cx));
+                let bv = rebuilt_page(iid, pid, url, requested, window, cx);
                 self.browsers.insert(iid, bv);
                 self.redock_into_layout(iid, pid, redock, cx);
             }
