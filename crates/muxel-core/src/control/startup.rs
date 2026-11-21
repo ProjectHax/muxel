@@ -22,6 +22,7 @@ pub enum StartupTurnState {
 pub enum StartupFailure {
     NotReady,
     NotAccepted,
+    ArgumentUnconfirmed,
     WriteFailed,
     UnsupportedProvider,
 }
@@ -34,6 +35,9 @@ impl StartupFailure {
             }
             Self::NotAccepted => {
                 "Startup task submission was not confirmed by the provider after at most one Enter retry. Inspect the pane before sending another task."
+            }
+            Self::ArgumentUnconfirmed => {
+                "Antigravity's startup turn was not confirmed. Inspect the pane before sending another task."
             }
             Self::WriteFailed => "Startup task could not be written to its terminal.",
             Self::UnsupportedProvider => {
@@ -54,6 +58,7 @@ struct Tracked {
     state: StartupTurnState,
     claimed: bool,
     may_have_pasted: bool,
+    argument_dispatched: bool,
     /// The writer admitted the task's Enter. Kept when the task fails, which
     /// `state` alone forgets.
     entered: bool,
@@ -73,6 +78,7 @@ impl Default for StartupTurn {
             state: StartupTurnState::Pending,
             claimed: false,
             may_have_pasted: false,
+            argument_dispatched: false,
             entered: false,
             guard: None,
             blocker: None,
@@ -192,7 +198,7 @@ impl StartupTurn {
                 PromptOutcome::PendingInComposer
             }
             StartupTurnState::Failed(_) | StartupTurnState::Cancelled
-                if tracked.may_have_pasted =>
+                if tracked.may_have_pasted || tracked.argument_dispatched =>
             {
                 PromptOutcome::Unconfirmed
             }
@@ -261,6 +267,18 @@ impl StartupTurnOwner {
         }
     }
 
+    /// Claim the argument once, immediately before the native process launch.
+    /// It may run later, but it has neither received an Enter nor confirmed a turn.
+    pub fn argument_admitted(&self, at: i64) -> bool {
+        let mut tracked = self.0.0.lock();
+        if tracked.state != StartupTurnState::Pending {
+            return false;
+        }
+        tracked.argument_dispatched = true;
+        tracked.state = StartupTurnState::AwaitingAcceptance(at);
+        true
+    }
+
     /// Fresh provider-owned turn evidence, observed by this launch's automation.
     /// Keep the first Enter timestamp so a fast reply predating this observation
     /// still belongs to the submitted task.
@@ -288,6 +306,33 @@ mod tests {
     use super::{StartupFailure, StartupTurn, StartupTurnState};
     use crate::AgentActivity;
     use crate::control::{AgentState, WaitOutcome, wait_outcome};
+
+    #[test]
+    fn antigravity_startup_argument_waits_for_acceptance() {
+        use crate::control::PromptOutcome;
+        let turn = StartupTurn::default();
+        let owner = turn.claim().unwrap();
+        assert!(owner.argument_admitted(10));
+        assert!(!owner.argument_admitted(11));
+        assert_eq!(turn.state(), StartupTurnState::AwaitingAcceptance(10));
+        let pending = turn.delivery("pane", false);
+        assert!(pending.prompt_pending && !pending.enter_admitted);
+        owner.submitted(12);
+        assert_eq!(turn.state(), StartupTurnState::Submitted(10));
+        assert_eq!(
+            turn.delivery("pane", false).outcome,
+            Some(PromptOutcome::Submitted)
+        );
+
+        let unconfirmed = StartupTurn::default();
+        let owner = unconfirmed.claim().unwrap();
+        assert!(owner.argument_admitted(13));
+        owner.fail(StartupFailure::ArgumentUnconfirmed);
+        assert_eq!(
+            unconfirmed.delivery("pane", false).outcome,
+            Some(PromptOutcome::Unconfirmed)
+        );
+    }
 
     #[test]
     fn startup_receipts_keep_undelivered_pending_and_uncertain_input_distinct() {

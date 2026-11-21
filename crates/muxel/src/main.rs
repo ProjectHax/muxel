@@ -232,6 +232,28 @@ pub(crate) fn window_options() -> WindowOptions {
     }
 }
 
+struct LaunchLogger(env_logger::Logger);
+
+impl log::Log for LaunchLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        log::Log::enabled(&self.0, metadata)
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        // portable-pty can log its own spawn error before returning it to us.
+        if record.target().starts_with("portable_pty::")
+            && record.args().to_string().contains("--prompt-interactive=")
+        {
+            return;
+        }
+        log::Log::log(&self.0, record);
+    }
+
+    fn flush(&self) {
+        log::Log::flush(&self.0);
+    }
+}
+
 fn main() {
     // `--user-data-dir DIR` moves every setting and file muxel keeps into DIR, for
     // this process and all it starts. First, before any path is read or thread runs.
@@ -302,7 +324,11 @@ fn main() {
     // gpui reports real render failures (swap-chain present, scene-too-large
     // draw errors, GPU device loss) through `log` and swallows the Result;
     // without a logger they vanish silently. Errors/warnings go to stderr.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    let logger =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).build();
+    let level = logger.filter();
+    log::set_boxed_logger(Box::new(LaunchLogger(logger))).expect("install logger");
+    log::set_max_level(level);
     // Opt-in lag harness (no-op unless MUXEL_PROFILE / MUXEL_PROFILE_UI / TERMINAL).
     ui_profile::init();
     // Before any pane spawns: GUI launchers hand us a soft limit far below what

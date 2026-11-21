@@ -60,6 +60,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 mod accomplishments_ui;
+#[cfg(windows)]
+mod antigravity;
 #[cfg(all(test, windows))]
 mod claude_capture_tests;
 mod claude_launch;
@@ -10233,6 +10235,8 @@ impl MuxelApp {
                 Some(SessionProvider::Grok)
             } else if muxel_core::muse::is_program(program) {
                 Some(SessionProvider::Muse)
+            } else if muxel_core::is_antigravity_program(program) {
+                Some(SessionProvider::Antigravity)
             } else {
                 None
             };
@@ -10279,10 +10283,7 @@ impl MuxelApp {
             if inst.literal_argv {
                 return None;
             }
-            let preset = inst
-                .preset_id
-                .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
-                .or_else(|| self.presets.iter().find(|p| p.name == inst.preset))?;
+            let preset = session_discovery::restore_preset(&self.presets, inst)?;
             preset.effective_resume_flag()?;
             if muxel_core::muse::is_program(inst.program.as_deref())
                 && inst.args.iter().any(|arg| arg == "--no-session-log")
@@ -10295,6 +10296,11 @@ impl MuxelApp {
                 .map(std::path::Path::to_path_buf)
                 .or_else(|| project.map(|project| project.root_path.clone()));
             let local = project.is_some_and(|project| project.remote.is_none());
+            if preset.builtin_antigravity_resume()
+                && !(local && preset.builtin_antigravity_resume_for(inst))
+            {
+                return None;
+            }
             Some((preset.clone(), cwd, local))
         })() else {
             return Ok(None);
@@ -10365,6 +10371,17 @@ impl MuxelApp {
             if inst.session_id.is_none() {
                 inst.session_path = None;
                 inst.session_started = false;
+            } else if preset.builtin_antigravity_resume() {
+                #[cfg(windows)]
+                match antigravity::saved_conversation_available(inst) {
+                    Some(true) => {}
+                    Some(false) => {
+                        inst.session_id = None;
+                        inst.session_path = None;
+                        inst.session_started = false;
+                    }
+                    None => return Ok(None),
+                }
             } else if local
                 && is_codex_program(preset.program.as_deref())
                 && let (Some(home), Some(id)) = (home_dir(), inst.session_id.as_deref())
@@ -10921,8 +10938,6 @@ impl MuxelApp {
             cx.notify();
             return;
         }
-        // Whether this launch will `--resume` a saved session (true on every
-        // launch after the first, for resume-capable agents).
         let spec = match self.command_for(instance_id, None) {
             Ok(spec) => spec,
             Err(error) => {
@@ -10930,10 +10945,6 @@ impl MuxelApp {
                 return;
             }
         };
-        let was_resume = self
-            .workspace
-            .instance(instance_id)
-            .is_some_and(|i| i.session_started);
         // Capture program + cwd before `spec` moves into the launch, so a failed
         // launch can be reported with the path it tried.
         let prog = spec.program.clone();
@@ -10944,7 +10955,7 @@ impl MuxelApp {
             token: 0,
             program: prog,
             cwd,
-            was_resume,
+            was_resume: spec.launch_resumed,
             started: Instant::now(),
         };
         let result = TerminalLaunch::spawn_for_instance(spec, size, instance_id);
@@ -10957,14 +10968,17 @@ impl MuxelApp {
             if inst.literal_argv {
                 return false;
             }
-            inst.preset_id
-                .and_then(|id| self.presets.iter().find(|preset| preset.id == id))
-                .or_else(|| {
-                    self.presets
-                        .iter()
-                        .find(|preset| preset.name == inst.preset)
-                })
-                .is_some_and(|preset| preset.effective_resume_flag().is_some())
+            session_discovery::restore_preset(&self.presets, inst).is_some_and(|preset| {
+                if preset.builtin_antigravity_resume() {
+                    preset.builtin_antigravity_resume_for(inst)
+                        && self
+                            .workspace
+                            .project(inst.project_id)
+                            .is_some_and(|p| p.remote.is_none())
+                } else {
+                    preset.effective_resume_flag().is_some()
+                }
+            })
         })
     }
 
@@ -11322,16 +11336,12 @@ impl MuxelApp {
         };
         let program = spec.program.clone();
         let cwd = spec.cwd.clone().unwrap_or_default();
-        let was_resume = self
-            .workspace
-            .instance(instance_id)
-            .is_some_and(|i| i.session_started);
         let meta = TerminalSpawnMeta {
             instance_id,
             token,
             program,
             cwd,
-            was_resume,
+            was_resume: spec.launch_resumed,
             started,
         };
         let size = self.launch_grid(instance_id, cx);
@@ -15645,6 +15655,13 @@ impl MuxelApp {
         explicit_missing: bool,
         early_nonzero_exit: bool,
     ) -> bool {
+        if self
+            .workspace
+            .instance(iid)
+            .is_some_and(|inst| muxel_core::is_antigravity_program(inst.program.as_deref()))
+        {
+            return false;
+        }
         should_recover_expired_session(
             self.resume_program(iid),
             explicit_missing,

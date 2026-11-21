@@ -201,6 +201,32 @@ pub(super) fn control_launch_spec(
         spec.auto_mode_presses = 0;
         spec.submit = false;
     }
+    // Only the admitted task can become a native Antigravity launch argument.
+    // Remote and tmux commands have already been wrapped and name their transport.
+    if let Some(owner) = owner.as_ref()
+        && instance.is_some_and(|instance| instance.control_prompt)
+        && !spec.literal_argv
+        && spec.submit
+        && muxel_core::is_antigravity_program(Some(&spec.program))
+        && let Some(task) = spec.startup_input.take()
+    {
+        spec.auto_mode_presses = 0;
+        let preset_has_prompt =
+            spec.args
+                .iter()
+                .take_while(|arg| arg.as_str() != "--")
+                .any(|arg| {
+                    matches!(
+                        arg.split('=').next(),
+                        Some("-i" | "--prompt-interactive" | "-p" | "--print" | "--prompt")
+                    )
+                });
+        if preset_has_prompt {
+            owner.fail(ctl::StartupFailure::UnsupportedProvider);
+        } else {
+            spec.startup_argument = Some(task);
+        }
+    }
     spec.startup_turn = owner;
     spec
 }

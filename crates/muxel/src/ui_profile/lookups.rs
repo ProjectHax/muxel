@@ -24,7 +24,7 @@ struct Totals {
 pub(super) struct Lookups {
     panes: HashMap<Uuid, (Option<SessionProvider>, SessionLookupOutcome, Instant)>,
     order: VecDeque<Uuid>,
-    totals: [Totals; 5],
+    totals: [Totals; 6],
 }
 
 impl Lookups {
@@ -56,7 +56,8 @@ impl Lookups {
             Some(SessionProvider::Claude) => 1,
             Some(SessionProvider::Grok) => 2,
             Some(SessionProvider::Muse) => 3,
-            None => 4,
+            Some(SessionProvider::Antigravity) => 4,
+            None => 5,
         };
         let totals = &mut self.totals[slot];
         totals.calls += 1;
@@ -72,7 +73,7 @@ impl Lookups {
         self.panes
             .retain(|_, (_, _, at)| now.saturating_duration_since(*at) < FORGET_AFTER);
         self.order.retain(|pane| self.panes.contains_key(pane));
-        ["codex", "claude", "grok", "muse", "other"].into_iter()
+        ["codex", "claude", "grok", "muse", "antigravity", "other"].into_iter()
             .zip(std::mem::take(&mut self.totals))
             .filter(|(_, totals)| totals.calls > 0)
             .map(|(provider, t)| format!(

@@ -841,6 +841,8 @@ pub struct CommandSpec {
     /// Text to type into the terminal shortly after start (system-prompt
     /// "type-in" injection). Handled by the view, not the session.
     pub startup_input: Option<String>,
+    /// An admitted Antigravity task, consumed at native spawn.
+    pub startup_argument: Option<String>,
     /// Runtime lease for the first task created through outside control.
     pub startup_turn: Option<muxel_core::control::StartupTurnOwner>,
     /// Where that task's startup reads the provider's title when the PTY can't
@@ -898,6 +900,7 @@ impl CommandSpec {
             env: Vec::new(),
             env_remove: Vec::new(),
             startup_input: None,
+            startup_argument: None,
             auto_mode_presses: 0,
             startup_turn: None,
             title_source: None,
@@ -927,6 +930,7 @@ impl CommandSpec {
             env: Vec::new(),
             env_remove: Vec::new(),
             startup_input: None,
+            startup_argument: None,
             auto_mode_presses: 0,
             startup_turn: None,
             title_source: None,
@@ -980,6 +984,40 @@ impl CommandSpec {
     pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
         self.cwd = Some(cwd.into());
         self
+    }
+
+    fn materialize_startup_argument(&mut self, _resolved_program: &str, now: i64) -> bool {
+        let Some(task) = self.startup_argument.take() else {
+            return false;
+        };
+        let Some(owner) = &self.startup_turn else {
+            return false;
+        };
+        #[cfg(windows)]
+        if is_windows_batch_program(_resolved_program) {
+            owner.fail(muxel_core::control::StartupFailure::UnsupportedProvider);
+            return false;
+        }
+        if !owner.argument_admitted(now) {
+            return false;
+        }
+        let position = self
+            .args
+            .iter()
+            .position(|arg| arg == "--")
+            .unwrap_or(self.args.len());
+        self.args
+            .insert(position, format!("--prompt-interactive={task}"));
+        true
+    }
+
+    fn spawn_command_error(error: anyhow::Error, task_in_argv: bool) -> anyhow::Error {
+        if task_in_argv {
+            // The PTY error can contain the entire command line.
+            anyhow::anyhow!("could not spawn Antigravity with its initial task")
+        } else {
+            error.context("spawn command")
+        }
     }
 
     pub fn with_startup_input(mut self, input: impl Into<String>) -> Self {
@@ -1759,6 +1797,15 @@ impl TerminalSession {
                 0,
             );
         }
+        let task_in_argv = if spec.startup_argument.is_some() {
+            let now = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            spec.materialize_startup_argument(&program, now)
+        } else {
+            false
+        };
         let mut builder = command_builder_for_spawn(&program, &spec.args);
         // Remembered for resolving relative file paths on ctrl+click.
         let cwd = spec.cwd.as_ref().map(std::path::PathBuf::from);
@@ -1817,7 +1864,10 @@ impl TerminalSession {
         }
 
         let phase = std::time::Instant::now();
-        let child = pair.slave.spawn_command(builder).context("spawn command")?;
+        let child = pair
+            .slave
+            .spawn_command(builder)
+            .map_err(|error| CommandSpec::spawn_command_error(error, task_in_argv))?;
         // portable-pty retries without a job Windows refused; only a child
         // really inside it is limited.
         #[cfg(windows)]
@@ -3576,6 +3626,20 @@ impl TerminalSession {
     /// descendants of this PID.
     pub fn child_pid(&self) -> Option<u32> {
         self.child_pid
+    }
+
+    /// Whether Windows still associates this PID with the exact child we launched.
+    pub fn owns_windows_child_pid(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.child_pid
+                .zip(self.child_started)
+                .is_some_and(|(pid, started)| crate::shell_process::started(pid) == Some(started))
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
     }
 
     /// The per-process memory limit, in bytes, this pane's local processes
@@ -8192,6 +8256,55 @@ mod startup_tests {
             CommandSpec::program("/bin/cat", vec![])
         };
         TerminalSession::spawn(spec, 40, 12).expect("spawn").0
+    }
+
+    #[test]
+    fn antigravity_startup_argument_is_literal_and_cannot_replay() {
+        use muxel_core::control::{StartupTurn, StartupTurnState};
+        let mut spec = CommandSpec::program(
+            "agy",
+            vec!["--mode".into(), "plan".into(), "--".into(), "tail".into()],
+        );
+        let task = "--first line\nwith \"quotes\" & | ^ %";
+        let turn = StartupTurn::default();
+        spec.startup_turn = turn.claim();
+        spec.startup_argument = Some(task.into());
+        spec.materialize_startup_argument("agy.exe", 10);
+        assert_eq!(
+            spec.args,
+            [
+                "--mode",
+                "plan",
+                &format!("--prompt-interactive={task}"),
+                "--",
+                "tail"
+            ]
+        );
+        assert_eq!(turn.state(), StartupTurnState::AwaitingAcceptance(10));
+        spec.materialize_startup_argument("agy.exe", 11);
+        assert_eq!(spec.args.len(), 5);
+
+        let mut cancelled = CommandSpec::program("agy", Vec::new());
+        let cancelled_turn = StartupTurn::default();
+        cancelled.startup_turn = cancelled_turn.claim();
+        cancelled.startup_argument = Some(task.into());
+        cancelled_turn.cancel();
+        cancelled.materialize_startup_argument("agy.exe", 12);
+        assert!(cancelled.args.is_empty());
+    }
+
+    #[test]
+    fn antigravity_startup_spawn_failure_hides_the_task() {
+        let marker = "fake task marker for launch failure";
+        let error = CommandSpec::spawn_command_error(
+            anyhow::anyhow!("CreateProcessW `--prompt-interactive={marker}` failed"),
+            true,
+        );
+        assert!(format!("{error:#}").contains("spawn"));
+        assert!(
+            !format!("{error:#}").contains(marker),
+            "launch failure exposed the startup argument"
+        );
     }
 
     #[test]

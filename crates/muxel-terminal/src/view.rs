@@ -3501,6 +3501,7 @@ impl TerminalView {
             launch_error,
         } = launch;
         let startup_input = spec.startup_input.clone();
+        let startup_argument = spec.startup_argument.is_some();
         let startup_owner = spec.startup_turn.clone();
         let title_source = spec.title_source.clone();
         let startup_turn = startup_owner
@@ -3569,7 +3570,37 @@ impl TerminalView {
                 input.len(),
             );
         }
-        if (auto_mode_presses > 0 || startup_input.is_some())
+        if startup_argument {
+            if let Some(owner) = startup_owner.clone() {
+                let session = session.clone();
+                cx.spawn(async move |view: WeakEntity<Self>, cx| {
+                    let deadline = Instant::now() + Duration::from_millis(STARTUP_MAX_WAIT_MS);
+                    while owner.is_pending() {
+                        match with_startup_view(&view, &session, cx, |_| {
+                            session.program_status_snapshot().working_revision > 0
+                        }) {
+                            Ok(true) => {
+                                owner.submitted(startup_now_ms());
+                                break;
+                            }
+                            Err(_) => {
+                                owner.cancel();
+                                break;
+                            }
+                            Ok(false) => {}
+                        }
+                        if Instant::now() >= deadline {
+                            owner.fail(muxel_core::control::StartupFailure::ArgumentUnconfirmed);
+                            break;
+                        }
+                        cx.background_executor()
+                            .timer(Duration::from_millis(STARTUP_POLL_MS))
+                            .await;
+                    }
+                })
+                .detach();
+            }
+        } else if (auto_mode_presses > 0 || startup_input.is_some())
             && let Some(owner) = startup_owner.clone()
         {
             let session = session.clone();

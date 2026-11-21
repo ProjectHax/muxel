@@ -19,6 +19,7 @@ pub enum SessionProvider {
     Claude,
     Grok,
     Muse,
+    Antigravity,
 }
 
 /// Captured without I/O on the UI thread. Binding generations distinguish an
@@ -455,7 +456,10 @@ impl SessionDiscovery {
             self.misses = self.misses.saturating_add(1);
             let cap = match request.key.provider {
                 SessionProvider::Codex => 30,
-                SessionProvider::Claude | SessionProvider::Grok | SessionProvider::Muse => 2,
+                SessionProvider::Claude
+                | SessionProvider::Grok
+                | SessionProvider::Muse
+                | SessionProvider::Antigravity => 2,
             };
             if quiet {
                 WATCHED_HOOK_FALLBACK
