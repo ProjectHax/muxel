@@ -5,6 +5,96 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-11-21
+
+### Added
+- **muxel Cloud: end-to-end encrypted sync, teams and tasks** — an optional
+  paid account, under Settings → muxel Cloud. Sign in by confirming a short
+  code in your browser, and your runners, loops, snippets, hosts and
+  identities (never passwords or SSH keys), appearance, keybindings and tasks
+  sync between your computers, each category Off, Upload, Download or Both.
+  Item contents are encrypted and signed on your computer before they're sent,
+  so the service can't read them; another computer unlocks with the Recovery
+  Key shown once at your first sign-in. Teams share runners, snippets and loops
+  as their own section of the drop-downs. A shared loop arrives switched off,
+  and running anything a teammate shared asks first. Your muxel hands a team's
+  keys only to members you've approved, so the server can't quietly add
+  someone. The new Tasks panel tracks personal and team tasks; Start with
+  agent opens a pane on a task, and that agent reports its progress back with
+  `muxel ctl task`. Teammates can opt in to seeing what each other's agents are
+  working on, never their prompts or output. Pausing sync stops it at once,
+  including a sync already under way, and Export my data saves everything
+  decrypted, even after a plan ends. Without an account, nothing changes.
+- **Antigravity panes show when they need you** — an Antigravity pane read
+  idle while it waited at a permission or question card, so nothing told you
+  it needed an answer, and `muxel ctl send` to it was never confirmed. muxel
+  now reads Antigravity's own status reports: the pane shows working, blocked
+  and done like a Claude or Codex pane, and raises a notification when it's
+  waiting. Where those reports don't arrive (under tmux, or on the stock
+  Windows console), the pane still reads blocked while one of Antigravity's
+  cards is on screen.
+- **Antigravity picks up its own conversation on Windows** — a local
+  Antigravity pane on Windows now reopens the conversation it was holding when
+  the pane or muxel restarts, instead of starting a new one, even with two
+  panes in the same folder. A startup task given to an Antigravity pane runs
+  once, and isn't replayed on restart.
+- **A notification's full text on hover** — the NOTIFICATIONS feed cuts each
+  row to one line, so the end of a long message, often a path in an error,
+  could only be read in the developer console. Hovering a row now shows its
+  title and detail in full. Thanks to [@railapex](https://github.com/railapex)
+  ([#187](https://github.com/ProjectHax/muxel/pull/187)).
+
+### Fixed
+- **Changes work in a project opened below its repository's root** — open a
+  project in a folder inside a larger repository, say one crate of a
+  workspace, and the Changes panel listed its files but nothing done to them
+  worked: Stage and Unstage failed, Discard changed nothing, the diff came up
+  empty, committing failed, and Open file opened a file that wasn't there. The
+  file browser marked none of the folder's files as changed. Every action now
+  works on the file listed, whether it's inside the folder or elsewhere in the
+  repository, and the file browser marks the folder's changes. Discard also
+  takes a file's name literally now, so discarding a file named like
+  `[ab].txt` no longer reverts a changed `a.txt` beside it. Thanks to
+  [@railapex](https://github.com/railapex) ([#189](https://github.com/ProjectHax/muxel/pull/189)).
+- **Windows hosts pass Test connection** — testing a Windows SSH host, and the
+  check before a remote project on one opens, failed with "'true' is not
+  recognized as an internal or external command" although the login worked.
+  muxel now sends a Windows host a check its shell understands. Thanks to
+  [@railapex](https://github.com/railapex) ([#188](https://github.com/ProjectHax/muxel/pull/188)).
+- **Next and previous tab or pane stay in a project window** — in a project
+  shown in its own window, Next Tab, Previous Tab, Next Pane and Previous Pane
+  moved through the main window's project instead. They now move through the
+  project in the window you pressed them in. Thanks to
+  [@railapex](https://github.com/railapex) ([#184](https://github.com/ProjectHax/muxel/pull/184)).
+- **One project, one window** — when the main window gave up its project,
+  because it moved to its own window or was removed, the main window could
+  switch to a project another window was already showing, and both drew its
+  panes. It now picks a project with no window of its own, and brings that
+  project's panes, files and default agent along properly. Thanks to
+  [@railapex](https://github.com/railapex) ([#180](https://github.com/ProjectHax/muxel/pull/180)).
+- **Typing in a project window's page address bar sticks** — in a project
+  window, whatever you typed into a web page's address bar was replaced about
+  once a second. It now stays put while you type. Thanks to
+  [@railapex](https://github.com/railapex) ([#179](https://github.com/ProjectHax/muxel/pull/179)).
+- **Links that open a new window work in a popped-out page** — in a page popped
+  out into its own window, a link meant for a new window (Ctrl+click,
+  middle-click or a `target=_blank` link) opened nothing, and clicking into the
+  page didn't take the keyboard back from its address bar. Such a link now
+  opens in the project's window and brings it forward. Thanks to
+  [@railapex](https://github.com/railapex) ([#178](https://github.com/ProjectHax/muxel/pull/178)).
+- **`muxel ctl send` confirms a multi-paragraph prompt to Claude** — a prompt
+  with a blank line, sent to a Claude pane that reports its status, came back
+  with no receipt, and as a startup task it failed after a minute while Claude
+  was already working on it. Claude starting the turn now counts as the
+  receipt. Thanks to [@railapex](https://github.com/railapex)
+  ([#175](https://github.com/ProjectHax/muxel/pull/175)).
+- **`muxel ctl wait` can follow an unconfirmed startup task** — when a
+  startup task's Enter went in but nothing confirmed it, every wait on the
+  pane failed at once, even while the agent worked on what was probably the
+  task. A wait now follows that turn and reports how it ends, and says the
+  task was unconfirmed. Thanks to [@railapex](https://github.com/railapex)
+  ([#176](https://github.com/ProjectHax/muxel/pull/176)).
+
 ## [0.4.0] — 2026-11-19
 
 ### Added
