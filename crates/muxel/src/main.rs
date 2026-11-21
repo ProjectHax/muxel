@@ -324,11 +324,20 @@ fn main() {
     // gpui reports real render failures (swap-chain present, scene-too-large
     // draw errors, GPU device loss) through `log` and swallows the Result;
     // without a logger they vanish silently. Errors/warnings go to stderr.
-    let logger =
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).build();
+    let default_log_filter = if cfg!(windows) {
+        "warn,portable_pty::win::psuedocon=info"
+    } else {
+        "warn"
+    };
+    let logger = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(default_log_filter),
+    )
+    .build();
     let level = logger.filter();
     log::set_boxed_logger(Box::new(LaunchLogger(logger))).expect("install logger");
     log::set_max_level(level);
+    #[cfg(windows)]
+    let _console_directory = update::prepare_windows_console();
     // Opt-in lag harness (no-op unless MUXEL_PROFILE / MUXEL_PROFILE_UI / TERMINAL).
     ui_profile::init();
     // Before any pane spawns: GUI launchers hand us a soft limit far below what

@@ -13,6 +13,12 @@
 use anyhow::{Context, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+#[cfg(windows)]
+use std::{fs, os::windows::fs::OpenOptionsExt as _};
+#[cfg(windows)]
+use windows::Win32::Storage::FileSystem::{
+    DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+};
 
 /// The running app's version, baked in at compile time.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -211,15 +217,15 @@ pub fn asset_for(kind: InstallKind, assets: &[(String, String)]) -> Option<&(Str
 }
 
 /// Download `asset_url` and apply it for `kind`, returning how to relaunch.
-pub fn download_and_apply(kind: InstallKind, asset_url: &str) -> Result<RelaunchPlan> {
+pub fn download_and_apply(kind: InstallKind, url: &str, version: &str) -> Result<RelaunchPlan> {
     let work = std::env::temp_dir().join(format!("muxel-update-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).context("creating update temp dir")?;
 
     let result = match kind {
-        InstallKind::AppImage | InstallKind::LinuxPortable => apply_linux(asset_url, &work),
-        InstallKind::WindowsPortable => apply_windows(asset_url, &work),
-        InstallKind::MacOsApp => apply_macos(asset_url, &work),
+        InstallKind::AppImage | InstallKind::LinuxPortable => apply_linux(url, &work),
+        InstallKind::WindowsPortable => apply_windows(url, &work, version),
+        InstallKind::MacOsApp => apply_macos(url, &work),
         InstallKind::SystemPackage => {
             bail!("this install updates via the system package manager")
         }
@@ -264,16 +270,185 @@ fn apply_linux(url: &str, work: &Path) -> Result<RelaunchPlan> {
     }
 }
 
-fn apply_windows(url: &str, work: &Path) -> Result<RelaunchPlan> {
+fn apply_windows(
+    url: &str,
+    work: &Path,
+    #[cfg_attr(not(windows), allow(unused_variables))] version: &str,
+) -> Result<RelaunchPlan> {
     let zip = work.join("muxel.zip");
     download_to(url, &zip)?;
-    let new_exe = extract_one(&zip, work, |n| n.ends_with("muxel.exe"))?;
-    self_replace::self_replace(&new_exe).context("replacing muxel.exe")?;
+    let new_exe = extract_windows_exe(&zip, work)?;
     let exe = std::env::current_exe().context("resolving current_exe")?;
+    #[cfg(windows)]
+    if let Some(install) = exe.parent()
+        && let Err(error) = stage_windows_console(&zip, install, version)
+    {
+        log::warn!("Windows console host update skipped: {error:#}");
+    }
+    self_replace::self_replace(&new_exe).context("replacing muxel.exe")?;
     Ok(RelaunchPlan {
         program: exe,
         args: vec![],
     })
+}
+
+#[cfg(windows)]
+const CONSOLE_FOLDER: &str = "muxel-console";
+#[cfg(windows)]
+const CONSOLE_FILES: [&str; 3] = ["conpty.dll", "OpenConsole.exe", "CONPTY-LICENSE.txt"];
+
+#[cfg(windows)]
+fn stage_windows_console(zip: &Path, install: &Path, version: &str) -> Result<()> {
+    if !version.starts_with(|c: char| c.is_ascii_digit())
+        || version.ends_with('.')
+        || !version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+    {
+        bail!("invalid Windows console host version {version}");
+    }
+    let mut archive = zip::ZipArchive::new(fs::File::open(zip)?)?;
+    let names = CONSOLE_FILES.map(|file| format!("{CONSOLE_FOLDER}/{version}/{file}"));
+    if names
+        .iter()
+        .all(|name| archive.index_for_name(name).is_none())
+    {
+        return Ok(());
+    }
+    let root = install.join(CONSOLE_FOLDER);
+    let dest = root.join(version);
+    let staging = root.join(format!(".staging-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    fs::create_dir(&staging)?;
+    let result = (|| {
+        for (name, file) in names.iter().zip(CONSOLE_FILES) {
+            extract_zip_entry(&mut archive, name, &staging.join(file))?;
+        }
+        publish_windows_console(&staging, &dest).context("publishing Windows console host")
+    })();
+    let _ = fs::remove_dir_all(&staging);
+    result
+}
+
+#[cfg(windows)]
+fn publish_windows_console(staging: &Path, dest: &Path) -> std::io::Result<()> {
+    let publish = || {
+        fs::rename(staging, dest).or_else(|error| {
+            if console_files_match(staging, dest) {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })
+    };
+    if publish().is_ok() {
+        return Ok(());
+    }
+    let guard = match open_console_for_removal(dest) {
+        Ok(guard) => guard,
+        // Another updater can move aside a stale directory before publishing.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return publish(),
+        Err(error) => {
+            return if console_files_match(staging, dest) {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+    };
+    if console_files_match(staging, dest) {
+        return Ok(());
+    }
+    let retired = staging.with_extension("old");
+    fs::rename(dest, &retired)?;
+    drop(guard);
+    if let Err(error) = publish() {
+        let _ = fs::rename(&retired, dest);
+        return Err(error);
+    }
+    let _ = fs::remove_dir_all(retired);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn console_files_match(staging: &Path, dest: &Path) -> bool {
+    use sha2::{Digest as _, Sha256};
+
+    CONSOLE_FILES.iter().all(|file| {
+        let compare = || -> std::io::Result<bool> {
+            let mut expected = fs::File::open(staging.join(file))?;
+            let mut actual = fs::File::open(dest.join(file))?;
+            if expected.metadata()?.len() != actual.metadata()?.len() {
+                return Ok(false);
+            }
+            let mut expected_hash = Sha256::new();
+            let mut actual_hash = Sha256::new();
+            std::io::copy(&mut expected, &mut expected_hash)?;
+            std::io::copy(&mut actual, &mut actual_hash)?;
+            Ok(expected_hash.finalize() == actual_hash.finalize())
+        };
+        compare().unwrap_or(false)
+    })
+}
+
+#[cfg(windows)]
+fn open_console_directory(directory: &Path) -> std::io::Result<std::fs::File> {
+    fs::File::options()
+        .read(true)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(directory)
+}
+
+#[cfg(windows)]
+fn open_console_for_removal(directory: &Path) -> std::io::Result<std::fs::File> {
+    use windows::Win32::Foundation::GENERIC_WRITE;
+
+    // DELETE conflicts with a running app. The write access, without write
+    // sharing, excludes other removers while allowing rename and deletion.
+    fs::File::options()
+        .access_mode(DELETE.0 | GENERIC_WRITE.0)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_DELETE).0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(directory)
+}
+
+#[cfg(windows)]
+pub fn prepare_windows_console() -> Option<std::fs::File> {
+    let exe = std::env::current_exe().ok()?;
+    let root = exe.parent()?.join(CONSOLE_FOLDER);
+    let directory = root.join(APP_VERSION);
+    let directory_handle = open_console_directory(&directory)
+        .inspect_err(|error| {
+            log::debug!(
+                "Skipping Windows console bundle at {}: {error}",
+                directory.display()
+            )
+        })
+        .ok();
+    if directory_handle.is_some() {
+        muxel_terminal::set_console_directory(directory);
+    }
+    prune_windows_consoles(&root, APP_VERSION);
+    directory_handle
+}
+
+#[cfg(windows)]
+fn prune_windows_consoles(root: &Path, current: &str) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !is_newer(current, &entry.file_name().to_string_lossy())
+            || !entry.file_type().is_ok_and(|kind| kind.is_dir())
+        {
+            continue;
+        }
+        let path = entry.path();
+        if let Ok(_guard) = open_console_for_removal(&path) {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
 }
 
 fn apply_macos(url: &str, work: &Path) -> Result<RelaunchPlan> {
@@ -394,24 +569,25 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Extract a single file matching `pred` from a zip to `out_dir`.
-fn extract_one(zip_path: &Path, out_dir: &Path, pred: impl Fn(&str) -> bool) -> Result<PathBuf> {
+fn extract_windows_exe(zip_path: &Path, out_dir: &Path) -> Result<PathBuf> {
     let file = std::fs::File::open(zip_path)?;
     let mut archive = zip::ZipArchive::new(file).context("opening zip")?;
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        let name = entry.name().to_string();
-        if entry.is_file() && pred(&name) {
-            let base = Path::new(&name)
-                .file_name()
-                .context("zip entry has no name")?;
-            let dest = out_dir.join(base);
-            let mut out = std::fs::File::create(&dest)?;
-            std::io::copy(&mut entry, &mut out)?;
-            return Ok(dest);
-        }
-    }
-    bail!("expected file not found in archive")
+    let dest = out_dir.join("muxel.exe");
+    extract_zip_entry(&mut archive, "muxel.exe", &dest)?;
+    Ok(dest)
+}
+
+fn extract_zip_entry(
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    name: &str,
+    dest: &Path,
+) -> Result<()> {
+    let mut entry = archive
+        .by_name(name)
+        .with_context(|| format!("opening ZIP entry {name}"))?;
+    anyhow::ensure!(entry.is_file(), "not a file in update ZIP: {name}");
+    std::io::copy(&mut entry, &mut std::fs::File::create(dest)?)?;
+    Ok(())
 }
 
 fn extract_all(zip_path: &Path, dest: &Path) -> Result<()> {
@@ -428,6 +604,203 @@ fn extract_all(zip_path: &Path, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    mod windows_console {
+        use super::{
+            extract_windows_exe, open_console_directory, prune_windows_consoles,
+            stage_windows_console,
+        };
+        use std::fs;
+        use std::io::Write as _;
+        use std::path::{Path, PathBuf};
+        use zip::result::ZipError;
+        use zip::unstable::write::FileOptionsExt as _;
+        use zip::write::SimpleFileOptions;
+
+        const FILES: [(&str, &[u8]); 3] = [
+            ("conpty.dll", b"console DLL"),
+            ("OpenConsole.exe", b"console host"),
+            ("CONPTY-LICENSE.txt", b"licence"),
+        ];
+
+        struct Fixture(PathBuf);
+
+        impl Fixture {
+            fn new() -> Self {
+                let path = std::env::temp_dir()
+                    .join(format!("muxel-update-test-{}", uuid::Uuid::new_v4()));
+                fs::create_dir(&path).unwrap();
+                Self(path)
+            }
+
+            fn zip(&self, version: &str, files: &[(&str, &[u8])]) -> PathBuf {
+                let zip = self.0.join(format!("{version}.zip"));
+                let mut archive = zip::ZipWriter::new(fs::File::create(&zip).unwrap());
+                archive
+                    .start_file("muxel.exe", SimpleFileOptions::default())
+                    .unwrap();
+                archive.write_all(b"updated app").unwrap();
+                for (name, bytes) in files {
+                    archive
+                        .start_file(
+                            format!("muxel-console/{version}/{name}"),
+                            SimpleFileOptions::default(),
+                        )
+                        .unwrap();
+                    archive.write_all(bytes).unwrap();
+                }
+                archive.finish().unwrap();
+                zip
+            }
+
+            fn console(&self, version: &str) -> PathBuf {
+                self.0.join("muxel-console").join(version)
+            }
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn assert_console(directory: &Path) {
+            for (name, bytes) in FILES {
+                assert_eq!(fs::read(directory.join(name)).unwrap(), bytes);
+            }
+        }
+
+        #[test]
+        fn update_delivers_the_complete_console_folder() {
+            let fixture = Fixture::new();
+            let zip = fixture.zip("2.0.0", &FILES);
+            stage_windows_console(&zip, &fixture.0, "2.0.0").unwrap();
+            assert_console(&fixture.console("2.0.0"));
+        }
+
+        #[test]
+        fn older_zip_can_update_without_console_files() {
+            let fixture = Fixture::new();
+            let zip = fixture.zip("1.0.0", &[]);
+            stage_windows_console(&zip, &fixture.0, "1.0.0").unwrap();
+            assert!(!fixture.0.join("muxel-console").exists());
+            let app = extract_windows_exe(&zip, &fixture.0).unwrap();
+            assert_eq!(fs::read(app).unwrap(), b"updated app");
+        }
+
+        #[test]
+        fn partial_zip_does_not_publish_a_console() {
+            let fixture = Fixture::new();
+            let zip = fixture.zip("2.0.0", &FILES[..1]);
+            assert!(stage_windows_console(&zip, &fixture.0, "2.0.0").is_err());
+            assert_eq!(
+                fs::read_dir(fixture.0.join("muxel-console"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+
+        #[test]
+        fn repairs_an_incomplete_destination_and_detects_stale_same_size_bytes() {
+            let fixture = Fixture::new();
+            let zip = fixture.zip("2.0.0", &FILES);
+            let dest = fixture.console("2.0.0");
+            fs::create_dir_all(&dest).unwrap();
+            fs::write(dest.join("conpty.dll"), FILES[0].1).unwrap();
+            stage_windows_console(&zip, &fixture.0, "2.0.0").unwrap();
+            assert_console(&dest);
+
+            let stale = vec![b'x'; FILES[2].1.len()];
+            fs::write(dest.join(FILES[2].0), &stale).unwrap();
+            stage_windows_console(&zip, &fixture.0, "2.0.0").unwrap();
+            assert_console(&dest);
+        }
+
+        #[test]
+        fn reuses_matching_files_but_cannot_repair_a_directory_held_by_the_app() {
+            let fixture = Fixture::new();
+            let zip = fixture.zip("2.0.0", &FILES);
+            let dest = fixture.console("2.0.0");
+            stage_windows_console(&zip, &fixture.0, "2.0.0").unwrap();
+            let active_directory = open_console_directory(&dest).unwrap();
+            stage_windows_console(&zip, &fixture.0, "2.0.0").unwrap();
+            assert_console(&dest);
+
+            // Use a different fixture at the same release path to require repair.
+            let replacement = fixture.zip(
+                "2.0.0",
+                &[("conpty.dll", b"updated DLL"), FILES[1], FILES[2]],
+            );
+            assert!(stage_windows_console(&replacement, &fixture.0, "2.0.0").is_err());
+            assert_console(&dest);
+            drop(active_directory);
+            stage_windows_console(&replacement, &fixture.0, "2.0.0").unwrap();
+            assert_eq!(fs::read(dest.join("conpty.dll")).unwrap(), b"updated DLL");
+        }
+
+        #[test]
+        fn extracts_the_root_exe_even_if_an_earlier_non_exe_entry_cannot_be_opened() {
+            let fixture = Fixture::new();
+            let zip = fixture.0.join("release.zip");
+            let plain = SimpleFileOptions::default();
+            for locked in [false, true] {
+                let sidecar = if locked {
+                    plain.with_deprecated_encryption(b"fixture")
+                } else {
+                    plain
+                };
+                let mut archive = zip::ZipWriter::new(fs::File::create(&zip).unwrap());
+                for (name, bytes, options) in [
+                    (
+                        "muxel-console/2.0.0/conpty.dll",
+                        b"sidecar".as_slice(),
+                        sidecar,
+                    ),
+                    ("nested/muxel.exe", b"nested app", plain),
+                    ("muxel.exe", b"root app", plain),
+                ] {
+                    archive.start_file(name, options).unwrap();
+                    archive.write_all(bytes).unwrap();
+                }
+                archive.finish().unwrap();
+                let mut archive = zip::ZipArchive::new(fs::File::open(&zip).unwrap()).unwrap();
+                let root = extract_windows_exe(&zip, &fixture.0).unwrap();
+                assert_eq!(fs::read(root).unwrap(), b"root app");
+                // A valid earlier member can still refuse lookup without credentials.
+                match archive.by_index(0) {
+                    Ok(entry) if !locked => {
+                        assert_eq!(entry.name(), "muxel-console/2.0.0/conpty.dll")
+                    }
+                    Err(ZipError::UnsupportedArchive(ZipError::PASSWORD_REQUIRED)) if locked => {}
+                    Ok(_) => panic!("locked fixture member opened without a password"),
+                    Err(error) => panic!("unexpected fixture error: {error}"),
+                }
+            }
+        }
+
+        #[test]
+        fn update_preserves_a_console_folder_in_use_until_a_later_start() {
+            let fixture = Fixture::new();
+            let old_zip = fixture.zip("1.0.0", &FILES);
+            stage_windows_console(&old_zip, &fixture.0, "1.0.0").unwrap();
+            let old = fixture.console("1.0.0");
+            let active_directory = open_console_directory(&old).unwrap();
+
+            let new_zip = fixture.zip("2.0.0", &FILES);
+            stage_windows_console(&new_zip, &fixture.0, "2.0.0").unwrap();
+            prune_windows_consoles(&fixture.0.join("muxel-console"), "1.0.0");
+            assert_console(&fixture.console("2.0.0"));
+            prune_windows_consoles(&fixture.0.join("muxel-console"), "2.0.0");
+            assert_console(&old);
+
+            drop(active_directory);
+            prune_windows_consoles(&fixture.0.join("muxel-console"), "2.0.0");
+            assert!(!old.exists());
+            assert_console(&fixture.console("2.0.0"));
+        }
+    }
 
     #[test]
     fn is_newer_compares_versions() {
