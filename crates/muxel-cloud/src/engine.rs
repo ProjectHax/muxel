@@ -59,6 +59,13 @@ pub struct EngineState {
     /// Whose account keys this device accepts, per team (see [`TeamTrust`]).
     #[serde(default)]
     pub trust: HashMap<Uuid, TeamTrust>,
+    /// This cycle's `Input::team_setting_writes` (by index) that the server
+    /// answered, stored or refused. The rest were never sent or may not have
+    /// arrived. Runtime only: a cycle that stops early (paused, failed) still
+    /// lets the caller drop the shares that went out, so a stale copy isn't
+    /// sent again over a teammate's newer edit.
+    #[serde(skip)]
+    pub shares_settled: Vec<usize>,
 }
 
 /// A member's published account keys (base64, as the server lists them).
@@ -451,6 +458,7 @@ impl<T: Transport> Engine<'_, T> {
     /// Run one cycle. `state` is updated in place (persist it afterwards, even
     /// on error: cursors and versions only move after successful writes).
     pub fn cycle(&self, input: &Input, state: &mut EngineState) -> Result<Output, CycleError> {
+        state.shares_settled.clear();
         let mut out = Output::default();
         let me = self.client.me()?;
         let personal_ok = me.entitlements.personal_sync;
@@ -561,8 +569,21 @@ impl<T: Transport> Engine<'_, T> {
                     );
                 }
             }
-            for w in input.team_setting_writes {
-                if let Err(e) = self.push_team_setting(w, &ctx, state, input.now_ms) {
+            for (i, w) in input.team_setting_writes.iter().enumerate() {
+                let res = self.push_team_setting(w, &ctx, state, input.now_ms);
+                let unsent = matches!(
+                    &res,
+                    Err(CycleError::Api(
+                        ApiError::Cancelled
+                            | ApiError::Network(_)
+                            | ApiError::RateLimited(_)
+                            | ApiError::Server(..)
+                    ))
+                );
+                if !unsent {
+                    state.shares_settled.push(i);
+                }
+                if let Err(e) = res {
                     out.errors
                         .push(format!("share {}: {e}", w.collection.as_str()));
                 }

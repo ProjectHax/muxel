@@ -20,6 +20,7 @@ use muxel_core::cloud::items::Collection;
 use muxel_core::cloud::merge3::WindowSync;
 use muxel_core::cloud::roles::Permission;
 use muxel_core::cloud::{SERVER_URL_ENV, SyncMode, Tristate, WorkspaceCloud};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// How often a window without the lock tries to take it over.
 const LOCK_RETRY: Duration = Duration::from_secs(10);
@@ -49,6 +50,17 @@ pub(super) enum CloudPhase {
     Ready,
 }
 
+/// What an outbox file the running cycle carried holds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SentOp {
+    /// The cycle's `team_setting_writes[i]`.
+    Share(usize),
+    /// A member decision. It lives only in the cycle's engine state, so it
+    /// stays queued unless the cycle's results are kept.
+    Trust,
+    Other,
+}
+
 pub(super) struct CloudRuntime {
     dir: Option<CloudDir>,
     pub(super) phase: CloudPhase,
@@ -58,6 +70,8 @@ pub(super) struct CloudRuntime {
     lock_tried: Option<Instant>,
     /// A background job (setup, poll or cycle) is running.
     busy: bool,
+    /// Set to stop the running sync cycle before its next request (pausing).
+    cycle_cancel: Option<Arc<AtomicBool>>,
     last_cycle: Option<Instant>,
     sync_requested: bool,
     pub(super) last_ok: Option<chrono::DateTime<chrono::Local>>,
@@ -84,7 +98,7 @@ pub(super) struct CloudRuntime {
     team_library: Option<Uuid>,
     /// Outbox files the last cycle carried: removed when it completes, sent
     /// again by the next one when it fails.
-    sent_ops: Vec<std::path::PathBuf>,
+    sent_ops: Vec<(std::path::PathBuf, SentOp)>,
     /// This window's presence file name.
     window_id: String,
     presence_at: Option<Instant>,
@@ -108,6 +122,7 @@ impl CloudRuntime {
             account: None,
             lock: None,
             lock_tried: None,
+            cycle_cancel: None,
             busy: false,
             last_cycle: None,
             sync_requested: false,
@@ -176,8 +191,16 @@ impl CloudRuntime {
         self.dir.as_ref().is_some_and(CloudDir::has_account)
     }
 
+    /// Stop the running sync cycle, if any, before its next request.
+    fn cancel_cycle(&self) {
+        if let Some(flag) = &self.cycle_cancel {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+
     /// Drop this window's session state (not the files or the keychain).
     fn forget_session(&mut self) {
+        self.cancel_cycle();
         self.lock = None;
         self.state = None;
         self.account = None;
@@ -265,6 +288,8 @@ struct CycleDone {
     /// The cycle started from nothing (a new device, or a reset): everything it
     /// pulls is the backlog, so it rings no new-task alert.
     first_pull: bool,
+    /// Sync was paused while the cycle ran, so it stopped short.
+    cancelled: bool,
 }
 
 enum CycleFail {
@@ -309,9 +334,11 @@ impl MuxelApp {
         if std::mem::take(&mut self.cloud.reapply_appearance) {
             self.cloud_apply_appearance(cx);
         }
-        if !self.settings.cloud.enabled && self.cloud.lock.is_some() {
-            // Paused, here or in another window: let another window take over
-            // when it's switched back on.
+        if !self.settings.cloud.enabled {
+            // Paused, here or in another window: stop a running cycle before
+            // its next request, and let another window take over when it's
+            // switched back on.
+            self.cloud.cancel_cycle();
             self.cloud.lock = None;
         }
         if self
@@ -363,7 +390,7 @@ impl MuxelApp {
                     && self.cloud.dir.as_ref().is_some_and(|dir| {
                         dir.outbox_files()
                             .iter()
-                            .any(|f| !self.cloud.sent_ops.contains(f))
+                            .any(|f| !self.cloud.sent_ops.iter().any(|(s, _)| s == f))
                     });
                 let due = self.cloud.sync_requested
                     || queued
@@ -872,6 +899,18 @@ impl MuxelApp {
         .detach();
     }
 
+    /// After a cycle that stopped early: remove the outbox files of the shares
+    /// the server answered, so they aren't sent again; the rest stay queued.
+    fn cloud_settle_shares(&mut self, settled: &[usize]) {
+        let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.cloud.sent_ops)
+            .into_iter()
+            .partition(|(_, k)| matches!(k, SentOp::Share(i) if settled.contains(i)));
+        if let Some(dir) = &self.cloud.dir {
+            dir.remove_ops(&done.into_iter().map(|(f, _)| f).collect::<Vec<_>>());
+        }
+        self.cloud.sent_ops = keep;
+    }
+
     pub(super) fn cloud_sync_now(&mut self, cx: &mut Context<Self>) {
         self.cloud.sync_requested = true;
         cx.notify();
@@ -880,6 +919,7 @@ impl MuxelApp {
     pub(super) fn set_cloud_enabled(&mut self, on: bool, cx: &mut Context<Self>) {
         self.settings.cloud.enabled = on;
         if !on {
+            self.cloud.cancel_cycle();
             self.cloud.lock = None;
         } else {
             self.cloud.sync_requested = true;
@@ -896,6 +936,11 @@ impl MuxelApp {
         };
         // Start from what every window has saved.
         self.cloud_reload_from_disk(cx);
+        if !self.settings.cloud.enabled {
+            // Another window paused sync since this tick checked.
+            self.cloud.lock = None;
+            return;
+        }
         let Some(dir) = &self.cloud.dir else {
             return;
         };
@@ -917,7 +962,21 @@ impl MuxelApp {
                 Op::Task { .. } | Op::SyncNow | Op::Share(_) => None,
             })
             .collect();
-        self.cloud.sent_ops = queued.into_iter().map(|(f, _)| f).collect();
+        let mut share_ix = 0;
+        self.cloud.sent_ops = queued
+            .into_iter()
+            .map(|(f, op)| {
+                let kind = match op {
+                    Op::Share(_) => {
+                        share_ix += 1;
+                        SentOp::Share(share_ix - 1)
+                    }
+                    Op::Trust(_) => SentOp::Trust,
+                    Op::Task { .. } | Op::SyncNow => SentOp::Other,
+                };
+                (f, kind)
+            })
+            .collect();
         let settings = self.settings_base();
         let tasks = self.cloud.tasks.clone();
         let url = server_url(&self.settings.cloud);
@@ -927,6 +986,8 @@ impl MuxelApp {
             .as_ref()
             .filter(|(at, _)| at.elapsed() < PROJECT_KEYS_TTL)
             .map(|(_, keys)| keys.clone());
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cloud.cycle_cancel = Some(cancel.clone());
         self.cloud.busy = true;
         self.cloud.sync_requested = false;
         cx.spawn(async move |view: WeakEntity<Self>, cx| {
@@ -943,13 +1004,14 @@ impl MuxelApp {
                         decisions,
                         presence,
                     };
-                    let out = run_cycle(&job, &tasks, &projects, &mut state);
+                    let out = run_cycle(&job, &tasks, &projects, &mut state, cancel.clone());
                     CycleDone {
                         out,
                         state,
                         projects,
                         tasks,
                         first_pull,
+                        cancelled: cancel.load(Ordering::SeqCst),
                     }
                 })
                 .await;
@@ -960,6 +1022,7 @@ impl MuxelApp {
 
     fn cloud_finish_cycle(&mut self, done: CycleDone, cx: &mut Context<Self>) {
         self.cloud.busy = false;
+        self.cloud.cycle_cancel = None;
         self.cloud.last_cycle = Some(Instant::now());
         let CycleDone {
             out,
@@ -967,7 +1030,18 @@ impl MuxelApp {
             projects,
             tasks: tasks_snapshot,
             first_pull,
+            cancelled,
         } = done;
+        if cancelled {
+            // Paused (or signed out) mid-cycle: requests after that were never
+            // sent. Shares the server already answered are done; everything
+            // else stays queued. Its state is dropped, like its results: it
+            // may record pulls that were never applied, so the next cycle
+            // starts from the state on disk.
+            self.cloud_settle_shares(&state.shares_settled);
+            cx.notify();
+            return;
+        }
         let keys_fresh = self
             .cloud
             .project_keys
@@ -976,16 +1050,13 @@ impl MuxelApp {
         if !keys_fresh {
             self.cloud.project_keys = Some((Instant::now(), projects.clone()));
         }
+        // A cycle that fails partway drops its state with its results: the
+        // state may record pulls whose changes were never applied, and the
+        // next cycle would push the older local copy over them. It starts
+        // from the last saved state instead.
         let out = match out {
-            Ok(out) => {
-                // Sent (a share the server refused is reported, not retried).
-                if let Some(dir) = &self.cloud.dir {
-                    dir.remove_ops(&std::mem::take(&mut self.cloud.sent_ops));
-                }
-                out
-            }
+            Ok(out) => out,
             Err(CycleFail::Cycle(CycleError::Api(ApiError::Unauthorized))) => {
-                self.cloud.state = Some(state);
                 self.cloud_lost_token(true, cx);
                 return;
             }
@@ -997,15 +1068,28 @@ impl MuxelApp {
             Err(e) => {
                 let text = cycle_fail_text(&e);
                 log::warn!("cloud: sync failed: {text}");
+                self.cloud_settle_shares(&state.shares_settled);
                 self.cloud.last_error = Some(text);
-                self.cloud.state = Some(state);
                 cx.notify();
                 return;
             }
         };
+        let sent = std::mem::take(&mut self.cloud.sent_ops);
         if !self.settings.cloud.enabled || !self.cloud.ready() {
-            // Signed out or paused while the cycle ran: drop its results.
+            // Signed out or paused while the cycle ran: drop its results,
+            // and with them its state. Every share was tried; member decisions
+            // live in that state, so they stay queued for the next cycle.
+            let (keep, done): (Vec<_>, Vec<_>) =
+                sent.into_iter().partition(|(_, k)| *k == SentOp::Trust);
+            if let Some(dir) = &self.cloud.dir {
+                dir.remove_ops(&done.into_iter().map(|(f, _)| f).collect::<Vec<_>>());
+            }
+            self.cloud.sent_ops = keep;
             return;
+        }
+        // Sent (a share the server refused is reported, not retried).
+        if let Some(dir) = &self.cloud.dir {
+            dir.remove_ops(&sent.into_iter().map(|(f, _)| f).collect::<Vec<_>>());
         }
         let mut live = self.settings_base();
         let before = muxel_core::cloud::items::Appearance::from_settings(&live);
@@ -1168,7 +1252,7 @@ impl MuxelApp {
 
     pub(super) fn render_settings_cloud(&self, form: &Form, cx: &mut Context<Self>) -> AnyElement {
         let mut blocks = vec![Block::Note(t(
-            "Sync your runners, loops, snippets, hosts and appearance between your computers, and share them and tasks with your team. Everything is encrypted on this computer before it is sent: muxel Cloud stores only data it cannot read.",
+            "Sync your runners, loops, snippets, hosts and appearance between your computers, and share them and tasks with your team. Item contents are encrypted on this computer before they are sent, so muxel Cloud can't read them.",
         ))];
         blocks.push(Block::Custom(self.render_cloud_account(form, cx)));
         if self.cloud.ready() {
@@ -2201,6 +2285,7 @@ fn run_cycle(
     tasks: &TaskStore,
     projects: &[(Uuid, String)],
     state: &mut EngineState,
+    cancel: Arc<AtomicBool>,
 ) -> Result<Output, CycleFail> {
     let CycleJob {
         url,
@@ -2210,7 +2295,7 @@ fn run_cycle(
         decisions,
         presence,
     } = job;
-    let (client, session) = open_session(url, account)?;
+    let (client, session) = open_session(url, account, Some(cancel))?;
     let engine = Engine {
         client: &client,
         session: &session,
@@ -2230,8 +2315,13 @@ fn run_cycle(
     Ok(engine.cycle(&input, state)?)
 }
 
-/// The signed-in client and unlocked keys, from the keychain.
-fn open_session(url: &str, account: &AccountFile) -> Result<(Client<Http>, Session), CycleFail> {
+/// The signed-in client and unlocked keys, from the keychain. `cancel` stops
+/// the client's requests once set.
+fn open_session(
+    url: &str,
+    account: &AccountFile,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<(Client<Http>, Session), CycleFail> {
     let keychain = |e: anyhow::Error| CycleFail::Keychain(format!("{e:#}"));
     let token = crate::secrets::read_cloud_secret(TOKEN_SECRET)
         .map_err(keychain)?
@@ -2241,13 +2331,17 @@ fn open_session(url: &str, account: &AccountFile) -> Result<(Client<Http>, Sessi
         .and_then(|a| account::decode_auk(&a))
         .ok_or_else(|| CycleFail::Keychain("the account key is missing".into()))?;
     let session = account::session(account, &auk).map_err(CycleError::from)?;
-    Ok((Client::new(Http::new(url), Some(token)), session))
+    let http = match cancel {
+        Some(flag) => Http::new(url).with_cancel(flag),
+        None => Http::new(url),
+    };
+    Ok((Client::new(http, Some(token)), session))
 }
 
 /// Decrypt everything the account can read and write it to `path` as JSON.
 /// Returns (items written, items skipped).
 fn run_export(url: &str, account: &AccountFile, path: &Path) -> Result<(usize, usize), String> {
-    let (client, session) = open_session(url, account).map_err(|e| cycle_fail_text(&e))?;
+    let (client, session) = open_session(url, account, None).map_err(|e| cycle_fail_text(&e))?;
     let engine = Engine {
         client: &client,
         session: &session,

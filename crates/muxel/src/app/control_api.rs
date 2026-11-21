@@ -643,6 +643,11 @@ impl MuxelApp {
             )
         } else if enabled {
             (muted, t("Starting…"))
+        } else if self.control.is_some() {
+            (
+                muted,
+                t("Off. muxel answers only task commands, for panes started on a task."),
+            )
         } else {
             (
                 muted,

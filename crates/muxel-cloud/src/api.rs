@@ -4,6 +4,8 @@
 //! update check does. [`Transport`] abstracts the wire so the engine can be
 //! tested against an in-memory server.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
@@ -39,6 +41,9 @@ pub enum ApiError {
     Server(u16, String),
     #[error("unexpected response: {0}")]
     Decode(String),
+    /// The caller cancelled (sync was paused): nothing was sent.
+    #[error("sync was paused")]
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, ApiError>;
@@ -58,6 +63,7 @@ pub trait Transport: Send + Sync {
 pub struct Http {
     base: String,
     agent: ureq::Agent,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Http {
@@ -69,7 +75,15 @@ impl Http {
                 .timeout(Duration::from_secs(30))
                 .user_agent(concat!("muxel/", env!("CARGO_PKG_VERSION")))
                 .build(),
+            cancel: None,
         }
+    }
+
+    /// Refuse every request once `flag` is set, before anything is sent. A
+    /// sync cycle carries one so pausing sync stops it between requests.
+    pub fn with_cancel(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(flag);
+        self
     }
 }
 
@@ -81,6 +95,13 @@ impl Transport for Http {
         token: Option<&str>,
         body: Option<&Value>,
     ) -> Result<(u16, Value)> {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::SeqCst))
+        {
+            return Err(ApiError::Cancelled);
+        }
         let mut req = self
             .agent
             .request(method, &format!("{}{}", self.base, path));
@@ -642,5 +663,29 @@ impl<T: Transport> Client<T> {
 
     pub fn activity(&self, team: Uuid) -> Result<Vec<ActivityRow>> {
         decode(self.req("GET", &format!("/teams/{team}/activity"), None)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ApiError, Http, Transport};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn a_cancelled_transport_sends_nothing() {
+        // Nothing listens on port 1: a request that went out would fail with
+        // a network error, not `Cancelled`.
+        let flag = Arc::new(AtomicBool::new(false));
+        let http = Http::new("http://127.0.0.1:1").with_cancel(flag.clone());
+        assert!(matches!(
+            http.call("GET", "/me", None, None),
+            Err(ApiError::Network(_))
+        ));
+        flag.store(true, Ordering::SeqCst);
+        assert_eq!(
+            http.call("GET", "/me", None, None),
+            Err(ApiError::Cancelled)
+        );
     }
 }

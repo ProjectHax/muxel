@@ -48,6 +48,9 @@ struct World {
     allow_any_write: bool,
     /// Item writes received (accepted or not).
     puts: usize,
+    /// Refuse item writes as the client's cancel does, once this many were
+    /// received: sync paused partway through a push.
+    cancel_after_puts: Option<usize>,
 }
 
 impl World {
@@ -282,6 +285,9 @@ impl Transport for Fake {
                 ok(json!({"items": v, "cursor": next, "more": false}))
             }
             ("PUT", ["scopes", scope, "items", collection, id]) => {
+                if w.cancel_after_puts.is_some_and(|n| w.puts >= n) {
+                    return Err(ApiError::Cancelled);
+                }
                 w.puts += 1;
                 let scope = Uuid::parse_str(scope).unwrap();
                 let id = Uuid::parse_str(id).unwrap();
@@ -1760,4 +1766,46 @@ fn share_snippet(team: Uuid, name: &str) -> muxel_cloud::engine::TeamSettingWrit
         id: Uuid::new_v4(),
         data: Some(json!({"name": name, "text": "make deploy"})),
     }
+}
+
+#[test]
+fn a_cycle_cut_short_settles_only_the_shares_that_went_out() {
+    let fake = Fake::default();
+    let (team, _owner, mut o) = team_with_owner(&fake);
+    cycle(&mut o, &[]);
+    let writes = [share_snippet(team, "one"), share_snippet(team, "two")];
+    {
+        let mut w = fake.0.lock().unwrap();
+        w.cancel_after_puts = Some(w.puts + 1);
+    }
+    let cloud = CloudSettings {
+        enabled: true,
+        ..Default::default()
+    };
+    let engine = Engine {
+        client: &o.client,
+        session: &o.session,
+    };
+    let input = Input {
+        cloud: &cloud,
+        settings: &o.settings,
+        projects: &[],
+        personal_tasks: &o.personal_tasks,
+        team_tasks: &o.team_tasks,
+        team_setting_writes: &writes,
+        member_decisions: &[],
+        presence: &[],
+        task_deletions: &[],
+        now_ms: 1_700_000_000_000,
+    };
+    let out = engine.cycle(&input, &mut o.state).expect("cycle");
+    assert_eq!(
+        o.state.shares_settled,
+        vec![0],
+        "only the first share reached the server: {:?}",
+        out.errors
+    );
+    let w = fake.0.lock().unwrap();
+    assert!(w.items.iter().any(|i| i.id == writes[0].id));
+    assert!(!w.items.iter().any(|i| i.id == writes[1].id));
 }

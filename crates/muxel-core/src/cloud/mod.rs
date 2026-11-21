@@ -148,7 +148,10 @@ impl Default for ActivityPrivacy {
 /// (device token, account unlock key) live in the OS keychain, never here.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CloudSettings {
-    /// Master switch: off = muxel never contacts the service.
+    /// Master switch: off = no background sync. No cycle starts, and a running
+    /// one stops before its next request. Replacing the Recovery Key and
+    /// exporting still reach the service when asked; signing in or unlocking
+    /// turns this back on.
     #[serde(default)]
     pub enabled: bool,
     /// Signed-in account's email, for display only.

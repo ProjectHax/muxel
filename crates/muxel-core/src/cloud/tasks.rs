@@ -407,8 +407,8 @@ pub fn panel_groups(
 /// With outside control on, every task the app can show. With it off, the
 /// control server runs only for panes started on a task, and each such pane
 /// may reach only its own task. The caller's pane id is self-declared, so this
-/// keeps a pane from reading or editing tasks it wasn't started on unless the
-/// user turned outside control on.
+/// keeps an agent that reports its own id to its own task; it doesn't stop a
+/// program running as the same user from declaring another task pane's id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CtlTaskScope {
     All,

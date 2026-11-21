@@ -963,14 +963,18 @@ feature is added or changed, update the matching entry here in the same change**
   identities (never passwords or SSH keys), appearance, keybindings and tasks
   sync between your computers. Each category can be Off, Upload, Download or
   Both. Items are encrypted and signed on the computer before they're sent, so
-  the server stores only ciphertext. Presets travel by name and loops by
+  the server can't read their contents (it does see metadata such as sizes,
+  timestamps and team names). Presets travel by name and loops by
   project (git remote). A loop that arrives from another computer starts
   switched off.
 - **Multi-window safe** — one window per profile runs the sync (Sync now; the
   check interval is adjustable). Every window saves settings through a
   per-item three-way merge with `config.toml`, and reloads when another window
   saves. A stale window can't revert pulled changes, and pausing sync in any
-  window pauses it everywhere.
+  window pauses it everywhere, stopping a sync already under way before its
+  next request. Replacing the Recovery Key and Export my data still work
+  while paused, since you ask for each one; signing in or unlocking switches
+  sync back on.
 - **Teams** — the Cloud page lists your teams and your role in each. It says
   when you're waiting for a team admin to approve you and share the team's
   keys. When a member loses a role's access, the next admin sync rotates that
@@ -1047,8 +1051,11 @@ feature is added or changed, update the matching entry here in the same change**
   `progress TASK TEXT [--percent N] [--status in_progress|blocked|done]`. TASK
   is an id or its first characters. An agent started on a task is told to
   report progress this way, and it may do so on its own task even with
-  outside control off: the control server then runs only for task commands.
-  Everything else still needs outside control.
+  outside control off: while such a pane is open, the control server keeps
+  running for task commands only. Everything else still needs outside
+  control. The pane is identified by the id it declares, so this keeps an
+  agent to its own task by default but doesn't stop another program running as
+  you from naming a different task pane.
 
 ## Built-in browser
 
@@ -1247,8 +1254,10 @@ feature is added or changed, update the matching entry here in the same change**
   Approvals expire 120 seconds after admission (`approval_timeout`), including
   time behind another card; denial returns `approval_denied`. Turning creation
   or outside control off refuses every pending request and removes its card.
-  Outside control off also stops the server, so polling callers receive
-  `host_unavailable` after connection retries. Connection, host-availability
+  Outside control off also stops the server (unless a pane started on a muxel
+  Cloud task is open, when it keeps answering only `ctl task` and
+  `new-status`), so polling callers receive `host_unavailable` after
+  connection retries. Connection, host-availability
   and `busy` failures retry up to three times against the same UUID; the CLI never reissues creation.
   Exhausted retries and uncoded status errors name the UUID to query with
   `new-status` and advise against repeating `new` while the original may still wait.

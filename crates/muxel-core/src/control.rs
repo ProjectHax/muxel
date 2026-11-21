@@ -1446,7 +1446,7 @@ With --prompt the reply comes once the pane exists: its task submitted, refused,
 All raw argv (even agent argv) and shell presets/defaults ALSO require \"Also allow typing into shell panes\".
 All three grants default off; upgrades do not infer creation permission from the older grants.
 Creation opt-out or outside control off refuses all pending requests. Existing panes, admitted launches and typing permissions are unchanged; toolbar creation is unaffected.
-Outside control off stops the server; pollers report host_unavailable after their retries.
+Outside control off stops the server (while a pane started on a Cloud task is open it answers only `ctl task` and new-status); pollers report host_unavailable after their retries.
 Commands run as the host muxel process, outside the caller's sandbox; agents/presets are not a sandbox.
 Turning \"Also allow typing into shell panes\" off blocks subsequent control writes to all raw-argv panes and shell-classified panes.
 Configured non-literal agents remain controllable while outside control is on. Revocation does not stop processes or undo input.
