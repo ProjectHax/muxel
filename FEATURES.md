@@ -654,6 +654,8 @@ feature is added or changed, update the matching entry here in the same change**
   An Antigravity Working report after Enter can confirm `ctl send`.
   With no reports, an Antigravity pane waiting at a trust, command, file-edit,
   or question card reads blocked.
+  Windows installers, portable zips, and in-app updates include Microsoft's
+  OpenConsole host so direct panes can receive these reports.
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
   icon, dashboard, and notification dots. A **done** you haven't looked at stays

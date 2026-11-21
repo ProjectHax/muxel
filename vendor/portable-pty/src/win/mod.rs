@@ -14,6 +14,7 @@ use winapi::um::winbase::INFINITE;
 pub mod conpty;
 mod procthreadattr;
 mod psuedocon;
+pub use psuedocon::set_console_directory;
 
 use filedescriptor::OwnedHandle;
 

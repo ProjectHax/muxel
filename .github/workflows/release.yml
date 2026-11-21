@@ -42,6 +42,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Release tag matches the workspace version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          version="$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          if [[ -z "$version" || "$GITHUB_REF_NAME" != "v$version" ]]; then
+            printf 'Release tag %s must match the workspace version v%s\n' "$GITHUB_REF_NAME" "$version" >&2
+            exit 1
+          fi
       - name: Translation catalogs are complete
         if: startsWith(github.ref, 'refs/tags/')
         run: python3 scripts/translate.py --check
@@ -358,26 +367,40 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --target ${{ matrix.target }} -p muxel
       - name: Package .zip
+        id: package
         shell: pwsh
         run: |
+          # Match the workspace version baked into the app, including manual workflow runs.
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          $console = "muxel-console/$ver"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/muxel.exe" dist/
+          ./scripts/fetch-conpty.ps1 -Architecture "${{ matrix.arch }}" -OutputDirectory "dist/$console"
+          Copy-Item packaging/windows/CONPTY-LICENSE.txt "dist/$console/"
           Copy-Item README.md, LICENSE dist/
-          Compress-Archive -Path dist/* -DestinationPath "${{ matrix.name }}.zip"
+          $zip = "${{ matrix.name }}.zip"
+          Compress-Archive -Path dist/* -DestinationPath $zip
+          $archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $zip).Path)
+          try {
+            foreach ($file in 'conpty.dll', 'OpenConsole.exe', 'CONPTY-LICENSE.txt') {
+              if ($null -eq $archive.GetEntry("$console/$file")) {
+                throw "Missing $console/$file in $zip"
+              }
+            }
+          } finally {
+            $archive.Dispose()
+          }
+          "version=$ver" >> $env:GITHUB_OUTPUT
       - name: Build installer (Inno Setup)
         shell: pwsh
         run: |
           # ISCC is the Inno Setup compiler; install it from Chocolatey.
           choco install innosetup --no-progress -y
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          # Version = the only line-anchored `version = "..."` in the root
-          # Cargo.toml (the workspace package), so this works for both tag pushes
-          # and manual workflow_dispatch runs.
-          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
           # Inno resolves [Files] / SetupIconFile paths relative to the .iss file's
           # OWN directory, not the cwd — so pass ABSOLUTE source/asset/output dirs.
           $root = (Get-Location).Path
-          & $iscc "/DMyAppVersion=$ver" "/DMyArch=${{ matrix.arch }}" `
+          & $iscc "/DMyAppVersion=${{ steps.package.outputs.version }}" "/DMyArch=${{ matrix.arch }}" `
             "/DSourceDir=$root\dist" "/DAssetDir=$root\crates\muxel\assets" `
             "/O$root" `
             "$root\packaging\windows\muxel.iss"

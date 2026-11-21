@@ -114,6 +114,7 @@ features = [
     "fileapi",
     "namedpipeapi",
     "synchapi",
+    "winver",
 ]
 
 [target."cfg(windows)".dependencies.winreg]

@@ -7,10 +7,10 @@ use lazy_static::lazy_static;
 use shared_library::shared_library;
 use std::ffi::OsString;
 use std::io::Error as IoError;
-use std::os::windows::ffi::OsStringExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
-use std::path::Path;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::{mem, ptr};
 use winapi::shared::minwindef::DWORD;
 use winapi::shared::winerror::{HRESULT, S_OK};
@@ -21,6 +21,7 @@ use winapi::um::winbase::{
 };
 use winapi::um::wincon::COORD;
 use winapi::um::winnt::HANDLE;
+use winapi::um::winver::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 
 pub type HPCON = HANDLE;
 
@@ -41,6 +42,15 @@ shared_library!(ConPtyFuncs,
     pub fn ClosePseudoConsole(hpc: HPCON),
 );
 
+static CONSOLE_DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
+
+/// Prefer this absolute directory for the bundled pair. Call before opening the first PTY.
+pub fn set_console_directory(directory: PathBuf) {
+    if directory.is_absolute() {
+        let _ = CONSOLE_DIRECTORY.set(directory);
+    }
+}
+
 fn load_conpty() -> ConPtyFuncs {
     // If the kernel doesn't export these functions then their system is
     // too old and we cannot run.
@@ -48,14 +58,74 @@ fn load_conpty() -> ConPtyFuncs {
         "this system does not support conpty.  Windows 10 October 2018 or newer is required",
     );
 
-    // We prefer to use a sideloaded conpty.dll and openconsole.exe host deployed
-    // alongside the application.  We check for this after checking for kernel
-    // support so that we don't try to proceed and do something crazy.
-    if let Ok(sideloaded) = ConPtyFuncs::open(Path::new("conpty.dll")) {
+    let bundled = std::env::current_exe()
+        .inspect_err(|error| log::debug!("Skipping executable-relative console bundles: {error}"))
+        .ok()
+        .and_then(|exe| {
+            CONSOLE_DIRECTORY
+                .get()
+                .map(PathBuf::as_path)
+                .into_iter()
+                .chain(exe.parent())
+                .find_map(|directory| {
+                    let host = directory.join("OpenConsole.exe");
+                    // The DLL silently selects the inbox host if its companion is missing.
+                    if !host.is_file() {
+                        log::debug!(
+                            "Skipping Windows console bundle: no host file at {}",
+                            host.display()
+                        );
+                        return None;
+                    }
+                    let dll = directory.join("conpty.dll");
+                    let functions = ConPtyFuncs::open(&dll)
+                        .inspect_err(|error| {
+                            log::debug!(
+                            "Skipping Windows console bundle: could not load {}: {error:?}",
+                                dll.display()
+                            )
+                        })
+                        .ok()?;
+                    Some((functions, dll, host))
+                })
+        });
+    if let Some((sideloaded, dll, host)) = bundled {
+        let version = file_version(&host).unwrap_or_else(|| "unavailable".to_owned());
+        log::info!(
+            "Windows console selection: DLL {}, OpenConsole.exe file version {version}",
+            dll.display()
+        );
         sideloaded
     } else {
+        log::info!("Windows console selection: system (kernel32.dll)");
         kernel
     }
+}
+
+fn file_version(path: &Path) -> Option<String> {
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let root = [b'\\' as u16, 0];
+    let size = unsafe { GetFileVersionInfoSizeW(path.as_ptr(), ptr::null_mut()) };
+    if size == 0 {
+        return None;
+    }
+    let mut buffer = vec![0u32; (size as usize).div_ceil(mem::size_of::<u32>())];
+    if unsafe { GetFileVersionInfoW(path.as_ptr(), 0, size, buffer.as_mut_ptr().cast()) } == 0 {
+        return None;
+    }
+    let mut value = ptr::null_mut();
+    let mut len = 0;
+    // The root value is VS_FIXEDFILEINFO. Read its first four DWORDs while
+    // the backing version buffer is still alive.
+    if unsafe { VerQueryValueW(buffer.as_ptr().cast(), root.as_ptr(), &mut value, &mut len) } == 0
+        || value.is_null()
+        || (len as usize) < mem::size_of::<[u32; 4]>()
+    {
+        return None;
+    }
+    let [signature, _, ms, ls] = unsafe { value.cast::<[u32; 4]>().read_unaligned() };
+    (signature == 0xFEEF04BD)
+        .then(|| format!("{}.{}.{}.{}", ms >> 16, ms & 0xffff, ls >> 16, ls & 0xffff))
 }
 
 lazy_static! {
@@ -119,7 +189,9 @@ impl PsuedoCon {
         match self.create_process(&cmd, Some(job as HANDLE)) {
             Ok(child) => Ok(child),
             Err(err) => {
-                log::warn!("starting the child in its job object failed, retrying without it: {err:#}");
+                log::warn!(
+                    "starting the child in its job object failed, retrying without it: {err:#}"
+                );
                 self.create_process(&cmd, None)
             }
         }
