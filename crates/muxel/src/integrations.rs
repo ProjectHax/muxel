@@ -1029,11 +1029,11 @@ fn ssh_spawn_error(auth: SshAuth, e: std::io::Error) -> anyhow::Error {
     }
 }
 
-/// Verify a host's SSH config by opening a quick connection (`ssh … -- true`).
+/// Verify a host's SSH config by opening a quick connection (an OS no-op).
 /// Also establishes the master at `control_path`, so the panes that ride it
 /// connect instantly.
 pub fn ssh_check(host: &RemoteHost, control_path: &str, password: Option<&str>) -> Result<()> {
-    ssh_exec(host, control_path, password, "true")
+    ssh_exec(host, control_path, password, remote_ops::noop(host.os))
 }
 
 /// Verify a host's *credentials* with a **fresh** connection. Unlike [`ssh_check`]
@@ -1060,7 +1060,7 @@ pub fn ssh_verify(host: &RemoteHost, password: Option<&str>) -> Result<()> {
     }
     argv.push(ssh::target(host));
     argv.push("--".into());
-    argv.push("true".into());
+    argv.push(remote_ops::noop(host.os).into());
 
     let mut cmd;
     if host.auth == SshAuth::Password {
