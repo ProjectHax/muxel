@@ -1691,13 +1691,50 @@ pub struct GitChange {
 /// List every changed/untracked file at `loc` — exactly what `git add -A` would
 /// stage — from `git status --porcelain=v1 -z`. Empty on git failure or a clean
 /// tree. The `-z` (NUL-separated) form sidesteps the path quoting `git status`
-/// otherwise applies to names with spaces or non-ASCII characters.
+/// otherwise applies to names with spaces or non-ASCII characters. Paths are
+/// from the repository's root, whatever folder of it `loc` is.
 pub fn git_status_files(loc: &RepoLoc) -> Vec<GitChange> {
     git_output(loc, &["status", "--porcelain=v1", "-z"])
         .ok()
         .filter(|o| o.status.success())
         .map(|o| parse_status_z(&o.stdout))
         .unwrap_or_default()
+}
+
+/// Where a folder sits in its repository, as `git rev-parse` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoPlace {
+    /// The repository's root, as git writes it (on the host, for a remote
+    /// folder).
+    pub top: String,
+    /// The folder's path from the root: empty at the root, else ending in `/`.
+    pub prefix: String,
+}
+
+impl RepoPlace {
+    /// A path from the root, as [`git_status_files`] lists it, from the
+    /// folder instead, or `None` when it lies outside the folder.
+    pub fn in_folder<'a>(&self, path: &'a str) -> Option<&'a str> {
+        path.strip_prefix(self.prefix.as_str())
+    }
+}
+
+/// Where `loc`'s folder sits in its repository, or `None` outside one.
+pub fn git_place(loc: &RepoLoc) -> Option<RepoPlace> {
+    let out = git_output(loc, &["rev-parse", "--show-toplevel", "--show-prefix"])
+        .ok()
+        .filter(|o| o.status.success())?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    let top = lines.next().filter(|top| !top.is_empty())?.to_string();
+    let prefix = lines.next().unwrap_or_default().to_string();
+    Some(RepoPlace { top, prefix })
+}
+
+/// A path from the repository's root, as [`git_status_files`] lists it, as a
+/// literal pathspec git reads from the root in any folder of the repository.
+fn from_root(path: &str) -> String {
+    format!(":(top,literal){path}")
 }
 
 /// Parse the NUL-separated records of `git status --porcelain -z`: each record is
@@ -1737,10 +1774,29 @@ pub fn git_diff_for(loc: &RepoLoc, path: &str) -> String {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
     };
-    let mut out = run(&["diff", "HEAD", "--no-color", "--", path]).unwrap_or_default();
+    let spec = from_root(path);
+    let mut out = run(&[
+        "-c",
+        "diff.relative=false",
+        "diff",
+        "HEAD",
+        "--no-color",
+        "--",
+        &spec,
+    ])
+    .unwrap_or_default();
     if out.trim().is_empty() {
         // New/staged file: HEAD has nothing for it, so show the staged diff.
-        out = run(&["diff", "--cached", "--no-color", "--", path]).unwrap_or_default();
+        out = run(&[
+            "-c",
+            "diff.relative=false",
+            "diff",
+            "--cached",
+            "--no-color",
+            "--",
+            &spec,
+        ])
+        .unwrap_or_default();
     }
     if out.len() > MAX_DIFF_BYTES {
         out.truncate(MAX_DIFF_BYTES);
@@ -1753,20 +1809,23 @@ pub fn git_diff_for(loc: &RepoLoc, path: &str) -> String {
     }
 }
 
-/// Stage a single file at `loc` (`git add -- <path>`).
+/// Stage a single file at `loc` (`git add -- <path>`), `path` as
+/// [`git_status_files`] lists it.
 pub fn git_stage_path(loc: &RepoLoc, path: &str) -> Result<String> {
-    git_run_loc(loc, &["add", "--", path])
+    git_run_loc(loc, &["add", "--", &from_root(path)])
 }
 
-/// Unstage a single file at `loc` (`git restore --staged -- <path>`).
+/// Unstage a single file at `loc` (`git restore --staged -- <path>`), `path`
+/// as [`git_status_files`] lists it.
 pub fn git_unstage_path(loc: &RepoLoc, path: &str) -> Result<String> {
-    git_run_loc(loc, &["restore", "--staged", "--", path])
+    git_run_loc(loc, &["restore", "--staged", "--", &from_root(path)])
 }
 
-/// Discard all changes to a single file at `loc`: revert a tracked file's index
-/// and worktree to HEAD, or delete it if untracked. DESTRUCTIVE — the caller must
-/// confirm first.
+/// Discard all changes to a single file at `loc`, `path` as
+/// [`git_status_files`] lists it: revert a tracked file's index and worktree to
+/// HEAD, or delete it if untracked. DESTRUCTIVE — the caller must confirm first.
 pub fn git_discard_path(loc: &RepoLoc, path: &str) -> Result<String> {
+    let spec = from_root(path);
     git_run_loc(
         loc,
         &[
@@ -1775,10 +1834,10 @@ pub fn git_discard_path(loc: &RepoLoc, path: &str) -> Result<String> {
             "--staged",
             "--worktree",
             "--",
-            path,
+            &spec,
         ],
     )
-    .or_else(|_| git_run_loc(loc, &["clean", "-fd", "--", path]))
+    .or_else(|_| git_run_loc(loc, &["clean", "-fd", "--", &spec]))
 }
 
 /// Merge `branch` into whatever is checked out at `loc` (the base). `RepoLoc`
@@ -1818,12 +1877,14 @@ pub fn delete_branch_loc(loc: &RepoLoc, branch: &str) -> Result<String> {
 /// Stage exactly `paths` (their additions, modifications, and deletions, via
 /// `git add -A -- <paths>`) and commit only those paths at `loc` (`git commit
 /// --only`). Files outside `paths` are left untouched — even if already staged.
-/// Errors on an empty selection or git failure.
+/// `paths` are as [`git_status_files`] lists them. Errors on an empty selection
+/// or git failure.
 pub fn git_commit_paths(loc: &RepoLoc, msg: &str, paths: &[String]) -> Result<String> {
     if paths.is_empty() {
         bail!("Select at least one file to commit");
     }
-    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let specs: Vec<String> = paths.iter().map(|path| from_root(path)).collect();
+    let refs: Vec<&str> = specs.iter().map(String::as_str).collect();
 
     // Stage the selected paths first so untracked ones become known to git; then
     // commit only those paths, taking their working-tree state.
@@ -7339,6 +7400,164 @@ mod tests {
         assert!(!repo.join("junk.txt").exists(), "untracked file removed");
 
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A repository with `crates/app/src/main.rs` and `docs/notes.md`
+    /// committed, for a project opened at `crates/app`.
+    fn repo_with_a_project_folder() -> (PathBuf, PathBuf) {
+        let repo =
+            std::env::temp_dir().join(format!("muxel-it-below-root-{}", uuid::Uuid::new_v4()));
+        let folder = repo.join("crates").join("app");
+        std::fs::create_dir_all(folder.join("src")).unwrap();
+        std::fs::create_dir_all(repo.join("docs")).unwrap();
+        let git = |args: &[&str]| {
+            command("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@muxel"]);
+        git(&["config", "user.name", "muxel test"]);
+        git(&["config", "core.autocrlf", "false"]);
+        std::fs::write(folder.join("src").join("main.rs"), "one\n").unwrap();
+        std::fs::write(repo.join("docs").join("notes.md"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        (repo, folder)
+    }
+
+    /// `git status --porcelain=v1 -z` lists paths from the repository's root,
+    /// whatever folder of it runs it, so a project opened below the root lists
+    /// `crates/app/src/main.rs`, and files outside its folder too. Each
+    /// per-file op takes a path as listed, even with `diff.relative=true`.
+    #[test]
+    fn per_file_ops_in_a_folder_below_the_root_act_on_the_listed_files() {
+        let (repo, folder) = repo_with_a_project_folder();
+        let loc = RepoLoc::Local(folder.clone());
+        assert!(
+            command("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["config", "diff.relative", "true"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(folder.join("src").join("main.rs"), "two\n").unwrap();
+        std::fs::write(repo.join("docs").join("notes.md"), "two\n").unwrap();
+        std::fs::write(folder.join("new.txt"), "x\n").unwrap();
+        let status = |path: &str| {
+            git_status_files(&loc)
+                .into_iter()
+                .find(|change| change.path == path)
+                .map(|change| change.status)
+        };
+        let mut listed: Vec<String> = git_status_files(&loc).into_iter().map(|c| c.path).collect();
+        listed.sort();
+        assert_eq!(
+            listed,
+            [
+                "crates/app/new.txt",
+                "crates/app/src/main.rs",
+                "docs/notes.md"
+            ]
+        );
+
+        let main = "crates/app/src/main.rs";
+        let diff = git_diff_for(&loc, main);
+        let outside_diff = git_diff_for(&loc, "docs/notes.md");
+        let stage = git_stage_path(&loc, main).map(|_| status(main));
+        let unstage = git_unstage_path(&loc, main).map(|_| status(main));
+        let discard_outside = git_discard_path(&loc, "docs/notes.md")
+            .map(|_| std::fs::read_to_string(repo.join("docs").join("notes.md")).unwrap());
+        let discard_new =
+            git_discard_path(&loc, "crates/app/new.txt").map(|_| folder.join("new.txt").exists());
+        let commit = git_commit_paths(&loc, "two", &[main.to_string()]).map(|_| status(main));
+        let _ = std::fs::remove_dir_all(&repo);
+
+        assert!(diff.contains("+two"), "the diff: {diff}");
+        assert!(
+            outside_diff.contains("+two"),
+            "outside diff under diff.relative=true: {outside_diff}"
+        );
+        assert_eq!(stage.ok(), Some(Some("M ".to_string())), "stage");
+        assert_eq!(unstage.ok(), Some(Some(" M".to_string())), "unstage");
+        assert_eq!(discard_outside.ok().as_deref(), Some("one\n"), "discard");
+        assert_eq!(discard_new.ok(), Some(false), "discard an untracked file");
+        assert_eq!(commit.ok(), Some(None), "commit");
+    }
+
+    /// Where a folder sits in its repository: the root, and the folder's path
+    /// from it, which takes a listed path to one from the folder.
+    #[test]
+    fn a_folders_place_in_its_repository() {
+        let (repo, folder) = repo_with_a_project_folder();
+        let below = git_place(&RepoLoc::Local(folder));
+        let at_root = git_place(&RepoLoc::Local(repo.clone()));
+        let outside = git_place(&RepoLoc::Local(
+            std::env::temp_dir().join("muxel-no-such-folder"),
+        ));
+        let top = below
+            .as_ref()
+            .and_then(|below| std::fs::canonicalize(&below.top).ok());
+        let repo_resolved = std::fs::canonicalize(&repo).ok();
+        let _ = std::fs::remove_dir_all(&repo);
+
+        let below = below.expect("the folder is in a repository");
+        assert_eq!(top, repo_resolved, "{below:?}");
+        assert_eq!(below.prefix, "crates/app/");
+        assert_eq!(
+            below.in_folder("crates/app/src/main.rs"),
+            Some("src/main.rs")
+        );
+        assert_eq!(below.in_folder("docs/notes.md"), None);
+        let at_root = at_root.expect("the root is in its repository");
+        assert_eq!(at_root.prefix, "");
+        assert_eq!(at_root.in_folder("docs/notes.md"), Some("docs/notes.md"));
+        assert_eq!(outside, None);
+    }
+
+    /// A filename containing git pathspec glob characters (`[ab].txt`) must be
+    /// matched literally, never expanding to also act on siblings like `a.txt`.
+    #[test]
+    fn discarding_a_wildcard_named_file_leaves_matching_siblings_alone() {
+        let (repo, folder) = repo_with_a_project_folder();
+        let git = |args: &[&str]| {
+            let out = command("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        std::fs::write(folder.join("[ab].txt"), "one\n").unwrap();
+        std::fs::write(folder.join("a.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "wildcard pair"]);
+
+        std::fs::write(folder.join("[ab].txt"), "two\n").unwrap();
+        std::fs::write(folder.join("a.txt"), "two\n").unwrap();
+
+        let loc = RepoLoc::Local(folder.clone());
+        let discarded = git_discard_path(&loc, "crates/app/[ab].txt");
+        let wild = std::fs::read_to_string(folder.join("[ab].txt")).unwrap();
+        let sibling = std::fs::read_to_string(folder.join("a.txt")).unwrap();
+        let _ = std::fs::remove_dir_all(&repo);
+
+        assert!(discarded.is_ok(), "discard failed: {discarded:?}");
+        assert_eq!(wild, "one\n", "[ab].txt was not discarded");
+        assert_eq!(
+            sibling, "two\n",
+            "discarding [ab].txt also reverted sibling a.txt"
+        );
     }
 
     // ---- Team libraries: non-interactive git runner ----
