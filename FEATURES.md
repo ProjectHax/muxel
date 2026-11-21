@@ -628,8 +628,8 @@ feature is added or changed, update the matching entry here in the same change**
 ## Agent status
 
 - **Program Status Protocol** — direct PTY panes answer an OSC 7501 capability
-  query before a following DA query, and Claude, Codex, Grok and Muse panes take
-  their reports as status. Working, blocked (including permission, question, or
+  query before a following DA query. Claude, Codex, Grok, Muse and Antigravity
+  panes take their reports as status. Working, blocked (including permission, question, or
   auth kind), and finished states come from the agent while its root report is
   current; a shell, opencode or Amp pane ignores reports, since anything printed
   there can carry one. A blocked prompt on screen or in the agent's title still
@@ -646,6 +646,7 @@ feature is added or changed, update the matching entry here in the same change**
   because tmux does not forward OSC 7501 reports. Once Claude has reported in a
   launch, its glyph-less title names the pane for the rest of that launch without
   supplying lifecycle status; a title in the current root report takes precedence.
+  An Antigravity Working report after Enter can confirm `ctl send`.
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
   icon, dashboard, and notification dots. A **done** you haven't looked at stays
