@@ -15608,6 +15608,32 @@ impl MuxelApp {
         )
     }
 
+    /// A click reached page `iid`'s native webview, in `window`, the one
+    /// showing it. Make it the active pane there, and blur its address bar
+    /// once if that had focus.
+    fn take_page_focus(
+        &mut self,
+        iid: Uuid,
+        view: &Entity<crate::browser::BrowserView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let address_focused = view.read(cx).address_focused(window, cx);
+        if self.active_instance == Some(iid) && !address_focused {
+            return;
+        }
+        if self.active_instance != Some(iid) {
+            self.focus_instance(iid, window, cx);
+        } else {
+            let handle = view.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        }
+        // GPUI focus bookkeeping may move OS focus to the parent. Return it
+        // once; the resulting GotFocus event is ignored next tick because pane
+        // and address state are settled.
+        view.read(cx).focus_native(cx);
+    }
+
     /// Status-refresh tick: re-render and fire desktop notifications for
     /// unfocused agents when they finish or ring the terminal bell. The bell is
     /// the agent's deliberate "I need you" signal (e.g. Claude on a permission
@@ -15696,28 +15722,57 @@ impl MuxelApp {
                 self.browsers.iter().map(|(i, v)| (*i, v.clone())).collect();
             let mut changed = false;
             let mut new_windows: Vec<(Uuid, String)> = Vec::new();
+            let here = window.window_handle().window_id();
             for (iid, view) in views {
-                if let Some(url) = view.update(cx, |v, cx| v.sync(window, cx))
+                // A page's address bar and focus belong to the window showing its
+                // project, which needn't be this one: the tick runs in the main
+                // window.
+                let elsewhere = self
+                    .workspace
+                    .instance(iid)
+                    .and_then(|i| self.window_showing(i.project_id))
+                    .filter(|shown_in| shown_in.window_id() != here);
+                let synced = match elsewhere {
+                    None => view.update(cx, |v, cx| v.sync(window, cx)),
+                    Some(shown_in) => shown_in
+                        .update(cx, |_, window, cx| {
+                            view.update(cx, |v, cx| v.sync(window, cx))
+                        })
+                        .ok()
+                        .flatten(),
+                };
+                if let Some(url) = synced
                     && let Some(inst) = self.workspace.instance_mut(iid)
                 {
                     inst.browser_url = Some(url);
                     changed = true;
                 }
                 // Native WebView focus never reaches GPUI. Mirror it into Muxel's
-                // active-pane state, and blur a focused address input once.
+                // active-pane state, in the page's window.
                 if view.update(cx, |v, _| v.take_native_focus()) == Some(true) {
-                    let address_focused = view.read(cx).address_focused(window, cx);
-                    if self.active_instance != Some(iid) || address_focused {
-                        if self.active_instance != Some(iid) {
-                            self.focus_instance(iid, window, cx);
-                        } else {
-                            let handle = view.read(cx).focus_handle(cx);
-                            window.focus(&handle, cx);
+                    match elsewhere {
+                        None => self.take_page_focus(iid, &view, window, cx),
+                        Some(shown_in) => {
+                            let this = cx.weak_entity();
+                            let view = view.clone();
+                            cx.defer(move |cx| {
+                                Self::update_in_window(&this, shown_in, cx, |this, window, cx| {
+                                    // The page may have moved on since the tick:
+                                    // popped out, or its project now in another
+                                    // window. Then the click isn't this window's.
+                                    let docked = this.browsers.get(&iid) == Some(&view);
+                                    let here = window.window_handle().window_id();
+                                    let shown_here = this
+                                        .workspace
+                                        .instance(iid)
+                                        .and_then(|i| this.window_showing(i.project_id))
+                                        .is_some_and(|shown_in| shown_in.window_id() == here);
+                                    if docked && shown_here {
+                                        this.take_page_focus(iid, &view, window, cx)
+                                    }
+                                });
+                            });
                         }
-                        // GPUI focus bookkeeping may move OS focus to the parent.
-                        // Return it once; the resulting GotFocus event is ignored
-                        // next tick because pane and address state are settled.
-                        view.read(cx).focus_native(cx);
                     }
                 }
                 new_windows.extend(

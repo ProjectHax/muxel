@@ -714,6 +714,27 @@ mod imp {
             self.address.read(cx).focus_handle(cx).is_focused(window)
         }
 
+        /// As the user does: focuses the address bar in `window`, the one
+        /// showing the page, and types `text` into it.
+        #[cfg(all(test, windows))]
+        pub(crate) fn type_address_for_test(
+            &mut self,
+            text: &str,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            let handle = self.address.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+            self.address
+                .update(cx, |s, cx| s.set_value(text.to_string(), window, cx));
+        }
+
+        /// What the address bar holds.
+        #[cfg(all(test, windows))]
+        pub(crate) fn address_for_test(&self, cx: &App) -> String {
+            self.address.read(cx).value().to_string()
+        }
+
         /// Reload the page the webview is *currently* on.
         ///
         /// This is wry's native reload, not a re-navigation to `self.url` and not a
