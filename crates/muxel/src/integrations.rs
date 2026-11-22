@@ -1745,14 +1745,16 @@ fn parse_status_z(bytes: &[u8]) -> Vec<GitChange> {
     let mut fields = text.split('\0').filter(|s| !s.is_empty());
     let mut out = Vec::new();
     while let Some(rec) = fields.next() {
-        // A record needs the two status chars, the separator space, and at least
-        // one path character.
-        if rec.len() < 4 {
+        // Check the ASCII prefix and nonempty path before slicing the UTF-8 record.
+        let [x, y, b' ', _, ..] = rec.as_bytes() else {
+            continue;
+        };
+        if !x.is_ascii() || !y.is_ascii() {
             continue;
         }
         let status = rec[..2].to_string();
         let path = rec[3..].to_string();
-        let orig = if status.starts_with('R') || status.starts_with('C') {
+        let orig = if matches!(x, b'R' | b'C') || matches!(y, b'R' | b'C') {
             fields.next().map(str::to_string)
         } else {
             None
@@ -7268,6 +7270,41 @@ mod tests {
                     orig: Some("old.txt".into()),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn parse_status_z_reads_worktree_rename_source() {
+        // Captured after moving src/old.txt to new.txt and running git add -N new.txt.
+        let raw = b" R new.txt\0src/old.txt\0 M z.txt\0";
+        assert_eq!(
+            parse_status_z(raw),
+            vec![
+                GitChange {
+                    status: " R".into(),
+                    path: "new.txt".into(),
+                    orig: Some("src/old.txt".into()),
+                },
+                GitChange {
+                    status: " M".into(),
+                    path: "z.txt".into(),
+                    orig: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_status_z_skips_a_multibyte_separator() {
+        // Git writes a space after the two status characters; here é takes its place.
+        let raw = " Mé.txt\0 M é.txt\0";
+        assert_eq!(
+            parse_status_z(raw.as_bytes()),
+            vec![GitChange {
+                status: " M".into(),
+                path: "é.txt".into(),
+                orig: None,
+            }]
         );
     }
 
