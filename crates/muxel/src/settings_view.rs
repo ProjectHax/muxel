@@ -437,7 +437,7 @@ impl SettingsSection {
             Self::Identities => SectionIcon::Named(IconName::CircleUser),
             Self::Projects => SectionIcon::Named(IconName::Folder),
             Self::Keybindings => SectionIcon::Path("icons/keyboard.svg"),
-            Self::Cloud => SectionIcon::Named(IconName::Globe),
+            Self::Cloud => SectionIcon::Path("icons/muxel-logo.svg"),
         }
     }
 }
