@@ -523,10 +523,11 @@ fn a_hidden_diff_pane_starts_no_git_until_it_is_shown() {
         add_line(&fx.a);
         add_line(&fx.b);
         // One pane's poll, as B now stands: its top level is already known.
-        let toplevel = crate::integrations::diff_plan(fx.b.path())
+        let toplevel = crate::integrations::diff_plan(fx.b.path(), None)
             .expect("a work tree")
             .toplevel;
-        let one = launches_while(|| crate::integrations::git_diff(fx.b.path(), Some(&toplevel)));
+        let one =
+            launches_while(|| crate::integrations::git_diff(fx.b.path(), Some(&toplevel), None));
         assert!(one > 0);
         let ticked = launches_while(|| tick(cx));
         assert_eq!(ticked, one, "only the shown pane ran git");
@@ -906,6 +907,7 @@ fn worktree_lists_read_for_one_project_dont_land_in_the_next() {
                     branch: "main".into(),
                     color: 0,
                     detached: false,
+                    base: None,
                 });
             }
             // A's worktrees and branches are still being read when B is
@@ -946,6 +948,7 @@ fn switching_projects_stops_offering_the_last_ones_branches() {
                     branch: "main".into(),
                     color: 0,
                     detached: false,
+                    base: None,
                 });
             }
             app.refresh_git_diff_worktrees(cx);
@@ -1069,5 +1072,213 @@ fn changes_file_returns_none_when_place_is_unknown() {
             opened, None,
             "Open file guessed a path without a known place"
         );
+    });
+}
+
+/// A muxel worktree of A on its own branch, made from `main` and registered
+/// with `base`, holding one commit `main` doesn't have. Removed on drop.
+struct WorktreeOfA {
+    path: PathBuf,
+    wid: Uuid,
+    repo: PathBuf,
+}
+
+impl Drop for WorktreeOfA {
+    fn drop(&mut self) {
+        let path = self.path.to_string_lossy().into_owned();
+        crate::test_support::git_out(&self.repo, &["worktree", "remove", "--force", &path]);
+    }
+}
+
+fn worktree_of_a(
+    cx: &mut TestAppContext,
+    main: &Main,
+    fx: &Fixture,
+    base: Option<&str>,
+) -> WorktreeOfA {
+    let path = crate::test_support::short_temp_path();
+    let shown = path.to_string_lossy().into_owned();
+    fx.a.git(&["worktree", "add", "-q", "-b", "muxel/wt", &shown]);
+    let worktree = WorktreeOfA {
+        path: path.clone(),
+        wid: Uuid::new_v4(),
+        repo: fx.a.path().to_path_buf(),
+    };
+    std::fs::write(path.join("notes.txt"), "first\nsecond\n").unwrap();
+    crate::test_support::git_out(&path, &["commit", "-q", "-am", "worktree work"]);
+    let (wid, pid, base) = (worktree.wid, fx.pid, base.map(str::to_string));
+    main.update(cx, |app, _, _| {
+        app.workspace.add_worktree(muxel_core::Worktree {
+            id: wid,
+            project_id: pid,
+            name: "fixture".into(),
+            path,
+            branch: "muxel/wt".into(),
+            color: 0,
+            detached: false,
+            base,
+        });
+    });
+    worktree
+}
+
+fn open_diff_at(cx: &mut TestAppContext, main: &Main, fx: &Fixture, dir: PathBuf) -> Uuid {
+    let iid = main.update(cx, |app, window, cx| {
+        let origin = ResourceOrigin::Chrome {
+            near: app.active_instance,
+        };
+        app.open_diff_for_dir(fx.pid, dir, origin, window, cx);
+        app.active_instance.expect("the new diff pane is focused")
+    });
+    cx.run_until_parked();
+    iid
+}
+
+/// A worktree's diff pane compares it with the branch it came from, so the
+/// worktree's commits show, not only what it hasn't committed. One made
+/// before muxel recorded its base compares with the project's branch.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn a_worktree_diff_pane_shows_its_commits_against_its_base() {
+    with_app(|cx, main, fx| {
+        let wt = worktree_of_a(cx, main, fx, Some("main"));
+        let iid = open_diff_at(cx, main, fx, wt.path.clone());
+        tick(cx);
+        let text = diff_text(cx, main, iid);
+        assert!(text.contains("compared with main"), "{text}");
+        assert!(text.contains("+second"), "{text}");
+
+        // Made before bases were recorded: the project's branch stands in.
+        let wid = wt.wid;
+        main.update(cx, |app, _, cx| {
+            app.workspace.worktree_mut(wid).unwrap().base = None;
+            app.project_branches.insert(fx.pid, Some("main".into()));
+            app.request_diff(iid, cx);
+        });
+        tick(cx);
+        let text = diff_text(cx, main, iid);
+        assert!(text.contains("compared with main"), "{text}");
+        assert!(text.contains("+second"), "{text}");
+
+        // With neither, it's HEAD's diff, as for any folder.
+        main.update(cx, |app, _, cx| {
+            app.project_branches.insert(fx.pid, None);
+            app.request_diff(iid, cx);
+        });
+        tick(cx);
+        let text = diff_text(cx, main, iid);
+        assert!(!text.contains("+second"), "{text}");
+    });
+}
+
+/// Merging a worktree into its base moves only the base's ref, and the
+/// watched pane follows it: nothing is left to show.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn merging_a_worktree_into_its_base_refreshes_its_diff() {
+    with_app(|cx, main, fx| {
+        let backend = watch_with(cx, main);
+        let wt = worktree_of_a(cx, main, fx, Some("main"));
+        let iid = open_diff_at(cx, main, fx, wt.path.clone());
+        assert!(watched(cx, main, iid), "the pane watches its worktree");
+        wait(cx, 2 * MIN_GAP);
+        assert!(diff_text(cx, main, iid).contains("+second"));
+        fx.a.git(&["merge", "-q", "--ff-only", "muxel/wt"]);
+        let heads = fx.a.path().join(".git").join("refs").join("heads");
+        send(
+            &backend,
+            notify::EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            &[heads.join("main.lock"), heads.join("main")],
+        );
+        wait(cx, SOON);
+        let text = diff_text(cx, main, iid);
+        assert!(!text.contains("+second"), "{text}");
+    });
+}
+
+/// The Worktrees tab lists what a worktree committed since its base beside
+/// what it hasn't committed, and a committed file's diff window shows its
+/// commits. One made before bases were recorded compares with the project's
+/// branch; with neither, only its uncommitted files show.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "gpui_component::Root asks a test window for its NSView, which gpui's test platform can't give"
+)]
+fn the_worktrees_tab_lists_a_worktrees_commits() {
+    with_app(|cx, main, fx| {
+        let wt = worktree_of_a(cx, main, fx, Some("main"));
+        let wid = wt.wid;
+        std::fs::write(wt.path.join("notes.txt"), "first\nsecond\nthird\n").unwrap();
+        let read = |cx: &mut TestAppContext| {
+            main.update(cx, |app, _, cx| app.refresh_git_diff_worktrees(cx));
+            cx.run_until_parked();
+            main.update(cx, |app, _, _| {
+                app.git_diff_worktree_files
+                    .get(&wid)
+                    .cloned()
+                    .expect("the worktree's lists were read")
+            })
+        };
+        let listed = |list: &[crate::integrations::GitChange]| {
+            list.iter()
+                .map(|change| format!("{}{}", change.status, change.path))
+                .collect::<Vec<_>>()
+        };
+
+        let changes = read(cx);
+        assert_eq!(changes.base.as_deref(), Some("main"));
+        assert_eq!(listed(&changes.committed), ["M notes.txt"]);
+        assert_eq!(listed(&changes.uncommitted), [" Mnotes.txt"]);
+        assert_eq!(changes.file_count(), 1, "a file in both lists counts once");
+
+        // Its committed diff is the commit, without the edit on top, in a
+        // window of its own beside the uncommitted one.
+        let committed = GitSource::WorktreeCommits(wid);
+        let window_text = |cx: &mut TestAppContext, src: GitSource| {
+            let handle = main.update(cx, |app, _, cx| {
+                app.open_file_diff_window(src, "notes.txt".into(), cx);
+                app.diff_file_windows
+                    .get(&(src, "notes.txt".to_string()))
+                    .copied()
+                    .expect("a diff window opened")
+            });
+            handle
+                .update(cx, |root, _, cx| {
+                    let view = root.view().clone().downcast::<super::FileDiffView>();
+                    view.expect("a file diff").read(cx).unified_src.to_string()
+                })
+                .unwrap()
+        };
+        let text = window_text(cx, committed);
+        assert!(
+            text.contains("+second") && !text.contains("+third"),
+            "{text}"
+        );
+        let text = window_text(cx, GitSource::Worktree(wid));
+        assert!(
+            text.contains("+third") && !text.contains("+second"),
+            "{text}"
+        );
+
+        main.update(cx, |app, _, _| {
+            app.workspace.worktree_mut(wid).unwrap().base = None;
+            app.project_branches.insert(fx.pid, Some("main".into()));
+        });
+        assert_eq!(listed(&read(cx).committed), ["M notes.txt"]);
+
+        main.update(cx, |app, _, _| {
+            app.project_branches.insert(fx.pid, None);
+        });
+        let changes = read(cx);
+        assert_eq!(changes.base, None);
+        assert!(changes.committed.is_empty(), "{:?}", changes.committed);
+        assert_eq!(listed(&changes.uncommitted), [" Mnotes.txt"]);
     });
 }

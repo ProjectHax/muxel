@@ -687,6 +687,7 @@ fn restore_shows_unused_registered_worktrees_and_leaves_used_ones() {
                         branch: format!("muxel/{name}"),
                         color: 0,
                         detached: false,
+                        base: None,
                     });
                 }
                 let mut pane = Instance::shell(used_project);
@@ -878,6 +879,7 @@ fn closing_both_tmux_panes_of_a_clean_worktree_removes_it() {
                     branch: "muxel/close-both".into(),
                     color: 0,
                     detached: false,
+                    base: None,
                 });
                 let mut second = Instance::shell(pid);
                 second.tmux_session = Some("close-worktree-shell".into());

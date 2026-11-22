@@ -2303,6 +2303,7 @@ pub fn migrate_worktrees(workspace: &mut Workspace) {
                 branch,
                 color,
                 detached: false,
+                base: None,
             });
             id
         });
@@ -4555,6 +4556,7 @@ mod remote_layout_tests {
             branch: format!("muxel/{name}"),
             color,
             detached: false,
+            base: None,
         }
     }
 
@@ -5698,6 +5700,7 @@ mod worktree_registry_tests {
             branch: "muxel/00000000".into(),
             color,
             detached: false,
+            base: None,
         }
     }
 
@@ -5775,6 +5778,7 @@ mod worktree_registry_tests {
             branch: "b".into(),
             color: 0,
             detached: false,
+            base: None,
         };
         let wid = registered.id;
         workspace.add_worktree(registered);

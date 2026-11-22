@@ -42,6 +42,20 @@ final class WorktreeTests: XCTestCase {
         XCTAssertEqual(WorktreeNaming.nextColor(worktrees: [wt(0, project: "other")], projectId: p), 0)
     }
 
+    // MARK: record coding (port of worktree.rs)
+
+    func testBaseIsOptionalAndRoundTrips() throws {
+        let old = #"{"id":"a","project_id":"p","name":"n","path":"/p","branch":"b","color":1}"#
+        let decoded = try JSONDecoder().decode(Worktree.self, from: Data(old.utf8))
+        XCTAssertNil(decoded.base)
+        let plain = String(decoding: try JSONEncoder().encode(decoded), as: UTF8.self)
+        XCTAssertFalse(plain.contains("base"))
+        var withBase = decoded
+        withBase.base = "main"
+        let back = try JSONDecoder().decode(Worktree.self, from: try JSONEncoder().encode(withBase))
+        XCTAssertEqual(back.base, "main")
+    }
+
     // MARK: remote create command + result parsing
 
     func testCreateCommandShape() {

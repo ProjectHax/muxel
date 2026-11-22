@@ -1177,8 +1177,12 @@ pub fn is_git_repo(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Create a worktree at `worktree_path` on a new `branch`, based on `repo`.
-pub fn create_worktree(repo: &Path, worktree_path: &Path, branch: &str) -> Result<()> {
+/// Create a worktree at `worktree_path` on a new `branch`, based on `repo`'s
+/// HEAD. Returns what it was made from, for its diff to compare with: the
+/// branch `repo` has checked out, or its commit when detached (`None` when git
+/// can't say).
+pub fn create_worktree(repo: &Path, worktree_path: &Path, branch: &str) -> Result<Option<String>> {
+    let base = repo_current_branch(&RepoLoc::Local(repo.to_path_buf())).or_else(|| repo_head(repo));
     let output = command("git")
         .arg("-C")
         .arg(repo)
@@ -1192,7 +1196,7 @@ pub fn create_worktree(repo: &Path, worktree_path: &Path, branch: &str) -> Resul
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(())
+    Ok(base)
 }
 
 /// Count uncommitted changes in `worktree_path` (staged, unstaged, untracked).
@@ -1800,6 +1804,12 @@ pub fn git_diff_for(loc: &RepoLoc, path: &str) -> String {
         ])
         .unwrap_or_default();
     }
+    file_diff_display(out, path)
+}
+
+/// A file's diff as its window shows it: cut at [`MAX_DIFF_BYTES`], or a
+/// short message when there's nothing to show.
+fn file_diff_display(mut out: String, path: &str) -> String {
     if out.len() > MAX_DIFF_BYTES {
         out.truncate(MAX_DIFF_BYTES);
         out.push_str(&t("\n… diff truncated …\n"));
@@ -1808,6 +1818,103 @@ pub fn git_diff_for(loc: &RepoLoc, path: &str) -> String {
         tf("# {path}\n\nNo diff available.\n", &[("path", path)])
     } else {
         out
+    }
+}
+
+/// The commits HEAD made since it left `base`, as git's `base...HEAD` range
+/// names them: a diff over it runs from where the two meet. `None` for a
+/// base starting with `-`, which git would read as an option; no branch does.
+fn since_base(base: &str) -> Option<String> {
+    (!base.is_empty() && !base.starts_with('-')).then(|| format!("{base}...HEAD"))
+}
+
+/// The files a worktree's commits changed since it left `base` (a
+/// [`muxel_core::Worktree::base`]), renames found, with paths from the
+/// repository's root as [`git_status_files`] lists them and each status a
+/// letter padded to that list's two columns (`"M "`, `"R "`). Its uncommitted
+/// edits are [`git_status_files`]'s. Empty when nothing was committed since,
+/// or git can't find `base` or where HEAD left it.
+pub fn git_committed_files(loc: &RepoLoc, base: &str) -> Vec<GitChange> {
+    let Some(range) = since_base(base) else {
+        return Vec::new();
+    };
+    let args = [
+        "-c",
+        "diff.relative=false",
+        "diff",
+        "--name-status",
+        "-z",
+        "-M",
+        &range,
+        "--",
+    ];
+    git_output(loc, &args)
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| parse_name_status_z(&o.stdout))
+        .unwrap_or_default()
+}
+
+/// Parse `git diff --name-status -z`: a status field (`M`, `A`, `D`, `T`, or
+/// `R`/`C` with a score such as `R100`), then its path, which for a rename or
+/// copy is the source and is followed by the new path.
+fn parse_name_status_z(bytes: &[u8]) -> Vec<GitChange> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut fields = text.split('\0');
+    let mut out = Vec::new();
+    while let Some(status) = fields.next() {
+        let Some(letter) = status.chars().next().filter(char::is_ascii_uppercase) else {
+            continue;
+        };
+        let Some(first) = fields.next().filter(|path| !path.is_empty()) else {
+            break;
+        };
+        let (path, orig) = if matches!(letter, 'R' | 'C') {
+            let Some(new) = fields.next().filter(|path| !path.is_empty()) else {
+                break;
+            };
+            (new, Some(first.to_string()))
+        } else {
+            (first, None)
+        };
+        out.push(GitChange {
+            status: format!("{letter} "),
+            path: path.to_string(),
+            orig,
+        });
+    }
+    out
+}
+
+/// Unified diff of one file as a worktree's commits changed it since it left
+/// `base`, from where the two meet to HEAD; its uncommitted edits are
+/// [`git_diff_for`]'s. `path`, and a rename's `orig`, are as
+/// [`git_committed_files`] lists them: naming both lets git show the rename.
+pub fn git_committed_diff_for(loc: &RepoLoc, base: &str, path: &str, orig: Option<&str>) -> String {
+    let Some(range) = since_base(base) else {
+        return tf("# {path}\n\nNo diff available.\n", &[("path", path)]);
+    };
+    let specs: Vec<String> = orig.into_iter().chain([path]).map(from_root).collect();
+    let mut args = vec![
+        "-c",
+        "diff.relative=false",
+        "diff",
+        "-M",
+        "--no-color",
+        &range,
+        "--",
+    ];
+    args.extend(specs.iter().map(String::as_str));
+    let out = git_output(loc, &args)
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    match out {
+        Some(out) => file_diff_display(out, path),
+        None => tf(
+            "# {path}\n\nCan't compare with {base}.\n",
+            &[("path", path), ("base", base)],
+        ),
     }
 }
 
@@ -2096,7 +2203,8 @@ pub struct DiffPlan {
     /// HEAD and the index.
     pub state: Vec<PathBuf>,
     /// HEAD's target: the current branch's loose ref, `packed-refs`, and
-    /// reftable's `tables.list` (a linked worktree's own too).
+    /// reftable's `tables.list` (a linked worktree's own too). For a diff
+    /// against a base branch, that branch's loose ref as well.
     pub refs: Vec<PathBuf>,
     /// Whether those files settle what `git diff HEAD` reads, by the same
     /// rules as [`GitRefStamp`]: no variable from [`GIT_DISCOVERY_ENV`] set,
@@ -2170,9 +2278,10 @@ fn git_path(bytes: &[u8]) -> Option<PathBuf> {
     }
 }
 
-/// Resolve [`DiffPlan`] for `dir` with two git commands, `rev-parse` and
-/// `ls-files`. `None` where `dir` isn't in a work tree git will read.
-pub fn diff_plan(dir: &Path) -> Option<DiffPlan> {
+/// Resolve [`DiffPlan`] for `dir`, diffed against `base` as [`git_diff`]
+/// takes it, with two git commands, `rev-parse` and `ls-files`. `None` where
+/// `dir` isn't in a work tree git will read.
+pub fn diff_plan(dir: &Path, base: Option<&str>) -> Option<DiffPlan> {
     let git = |args: &[&str]| {
         git_read_command()
             .arg("-C")
@@ -2225,6 +2334,10 @@ pub fn diff_plan(dir: &Path) -> Option<DiffPlan> {
                 .any(|prefix| refname.starts_with(prefix));
         refs.push(if per_worktree { &git_dir } else { &common }.join(refname));
     }
+    // Merging the worktree into its base moves where the two meet.
+    if let Some(refname) = base.and_then(base_branch_ref) {
+        refs.push(common.join(refname));
+    }
     Some(DiffPlan {
         toplevel,
         tracked,
@@ -2233,6 +2346,24 @@ pub fn diff_plan(dir: &Path) -> Option<DiffPlan> {
         settled: head.is_some() && !submodules,
         inputs,
     })
+}
+
+/// The ref a diff's `base` names when it's a branch, spelled as
+/// [`list_branches`] spells it (`heads/<name>` where a tag shares the name),
+/// or in full. `None` for a commit id, or a name git wouldn't take, which
+/// keeps the ref's path inside the git directory.
+fn base_branch_ref(base: &str) -> Option<String> {
+    let commit_id =
+        matches!(base.len(), 40 | 64) && base.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if commit_id {
+        return None;
+    }
+    let name = base
+        .strip_prefix("refs/heads/")
+        .or_else(|| base.strip_prefix("heads/"))
+        .unwrap_or(base);
+    let refname = format!("refs/heads/{name}");
+    is_valid_ref_name(&refname).then_some(refname)
 }
 
 /// The paths in `git ls-files -z -s` output (`<mode> <object> <stage>\t<path>`),
@@ -2266,7 +2397,13 @@ pub fn not_a_git_repo(dir: &Path) -> String {
 /// (we can't tell agent-created files from pre-existing ones without a baseline).
 /// With the repository's `toplevel` already known (from a [`DiffPlan`]) it runs
 /// one git command instead of two.
-pub fn git_diff(dir: &Path, toplevel: Option<&str>) -> String {
+///
+/// With a `base` (a worktree's [`muxel_core::Worktree::base`]) the diff runs
+/// from where HEAD left that branch instead, as a pull request shows it: the
+/// worktree's commits and its uncommitted edits, without what the base gained
+/// since. That costs a `merge-base` first. A base git can't find, or that
+/// shares no history with HEAD, falls back to HEAD, saying so.
+pub fn git_diff(dir: &Path, toplevel: Option<&str>, base: Option<&str>) -> String {
     let git = |args: &[&str]| {
         git_read_command()
             .arg("-C")
@@ -2298,12 +2435,39 @@ pub fn git_diff(dir: &Path, toplevel: Option<&str>) -> String {
             &[("toplevel", &toplevel)],
         ));
     }
+    // An argument starting with `-` would read as an option; no branch does.
+    let base = base.filter(|base| !base.is_empty() && !base.starts_with('-'));
+    let fork = base.and_then(|base| {
+        let out = git(&["merge-base", base, "HEAD"])
+            .ok()
+            .filter(|out| out.status.success())?;
+        let fork = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!fork.is_empty()).then_some(fork)
+    });
+    match (base, &fork) {
+        (Some(base), Some(_)) => header.push_str(&tf(
+            "# (compared with {base}: commits since branching from it, and uncommitted changes)\n",
+            &[("base", base)],
+        )),
+        (Some(base), None) => header.push_str(&tf(
+            "# (can't compare with {base} — showing uncommitted changes only)\n",
+            &[("base", base)],
+        )),
+        (None, _) => {}
+    }
     header.push('\n');
 
-    // Tracked changes (staged + unstaged) vs HEAD, scoped to this folder (`-- .`)
-    // so a parent repo's changes elsewhere never bleed in.
+    // Tracked changes (staged + unstaged) vs HEAD, or vs where HEAD left the
+    // base, scoped to this folder (`-- .`) so a parent repo's changes
+    // elsewhere never bleed in.
     let mut out = String::new();
-    match git(&["diff", "HEAD", "--no-color", "--", "."]) {
+    match git(&[
+        "diff",
+        fork.as_deref().unwrap_or("HEAD"),
+        "--no-color",
+        "--",
+        ".",
+    ]) {
         Ok(o) if o.status.success() => out.push_str(&String::from_utf8_lossy(&o.stdout)),
         // No commits yet (HEAD invalid): fall back to the worktree/index diff.
         _ => {
@@ -6865,13 +7029,13 @@ mod tests {
         std::fs::write(repo.join("sub/insub.txt"), "a\nSUBCHANGED\n").unwrap();
         std::fs::write(repo.join("untracked_new.txt"), "nope\n").unwrap();
 
-        let diff = git_diff(&repo, None);
+        let diff = git_diff(&repo, None, None);
         // A watched pane's refresh, which knows the top level, shows the same.
         for dir in [repo.clone(), repo.join("sub")] {
-            let plan = diff_plan(&dir).expect("a work tree");
+            let plan = diff_plan(&dir, None).expect("a work tree");
             assert_eq!(
-                git_diff(&dir, Some(&plan.toplevel)),
-                git_diff(&dir, None),
+                git_diff(&dir, Some(&plan.toplevel), None),
+                git_diff(&dir, None, None),
                 "{}",
                 dir.display()
             );
@@ -6894,7 +7058,7 @@ mod tests {
 
         // Diffing the subfolder is scoped to it: flags the parent repo, shows the
         // subfolder's change, and does NOT include the parent's tracked.txt change.
-        let sub_diff = git_diff(&repo.join("sub"), None);
+        let sub_diff = git_diff(&repo.join("sub"), None, None);
         assert!(
             sub_diff.contains("subfolder of git repo"),
             "subfolder note shown:\n{sub_diff}"
@@ -6913,13 +7077,179 @@ mod tests {
         let _ = std::fs::remove_dir_all(&plain);
         std::fs::create_dir_all(&plain).unwrap();
         assert!(
-            git_diff(&plain, None).contains("Not a git repository."),
+            git_diff(&plain, None, None).contains("Not a git repository."),
             "non-repo message"
         );
-        assert!(diff_plan(&plain).is_none(), "nothing to watch");
+        assert!(diff_plan(&plain, None).is_none(), "nothing to watch");
 
         let _ = std::fs::remove_dir_all(&plain);
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A worktree remembers the branch it was made from, and its diff
+    /// against that branch runs from where the two meet: the worktree's
+    /// commits and uncommitted edits show, and what the base gained since
+    /// doesn't show as undone. A base git can't find falls back to HEAD.
+    #[test]
+    fn a_worktree_diff_against_its_base_shows_its_commits() {
+        let repo = crate::test_support::TestRepo::init();
+        repo.commit(&[("notes.txt", "first\n"), ("other.txt", "base\n")], "seed");
+        let wt = crate::test_support::short_temp_path();
+        let made_from = create_worktree(repo.path(), &wt, "muxel/wt").expect("create worktree");
+        assert_eq!(made_from.as_deref(), Some("main"));
+        let wt_git = |args: &[&str]| crate::test_support::git_out(&wt, args);
+
+        std::fs::write(wt.join("notes.txt"), "first\ncommitted\n").unwrap();
+        wt_git(&["commit", "-q", "-am", "worktree work"]);
+        std::fs::write(wt.join("notes.txt"), "first\ncommitted\nuncommitted\n").unwrap();
+        // The base moves on after the worktree left it.
+        repo.commit(&[("other.txt", "base\nlater on main\n")], "main moves");
+
+        let against_base = git_diff(&wt, None, Some("main"));
+        let against_head = git_diff(&wt, None, None);
+        let gone = git_diff(&wt, None, Some("no-such-branch"));
+        let option = git_diff(&wt, None, Some("--output=x"));
+        let plan = diff_plan(&wt, Some("main")).expect("a work tree");
+        let _ = remove_worktree(repo.path(), &wt);
+
+        assert!(
+            against_base.contains("compared with main"),
+            "{against_base}"
+        );
+        assert!(against_base.contains("+committed"), "{against_base}");
+        assert!(against_base.contains("+uncommitted"), "{against_base}");
+        assert!(
+            !against_base.contains("other.txt"),
+            "the base's own later work isn't the worktree's:\n{against_base}"
+        );
+        assert!(!against_head.contains("+committed"), "{against_head}");
+        assert!(against_head.contains("+uncommitted"), "{against_head}");
+        assert!(gone.contains("can't compare with no-such-branch"), "{gone}");
+        assert!(gone.contains("+uncommitted") && !gone.contains("+committed"));
+        assert_eq!(option, against_head, "a leading `-` never reaches git");
+        // Its watch follows the base branch, in the common git directory.
+        let base_ref = Path::new(".git").join("refs").join("heads").join("main");
+        assert!(
+            plan.refs.iter().any(|file| file.ends_with(&base_ref)),
+            "{:?}",
+            plan.refs
+        );
+    }
+
+    /// From a detached checkout a worktree is made from its commit.
+    #[test]
+    fn a_worktree_made_from_a_detached_checkout_remembers_the_commit() {
+        let repo = crate::test_support::TestRepo::init();
+        let head = repo.commit(&[("notes.txt", "first\n")], "seed");
+        repo.git(&["checkout", "-q", "--detach"]);
+        let wt = crate::test_support::short_temp_path();
+        let made_from = create_worktree(repo.path(), &wt, "muxel/wt").expect("create worktree");
+        let _ = remove_worktree(repo.path(), &wt);
+        assert_eq!(made_from, Some(head));
+    }
+
+    /// A base's branch ref, however the branch is spelled; none for a commit
+    /// or a name that would leave the git directory.
+    #[test]
+    fn a_base_names_its_branch_ref() {
+        assert_eq!(base_branch_ref("main").as_deref(), Some("refs/heads/main"));
+        assert_eq!(
+            base_branch_ref("heads/feature/x").as_deref(),
+            Some("refs/heads/feature/x")
+        );
+        assert_eq!(
+            base_branch_ref("refs/heads/main").as_deref(),
+            Some("refs/heads/main")
+        );
+        assert_eq!(base_branch_ref(&"a".repeat(40)), None);
+        assert_eq!(base_branch_ref("../../config"), None);
+        assert_eq!(base_branch_ref("/etc"), None);
+    }
+
+    /// The Worktrees tab lists what a worktree committed since it left its
+    /// base, from where the two meet: not what the base did since, nor what
+    /// the worktree hasn't committed. Each file's diff covers the same.
+    #[test]
+    fn a_worktrees_committed_files_run_from_its_base() {
+        let repo = crate::test_support::TestRepo::init();
+        repo.commit(
+            &[
+                ("notes.txt", "first\n"),
+                ("old.txt", "kept the same\nacross the move\n"),
+                ("gone.txt", "bye\n"),
+                ("other.txt", "base\n"),
+            ],
+            "seed",
+        );
+        let wt = crate::test_support::short_temp_path();
+        create_worktree(repo.path(), &wt, "muxel/wt").expect("create worktree");
+        let wt_git = |args: &[&str]| crate::test_support::git_out(&wt, args);
+        std::fs::write(wt.join("notes.txt"), "first\ncommitted\n").unwrap();
+        std::fs::write(wt.join("new.txt"), "new\n").unwrap();
+        wt_git(&["mv", "old.txt", "moved.txt"]);
+        wt_git(&["rm", "-q", "gone.txt"]);
+        wt_git(&["add", "-A"]);
+        wt_git(&["commit", "-q", "-m", "worktree work"]);
+        std::fs::write(wt.join("notes.txt"), "first\ncommitted\nuncommitted\n").unwrap();
+        std::fs::write(wt.join("loose.txt"), "not committed\n").unwrap();
+        repo.commit(&[("other.txt", "base\nlater on main\n")], "main moves");
+
+        let loc = RepoLoc::Local(wt.clone());
+        let files = git_committed_files(&loc, "main");
+        let notes = git_committed_diff_for(&loc, "main", "notes.txt", None);
+        let moved = git_committed_diff_for(&loc, "main", "moved.txt", Some("old.txt"));
+        let gone = git_committed_files(&loc, "no-such-branch");
+        let gone_diff = git_committed_diff_for(&loc, "no-such-branch", "notes.txt", None);
+        let option = git_committed_files(&loc, "--output=x");
+        let _ = remove_worktree(repo.path(), &wt);
+
+        let change = |status: &str, path: &str, orig: Option<&str>| GitChange {
+            status: status.into(),
+            path: path.into(),
+            orig: orig.map(str::to_string),
+        };
+        let mut files = files;
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(
+            files,
+            vec![
+                change("D ", "gone.txt", None),
+                change("R ", "moved.txt", Some("old.txt")),
+                change("A ", "new.txt", None),
+                change("M ", "notes.txt", None),
+            ]
+        );
+        assert!(notes.contains("+committed"), "{notes}");
+        assert!(!notes.contains("uncommitted"), "{notes}");
+        assert!(moved.contains("rename from old.txt"), "{moved}");
+        assert!(gone.is_empty(), "{gone:?}");
+        assert!(gone_diff.contains("Can't compare with no-such-branch"));
+        assert!(option.is_empty(), "a leading `-` never reaches git");
+    }
+
+    #[test]
+    fn parse_name_status_z_reads_renames_and_odd_names() {
+        let raw = b"M\0a.txt\0R087\0old name.txt\0new/n\xc3\xa4me.txt\0A\0b\0C100\0src\0copy\0";
+        let change = |status: &str, path: &str, orig: Option<&str>| GitChange {
+            status: status.into(),
+            path: path.into(),
+            orig: orig.map(str::to_string),
+        };
+        assert_eq!(
+            parse_name_status_z(raw),
+            vec![
+                change("M ", "a.txt", None),
+                change("R ", "new/näme.txt", Some("old name.txt")),
+                change("A ", "b", None),
+                change("C ", "copy", Some("src")),
+            ]
+        );
+        // Output cut off mid-rename keeps what came before.
+        assert_eq!(
+            parse_name_status_z(b"M\0a.txt\0R100\0half\0"),
+            vec![change("M ", "a.txt", None)]
+        );
+        assert!(parse_name_status_z(b"").is_empty());
     }
 
     #[test]

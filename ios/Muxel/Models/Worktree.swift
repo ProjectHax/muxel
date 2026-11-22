@@ -11,9 +11,13 @@ struct Worktree: Codable, Equatable, Identifiable {
     var branch: String
     var color: Int
     var detached: Bool
+    /// The branch (or commit) the worktree was made from; desktop diffs the worktree
+    /// against it. Optional and omitted when nil, as in Rust, so a record iOS rewrites
+    /// keeps it and one iOS creates (nil) falls back to the project's branch.
+    var base: String?
 
     init(id: String, projectId: String, name: String, path: String, branch: String,
-         color: Int, detached: Bool = false) {
+         color: Int, detached: Bool = false, base: String? = nil) {
         self.id = id
         self.projectId = projectId
         self.name = name
@@ -21,12 +25,13 @@ struct Worktree: Codable, Equatable, Identifiable {
         self.branch = branch
         self.color = color
         self.detached = detached
+        self.base = base
     }
 
     private enum CodingKeys: String, CodingKey {
         case id
         case projectId = "project_id"
-        case name, path, branch, color, detached
+        case name, path, branch, color, detached, base
     }
 
     init(from decoder: Decoder) throws {
@@ -38,6 +43,7 @@ struct Worktree: Codable, Equatable, Identifiable {
         branch = try c.decode(String.self, forKey: .branch)
         color = try c.decode(Int.self, forKey: .color)
         detached = (try c.decodeIfPresent(Bool.self, forKey: .detached)) ?? false
+        base = try c.decodeIfPresent(String.self, forKey: .base)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -49,5 +55,6 @@ struct Worktree: Codable, Equatable, Identifiable {
         try c.encode(branch, forKey: .branch)
         try c.encode(color, forKey: .color)
         try c.encode(detached, forKey: .detached)
+        try c.encodeIfPresent(base, forKey: .base)
     }
 }

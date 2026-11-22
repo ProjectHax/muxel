@@ -1799,15 +1799,22 @@ feature is added or changed, update the matching entry here in the same change**
     its repository's root lists the whole repository's changes, as git does, and
     every action works on the file listed, inside the folder or not.
   - **Worktrees** — every worktree of the active project, expandable to its changed
-    files (same rows + diff windows). Per worktree: **Merge into…** any branch
+    files (same rows + diff windows): what it committed since leaving the branch it
+    was made from (its diffs run from where the two meet; View diff and Open file
+    only), then what it hasn't committed. Per worktree: **Merge into…** any branch
     (checks it out + merges, then offers to remove the worktree), and **Delete** the
     worktree + its branch (enabled only when no instance is loaded in it).
   Works for local and remote (SSH) projects; panel width persists per workspace.
 - **Git diff pane** — a simpler read-only pane showing the working-tree diff for a
   directory. From a pane's diff button it opens as a tab beside that pane; from
   the project menu or a worktree's **View changes** it joins the nearest diff
-  tab, if there is one. While it's on screen, docked or popped out, it refreshes
-  when a tracked file under its folder changes or HEAD's branch moves, once the
+  tab, if there is one. A muxel worktree's diff compares it with the branch it was
+  made from, from where the two meet, as a pull request does: the worktree's
+  commits and its uncommitted edits, without what that branch gained since. A
+  worktree made before muxel recorded its branch compares with the project's
+  current branch. While it's on screen, docked or popped out, it refreshes
+  when a tracked file under its folder changes or HEAD's branch (or a worktree's
+  base branch) moves, once the
   writes have been quiet for 0.3 s (at most 2 s into a steady stream, and at
   most once a second), and keeps your scroll position. New untracked files and
   build output don't wake it, and it re-checks every 30 s anyway, re-reading

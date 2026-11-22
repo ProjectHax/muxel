@@ -657,7 +657,7 @@ mod tests {
         repo.commit(&[("top.txt", ""), ("a/x.rs", ""), ("a/b/y.rs", "")], "seed");
         std::fs::create_dir_all(repo.path().join("untracked/deep")).unwrap();
         let root = repo.path();
-        let plan = diff_plan(root).expect("a work tree");
+        let plan = diff_plan(root, None).expect("a work tree");
         let tree = diff_sources_with(root, &plan, false, 1).expect("within budget");
         assert_eq!(
             resolved(&tree.paths),
@@ -689,7 +689,7 @@ mod tests {
         repo.commit(&files, "seed");
         let root = repo.path();
         let paths = || {
-            let plan = diff_plan(root).expect("a work tree");
+            let plan = diff_plan(root, None).expect("a work tree");
             diff_sources_with(root, &plan, true, usize::MAX)
                 .expect("within budget")
                 .paths
@@ -715,7 +715,7 @@ mod tests {
             &linked.to_string_lossy(),
         ]);
         for dir in [repo.path().to_path_buf(), linked.clone()] {
-            let plan = diff_plan(&dir).expect("a work tree");
+            let plan = diff_plan(&dir, None).expect("a work tree");
             let spec = diff_sources(&dir, &plan).expect("watchable");
             let (mut watch, signal) = FileWatch::start().unwrap();
             let id = watch.register(spec).unwrap();
@@ -794,7 +794,7 @@ mod tests {
         repo.commit(&[("top.txt", ""), ("src/lib.rs", "")], "seed");
         let root = repo.path();
         let spec = || {
-            let plan = diff_plan(root).expect("a work tree");
+            let plan = diff_plan(root, None).expect("a work tree");
             diff_sources(root, &plan).expect("watchable")
         };
         let (mut watch, signal) = FileWatch::start().unwrap();

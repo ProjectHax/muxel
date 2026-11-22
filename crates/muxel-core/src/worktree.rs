@@ -23,6 +23,14 @@ pub struct Worktree {
     /// True when no instance references it but it's kept on disk (resumable).
     #[serde(default)]
     pub detached: bool,
+    /// The branch the worktree was made from, as `git rev-parse --abbrev-ref
+    /// HEAD` named it in the project's checkout then, or that checkout's
+    /// commit when it was detached. The worktree's diff compares with it from
+    /// where the two meet, so the worktree's commits show beside its
+    /// uncommitted edits. `None` for a worktree made before muxel recorded
+    /// it: that one compares with the checkout's current branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 const ADJECTIVES: &[&str] = &[
@@ -86,6 +94,23 @@ pub fn worktree_path(base: &Path, repo_name: &str, instance: Uuid) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A record written before bases were recorded loads with none, and one
+    /// without a base writes no key, so older muxels and the iOS port read it
+    /// as before.
+    #[test]
+    fn a_worktree_base_is_optional_on_disk() {
+        let old = r#"{"id":"00000000-0000-0000-0000-000000000001",
+            "project_id":"00000000-0000-0000-0000-000000000002",
+            "name":"swift-pine","path":"/wt","branch":"muxel/00000001","color":3}"#;
+        let mut worktree: Worktree = serde_json::from_str(old).unwrap();
+        assert_eq!(worktree.base, None);
+        assert!(!serde_json::to_string(&worktree).unwrap().contains("base"));
+        worktree.base = Some("main".into());
+        let json = serde_json::to_string(&worktree).unwrap();
+        let back: Worktree = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.base.as_deref(), Some("main"));
+    }
 
     #[test]
     fn slug_sanitizes() {

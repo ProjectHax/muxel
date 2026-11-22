@@ -1278,6 +1278,7 @@ fn discard_reports_a_worktree_folder_a_program_still_uses() {
                     branch: "muxel/held-fixture".into(),
                     color: 0,
                     detached: false,
+                    base: None,
                 });
                 wid
             })
@@ -1359,6 +1360,7 @@ fn discarding_a_worktree_git_keeps_says_so_without_delete_advice() {
                     branch: "muxel/kept-fixture".into(),
                     color: 0,
                     detached: false,
+                    base: None,
                 });
                 (root, wid)
             })
@@ -1435,6 +1437,7 @@ fn review_close_dirty_worktree_keep_preserves_the_busy_agent_and_undo() {
                     branch: "muxel/close-fixture".into(),
                     color: 0,
                     detached: false,
+                    base: None,
                 });
                 let instance = app.workspace.instance_mut(pane).unwrap();
                 instance.worktree_id = Some(wid);
@@ -1844,6 +1847,7 @@ fn clean_worktree(
                 branch: "muxel/clean-close-fixture".into(),
                 color: 0,
                 detached: false,
+                base: None,
             });
             let instance = app.workspace.instance_mut(pane).unwrap();
             instance.worktree_id = Some(wid);
@@ -3518,6 +3522,7 @@ fn a_discarded_worktrees_kill_does_not_hold_another_worktree() {
                     branch: branch.into(),
                     color: 1,
                     detached: false,
+                    base: None,
                 });
                 let instance = app.workspace.instance_mut(discarded).unwrap();
                 instance.worktree_id = Some(wid);

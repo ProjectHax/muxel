@@ -6869,8 +6869,9 @@ pub struct MuxelApp {
     /// lists paths from the repository's root, whatever folder it runs in.
     git_diff_files_place: Option<integrations::RepoPlace>,
     /// Cached changed-file lists per worktree (keyed by worktree id), for the
-    /// Worktrees tab; refreshed off the UI thread.
-    git_diff_worktree_files: HashMap<Uuid, Vec<integrations::GitChange>>,
+    /// Worktrees tab: what each committed since its base, and what it hasn't
+    /// committed. Refreshed off the UI thread.
+    git_diff_worktree_files: HashMap<Uuid, WorktreeChanges>,
     /// Which worktree rows are expanded to show their changed files.
     git_diff_worktrees_expanded: std::collections::HashSet<Uuid>,
     /// Cached branch names for the active project (the "Merge into…" picker),
@@ -8820,6 +8821,37 @@ fn git_status_glyph_label(xy: &str) -> (&'static str, GlyphKind) {
 enum GitSource {
     Project(Uuid),
     Worktree(Uuid),
+    /// What a worktree committed since it left its base: rows to read, not
+    /// stage or discard, whose diffs run from where the two meet.
+    WorktreeCommits(Uuid),
+}
+
+/// One worktree's lists in the Changes panel's Worktrees tab.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct WorktreeChanges {
+    /// The branch its commits were compared with, when it has one.
+    base: Option<String>,
+    /// The files its commits changed since it left `base`.
+    committed: Vec<integrations::GitChange>,
+    /// What it hasn't committed, as `git status` lists it: the files Stage,
+    /// Unstage and Discard act on.
+    uncommitted: Vec<integrations::GitChange>,
+}
+
+impl WorktreeChanges {
+    /// How many files the two lists name, one in both counted once.
+    fn file_count(&self) -> usize {
+        self.committed
+            .iter()
+            .chain(&self.uncommitted)
+            .map(|change| change.path.as_str())
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.committed.is_empty() && self.uncommitted.is_empty()
+    }
 }
 
 /// Which view the git-diff panel is showing.
@@ -14438,7 +14470,7 @@ impl MuxelApp {
                 };
                 Some((pid, path))
             }
-            GitSource::Worktree(wid) => self
+            GitSource::Worktree(wid) | GitSource::WorktreeCommits(wid) => self
                 .workspace
                 .worktree(wid)
                 .map(|w| (w.project_id, w.path.join(rel))),
@@ -14498,7 +14530,7 @@ impl MuxelApp {
     fn git_source_loc(&self, src: GitSource) -> Option<integrations::RepoLoc> {
         match src {
             GitSource::Project(pid) => self.repo_loc(pid),
-            GitSource::Worktree(wid) => self
+            GitSource::Worktree(wid) | GitSource::WorktreeCommits(wid) => self
                 .workspace
                 .worktree(wid)
                 .map(|w| integrations::RepoLoc::Local(w.path.clone())),
@@ -14538,12 +14570,34 @@ impl MuxelApp {
         let Some(loc) = self.git_source_loc(src) else {
             return;
         };
+        // A committed file's diff runs against the base its row was listed
+        // with, naming a rename's source so git shows the rename.
+        let committed = match src {
+            GitSource::WorktreeCommits(wid) => {
+                let Some(changes) = self.git_diff_worktree_files.get(&wid) else {
+                    return;
+                };
+                let Some(base) = changes.base.clone() else {
+                    return;
+                };
+                let orig = changes
+                    .committed
+                    .iter()
+                    .find(|change| change.path == path)
+                    .and_then(|change| change.orig.clone());
+                Some((base, orig))
+            }
+            GitSource::Project(_) | GitSource::Worktree(_) => None,
+        };
         let fname = Path::new(&path)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.clone());
         let split = self.settings.diff_split_view;
-        let title = format!("diff — {fname}");
+        let title = match &committed {
+            Some((base, _)) => format!("diff — {fname} ({base}...HEAD)"),
+            None => format!("diff — {fname}"),
+        };
         let opened = cx.open_window(
             gpui::WindowOptions {
                 window_min_size: Some(size(px(400.0), px(300.0))),
@@ -14555,7 +14609,12 @@ impl MuxelApp {
                     window,
                 );
                 window.set_window_title(&title);
-                let content = integrations::git_diff_for(&loc, &path);
+                let content = match &committed {
+                    Some((base, orig)) => {
+                        integrations::git_committed_diff_for(&loc, base, &path, orig.as_deref())
+                    }
+                    None => integrations::git_diff_for(&loc, &path),
+                };
                 let view = cx.new(|cx| FileDiffView::new(title.clone(), content, split, cx));
                 let fh = view.read(cx).focus_handle(cx);
                 window.focus(&fh, cx);
@@ -14669,18 +14728,19 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// Refresh each active-project worktree's changed-file list off the UI thread.
+    /// Refresh each active-project worktree's changed-file lists off the UI
+    /// thread: what it committed since its base, and what it hasn't committed.
     fn refresh_git_diff_worktrees(&mut self, cx: &mut Context<Self>) {
         let Some(pid) = self.workspace.active_project else {
             self.git_diff_worktree_files.clear();
             return;
         };
-        let paths: Vec<(Uuid, PathBuf)> = self
+        let paths: Vec<(Uuid, PathBuf, Option<String>)> = self
             .workspace
             .worktrees
             .iter()
             .filter(|w| w.project_id == pid)
-            .map(|w| (w.id, w.path.clone()))
+            .map(|w| (w.id, w.path.clone(), self.worktree_base(w)))
             .collect();
         if paths.is_empty() {
             self.git_diff_worktree_files.clear();
@@ -14694,17 +14754,25 @@ impl MuxelApp {
         let loc = self.repo_loc(pid);
         let source = self.changes_source();
         cx.spawn(async move |this, cx| {
-            let (results, branches): (Vec<(Uuid, Vec<integrations::GitChange>)>, Vec<String>) = cx
+            let (results, branches): (Vec<(Uuid, WorktreeChanges)>, Vec<String>) = cx
                 .background_executor()
                 .spawn(async move {
                     let _git = ui_profile::git_caller("git-panel-worktrees");
                     let files = paths
                         .into_iter()
-                        .map(|(wid, path)| {
-                            (
-                                wid,
-                                integrations::git_status_files(&integrations::RepoLoc::Local(path)),
-                            )
+                        .map(|(wid, path, base)| {
+                            let loc = integrations::RepoLoc::Local(path);
+                            let committed = base
+                                .as_deref()
+                                .map(|base| integrations::git_committed_files(&loc, base))
+                                .unwrap_or_default();
+                            let uncommitted = integrations::git_status_files(&loc);
+                            let changes = WorktreeChanges {
+                                base,
+                                committed,
+                                uncommitted,
+                            };
+                            (wid, changes)
                         })
                         .collect();
                     let branches = loc
@@ -17301,12 +17369,13 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// Create a git worktree for `instance`, filling in its worktree fields. On
-    /// any problem the worktree option is turned off for this instance.
-    fn setup_worktree(&self, pid: Uuid, instance: &mut Instance) {
+    /// Create a git worktree for `instance`, filling in its worktree fields, and
+    /// return what it was made from (see [`Worktree::base`]). On any problem the
+    /// worktree option is turned off for this instance.
+    fn setup_worktree(&self, pid: Uuid, instance: &mut Instance) -> Option<String> {
         let Some(root) = self.workspace.project(pid).map(|p| p.root_path.clone()) else {
             instance.use_worktree = false;
-            return;
+            return None;
         };
         let repo_name = self
             .workspace
@@ -17319,23 +17388,25 @@ impl MuxelApp {
                 root.display()
             );
             instance.use_worktree = false;
-            return;
+            return None;
         }
         let Some(base) = muxel_store::data_dir().map(|d| d.join("worktrees")) else {
             instance.use_worktree = false;
-            return;
+            return None;
         };
         let _ = std::fs::create_dir_all(&base);
         let path = muxel_core::worktree::worktree_path(&base, &repo_name, instance.id);
         let branch = muxel_core::worktree::branch_name(instance.id);
         match integrations::create_worktree(&root, &path, &branch) {
-            Ok(()) => {
+            Ok(made_from) => {
                 instance.worktree_path = Some(path);
                 instance.worktree_branch = Some(branch);
+                made_from
             }
             Err(e) => {
                 log::warn!("worktree creation failed: {e}");
                 instance.use_worktree = false;
+                None
             }
         }
     }
@@ -17751,7 +17822,8 @@ impl MuxelApp {
     /// Create a fresh git worktree for `instance` (via `setup_worktree`) and add a
     /// named, colored registry entry, linking the instance to it.
     fn setup_worktree_into_registry(&mut self, pid: Uuid, instance: &mut Instance) {
-        self.setup_worktree(pid, instance); // sets path/branch, or clears use_worktree
+        // Sets path/branch, or clears use_worktree.
+        let made_from = self.setup_worktree(pid, instance);
         if instance.use_worktree {
             let id = Uuid::new_v4();
             let color = self.workspace.next_worktree_color(pid);
@@ -17763,6 +17835,7 @@ impl MuxelApp {
                 branch: instance.worktree_branch.clone().unwrap_or_default(),
                 color,
                 detached: false,
+                base: made_from,
             });
             instance.worktree_id = Some(id);
         }
@@ -29437,8 +29510,9 @@ impl MuxelApp {
         };
         let open_path = path.clone();
         let menu_path = path.clone();
+        // A path can show in two lists, and in two worktrees.
         div()
-            .id(SharedString::from(format!("gdiff-{path}")))
+            .id(SharedString::from(format!("gdiff-{src:?}-{path}")))
             .flex()
             .items_center()
             .gap_2()
@@ -29471,69 +29545,76 @@ impl MuxelApp {
             )
             .context_menu(move |menu, window, _cx| {
                 let view_p = menu_path.clone();
-                let stage_p = menu_path.clone();
-                let unstage_p = menu_path.clone();
-                let discard_p = menu_path.clone();
                 let open_p = menu_path.clone();
-                menu.item(
-                    PopupMenuItem::new(t("View diff"))
-                        .icon(Icon::empty().path("icons/diff.svg"))
-                        .on_click(window.listener_for(&entity, move |this, _, _w, cx| {
-                            this.open_file_diff_window(src, view_p.clone(), cx)
-                        })),
-                )
-                .separator()
-                .item(
-                    PopupMenuItem::new(t("Stage"))
-                        .icon(IconName::Plus)
-                        .on_click(window.listener_for(&entity, move |this, _, window, cx| {
-                            let p = stage_p.clone();
-                            this.run_git_source(
-                                src,
-                                t("Staged").into(),
-                                t("Stage failed").into(),
-                                move |loc| integrations::git_stage_path(loc, &p),
-                                window,
-                                cx,
-                            );
-                        })),
-                )
-                .item(
-                    PopupMenuItem::new(t("Unstage"))
-                        .icon(IconName::Undo)
-                        .on_click(window.listener_for(&entity, move |this, _, window, cx| {
-                            let p = unstage_p.clone();
-                            this.run_git_source(
-                                src,
-                                t("Unstaged").into(),
-                                t("Unstage failed").into(),
-                                move |loc| integrations::git_unstage_path(loc, &p),
-                                window,
-                                cx,
-                            );
-                        })),
-                )
-                .separator()
-                .item(
-                    PopupMenuItem::new(t("Discard changes"))
-                        .icon(IconName::Delete)
-                        .on_click(window.listener_for(&entity, move |this, _, _w, cx| {
-                            this.request_confirm(
-                                t("Discard changes?"),
-                                tf(
-                                    "This permanently discards your changes to {path}.",
-                                    &[("path", &discard_p)],
-                                ),
-                                t("Discard"),
-                                ConfirmAction::DiscardFilePath {
+                let menu = menu
+                    .item(
+                        PopupMenuItem::new(t("View diff"))
+                            .icon(Icon::empty().path("icons/diff.svg"))
+                            .on_click(window.listener_for(&entity, move |this, _, _w, cx| {
+                                this.open_file_diff_window(src, view_p.clone(), cx)
+                            })),
+                    )
+                    .separator();
+                // A committed file's change lives in a commit: there's
+                // nothing to stage, unstage or discard in the worktree.
+                let menu = if matches!(src, GitSource::WorktreeCommits(_)) {
+                    menu
+                } else {
+                    let stage_p = menu_path.clone();
+                    let unstage_p = menu_path.clone();
+                    let discard_p = menu_path.clone();
+                    menu.item(
+                        PopupMenuItem::new(t("Stage"))
+                            .icon(IconName::Plus)
+                            .on_click(window.listener_for(&entity, move |this, _, window, cx| {
+                                let p = stage_p.clone();
+                                this.run_git_source(
                                     src,
-                                    path: discard_p.clone(),
-                                },
-                                cx,
-                            );
-                        })),
-                )
-                .item(
+                                    t("Staged").into(),
+                                    t("Stage failed").into(),
+                                    move |loc| integrations::git_stage_path(loc, &p),
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    )
+                    .item(
+                        PopupMenuItem::new(t("Unstage"))
+                            .icon(IconName::Undo)
+                            .on_click(window.listener_for(&entity, move |this, _, window, cx| {
+                                let p = unstage_p.clone();
+                                this.run_git_source(
+                                    src,
+                                    t("Unstaged").into(),
+                                    t("Unstage failed").into(),
+                                    move |loc| integrations::git_unstage_path(loc, &p),
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    )
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(t("Discard changes"))
+                            .icon(IconName::Delete)
+                            .on_click(window.listener_for(&entity, move |this, _, _w, cx| {
+                                this.request_confirm(
+                                    t("Discard changes?"),
+                                    tf(
+                                        "This permanently discards your changes to {path}.",
+                                        &[("path", &discard_p)],
+                                    ),
+                                    t("Discard"),
+                                    ConfirmAction::DiscardFilePath {
+                                        src,
+                                        path: discard_p.clone(),
+                                    },
+                                    cx,
+                                );
+                            })),
+                    )
+                };
+                menu.item(
                     PopupMenuItem::new(t("Open file"))
                         .icon(IconName::File)
                         .on_click(window.listener_for(&entity, move |this, _, window, cx| {
@@ -29594,8 +29675,8 @@ impl MuxelApp {
         let dot = worktree_color(w.color);
         let expanded = self.git_diff_worktrees_expanded.contains(&wid);
         let loaded = !self.workspace.instances_using(wid).is_empty();
-        let files = self.git_diff_worktree_files.get(&wid);
-        let count = files.map(|f| f.len()).unwrap_or(0);
+        let changes = self.git_diff_worktree_files.get(&wid);
+        let count = changes.map(WorktreeChanges::file_count).unwrap_or(0);
         let hover_bg = cx.theme().sidebar_accent;
         let branches = self.shown_git_diff_branches().to_vec();
         let chevron = if expanded {
@@ -29689,21 +29770,44 @@ impl MuxelApp {
                     .text_color(cx.theme().muted_foreground)
                     .child(msg)
             };
-            match files {
+            match changes {
                 None => col = col.child(indented(t("Loading…"))),
-                Some(files) if files.is_empty() => {
+                Some(changes) if changes.is_empty() => {
                     col = col.child(indented(t("Clean — no changes.")))
                 }
-                Some(files) => {
-                    let mut inner = div().flex().flex_col().pl_4();
-                    for f in files {
-                        inner = inner.child(self.render_git_diff_file_row(
-                            f,
-                            GitSource::Worktree(wid),
-                            cx,
-                        ));
+                Some(changes) => {
+                    // What it committed since its base, then what it hasn't
+                    // committed, each under a label once there's any.
+                    let committed = changes.base.as_deref().map(|base| {
+                        let label =
+                            SharedString::from(tf("Committed vs {base}", &[("base", base)]));
+                        (label, &changes.committed, GitSource::WorktreeCommits(wid))
+                    });
+                    let uncommitted = (
+                        t("Uncommitted"),
+                        &changes.uncommitted,
+                        GitSource::Worktree(wid),
+                    );
+                    for (label, files, src) in committed.into_iter().chain([uncommitted]) {
+                        if files.is_empty() {
+                            continue;
+                        }
+                        let mut inner = div().flex().flex_col().pl_4().child(
+                            div()
+                                .px_2()
+                                .pt_1()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(label),
+                        );
+                        for f in files {
+                            inner = inner.child(self.render_git_diff_file_row(f, src, cx));
+                        }
+                        col = col.child(inner);
                     }
-                    col = col.child(inner);
                 }
             }
         }

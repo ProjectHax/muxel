@@ -9,6 +9,9 @@
 //! Each refresh of a watched pane first checks HEAD and the index against
 //! its plan's [`PlanInputs`], and a watcher overflow re-plans too, so a lost
 //! event can't leave the plan filtering by stale tracked files.
+//!
+//! A pane over a muxel worktree diffs against the branch the worktree came
+//! from ([`MuxelApp::diff_base`]), and its watch follows that branch too.
 
 use super::MuxelApp;
 use super::watching::WatchTarget;
@@ -19,7 +22,7 @@ use gpui::{Context, Task, WeakEntity};
 use muxel_core::diff_schedule::DiffSchedule;
 use muxel_core::file_watch::{TrackedFiles, WatchFilter, WatchId, WatchSpec};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
@@ -40,6 +43,9 @@ pub(super) struct DiffPanes {
 /// What one pane's refreshes read.
 pub(super) struct DiffSource {
     dir: PathBuf,
+    /// What the last refresh diffed against (see [`MuxelApp::diff_base`]),
+    /// whose branch its plan watches.
+    base: Option<String>,
     /// The repository's top level from the last [`DiffPlan`]. `None` before
     /// the first refresh, or where `dir` isn't in a work tree.
     toplevel: Option<String>,
@@ -58,6 +64,7 @@ pub(super) struct DiffSource {
 struct DiffJob {
     pane: Uuid,
     dir: PathBuf,
+    base: Option<String>,
     toplevel: Option<String>,
     /// The watched plan's inputs, checked before reusing it; `None` for a
     /// pane that polls, which doesn't need its plan.
@@ -107,7 +114,7 @@ impl DiffJob {
         // event) would keep filtering by the old tracked files.
         let stale = self.inputs.as_ref().is_some_and(|inputs| !inputs.current());
         let (toplevel, planned) = if self.replan || stale {
-            let plan: Option<DiffPlan> = integrations::diff_plan(&self.dir);
+            let plan: Option<DiffPlan> = integrations::diff_plan(&self.dir, self.base.as_deref());
             let spec = plan.as_ref().and_then(|plan| diff_sources(&self.dir, plan));
             // Here, off the UI thread: a pane can track thousands of files.
             let retracked = match (&self.tracked, spec.as_ref().map(|spec| &spec.filter)) {
@@ -131,7 +138,7 @@ impl DiffJob {
         };
         DiffResult {
             pane: self.pane,
-            text: integrations::git_diff(&self.dir, toplevel.as_deref()),
+            text: integrations::git_diff(&self.dir, toplevel.as_deref(), self.base.as_deref()),
             planned,
             gone: false,
         }
@@ -139,6 +146,25 @@ impl DiffJob {
 }
 
 impl MuxelApp {
+    /// What a diff pane over `dir` compares with, when `dir` is one of muxel's
+    /// worktrees: [`Self::worktree_base`]. `None` diffs against HEAD.
+    pub(super) fn diff_base(&self, dir: &Path) -> Option<String> {
+        let worktree = self.workspace.worktrees.iter().find(|w| w.path == dir)?;
+        self.worktree_base(worktree)
+    }
+
+    /// The branch a worktree's diffs compare with: the one it was made from,
+    /// or, for one made before muxel recorded that, its project checkout's
+    /// current branch as the branch poll last read it.
+    pub(super) fn worktree_base(&self, worktree: &muxel_core::Worktree) -> Option<String> {
+        worktree.base.clone().or_else(|| {
+            self.project_branches
+                .get(&worktree.project_id)
+                .cloned()
+                .flatten()
+        })
+    }
+
     /// Run each frame: tell the schedule which diff panes are open and on
     /// screen, docked in a shown tab or popped out.
     pub(super) fn sync_diff_visibility(&mut self, cx: &mut Context<Self>) {
@@ -172,6 +198,7 @@ impl MuxelApp {
                 .entry(iid)
                 .or_insert_with(|| DiffSource {
                     dir,
+                    base: None,
                     toplevel: None,
                     inputs: PlanInputs::default(),
                     replan: true,
@@ -239,15 +266,26 @@ impl MuxelApp {
     fn refresh_diffs(&mut self, panes: Vec<Uuid>, cx: &mut Context<Self>) {
         let mut jobs = Vec::with_capacity(panes.len());
         for pane in panes {
+            let base = self
+                .diff_panes
+                .sources
+                .get(&pane)
+                .and_then(|source| self.diff_base(&source.dir));
             match self.diff_panes.sources.get_mut(&pane) {
-                Some(source) => jobs.push(DiffJob {
-                    pane,
-                    dir: source.dir.clone(),
-                    toplevel: source.toplevel.clone(),
-                    inputs: source.watch.is_some().then(|| source.inputs.clone()),
-                    replan: std::mem::take(&mut source.replan),
-                    tracked: source.tracked.clone(),
-                }),
+                Some(source) => {
+                    // Another base is another branch to watch.
+                    let rebased = source.base != base;
+                    source.base = base.clone();
+                    jobs.push(DiffJob {
+                        pane,
+                        dir: source.dir.clone(),
+                        base,
+                        toplevel: source.toplevel.clone(),
+                        inputs: source.watch.is_some().then(|| source.inputs.clone()),
+                        replan: std::mem::take(&mut source.replan) || rebased,
+                        tracked: source.tracked.clone(),
+                    })
+                }
                 // Asked for before its first frame; it rejoins once it's on
                 // screen.
                 None => self.diff_panes.schedule.remove(pane),
