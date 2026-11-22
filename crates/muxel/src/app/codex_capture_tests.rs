@@ -235,6 +235,64 @@ fn codex_pane(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -> Uuid {
         .unwrap()
 }
 
+#[test]
+fn codex_command_forwards_the_id_only_for_the_default_route() {
+    const PRESET_ROUTE: &str = "fixture-route!";
+    with_app(|cx, window| {
+        let pane = codex_pane(cx, window);
+        let inherited_root = std::env::var_os(muxel_store::USER_DATA_DIR_ENV);
+        let isolated_root = inherited_root.as_deref().filter(|root| !root.is_empty());
+        let inherited_route =
+            inherited_root.is_some() || std::env::var_os(crate::control::CONTROL_ENV).is_some();
+        // The Windows batch path skips an isolated route it cannot represent.
+        let can_forward_isolated_root =
+            isolated_root
+                .and_then(|root| root.to_str())
+                .is_some_and(|root| {
+                    root.chars()
+                        .all(|ch| ch.is_alphanumeric() || " :/\\._-".contains(ch))
+                });
+        for (program, configured_route) in [
+            ("codex", None),
+            ("codex", Some(muxel_store::USER_DATA_DIR_ENV)),
+            ("codex", Some("muxel_control")),
+            (r"C:\fixture\CoDeX.BaT", None),
+        ] {
+            let spec = window
+                .update(cx, |app, _, _| {
+                    let instance = app.workspace.instance_mut(pane).unwrap();
+                    instance.program = Some(program.into());
+                    instance.env = configured_route
+                        .map(|key| muxel_core::EnvVar {
+                            key: key.into(),
+                            value: PRESET_ROUTE.into(),
+                        })
+                        .into_iter()
+                        .collect();
+                    app.command_for(pane, None)
+                })
+                .unwrap()
+                .unwrap();
+            let id = format!("shell_environment_policy.set.MUXEL_INSTANCE_ID='{pane}'");
+            assert_eq!(
+                spec.args
+                    .windows(2)
+                    .any(|pair| pair[0] == "-c" && pair[1] == id),
+                can_forward_isolated_root || (configured_route.is_none() && !inherited_route),
+                "{program} with configured route {configured_route:?}, inherited route {inherited_route}, isolated profile {}, encodable root {can_forward_isolated_root}",
+                isolated_root.is_some(),
+            );
+            if let Some(key) = configured_route {
+                assert_eq!(
+                    spec.env.iter().any(|(name, _)| name == key),
+                    isolated_root.is_none(),
+                );
+                assert!(!spec.args.iter().any(|arg| arg.contains(PRESET_ROUTE)));
+            }
+        }
+    });
+}
+
 /// Launch preparation itself never searches history on the UI thread. The
 /// one restore-time lookup runs on a worker beforehand (next test); without
 /// it, an unbound started pane starts fresh.

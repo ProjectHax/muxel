@@ -10593,6 +10593,33 @@ impl MuxelApp {
             resolved.args.push(settings_path);
         }
 
+        let root = std::env::var_os(muxel_store::USER_DATA_DIR_ENV).map(PathBuf::from);
+        let isolated = root
+            .as_ref()
+            .is_some_and(|root| !root.as_os_str().is_empty());
+        // Without an isolated root, the pane can use a different ctl route from
+        // its parent or preset. Passing just its ID could target the wrong profile.
+        let unmanaged_route = !isolated
+            && (root.is_some()
+                || std::env::var_os(crate::control::CONTROL_ENV).is_some()
+                || resolved.env.iter().any(|(key, _)| {
+                    [muxel_store::USER_DATA_DIR_ENV, crate::control::CONTROL_ENV]
+                        .into_iter()
+                        .any(|name| {
+                            key == name || (cfg!(windows) && key.eq_ignore_ascii_case(name))
+                        })
+                }));
+        if let Some(instance) = inst
+            && !unmanaged_route
+        {
+            muxel_core::prepend_codex_pane_env(
+                instance,
+                project.is_some_and(|project| project.remote.is_none()),
+                root.as_deref(),
+                &mut resolved.args,
+            );
+        }
+
         // Remote (SSH) project? Resolve its configured host.
         let remote = project.and_then(|p| p.remote.as_ref()).and_then(|r| {
             let host = self
@@ -10664,7 +10691,6 @@ impl MuxelApp {
                     .map(|name| SessionTarget::new(name.clone(), i.tmux_socket.clone()))
             }) {
                 Some(session) => {
-                    let root = std::env::var_os(muxel_store::USER_DATA_DIR_ENV).map(PathBuf::from);
                     let socket = integrations::local_tmux_socket(&session);
                     armed_resume = arms_tmux_resume_recovery(
                         self.codex_unconfirmed_resumes.contains(&instance_id),
@@ -10781,7 +10807,7 @@ impl MuxelApp {
             extra_env,
             instance_id,
             process,
-            crate::user_data_dir::is_isolated(),
+            isolated,
         );
         // Point a memory-enabled *local* project's agent at its memory file so tools
         // can find it without being told the path. Remote agents get the path via the

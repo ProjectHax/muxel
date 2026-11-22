@@ -8,6 +8,10 @@ pub enum TmuxEnvironmentError {
     NonUnicodeRoot,
 }
 
+pub(crate) fn control_endpoint(root: &Path) -> PathBuf {
+    root.join("data").join(crate::control::ENDPOINT_FILE)
+}
+
 /// A local tmux server may predate this profile. Pass the effective root and its
 /// endpoint per session, never through the shared server's global environment.
 /// `root` is the absolute startup-resolved override; empty means no override.
@@ -28,7 +32,7 @@ pub fn local_tmux_environment(
         ));
     }
     if let Some(root) = root {
-        let endpoint = root.join("data").join(crate::control::ENDPOINT_FILE);
+        let endpoint = control_endpoint(root);
         let root = root.to_str().ok_or(TmuxEnvironmentError::NonUnicodeRoot)?;
         let endpoint = endpoint
             .to_str()
