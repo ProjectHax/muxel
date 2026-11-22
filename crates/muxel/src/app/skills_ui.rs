@@ -907,7 +907,7 @@ impl MuxelApp {
     fn render_skill_targets(&self, snap: &Snapshot, form: &Form, cx: &mut Context<Self>) -> Div {
         let targets = self.skills_targets();
         let all = self.skills_page.targets.is_none();
-        let mut chips = div().w(form.control_w()).flex().flex_wrap().gap_1();
+        let mut chips = div().w(form.inner_w()).flex().flex_wrap().gap_1();
         chips = chips.child({
             let b = Button::new("skill-target-all")
                 .small()
@@ -1021,7 +1021,13 @@ impl MuxelApp {
         for cat in CuratedCategory::ALL {
             let mut rows = Vec::new();
             for c in CATALOG.iter().filter(|c| c.category == cat) {
-                rows.push(self.render_curated_row(c, snap, no_agents || targets.is_empty(), cx));
+                rows.push(self.render_curated_row(
+                    c,
+                    snap,
+                    no_agents || targets.is_empty(),
+                    form,
+                    cx,
+                ));
             }
             col = col.child(form.group(Group::new(category_title(cat), rows), &[]));
         }
@@ -1142,6 +1148,7 @@ impl MuxelApp {
         c: &'static CuratedSkill,
         snap: &Snapshot,
         no_targets: bool,
+        form: &Form,
         cx: &mut Context<Self>,
     ) -> Row {
         let (title, blurb) = curated_text(c);
@@ -1176,14 +1183,16 @@ impl MuxelApp {
             .xsmall()
             .label(format!("{} · {}", c.repo, c.license))
             .on_click(move |_e, _w, cx| cx.open_url(&url));
-        Row::new(
+        Row::stacked(
             title,
             div()
+                .w(form.inner_w())
                 .flex()
+                .flex_wrap()
                 .items_center()
-                .justify_end()
-                .gap_1()
-                .child(repo)
+                .justify_between()
+                .gap_2()
+                .child(div().flex_none().max_w_full().overflow_hidden().child(repo))
                 .child(button),
         )
         .desc(blurb)
@@ -1276,9 +1285,16 @@ impl MuxelApp {
                 .text_color(pal.dim)
                 .child(text)
         };
+        let stacked_value = |text: String| {
+            div()
+                .w(form.inner_w())
+                .text_sm()
+                .text_color(pal.dim)
+                .child(text)
+        };
         let mut info = vec![Row::stacked(
             t("Description"),
-            value(row.description.clone()),
+            stacked_value(row.description.clone()),
         )];
         if let Some(rec) = &row.record {
             let src = rec.source.clone();
@@ -1286,15 +1302,20 @@ impl MuxelApp {
                 .ok()
                 .and_then(|s| s.web_url());
             let source: AnyElement = match web {
-                Some(url) => Button::new("skill-source")
-                    .ghost()
-                    .small()
-                    .label(src)
-                    .on_click(move |_e, _w, cx| cx.open_url(&url))
+                Some(url) => div()
+                    .max_w(form.inner_w())
+                    .overflow_hidden()
+                    .child(
+                        Button::new("skill-source")
+                            .ghost()
+                            .small()
+                            .label(src)
+                            .on_click(move |_e, _w, cx| cx.open_url(&url)),
+                    )
                     .into_any_element(),
-                None => value(src).into_any_element(),
+                None => stacked_value(src).into_any_element(),
             };
-            info.push(Row::new(t("Source"), source));
+            info.push(Row::stacked(t("Source"), source));
             if !rec.updated_at.is_empty() {
                 info.push(Row::new(t("Updated"), value(short_date(&rec.updated_at))));
             }
