@@ -64,11 +64,12 @@ const NOT_RUNNING: &str = "muxel isn't running, or outside control is off: open 
 pub struct Incoming {
     pub command: Command,
     pub caller_instance_id: Option<Uuid>,
+    pub task_launch_hash: Option<control::TaskLaunchHash>,
     pub reply: std::sync::mpsc::Sender<Response>,
 }
 
-/// The listening side, alive while outside control is on. Dropping it stops
-/// accepting and removes the endpoint file (if it is still this server's).
+/// The listener for outside control and local task panes.
+/// Dropping it stops accepting and removes its endpoint file.
 pub struct Server {
     stop: Arc<AtomicBool>,
     port: u16,
@@ -373,6 +374,11 @@ fn dispatch(request: Request, token: &str, tx: &async_channel::Sender<Incoming>)
     };
     let (reply, answer) = std::sync::mpsc::channel();
     let incoming = Incoming {
+        task_launch_hash: request
+            .task_launch_token
+            .filter(|_| request.command.is_task())
+            .as_ref()
+            .map(task_launch_hash),
         command: request.command,
         caller_instance_id: request.caller_instance_id,
         reply,
@@ -388,6 +394,11 @@ fn dispatch(request: Request, token: &str, tx: &async_channel::Sender<Incoming>)
 /// Compare secrets without leaking, through timing, how much of a guess was right.
 fn same_secret(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+pub(crate) fn task_launch_hash(token: &control::TaskLaunchToken) -> control::TaskLaunchHash {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(token.0.as_bytes()).into()
 }
 
 /// Write the endpoint file atomically. Unix creates mode 0600; Windows inherits
@@ -979,6 +990,11 @@ fn request_at(path: &Path, command: Command) -> Result<Value, control::Error> {
         caller_instance_id: std::env::var(control::INSTANCE_ID_ENV)
             .ok()
             .and_then(|id| id.parse().ok()),
+        task_launch_token: command
+            .is_task()
+            .then(|| std::env::var(control::TASK_LAUNCH_TOKEN_ENV).ok())
+            .flatten()
+            .map(control::TaskLaunchToken),
         command,
     })
     .map_err(|e| e.to_string())?;
@@ -986,6 +1002,7 @@ fn request_at(path: &Path, command: Command) -> Result<Value, control::Error> {
     stream
         .write_all(line.as_bytes())
         .map_err(|e| transport_error(format!("sending to muxel: {e}")))?;
+    drop(line);
     let mut reply = String::new();
     BufReader::new(&stream)
         .read_line(&mut reply)
@@ -1878,6 +1895,7 @@ mod tests {
                 version: control::request_version(&command),
                 token: "test".into(),
                 caller_instance_id: None,
+                task_launch_token: None,
                 command,
             };
             assert_eq!(

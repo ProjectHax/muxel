@@ -6687,6 +6687,7 @@ struct TerminalSpawnMeta {
     program: String,
     cwd: String,
     was_resume: bool,
+    task_launch_hash: Option<muxel_core::control::TaskLaunchHash>,
     started: Instant,
 }
 
@@ -10493,7 +10494,7 @@ impl MuxelApp {
         &mut self,
         instance_id: Uuid,
         resume_cwd: Option<PathBuf>,
-    ) -> anyhow::Result<CommandSpec> {
+    ) -> anyhow::Result<(CommandSpec, Option<muxel_core::control::TaskLaunchHash>)> {
         let _phase = ui_profile::phase("activation", "command-for", Some(instance_id));
         // Literal commands bypass every transport, prompt and resume wrapper,
         // including stale tmux metadata adopted from a shared layout.
@@ -10505,9 +10506,11 @@ impl MuxelApp {
             )
         }) {
             create_missing_cwd(&spec)?;
-            return Ok(spec
-                .with_memory_limit(self.settings.pane_memory_limit_bytes())
-                .with_launch_prefix(self.pane_scope_prefix(instance_id)));
+            return Ok((
+                spec.with_memory_limit(self.settings.pane_memory_limit_bytes())
+                    .with_launch_prefix(self.pane_scope_prefix(instance_id)),
+                None,
+            ));
         }
         // Resume-capable agents (e.g. Claude): give the pane a stable session id and
         // resolve the --session-id / --resume flag *before* anything borrows the
@@ -10522,6 +10525,7 @@ impl MuxelApp {
         // Seat a remote pane on one of its host's masters before anything borrows
         // the workspace.
         let pane_master = self.pane_control_path(instance_id);
+        let tmux_task = self.prepare_tmux_task(instance_id);
         let inst = self.workspace.instance(instance_id);
         let project = inst.and_then(|i| self.workspace.project(i.project_id));
         let session_preset = inst.and_then(|i| {
@@ -10675,6 +10679,8 @@ impl MuxelApp {
         // command becomes `ssh … -- 'cd <dir> && exec <program>'`; the cwd lives
         // inside that remote string, so there is no local PTY cwd.
         let mut armed_resume = false;
+        let local_task = project.is_some_and(|p| !p.is_remote())
+            && self.workspace.task_links.contains_key(&instance_id);
         let (mut spec, local_cwd, extra_env) = if let Some((host, rref)) = remote {
             let remote_cwd = inst
                 .and_then(Instance::working_directory)
@@ -10723,7 +10729,10 @@ impl MuxelApp {
                     .map(|name| SessionTarget::new(name.clone(), i.tmux_socket.clone()))
             }) {
                 Some(session) => {
-                    let socket = integrations::local_tmux_socket(&session);
+                    let socket = tmux_task
+                        .as_ref()
+                        .and_then(|(target, _, _)| target.socket.clone())
+                        .unwrap_or_else(|| integrations::local_tmux_socket(&session));
                     armed_resume = arms_tmux_resume_recovery(
                         self.codex_unconfirmed_resumes.contains(&instance_id),
                         || {
@@ -10749,14 +10758,19 @@ impl MuxelApp {
                         );
                         (Some(program), args)
                     };
+                    let session_env = integrations::tmux_session_env_supported();
+                    let task_bootstrap = tmux_task
+                        .as_ref()
+                        .and_then(|(_, permit, _)| permit.as_deref())
+                        .map(|permit| (crate::control::exe_path(), permit));
                     let launch = crate::session_binding::tmux_pane_args(
                         socket.clone(),
                         &session.name,
-                        scoped_program.as_deref(),
-                        &scoped_args,
+                        scoped_program.as_deref().map(|program| (program, scoped_args.as_slice())),
                         instance_id,
-                        integrations::tmux_session_env_supported(),
+                        session_env,
                         root.as_deref(),
+                        task_bootstrap.as_ref().map(|(helper, id)| (helper.as_str(), *id)),
                     )
                     .map_err(|error| anyhow::Error::msg(match error {
                         muxel_core::isolated_root::TmuxEnvironmentError::SessionEnvironmentUnsupported =>
@@ -10779,13 +10793,21 @@ impl MuxelApp {
                     // Outside-control input goes to this client's pane through
                     // the same server, never through the client.
                     let input_socket = socket.clone();
-                    let input = muxel_terminal::TmuxInputRoute::new(
+                    let mut input = muxel_terminal::TmuxInputRoute::new(
                         session.name.clone(),
-                        resolved.program.is_some(),
+                        resolved.program.is_some() || task_bootstrap.is_some(),
                         move |args: &[String], stdin: Option<&[u8]>| {
                             integrations::run_local_tmux_input(&input_socket, args, stdin)
                         },
                     );
+                    if let Some((target, _, needs_save)) = tmux_task {
+                        input = input.with_task_target(integrations::tmux_task_target(
+                            target,
+                            &resolved.env,
+                            cwd.clone(),
+                            needs_save,
+                        ));
+                    }
                     (
                         CommandSpec::program("tmux", launch.args)
                             .with_title_source(title)
@@ -10894,7 +10916,9 @@ impl MuxelApp {
             Some(ticket) => ticket.startup.clone(),
             None => self.claim_control_startup(instance_id),
         };
-        Ok(control_api::control_launch_spec(
+        let task_launch_hash =
+            crate::session_binding::prepare_task_launch(&mut spec, local_task, process)?;
+        let spec = control_api::control_launch_spec(
             inst,
             self.control_turns.get(&instance_id),
             owner,
@@ -10906,7 +10930,8 @@ impl MuxelApp {
                 // Covers the pane's local process tree only: for an ssh or
                 // tmux client, that's the client, not the remote or server side.
                 .with_memory_limit(self.settings.pane_memory_limit_bytes()),
-        ))
+        );
+        Ok((spec, task_launch_hash))
     }
 
     /// Linux: the argv that starts a local pane's program in a systemd scope of
@@ -11020,7 +11045,7 @@ impl MuxelApp {
             cx.notify();
             return;
         }
-        let spec = match self.command_for(instance_id, None) {
+        let (spec, task_launch_hash) = match self.command_for(instance_id, None) {
             Ok(spec) => spec,
             Err(error) => {
                 self.refuse_terminal_launch(instance_id, error.to_string(), cx);
@@ -11038,6 +11063,7 @@ impl MuxelApp {
             program: prog,
             cwd,
             was_resume: spec.launch_resumed,
+            task_launch_hash,
             started: Instant::now(),
         };
         let result = TerminalLaunch::spawn_for_instance(spec, size, instance_id);
@@ -11409,7 +11435,7 @@ impl MuxelApp {
         // it only after preparation succeeds, without re-reserving the launch.
         self.claim_reserved_control_startup(instance_id, token);
         let started = self.terminal_launching.get(&instance_id)?.since;
-        let spec = match self.command_for(instance_id, resume_cwd) {
+        let (spec, task_launch_hash) = match self.command_for(instance_id, resume_cwd) {
             Ok(spec) => spec,
             Err(error) => {
                 self.refuse_terminal_launch(instance_id, error.to_string(), cx);
@@ -11424,6 +11450,7 @@ impl MuxelApp {
             program,
             cwd,
             was_resume: spec.launch_resumed,
+            task_launch_hash,
             started,
         };
         let size = self.launch_grid(instance_id, cx);
@@ -11581,6 +11608,7 @@ impl MuxelApp {
             program,
             cwd,
             was_resume,
+            task_launch_hash,
             started,
         } = meta;
         let _phase = ui_profile::phase("activation", "install-terminal-spawn", Some(instance_id));
@@ -11589,6 +11617,10 @@ impl MuxelApp {
             Err(error) => {
                 self.terminals.remove(&instance_id);
                 self.terminal_launches.remove(&instance_id);
+                if self.workspace.set_task_launch_hash(instance_id, None) {
+                    self.persist();
+                    self.sync_control(cx);
+                }
                 self.failed_launches
                     .insert(instance_id, format!("{error:#}"));
                 self.add_event(
@@ -11602,13 +11634,16 @@ impl MuxelApp {
         };
         muxel_terminal::startup_event(instance_id, &program, "pty-spawn", started.elapsed(), 0);
         self.failed_launches.remove(&instance_id);
-        if let Some(error) = launch.launch_error().map(str::to_string) {
+        let task_launch_hash = if let Some(error) = launch.launch_error().map(str::to_string) {
             self.add_event(
                 NotifKind::Error,
                 tf("Launch failed: {prog}", &[("prog", &program)]),
                 format!("tried `{program}` in `{cwd}` — {error}"),
             );
-        }
+            None
+        } else {
+            task_launch_hash
+        };
         let palette = theme::palette_from_theme(cx);
         let font_family: SharedString = self.settings.font_family.clone().into();
         let font_size = self.settings.font_size * self.settings.zoom;
@@ -11715,7 +11750,10 @@ impl MuxelApp {
         self.terminals.insert(instance_id, view);
         self.terminal_launches
             .insert(instance_id, (Instant::now(), was_resume));
-        let mut state_changed = false;
+        let task_launch_changed = self
+            .workspace
+            .set_task_launch_hash(instance_id, task_launch_hash);
+        let mut state_changed = task_launch_changed;
         if let Some(inst) = self.workspace.instance_mut(instance_id)
             && inst.consume_runner_prompt()
         {
@@ -11724,6 +11762,9 @@ impl MuxelApp {
         state_changed |= self.mark_terminal_session_started(instance_id);
         if state_changed {
             self.persist();
+        }
+        if self.workspace.task_links.contains_key(&instance_id) {
+            self.sync_control(cx);
         }
         cx.notify();
     }

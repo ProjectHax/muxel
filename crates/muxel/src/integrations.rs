@@ -2655,7 +2655,8 @@ fn tmux_server_command(socket: Socket, root: Option<&Path>) -> Command {
     let mut tmux = tmux_on(socket);
     tmux.args(muxel_core::tmux::start_server_args())
         .env(muxel_core::tmux::SERVER_MARK_ENV, "1")
-        .env_remove(crate::session_binding::MUXEL_INSTANCE_ID_ENV);
+        .env_remove(crate::session_binding::MUXEL_INSTANCE_ID_ENV)
+        .env_remove(muxel_core::control::TASK_LAUNCH_TOKEN_ENV);
     if root.is_some() {
         // A server first started by an isolated GUI must not make its profile
         // the global default for unrelated sessions. Local panes get these
@@ -2672,6 +2673,32 @@ mod tmux_server_environment_tests {
     use std::ffi::OsStr;
 
     #[test]
+    fn task_launch_receipt_lookup_replays_the_client_socket_environment() {
+        let socket_env = vec![
+            ("TMUX_TMPDIR".into(), "relative-sockets".into()),
+            ("TMUX".into(), "socket,10,0".into()),
+        ];
+        let target = super::tmux_task_target(
+            muxel_core::tmux::SessionTarget::new(
+                "fixture",
+                Some(muxel_core::tmux::Socket::Default),
+            ),
+            &socket_env,
+            Some("fixture-cwd".into()),
+            false,
+        );
+        let cmd = super::tmux_task_probe_command(&target).unwrap();
+        let vars: Vec<_> = cmd.get_envs().collect();
+        for (key, value) in &socket_env {
+            assert!(vars.contains(&(OsStr::new(key), Some(OsStr::new(value)))));
+        }
+        assert_eq!(
+            cmd.get_current_dir(),
+            Some(std::path::Path::new("fixture-cwd"))
+        );
+    }
+
+    #[test]
     fn isolated_startup_uses_its_socket_without_seeding_profile_environment() {
         for isolated in [false, true] {
             let root = isolated.then_some(std::path::Path::new("/isolated"));
@@ -2685,6 +2712,7 @@ mod tmux_server_environment_tests {
                 .map(|(key, _)| key)
                 .collect();
             assert!(removed.contains(&OsStr::new(crate::session_binding::MUXEL_INSTANCE_ID_ENV)));
+            assert!(removed.contains(&OsStr::new(muxel_core::control::TASK_LAUNCH_TOKEN_ENV)));
             for key in [muxel_store::USER_DATA_DIR_ENV, crate::control::CONTROL_ENV] {
                 assert_eq!(removed.contains(&OsStr::new(key)), isolated);
             }
@@ -3812,6 +3840,63 @@ fn tmux_command_at(loc: &RepoLoc, session: &SessionTarget, args: &[String]) -> O
 /// How long one outside-control tmux command may take before it counts as
 /// unanswered.
 const TMUX_INPUT_DEADLINE: Duration = Duration::from_secs(10);
+
+const TMUX_TASK_PROBE_DEADLINE: Duration = Duration::from_secs(1);
+
+pub(crate) fn publish_tmux_task_launch(socket: &str, args: &[String]) -> bool {
+    let mut cmd = command("tmux");
+    muxel_terminal::sanitize_appimage_command_env(&mut cmd);
+    cmd.args(["-S", socket])
+        .args(args)
+        .env_remove(muxel_core::control::TASK_LAUNCH_TOKEN_ENV);
+    run_tmux_input(cmd, None, false, TMUX_TASK_PROBE_DEADLINE).is_ok_and(|out| out.status.success())
+}
+
+pub(crate) fn tmux_task_target(
+    session: SessionTarget,
+    env: &[(String, String)],
+    cwd: Option<String>,
+    needs_save: bool,
+) -> muxel_terminal::TmuxTaskTarget {
+    muxel_terminal::TmuxTaskTarget {
+        session,
+        env: env
+            .iter()
+            .filter(|(key, _)| {
+                key.eq_ignore_ascii_case("TMUX") || key.eq_ignore_ascii_case("TMUX_TMPDIR")
+            })
+            .cloned()
+            .collect(),
+        cwd,
+        needs_save: needs_save.into(),
+    }
+}
+
+fn tmux_task_probe_command(target: &muxel_terminal::TmuxTaskTarget) -> Option<Command> {
+    let mut cmd = tmux_on(target.session.socket.as_ref()?);
+    // The PTY builder cleans the inherited AppImage environment before
+    // applying the preset. Follow the same order for the receipt lookup.
+    muxel_terminal::sanitize_appimage_command_env(&mut cmd);
+    cmd.envs(target.env.iter().map(|(key, value)| (key, value)))
+        .args(muxel_core::tmux::task_launch::observation_args(
+            &target.session.name,
+        ))
+        .env_remove(muxel_core::control::TASK_LAUNCH_TOKEN_ENV);
+    if let Some(cwd) = &target.cwd {
+        cmd.current_dir(cwd);
+    }
+    Some(cmd)
+}
+
+pub(crate) fn observe_tmux_task_launch(target: &muxel_terminal::TmuxTaskTarget) -> Option<String> {
+    let cmd = tmux_task_probe_command(target)?;
+    let out = run_tmux_input(cmd, None, false, TMUX_TASK_PROBE_DEADLINE).ok()?;
+    if out.status.success() {
+        String::from_utf8(out.stdout).ok()
+    } else {
+        None
+    }
+}
 
 /// One outside-control input command (`muxel_terminal::TmuxInputRoute`) on the
 /// local tmux server `socket` a pane's client attached to, with `stdin` as its

@@ -98,9 +98,19 @@ pub type TmuxRunner = Arc<dyn Fn(&[String], Option<&[u8]>) -> io::Result<Output>
 pub struct TmuxInputRoute {
     session: String,
     run: TmuxRunner,
+    task_target: Option<Arc<TmuxTaskTarget>>,
     /// Whether muxel created the session with a program of its own (an agent),
     /// rather than the user's default shell. See [`tmux::parse_control_pane`].
     with_command: bool,
+}
+
+/// The receipt lookup follows the same socket environment and directory as
+/// the attached client. A failed permit save delays task-only authorization.
+pub struct TmuxTaskTarget {
+    pub session: tmux::SessionTarget,
+    pub env: Vec<(String, String)>,
+    pub cwd: Option<String>,
+    pub needs_save: AtomicBool,
 }
 
 impl TmuxInputRoute {
@@ -112,8 +122,15 @@ impl TmuxInputRoute {
         Self {
             session: session.into(),
             run: Arc::new(run),
+            task_target: None,
             with_command,
         }
+    }
+
+    /// The exact local target selected when this task pane's client launched.
+    pub fn with_task_target(mut self, target: TmuxTaskTarget) -> Self {
+        self.task_target = Some(Arc::new(target));
+        self
     }
 }
 
@@ -291,6 +308,10 @@ impl TmuxInput {
     /// The tmux pane id ctl input goes to, once found.
     pub(crate) fn pinned_pane(&self) -> Option<String> {
         self.shared.pin.lock().as_ref().map(|pane| pane.id.clone())
+    }
+
+    pub(crate) fn task_target(&self) -> Option<&Arc<TmuxTaskTarget>> {
+        self.route.task_target.as_ref()
     }
 
     /// Queue `input`, admitted in input `epoch`, for the agent's pane, which

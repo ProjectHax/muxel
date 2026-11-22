@@ -258,7 +258,7 @@ fn codex_command_forwards_the_id_only_for_the_default_route() {
             ("codex", Some("muxel_control")),
             (r"C:\fixture\CoDeX.BaT", None),
         ] {
-            let spec = window
+            let (spec, _) = window
                 .update(cx, |app, _, _| {
                     let instance = app.workspace.instance_mut(pane).unwrap();
                     instance.program = Some(program.into());

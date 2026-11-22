@@ -835,6 +835,9 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     pub cwd: Option<String>,
     pub env: Vec<(String, String)>,
+    /// Credential for the initial direct program. Muxel drops it from the
+    /// launch spec after spawning and never copies it to a fallback.
+    pub task_launch_token: Option<muxel_core::control::TaskLaunchToken>,
     /// Variables the child must not have, whether muxel's own environment or
     /// `env` has them.
     pub env_remove: Vec<String>,
@@ -898,6 +901,7 @@ impl CommandSpec {
             args: Vec::new(),
             cwd: None,
             env: Vec::new(),
+            task_launch_token: None,
             env_remove: Vec::new(),
             startup_input: None,
             startup_argument: None,
@@ -928,6 +932,7 @@ impl CommandSpec {
             allow_shell_fallback: true,
             cwd: None,
             env: Vec::new(),
+            task_launch_token: None,
             env_remove: Vec::new(),
             startup_input: None,
             startup_argument: None,
@@ -2692,6 +2697,10 @@ impl TerminalSession {
         self.tmux_input.is_some()
     }
 
+    pub fn task_tmux_target(&self) -> Option<&Arc<crate::TmuxTaskTarget>> {
+        self.tmux_input.as_ref()?.task_target()
+    }
+
     /// The tmux pane id outside-control input goes to, once found.
     pub fn tmux_input_pane(&self) -> Option<String> {
         self.tmux_input.as_ref()?.pinned_pane()
@@ -4260,11 +4269,18 @@ fn ensure_utf8_locale(_builder: &mut CommandBuilder) {}
 /// environment and its defaults), then without `spec.env_remove` or the parent
 /// muxel's profiler settings. Removals cover both inherited and configured env.
 fn apply_spec_env(builder: &mut CommandBuilder, spec: &CommandSpec) {
+    use muxel_core::control::TASK_LAUNCH_TOKEN_ENV;
     for (k, v) in &spec.env {
-        builder.env(k, v);
+        if !k.eq_ignore_ascii_case(TASK_LAUNCH_TOKEN_ENV) {
+            builder.env(k, v);
+        }
     }
     for k in &spec.env_remove {
         builder.env_remove(k);
+    }
+    builder.env_remove(TASK_LAUNCH_TOKEN_ENV);
+    if let Some(token) = &spec.task_launch_token {
+        builder.env(TASK_LAUNCH_TOKEN_ENV, &token.0);
     }
     // Profiler settings belong to the parent muxel, even when a preset repeats
     // them. Apply last so no configured override can leak them into a pane.
@@ -4287,18 +4303,32 @@ fn apply_spec_env(builder: &mut CommandBuilder, spec: &CommandSpec) {
 /// shell/agent muxel spawns gets a clean system environment. No-op unless muxel
 /// itself is running from an AppImage (`$APPIMAGE` set).
 fn sanitize_appimage_env(builder: &mut CommandBuilder) {
-    let Some(appimage) = std::env::var_os("APPIMAGE") else {
-        return;
-    };
-    let appdir = std::env::var_os("APPDIR").unwrap_or_default();
-    let vars: Vec<_> = std::env::vars_os().collect();
-    let (drop, overrides) = appimage_env_fixups(&vars, &appimage, &appdir);
+    let (drop, overrides) = inherited_appimage_env_fixups();
     for k in drop {
         builder.env_remove(&k);
     }
     for (k, v) in overrides {
         builder.env(&k, &v);
     }
+}
+
+/// Apply the same cleanup when a tmux launch helper starts a program without
+/// muxel-terminal owning the PTY.
+pub fn sanitize_appimage_command_env(command: &mut std::process::Command) {
+    let (drop, overrides) = inherited_appimage_env_fixups();
+    for key in drop {
+        command.env_remove(key);
+    }
+    command.envs(overrides);
+}
+
+fn inherited_appimage_env_fixups() -> (Vec<OsString>, Vec<(OsString, OsString)>) {
+    let Some(appimage) = std::env::var_os("APPIMAGE") else {
+        return (Vec::new(), Vec::new());
+    };
+    let appdir = std::env::var_os("APPDIR").unwrap_or_default();
+    let vars: Vec<_> = std::env::vars_os().collect();
+    appimage_env_fixups(&vars, &appimage, &appdir)
 }
 
 /// Pure half of [`sanitize_appimage_env`]: given the current environment plus the
@@ -5007,7 +5037,7 @@ mod status_bar_redraw_tests {
 mod wheel_report_tests {
     use super::{
         CommandSpec, PtyChunk, TerminalSession, appimage_env_fixups, apply_spec_env,
-        push_mouse_report, push_wheel_report,
+        command_builder_for_spawn, push_mouse_report, push_wheel_report,
     };
     use std::time::{Duration, Instant};
 
@@ -5052,6 +5082,38 @@ mod wheel_report_tests {
         for key in context {
             assert_eq!(builder.get_env(key), Some("configured".as_ref()));
         }
+    }
+
+    #[test]
+    fn task_launch_token_cannot_come_from_inherited_or_configured_environment() {
+        use muxel_core::control::TASK_LAUNCH_TOKEN_ENV as KEY;
+        let lower = KEY.to_ascii_lowercase();
+        let mut spec = CommandSpec::program("tmux", vec!["new-session".into()]);
+        spec.env = vec![(lower.clone(), "fixture-configured-value".into())];
+        let mut builder = command_builder_for_spawn(&spec.program, &spec.args);
+        builder.env(KEY, "fixture-inherited-value");
+        apply_spec_env(&mut builder, &spec);
+        assert!(builder.get_env(KEY).is_none());
+        assert!(builder.get_env(lower).is_none());
+    }
+
+    #[test]
+    fn task_launch_token_reaches_direct_child_environment_without_argv() {
+        use muxel_core::control::{TASK_LAUNCH_TOKEN_ENV, TaskLaunchToken};
+
+        let fake = "fixture-direct-task-token";
+        let mut spec = CommandSpec::program("fake-agent", vec!["--fixture".into()]);
+        spec.task_launch_token = Some(TaskLaunchToken(fake.into()));
+        let mut builder = command_builder_for_spawn(&spec.program, &spec.args);
+        apply_spec_env(&mut builder, &spec);
+        assert_eq!(builder.get_env(TASK_LAUNCH_TOKEN_ENV), Some(fake.as_ref()));
+        assert!(
+            !builder
+                .get_argv()
+                .iter()
+                .any(|arg| arg.to_string_lossy().contains(fake))
+        );
+        assert!(!format!("{spec:?}").contains(fake));
     }
 
     #[test]

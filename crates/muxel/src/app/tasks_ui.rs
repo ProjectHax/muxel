@@ -15,7 +15,9 @@ use muxel_core::cloud::tasks::{
     self as mtasks, Actor, PanelGroups, PanelTask, ProgressNote, Task, TaskStatus,
 };
 use muxel_core::control as ctl_types;
+use muxel_core::tmux::{SessionTarget, task_launch::TaskLaunch};
 use serde_json::{Value, json};
+use std::sync::atomic::Ordering;
 
 /// Finished tasks the panel keeps listing.
 const DONE_SHOWN: usize = 15;
@@ -297,9 +299,7 @@ impl MuxelApp {
         if self.tasks_ui.selected == Some(id) {
             self.tasks_ui.selected = None;
         }
-        let before = self.workspace.task_links.len();
-        self.workspace.task_links.retain(|_, task| *task != id);
-        if self.workspace.task_links.len() != before {
+        if self.workspace.retain_task_links(|_, task| task != id) {
             self.persist();
         }
         self.cloud.request_sync();
@@ -492,11 +492,10 @@ impl MuxelApp {
             return;
         }
         let live: HashSet<Uuid> = self.workspace.instances.iter().map(|i| i.id).collect();
-        let before = self.workspace.task_links.len();
-        self.workspace
-            .task_links
-            .retain(|iid, _| live.contains(iid));
-        if self.workspace.task_links.len() != before {
+        if self
+            .workspace
+            .retain_task_links(|iid, _| live.contains(&iid))
+        {
             self.tasks_ui.seen.retain(|iid, _| live.contains(iid));
             self.persist();
         }
@@ -583,7 +582,11 @@ impl MuxelApp {
         out
     }
 
-    fn ctl_resolve_task(&self, query: &str) -> Result<Uuid, ctl_types::Error> {
+    fn ctl_resolve_task(
+        &self,
+        query: &str,
+        scope: mtasks::CtlTaskScope,
+    ) -> Result<Uuid, ctl_types::Error> {
         let q = query.trim().to_ascii_lowercase().replace('-', "");
         if q.len() < 4 {
             return Err("give at least the first 4 characters of the task id".into());
@@ -592,6 +595,7 @@ impl MuxelApp {
             .ctl_tasks()
             .iter()
             .map(|(_, t)| t.id)
+            .filter(|&id| scope.allows(id))
             .filter(|id| id.simple().to_string().starts_with(&q))
             .collect();
         match hits.as_slice() {
@@ -634,33 +638,208 @@ impl MuxelApp {
         })
     }
 
-    /// `muxel ctl task …`. With outside control off, only a pane started on
-    /// a task may ask, and only about its own task.
+    pub(super) fn live_task_launch(&self, iid: Uuid, cx: &App) -> bool {
+        self.workspace.task_links.contains_key(&iid)
+            && self.workspace.instance(iid).is_some_and(|instance| {
+                self.workspace
+                    .project(instance.project_id)
+                    .is_some_and(|project| !project.is_remote())
+            })
+            && !self.is_closing(iid)
+            && self
+                .terminal_view(iid)
+                .is_some_and(|view| !view.read(cx).exited())
+    }
+
+    pub(super) fn save_tmux_task_launch(
+        &mut self,
+        iid: Uuid,
+        state: muxel_core::tmux::task_launch::TaskLaunch,
+    ) -> bool {
+        let previous = self.workspace.task_tmux_launches.insert(iid, state);
+        if self.try_persist() {
+            return true;
+        }
+        if let Some(previous) = previous {
+            self.workspace.task_tmux_launches.insert(iid, previous);
+        } else {
+            self.workspace.task_tmux_launches.remove(&iid);
+        }
+        false
+    }
+
+    pub(super) fn prepare_tmux_task(
+        &mut self,
+        iid: Uuid,
+    ) -> Option<(SessionTarget, Option<String>, bool)> {
+        if !self.workspace.task_links.contains_key(&iid) {
+            return None;
+        }
+        let instance = self.workspace.instance(iid)?;
+        if self.workspace.project(instance.project_id)?.is_remote() {
+            return None;
+        }
+        let mut target =
+            SessionTarget::new(instance.tmux_session.clone()?, instance.tmux_socket.clone());
+        target.socket = Some(crate::integrations::local_tmux_socket(&target));
+        let (permit, needs_save) = if crate::integrations::tmux_session_env_supported() {
+            self.tmux_task_permit(iid, &target)
+        } else {
+            (None, false)
+        };
+        Some((target, permit, needs_save))
+    }
+
+    pub(super) fn tmux_task_permit(
+        &mut self,
+        iid: Uuid,
+        target: &SessionTarget,
+    ) -> (Option<String>, bool) {
+        let mut state = self
+            .workspace
+            .task_tmux_launches
+            .get(&iid)
+            .cloned()
+            .unwrap_or_else(|| TaskLaunch::new(target.clone()));
+        let Some(permit) = state.issue(target) else {
+            return (None, false);
+        };
+        if self.save_tmux_task_launch(iid, state) {
+            (Some(permit), false)
+        } else {
+            // Launch normally. Only a previously saved receipt can be used
+            // on this attach, and only once workspace persistence recovers.
+            (None, true)
+        }
+    }
+
+    pub(super) fn defer_tmux_task(
+        &self,
+        incoming: crate::control::Incoming,
+        cx: &mut Context<Self>,
+    ) -> Option<crate::control::Incoming> {
+        let Some(iid) = incoming.caller_instance_id.filter(|&iid| {
+            incoming.command.is_task()
+                && incoming.task_launch_hash.is_some()
+                && self.current_workspace.is_some()
+                && self.tasks_available()
+                && self.live_task_launch(iid, cx)
+                && self.workspace.task_tmux_launches.contains_key(&iid)
+        }) else {
+            return Some(incoming);
+        };
+        let Some(terminal) = self.terminal_view(iid).map(|view| view.read(cx).session()) else {
+            return Some(incoming);
+        };
+        let Some(target) = terminal.task_tmux_target().cloned() else {
+            return Some(incoming);
+        };
+        let terminal = Arc::downgrade(terminal);
+        let workspace = self.current_workspace;
+        let task = self.workspace.task_links[&iid];
+        cx.spawn(async move |this: WeakEntity<Self>, cx| {
+            let receipt = cx.background_executor()
+                .spawn(async move { crate::integrations::observe_tmux_task_launch(&target) })
+                .await
+                .ok_or_else(|| ctl_types::Error::from(
+                    "could not read the task pane from its tmux server. Try the task command again.",
+                ));
+            let result = this.update(cx, |app, cx| {
+                if app.current_workspace != workspace
+                    || app.workspace.task_links.get(&iid) != Some(&task)
+                    || !app.live_task_launch(iid, cx)
+                    || app.terminal_view(iid).is_none_or(|view| {
+                        !terminal.ptr_eq(&Arc::downgrade(view.read(cx).session()))
+                    })
+                {
+                    return Err("the task pane changed while checking its launch. Try the task command again.".into());
+                }
+                app.control_task(
+                    incoming.command, Some(iid), incoming.task_launch_hash, Some(receipt), cx,
+                )
+            }).unwrap_or_else(|_| Err("muxel is shutting down".into()));
+            let reply = match result {
+                Ok(value) => ctl_types::Response::ok(value),
+                Err(error) => ctl_types::Response::err(error),
+            };
+            let _ = incoming.reply.send(reply);
+        }).detach();
+        None
+    }
+
+    fn authenticate_task_launch(
+        &mut self,
+        iid: Uuid,
+        proof_hash: Option<&ctl_types::TaskLaunchHash>,
+        receipt: Option<Result<String, ctl_types::Error>>,
+        cx: &App,
+    ) -> Result<(bool, Option<Uuid>), ctl_types::Error> {
+        let Some(view) = self.terminal_view(iid) else {
+            return Ok((false, None));
+        };
+        let terminal = view.read(cx).session();
+        if !terminal.delivers_through_tmux() {
+            return Ok((
+                self.workspace.task_launch_hashes.contains_key(&iid),
+                self.workspace.authenticated_task_link(iid, proof_hash),
+            ));
+        }
+        let saved = self.workspace.task_tmux_launches.get(&iid);
+        let (Some(proof), Some(receipt), Some(saved), Some(target)) = (
+            proof_hash,
+            receipt,
+            saved,
+            terminal.task_tmux_target().cloned(),
+        ) else {
+            return Ok((saved.is_some_and(TaskLaunch::has_pin), None));
+        };
+        let mut pin = saved.clone();
+        let Some(expected) = pin.observe(&target.session, &receipt?) else {
+            return Ok((false, None));
+        };
+        if !mtasks::task_hash_matches(&expected, proof) {
+            return Ok((true, None));
+        }
+        if pin != *saved || target.needs_save.load(Ordering::Relaxed) {
+            if !self.save_tmux_task_launch(iid, pin) {
+                return Err("could not save the task pane's launch proof. Try the task command again after workspace saving recovers.".into());
+            }
+            target.needs_save.store(false, Ordering::Relaxed);
+        }
+        Ok((true, self.workspace.task_links.get(&iid).copied()))
+    }
+
+    /// With outside control off, only an authenticated local launch may
+    /// ask about its own task.
     pub(super) fn control_task(
         &mut self,
         command: ctl_types::Command,
         caller: Option<Uuid>,
+        task_launch_hash: Option<ctl_types::TaskLaunchHash>,
+        receipt: Option<Result<String, ctl_types::Error>>,
         cx: &mut Context<Self>,
     ) -> Result<Value, ctl_types::Error> {
         use ctl_types::Command as C;
         if !self.tasks_available() {
             return Err("tasks need muxel Cloud: sign in with a plan that includes sync".into());
         }
-        let linked = caller.and_then(|c| self.workspace.task_links.get(&c).copied());
+        let live_caller = caller.filter(|&iid| self.live_task_launch(iid, cx));
+        let (launch_ready, linked) = match live_caller
+            .map(|iid| self.authenticate_task_launch(iid, task_launch_hash.as_ref(), receipt, cx))
+            .unwrap_or(Ok((false, None)))
+        {
+            Ok(result) => result,
+            Err(_) if self.settings.control_enabled => (false, None),
+            Err(error) => return Err(error),
+        };
         let scope = mtasks::CtlTaskScope::of(self.settings.control_enabled, linked);
-        let refuse = || -> ctl_types::Error {
-            "outside control is off: a pane started on a task may only use `ctl task` on its own task".into()
-        };
         if scope == mtasks::CtlTaskScope::Refused {
-            return Err(refuse());
+            return Err(ctl_types::task_launch_refusal(
+                caller.is_some(),
+                task_launch_hash.is_some(),
+                launch_ready,
+            ));
         }
-        let check = |id: Uuid| {
-            if scope.allows(id) {
-                Ok(id)
-            } else {
-                Err(refuse())
-            }
-        };
         let shown = |this: &Self, id: Uuid| -> Value {
             this.ctl_tasks()
                 .into_iter()
@@ -679,11 +858,11 @@ impl MuxelApp {
                 Ok(json!({ "tasks": tasks, "linked": linked }))
             }
             C::TaskShow { task } => {
-                let id = check(self.ctl_resolve_task(&task)?)?;
+                let id = self.ctl_resolve_task(&task, scope)?;
                 Ok(json!({ "task": shown(self, id) }))
             }
             C::TaskTake { task } => {
-                let id = check(self.ctl_resolve_task(&task)?)?;
+                let id = self.ctl_resolve_task(&task, scope)?;
                 self.try_edit_task(id, cx, mtasks::take)
                     .map_err(|e| ctl_types::Error::from(e.to_string()))?;
                 Ok(json!({ "task": shown(self, id) }))
@@ -694,9 +873,10 @@ impl MuxelApp {
                 percent,
                 status,
             } => {
-                let id = check(self.ctl_resolve_task(&task)?)?;
-                let agent = caller
-                    .and_then(|c| self.workspace.instances.iter().find(|i| i.id == c))
+                let id = self.ctl_resolve_task(&task, scope)?;
+                let agent = linked
+                    .and(live_caller)
+                    .and_then(|iid| self.workspace.instance(iid))
                     .map(|i| i.program.clone().unwrap_or_else(|| i.title.clone()));
                 let status = status.as_deref().and_then(TaskStatus::parse);
                 let text = if text.trim().is_empty() {

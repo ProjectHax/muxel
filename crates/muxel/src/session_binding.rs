@@ -790,6 +790,21 @@ pub(crate) enum PaneProcess {
     SshClient,
 }
 
+/// Add the proof to a direct PTY launch. Local tmux issues its proof from
+/// inside the new session's agent wrapper.
+pub(crate) fn prepare_task_launch(
+    spec: &mut muxel_terminal::CommandSpec,
+    linked: bool,
+    process: PaneProcess,
+) -> anyhow::Result<Option<muxel_core::control::TaskLaunchHash>> {
+    if !linked || process != PaneProcess::Program {
+        return Ok(None);
+    }
+    let (token, hash) = crate::task_launch::new_proof()?;
+    spec.task_launch_token = Some(token);
+    Ok(Some(hash))
+}
+
 /// The environment a pane's process starts with, on top of muxel's own: the
 /// variables to set (what the preset and instance set, then `launch`, what the
 /// launch itself needs, such as ssh's password), and the ones to remove.
@@ -870,11 +885,11 @@ pub(crate) struct LocalTmuxLaunch {
 pub(crate) fn tmux_pane_args(
     socket: muxel_core::tmux::Socket,
     session: &str,
-    program: Option<&str>,
-    args: &[String],
+    program: Option<(&str, &[String])>,
     instance_id: Uuid,
     session_env: bool,
     user_data_root: Option<&Path>,
+    task: Option<(&str, &str)>,
 ) -> Result<LocalTmuxLaunch, muxel_core::isolated_root::TmuxEnvironmentError> {
     let env = muxel_core::isolated_root::local_tmux_environment(
         user_data_root,
@@ -888,13 +903,21 @@ pub(crate) fn tmux_pane_args(
         .filter(|root| !root.as_os_str().is_empty())
         .map(muxel_core::tmux::Socket::isolated)
         .unwrap_or(socket);
-    let args = socket.argv(muxel_core::tmux::launch_session_args_with_env(
+    let command = match task {
+        Some((helper, id)) => Some(muxel_core::tmux::task_pane_program(helper, id, program)),
+        None => {
+            program.map(|(program, args)| muxel_core::tmux::control_pane_program(program, args))
+        }
+    };
+    let args = socket.argv(muxel_core::tmux::launch_session_args_with_command(
         session,
         None,
-        program,
-        args,
+        command.as_deref(),
         &env,
-        &[MUXEL_INSTANCE_ID_ENV],
+        &[
+            MUXEL_INSTANCE_ID_ENV,
+            muxel_core::control::TASK_LAUNCH_TOKEN_ENV,
+        ],
     ));
     // The same profile values on the client cover user-defined
     // update-environment options during attach. pane_env strips the pane id.
@@ -2675,13 +2698,32 @@ mod tests {
     fn a_tmux_panes_program_gets_its_own_id_or_none_never_the_servers() {
         let id = Uuid::new_v4();
         let own = format!("{MUXEL_INSTANCE_ID_ENV}={id}");
-        let clear = ["set-environment", "-g", "-u", MUXEL_INSTANCE_ID_ENV, ";"];
+        let clear = [
+            "set-environment",
+            "-g",
+            "-u",
+            MUXEL_INSTANCE_ID_ENV,
+            ";",
+            "set-environment",
+            "-g",
+            "-u",
+            muxel_core::control::TASK_LAUNCH_TOKEN_ENV,
+            ";",
+        ];
         // After `-u set -g mouse on ;`, before the session is created.
-        let args = tmux_pane_args(Socket::Default, "s", Some("claude"), &[], id, true, None)
-            .unwrap()
-            .args;
+        let args = tmux_pane_args(
+            Socket::Default,
+            "s",
+            Some(("claude", &[])),
+            id,
+            true,
+            None,
+            None,
+        )
+        .unwrap()
+        .args;
         let new = args.iter().position(|arg| arg == "new-session").unwrap();
-        assert_eq!(args[new - 5..new], clear);
+        assert_eq!(args[new - clear.len()..new], clear);
         assert_eq!(
             args[new..],
             [
@@ -2701,11 +2743,11 @@ mod tests {
         );
         // Older tmux has no `-e`: the program starts without an id rather than
         // with whichever pane's the server had.
-        let args = tmux_pane_args(Socket::Default, "s", None, &[], id, false, None)
+        let args = tmux_pane_args(Socket::Default, "s", None, id, false, None, None)
             .unwrap()
             .args;
         let new = args.iter().position(|arg| arg == "new-session").unwrap();
-        assert_eq!(args[new - 5..new], clear);
+        assert_eq!(args[new - clear.len()..new], clear);
         assert_eq!(args[new..], ["new-session", "-A", "-s", "s"]);
     }
 
@@ -2715,12 +2757,28 @@ mod tests {
     #[test]
     fn a_tmux_pane_names_the_server_its_session_is_on() {
         let id = Uuid::new_v4();
-        let private = tmux_pane_args(Socket::Private, "s", Some("claude"), &[], id, true, None)
-            .unwrap()
-            .args;
-        let default = tmux_pane_args(Socket::Default, "s", Some("claude"), &[], id, true, None)
-            .unwrap()
-            .args;
+        let private = tmux_pane_args(
+            Socket::Private,
+            "s",
+            Some(("claude", &[])),
+            id,
+            true,
+            None,
+            None,
+        )
+        .unwrap()
+        .args;
+        let default = tmux_pane_args(
+            Socket::Default,
+            "s",
+            Some(("claude", &[])),
+            id,
+            true,
+            None,
+            None,
+        )
+        .unwrap()
+        .args;
         assert_eq!(private[..2], ["-L", "mxl"]);
         assert_eq!(private[2..], default[..]);
         assert_eq!(default[0], "-u");
@@ -2734,11 +2792,11 @@ mod tests {
         let launch = tmux_pane_args(
             Socket::Default,
             "s",
-            Some("agent"),
-            &argv,
+            Some(("agent", &argv)),
             id,
             true,
             Some(root),
+            None,
         )
         .unwrap();
         assert_eq!(&launch.args[..2], Socket::isolated(root).args());
@@ -2771,7 +2829,7 @@ mod tests {
         assert_eq!(
             launch.args[2..8]
                 .iter()
-                .chain(launch.args[new - 5..new].iter())
+                .chain(launch.args[new - 10..new].iter())
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
             [
@@ -2785,6 +2843,11 @@ mod tests {
                 "-g",
                 "-u",
                 MUXEL_INSTANCE_ID_ENV,
+                ";",
+                "set-environment",
+                "-g",
+                "-u",
+                muxel_core::control::TASK_LAUNCH_TOKEN_ENV,
                 ";"
             ]
         );
@@ -2817,7 +2880,118 @@ mod tests {
                     .into()
             )
         );
-        assert!(tmux_pane_args(Socket::Default, "s", None, &[], id, false, Some(root)).is_err());
+        assert!(tmux_pane_args(Socket::Default, "s", None, id, false, Some(root), None).is_err());
+    }
+
+    #[test]
+    fn task_launch_credential_is_fresh_and_only_its_hash_survives_a_save() {
+        use muxel_core::Workspace;
+        use muxel_terminal::CommandSpec;
+
+        let pane = Uuid::new_v4();
+        let task = Uuid::new_v4();
+        let mut workspace = Workspace::default();
+        workspace.task_links.insert(pane, task);
+        let mut spec = CommandSpec::program("fake-agent", vec!["--fixture".into()]);
+        let first = prepare_task_launch(&mut spec, true, PaneProcess::Program)
+            .unwrap()
+            .unwrap();
+        let token = spec.task_launch_token.as_ref().unwrap();
+        assert_eq!(token.0.len(), 64);
+        assert!(!format!("{spec:?}").contains(&token.0));
+        assert!(workspace.set_task_launch_hash(pane, Some(first)));
+        let root = temp_dir();
+        let path = root.join("workspace.json");
+        muxel_store::save_workspace_to(&path, &workspace).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let mut restored = muxel_store::load_workspace_from(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        assert!(!saved.contains(&token.0));
+        assert!(saved.contains("task_launch_hashes"));
+        assert_eq!(
+            restored.authenticated_task_link(pane, Some(&first)),
+            Some(task)
+        );
+
+        let fresh = prepare_task_launch(&mut spec, true, PaneProcess::Program)
+            .unwrap()
+            .unwrap();
+        assert_ne!(first, fresh);
+        assert!(restored.set_task_launch_hash(pane, Some(fresh)));
+        assert_eq!(restored.authenticated_task_link(pane, Some(&first)), None);
+        assert_eq!(
+            restored.authenticated_task_link(pane, Some(&fresh)),
+            Some(task)
+        );
+        assert!(restored.retain_task_links(|_, _| false));
+        assert!(restored.task_launch_hashes.is_empty());
+    }
+
+    #[test]
+    fn task_launch_keeps_the_proof_out_of_tmux_client_argv_and_ssh() {
+        use muxel_terminal::CommandSpec;
+
+        let id = Uuid::new_v4();
+        let public_id = format!("{id}.1");
+        let program = "/fixture with space/muxel";
+        let launch = tmux_pane_args(
+            Socket::Private,
+            "task",
+            Some(("fake-agent", &["fixture argument".into()])),
+            id,
+            true,
+            None,
+            Some((program, &public_id)),
+        )
+        .unwrap();
+        let mut tmux = CommandSpec::program("tmux", launch.args);
+        assert!(
+            prepare_task_launch(&mut tmux, true, PaneProcess::TmuxClient)
+                .unwrap()
+                .is_none()
+        );
+        assert!(tmux.task_launch_token.is_none());
+        // Both fresh and reattached panes use this command. The reserved key
+        // appears only in the clear operation checked above.
+        let key = muxel_core::control::TASK_LAUNCH_TOKEN_ENV;
+        assert!(
+            !tmux
+                .args
+                .iter()
+                .any(|arg| arg.starts_with(&format!("{key}=")))
+        );
+        assert!(launch.env.iter().all(|(name, _)| name != key));
+        assert!(
+            tmux.args
+                .windows(2)
+                .any(|args| args == ["new-session", "-A"])
+        );
+        assert!(
+            tmux.args
+                .windows(2)
+                .any(|args| args == [program, public_id.as_str()])
+        );
+        assert!(
+            tmux.args
+                .iter()
+                .any(|arg| arg.contains(muxel_core::control::TMUX_TASK_LAUNCH_FLAG))
+        );
+
+        let mut ssh = CommandSpec::program("ssh", vec![]);
+        assert!(
+            prepare_task_launch(&mut ssh, true, PaneProcess::SshClient)
+                .unwrap()
+                .is_none()
+        );
+        assert!(ssh.task_launch_token.is_none());
+        let mut unlinked = CommandSpec::shell();
+        assert!(
+            prepare_task_launch(&mut unlinked, false, PaneProcess::Program)
+                .unwrap()
+                .is_none()
+        );
+        assert!(unlinked.task_launch_token.is_none());
     }
 
     #[test]
@@ -2827,10 +3001,10 @@ mod tests {
             Socket::Default,
             "s",
             None,
-            &[],
             Uuid::new_v4(),
             true,
             Some(root),
+            None,
         )
         .unwrap();
         assert!(

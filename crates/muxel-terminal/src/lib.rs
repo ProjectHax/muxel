@@ -35,7 +35,7 @@ mod view;
 
 pub use colors::TerminalPalette;
 pub use control_input::{
-    ControlInput, ControlWrite, ControlWriteError, TmuxInputRoute, TmuxRunner,
+    ControlInput, ControlWrite, ControlWriteError, TmuxInputRoute, TmuxRunner, TmuxTaskTarget,
 };
 pub use links::{FileLinkTarget, file_target_from_uri, file_uri, path_from_file_uri};
 pub use pane_job::{HitStatus, MemoryLimitHit};
@@ -48,6 +48,7 @@ pub use session::{
     CommandSpec, LaunchBinding, PTY_OUTPUT_QUEUE_BYTE_CAPACITY, PTY_OUTPUT_QUEUE_CHUNK_CAPACITY,
     PtyChunk, PtyOutputQueueStats, PtyReceiver, ShellCloseCheck, ShellCloseReading,
     TerminalSession, TitleSource, literal_program_for_spawn, muse_config_supported,
+    sanitize_appimage_command_env,
 };
 pub use view::{
     AgentStatus, DisplayEpoch, LocalPaste, LocalPasteHandler, OpenLink, OpenLinkBackground,

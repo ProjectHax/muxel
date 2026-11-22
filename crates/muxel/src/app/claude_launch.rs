@@ -357,6 +357,7 @@ impl MuxelApp {
             program: request.key.preset.program.clone().unwrap_or_default(),
             cwd: request.key.cwd.display().to_string(),
             was_resume: request.key.started,
+            task_launch_hash: None,
             started: self.terminal_launching.get(&pane)?.since,
         };
         Some(TerminalPreparation {

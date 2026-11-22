@@ -56,13 +56,57 @@ pub const GUARDED_SEND_VERSION: u32 = 2;
 pub const PARAMETERIZED_NEW_VERSION: u32 = 3;
 
 /// The file, in muxel's data directory, where the running app says how to reach
-/// it. Owner-only: the token in it is the whole of the authorization.
+/// it. The owner-only file holds the profile's connection credential.
 pub const ENDPOINT_FILE: &str = "control.json";
 
 /// The environment variable that tells a program muxel starts in a pane which
 /// pane it runs in: the pane's `uuid`, which works as AGENT. Only a pane on this
 /// computer has one; a remote pane is kept from taking one (see `ssh`).
 pub const INSTANCE_ID_ENV: &str = "MUXEL_INSTANCE_ID";
+
+/// Set only in the environment of a local task pane's launched program.
+pub const TASK_LAUNCH_TOKEN_ENV: &str = "MUXEL_TASK_LAUNCH_PROOF";
+pub const TMUX_TASK_LAUNCH_FLAG: &str = "--tmux-task-launch";
+pub type TaskLaunchHash = [u8; 32];
+
+pub fn task_launch_refusal(has_pane: bool, has_proof: bool, launch_ready: bool) -> Error {
+    if !has_pane || (launch_ready && !has_proof) {
+        "outside control is off: this process did not receive the task pane's environment. Run `ctl task` from a tool that inherits that environment.".into()
+    } else if !launch_ready {
+        "outside control is off: no task launch proof is available for this process. Relaunch the task pane if it was started before launch proofs were available. Run `ctl task` from a tool that inherits the task pane's environment.".into()
+    } else {
+        "outside control is off: `ctl task` needs the proof from the current task pane launch."
+            .into()
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn task_launch_refusal_names_missing_environment_and_preupgrade_relaunch() {
+    for (pane, proof, launch) in [(false, false, false), (true, false, true)] {
+        assert!(
+            task_launch_refusal(pane, proof, launch)
+                .message
+                .contains("did not receive the task pane's environment")
+        );
+    }
+    assert!(
+        task_launch_refusal(true, false, false)
+            .message
+            .contains("Relaunch the task pane")
+    );
+}
+
+/// Plaintext only while constructing a pane environment or a control request.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TaskLaunchToken(pub String);
+
+impl std::fmt::Debug for TaskLaunchToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TaskLaunchToken(..)")
+    }
+}
 
 /// How long after a prompt is sent an agent may take to visibly start working
 /// before `wait` stops expecting it to.
@@ -99,6 +143,8 @@ pub struct Request {
     /// not an authenticated identity; older hosts ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_instance_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_launch_token: Option<TaskLaunchToken>,
     pub command: Command,
 }
 
@@ -186,8 +232,8 @@ pub enum Command {
 }
 
 impl Command {
-    /// The task commands, which a pane started on a task may use even with
-    /// outside control off.
+    /// Task commands, available with outside control off to an authenticated
+    /// local task pane on its own task.
     pub fn is_task(&self) -> bool {
         matches!(
             self,
@@ -1446,7 +1492,7 @@ With --prompt the reply comes once the pane exists: its task submitted, refused,
 All raw argv (even agent argv) and shell presets/defaults ALSO require \"Also allow typing into shell panes\".
 All three grants default off; upgrades do not infer creation permission from the older grants.
 Creation opt-out or outside control off refuses all pending requests. Existing panes, admitted launches and typing permissions are unchanged; toolbar creation is unaffected.
-Outside control off stops the server (while a pane started on a Cloud task is open it answers only `ctl task` and new-status); pollers report host_unavailable after their retries.
+With outside control off, the server stays up only while a local task pane is live. It answers scoped `ctl task` and `new-status`; pollers get host_unavailable after the server closes.
 Commands run as the host muxel process, outside the caller's sandbox; agents/presets are not a sandbox.
 Turning \"Also allow typing into shell panes\" off blocks subsequent control writes to all raw-argv panes and shell-classified panes.
 Configured non-literal agents remain controllable while outside control is on. Revocation does not stop processes or undo input.
@@ -1497,7 +1543,7 @@ pub fn command_help(command: &str) -> Option<&'static str> {
             "usage: muxel ctl keys AGENT KEY... [--force]\nPress keys such as enter, esc, tab, arrows, backspace and ctrl-c. --force permits your own pane."
         }
         "task" => {
-            "usage: muxel ctl task list | show TASK | take TASK | progress TASK TEXT [--percent N] [--status in_progress|blocked|done]\nWork with the Tasks panel. TASK is a task id or the start of one. An agent started on a task (Start with agent) may use these on its own task even with outside control off; anything else needs outside control. progress adds a note; agents should report every meaningful step, and --status done when the task is finished."
+            "usage: muxel ctl task list | show TASK | take TASK | progress TASK TEXT [--percent N] [--status in_progress|blocked|done]\nWork with the Tasks panel. TASK is a task id or the start of one. With outside control off, a local task pane may use these on its own task if its environment reaches the agent's tools. The CLI reads the pane ID and per-launch proof from that environment. Relaunch older task panes to get a proof. progress adds a note; agents should report every meaningful step, and --status done when the task is finished."
         }
         "skill" => "usage: muxel ctl skill\nPrint instructions for an orchestrating agent.",
         "help" => {
@@ -1992,9 +2038,10 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   host restart. Plain creation and status requests use protocol v2; creation with
   model or effort uses v3 so older hosts cannot silently discard the choices.
   The host requires the exact command version, including for JSON callers.
-  Turning creation or outside control off refuses all pending requests. Outside
-  control off also stops the server, so pollers receive `host_unavailable`
-  after their connection retries rather than the recorded `control_disabled`.
+  Turning creation or outside control off refuses all pending requests. With
+  outside control off, the server stays up only while a local task pane is live,
+  and answers scoped `ctl task` and `new-status`. After the
+  server closes, pollers receive `host_unavailable` after connection retries.
   Revocation leaves
   existing panes, already admitted launches and
   typing permissions unchanged. Deferred requests recheck current permission;
@@ -2409,6 +2456,7 @@ mod tests {
             version: 1,
             token: "t".into(),
             caller_instance_id: None,
+            task_launch_token: None,
             command: Command::Show {
                 agent: "claude".into(),
                 full: true,
@@ -2422,6 +2470,7 @@ mod tests {
                 .unwrap();
         assert_eq!(unit.command, Command::Projects);
         assert_eq!(unit.caller_instance_id, None);
+        assert_eq!(unit.task_launch_token, None);
         let defaults: Request = serde_json::from_str(
             r#"{"version":1,"token":"t","command":{"cmd":"send","agent":"a","text":"hi"}}"#,
         )
@@ -2439,6 +2488,7 @@ mod tests {
         let line = serde_json::to_string(&defaults).unwrap();
         assert!(!line.contains("launch_id"), "{line}");
         assert!(!line.contains("caller_instance_id"), "{line}");
+        assert!(!line.contains("task_launch_token"), "{line}");
         let caller = Request {
             caller_instance_id: Some(id(7)),
             command: Command::Keys {
