@@ -39,6 +39,8 @@ pub use control_input::{
 };
 pub use links::{FileLinkTarget, file_target_from_uri, file_uri, path_from_file_uri};
 pub use pane_job::{HitStatus, MemoryLimitHit};
+#[cfg(windows)]
+pub use portable_pty::win::{set_console_directory, set_force_system_console};
 pub use present_flag::{mark_present_needed, take_present_needed};
 pub use profile::startup_event;
 pub use program_status::ProgramStatusKind;

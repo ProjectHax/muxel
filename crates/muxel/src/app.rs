@@ -14957,9 +14957,9 @@ impl MuxelApp {
     /// Download the matching release asset and apply it (off the UI thread).
     fn start_update_download(&mut self, cx: &mut Context<Self>) {
         let kind = self.install_kind;
-        let url = match &self.update_state {
+        let (url, version) = match &self.update_state {
             UpdateState::Available(info) => match crate::update::asset_for(kind, &info.assets) {
-                Some((_, url)) => url.clone(),
+                Some((_, url)) => (url.clone(), info.version.clone()),
                 // No asset matched this platform/arch — surface it instead of
                 // leaving the button looking dead.
                 None => {
@@ -14979,7 +14979,7 @@ impl MuxelApp {
         cx.spawn(async move |view: WeakEntity<Self>, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { crate::update::download_and_apply(kind, &url) })
+                .spawn(async move { crate::update::download_and_apply(kind, &url, &version) })
                 .await;
             let _ = view.update(cx, |this, cx| {
                 match result {

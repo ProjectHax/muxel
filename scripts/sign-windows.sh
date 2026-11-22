@@ -92,8 +92,8 @@ sign_pe() {
         "$file"
 }
 
-# Extract muxel.exe from a release zip, sign it, and repackage the zip with the
-# signed exe (preserving README.md / LICENSE alongside it).
+# Sign muxel.exe and repackage the full release zip, preserving Microsoft's
+# already-signed console host and the other files.
 sign_zip() {
     local zip="$1"
     [[ -f "$zip" ]] || die "no such file: $zip"

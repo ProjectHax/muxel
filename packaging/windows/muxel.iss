@@ -1,10 +1,10 @@
 ; Inno Setup script for muxel — a basic, per-user Windows installer.
 ;
-; Installs muxel.exe to %LOCALAPPDATA%\Programs\muxel with a Start Menu shortcut
+; Installs muxel and its console host to %LOCALAPPDATA%\Programs\muxel with a Start Menu shortcut
 ; and an Add/Remove Programs uninstaller. It is deliberately a PER-USER install
 ; (PrivilegesRequired=lowest, no admin): the install directory is user-writable,
-; so muxel's in-app auto-updater (which self-replaces muxel.exe from the latest
-; GitHub Release) keeps working without ever prompting for elevation.
+; so muxel's in-app updater can install the new app and its console host
+; from the latest GitHub Release without prompting for elevation.
 ;
 ; Built in CI by .github/workflows/release.yml, which passes the version, arch,
 ; and source/asset directories on the command line:
@@ -70,9 +70,16 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
 
 [Files]
+Source: "{#SourceDir}\muxel-console\{#MyAppVersion}\conpty.dll"; DestDir: "{app}\muxel-console\{#MyAppVersion}"; Flags: ignoreversion
+Source: "{#SourceDir}\muxel-console\{#MyAppVersion}\OpenConsole.exe"; DestDir: "{app}\muxel-console\{#MyAppVersion}"; Flags: ignoreversion
+Source: "{#SourceDir}\muxel-console\{#MyAppVersion}\CONPTY-LICENSE.txt"; DestDir: "{app}\muxel-console\{#MyAppVersion}"; Flags: ignoreversion
 Source: "{#SourceDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+
+[UninstallDelete]
+; Include versions installed later by the in-app updater.
+Type: filesandordirs; Name: "{app}\muxel-console"
 
 [Icons]
 Name: "{autoprograms}\muxel"; Filename: "{app}\{#MyAppExeName}"

@@ -68,6 +68,15 @@ Or grab a package from the [Releases](https://github.com/projecthax/muxel/releas
 - **Windows** (x64 + arm64): a signed **installer** (`.exe`, per-user, no admin,
   with in-app auto-updates) or a portable `.zip`
 
+Both Windows packages include Microsoft's OpenConsole host so direct panes can
+receive OSC 7501 status reports. If Windows rejects creation of the bundled
+console, muxel retries with the built-in host; set `MUXEL_SYSTEM_CONSOLE=1` to
+force the system host from startup. The older in-app updater installs only the
+app, so its first upgrade to a bundled release gets the host files on the
+following update. Run the installer or extract the complete zip to get them
+immediately. An installation that only updates in-app keeps its original
+uninstaller. An older uninstaller leaves the `muxel-console` folder behind.
+
 **Nix / NixOS:**
 
 ```sh
@@ -90,6 +99,10 @@ cargo run -p muxel
 
 The first build compiles GPUI from source (a git dependency on Zed), so expect it
 to take a while.
+
+On Windows, put the verified console host beside a local debug build with
+`pwsh -File scripts/fetch-conpty.ps1 -Architecture x64 -OutputDirectory target/debug`
+(use `arm64` for an arm64 build).
 
 ### Linux build dependencies
 
