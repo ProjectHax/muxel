@@ -7094,6 +7094,10 @@ mod tests {
     fn a_worktree_diff_against_its_base_shows_its_commits() {
         let repo = crate::test_support::TestRepo::init();
         repo.commit(&[("notes.txt", "first\n"), ("other.txt", "base\n")], "seed");
+        // Windows git's system core.autocrlf=true would check the worktree
+        // out as CRLF, which the test's git, without that config, sees as
+        // edits to every file.
+        repo.git(&["config", "core.autocrlf", "false"]);
         let wt = crate::test_support::short_temp_path();
         let made_from = create_worktree(repo.path(), &wt, "muxel/wt").expect("create worktree");
         assert_eq!(made_from.as_deref(), Some("main"));
@@ -7181,6 +7185,9 @@ mod tests {
             ],
             "seed",
         );
+        // Windows git's system core.autocrlf=true would check the worktree
+        // out as CRLF, which the test's git sees as edits.
+        repo.git(&["config", "core.autocrlf", "false"]);
         let wt = crate::test_support::short_temp_path();
         create_worktree(repo.path(), &wt, "muxel/wt").expect("create worktree");
         let wt_git = |args: &[&str]| crate::test_support::git_out(&wt, args);

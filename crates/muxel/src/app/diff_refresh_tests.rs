@@ -1190,11 +1190,21 @@ fn merging_a_worktree_into_its_base_refreshes_its_diff() {
         wait(cx, 2 * MIN_GAP);
         assert!(diff_text(cx, main, iid).contains("+second"));
         fx.a.git(&["merge", "-q", "--ff-only", "muxel/wt"]);
-        let heads = fx.a.path().join(".git").join("refs").join("heads");
+        // The ref as the plan names it: a linked worktree finds the common
+        // git directory from the path git wrote into its `.git` file, which
+        // on Windows is the long form of the temp directory's short name.
+        let plan = crate::integrations::diff_plan(&wt.path, Some("main")).expect("a work tree");
+        let base_ref = std::path::Path::new("refs").join("heads").join("main");
+        let main_ref = plan
+            .refs
+            .iter()
+            .find(|file| file.ends_with(&base_ref))
+            .expect("the plan watches the base branch")
+            .clone();
         send(
             &backend,
             notify::EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
-            &[heads.join("main.lock"), heads.join("main")],
+            &[main_ref.with_file_name("main.lock"), main_ref],
         );
         wait(cx, SOON);
         let text = diff_text(cx, main, iid);
