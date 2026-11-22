@@ -3343,13 +3343,15 @@ impl TerminalLaunch {
 
     /// Testable inner half of [`Self::spawn`]: the fallback spec is injectable.
     fn spawn_with_fallback(
-        spec: CommandSpec,
+        mut spec: CommandSpec,
         fallback: CommandSpec,
         (cols, rows): (u16, u16),
         instance_id: Option<Uuid>,
     ) -> anyhow::Result<Self> {
         let spawn = |spec| TerminalSession::spawn_internal(spec, cols, rows, instance_id);
-        match spawn(spec.clone()) {
+        let result = spawn(spec.clone());
+        spec.task_launch_token = None;
+        match result {
             Ok((session, rx)) => Ok(Self {
                 spec,
                 session,

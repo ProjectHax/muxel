@@ -172,7 +172,7 @@ fn a_ctl_task_reaches_codex_argv_only_through_its_owner() {
                 ("owned by its reservation", reserved, Some(TASK), SKIP),
             ];
             for (case, iid, typed, settings) in cases {
-                let spec = app.command_for(iid, None).unwrap();
+                let (spec, _) = app.command_for(iid, None).unwrap();
                 assert_eq!(
                     spec.startup_input.as_deref(),
                     typed,

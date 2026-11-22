@@ -470,6 +470,174 @@ fn idle_agent_close_holds_process_and_undo_restores_tab_order() {
 }
 
 #[test]
+fn task_launch_keeps_the_preset_tmux_socket_environment() {
+    use muxel_core::EnvVar;
+    use muxel_core::tmux::Socket;
+
+    with_app(|cx, window| {
+        let project = project(cx, window);
+        window
+            .update(cx, |app, _, _| {
+                let mut instance = Instance::shell(project);
+                instance.tmux_session = Some("fixture".into());
+                instance.tmux_socket = Some(Socket::Named(format!("fixture-{}", instance.id)));
+                instance.env = vec![
+                    EnvVar {
+                        key: "TMUX_TMPDIR".into(),
+                        value: "fixture-tmux-sockets".into(),
+                    },
+                    EnvVar {
+                        key: "TMUX".into(),
+                        value: "fixture-tmux-sockets/socket,10,0".into(),
+                    },
+                ];
+                let pane = instance.id;
+                app.workspace.add_instance(instance);
+                let (ordinary, _) = app.command_for(pane, None).unwrap();
+                app.workspace.task_links.insert(pane, Uuid::new_v4());
+                let (task, _) = app.command_for(pane, None).unwrap();
+                let socket_env = |spec: &CommandSpec| {
+                    spec.env
+                        .iter()
+                        .filter(|(key, _)| key.starts_with("TMUX"))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(socket_env(&ordinary).len(), 2);
+                assert_eq!(socket_env(&task), socket_env(&ordinary));
+                assert!(!task.env_remove.iter().any(|key| key == "TMUX"));
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn task_launch_authentication_serves_only_the_live_task_pane_with_control_off() {
+    use super::cloud_ui::CloudPhase;
+    use muxel_cloud::api::{Entitlements, Me, MeDevice, MeUser};
+    use muxel_core::cloud::tasks::Task;
+    use muxel_core::control::Command;
+
+    with_app(|cx, window| {
+        let project = project(cx, window);
+        window
+            .update(cx, |app, window, cx| {
+                let user = Uuid::new_v4();
+                let task = Task::new("Linked", Some(user), 0);
+                let id = task.id;
+                app.cloud.phase = CloudPhase::Ready;
+                app.cloud.me = Some(Me {
+                    user: MeUser {
+                        id: user,
+                        email: "fixture@example.com".into(),
+                        name: "Fixture".into(),
+                    },
+                    device: MeDevice {
+                        id: Uuid::new_v4(),
+                        name: "Fixture".into(),
+                    },
+                    entitlements: Entitlements {
+                        personal_sync: true,
+                        ..Entitlements::default()
+                    },
+                    teams: vec![],
+                });
+                app.cloud.tasks.personal = vec![task, Task::new("Other", Some(user), 0)];
+                app.settings.control_enabled = false;
+                let mut instance = Instance::shell(project);
+                instance.program = Some("cmd.exe".into());
+                instance.args = vec!["/D".into(), "/Q".into(), "/K".into()];
+                let pane = instance.id;
+                app.workspace.add_instance(instance);
+                app.workspace.task_links.insert(pane, id);
+                app.spawn_terminal_for(pane, muxel_core::TerminalLaunchReason::NewPane, window, cx);
+                let hash = app.workspace.task_launch_hashes[&pane];
+                assert!(app.control.is_some());
+                let error = app
+                    .control_task(Command::TaskList, None, None, None, cx)
+                    .unwrap_err();
+                assert!(
+                    error
+                        .message
+                        .contains("did not receive the task pane's environment")
+                );
+                for credential in [None, Some([0; 32])] {
+                    assert!(
+                        app.control_task(Command::TaskList, Some(pane), credential, None, cx)
+                            .is_err()
+                    );
+                }
+                let reply = app
+                    .control_task(Command::TaskList, Some(pane), Some(hash), None, cx)
+                    .unwrap();
+                assert_eq!(reply["linked"], id.to_string());
+                assert_eq!(reply["tasks"].as_array().unwrap().len(), 1);
+                assert_eq!(reply["tasks"][0]["id"], id.to_string());
+
+                app.workspace.set_task_launch_hash(pane, None);
+                let error = app
+                    .control_task(Command::TaskList, Some(pane), None, None, cx)
+                    .unwrap_err();
+                assert!(error.message.contains("Relaunch the task pane"));
+
+                app.settings.control_enabled = true;
+                let reply = app
+                    .control_task(Command::TaskList, Some(pane), None, None, cx)
+                    .unwrap();
+                assert!(reply["linked"].is_null());
+                assert_eq!(reply["tasks"].as_array().unwrap().len(), 2);
+
+                // Switch the fixture to a tmux route without starting a real
+                // tmux client on Windows. A failed save lets the client attach
+                // but the previous pin must be saved again before use.
+                use muxel_core::tmux::{SessionTarget, Socket, task_launch::TaskLaunch};
+                let target = SessionTarget::new("fixture", Some(Socket::Private));
+                let mut state = TaskLaunch::new(target.clone());
+                let permit = state.issue(&target).unwrap();
+                let receipt = format!("fixture\t321\t1000\t$1\t%9\t400\t0\t%9\t{permit}:{}:%9:400", hex::encode([2; 32]));
+                assert_eq!(state.observe(&target, &receipt), Some([2; 32]));
+                assert!(app.save_tmux_task_launch(pane, state.clone()));
+                let doc = muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap();
+                let blocked = doc.with_extension("json.tmp");
+                std::fs::create_dir(&blocked).unwrap();
+                let (permit, needs_save) = app.tmux_task_permit(pane, &target);
+                assert!(permit.is_none());
+                assert!(needs_save);
+                assert_eq!(app.workspace.task_tmux_launches[&pane], state);
+                let route = muxel_terminal::TmuxInputRoute::new("fixture", true, |_, _| {
+                    panic!("probe sent terminal input")
+                }).with_task_target(crate::integrations::tmux_task_target(target, &[], None, needs_save));
+                let spec = CommandSpec::program("cmd.exe", vec!["/D".into(), "/Q".into(), "/K".into()])
+                    .with_tmux_input(route);
+                let launch = TerminalLaunch::spawn(spec, (80, 24)).unwrap();
+                let view = cx.new(|cx| TerminalView::new(launch, pane, Instant::now(), window, cx));
+                app.terminals.insert(pane, view);
+                app.settings.control_enabled = false;
+                let (send, _) = std::sync::mpsc::channel();
+                let unchanged = app.defer_tmux_task(crate::control::Incoming {
+                    command: Command::TaskList,
+                    caller_instance_id: Some(pane),
+                    task_launch_hash: None,
+                    reply: send,
+                }, cx);
+                assert!(unchanged.is_some(), "a proofless request must stay on the immediate path");
+                let error = app.control_task(Command::TaskList, Some(pane), Some([2; 32]),
+                    Some(Ok(receipt.clone())), cx).unwrap_err();
+                assert!(error.message.contains("could not save"));
+                std::fs::remove_dir(&blocked).unwrap();
+                let transient = muxel_core::control::Error::from("could not read the task pane from its tmux server. Try the task command again.");
+                let error = app.control_task(Command::TaskList, Some(pane), Some([2; 32]),
+                    Some(Err(transient.clone())), cx).unwrap_err();
+                assert_eq!(error.message, transient.message);
+                let reply = app.control_task(Command::TaskList, Some(pane), Some([2; 32]),
+                    Some(Ok(receipt)), cx).unwrap();
+                assert_eq!(reply["linked"], id.to_string());
+            })
+            .unwrap();
+    });
+}
+
+#[test]
 fn held_panes_allow_ctl_reads_but_refuse_input_with_current_close_state() {
     with_app(|cx, window| {
         let pid = project(cx, window);
@@ -503,7 +671,7 @@ fn held_panes_allow_ctl_reads_but_refuse_input_with_current_close_state() {
                         lines: Some(10),
                     },
                 ] {
-                    match app.control_command(command, None, cx) {
+                    match app.control_command(command, None, None, cx) {
                         super::control_api::Answer::Now(result) => {
                             result.unwrap();
                         }

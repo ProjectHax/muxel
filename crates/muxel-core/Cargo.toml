@@ -10,6 +10,8 @@ description = "Core domain types for muxel: projects, agent instances, and the p
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+subtle = "2.6"
+hex = "0.4"
 uuid.workspace = true
 # PowerShell's `-EncodedCommand` takes UTF-16LE base64. Already in the tree via
 # muxel-terminal, so this adds a dependency edge, not a new crate.

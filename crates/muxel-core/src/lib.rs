@@ -1349,6 +1349,13 @@ pub struct Workspace {
     /// on `Instance`, whose serialization is shared with remote peers.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub task_links: std::collections::HashMap<Uuid, Uuid>,
+    /// SHA-256 verifiers for direct launches of task-linked panes. Local only,
+    /// alongside the links. A legacy link has no entry here.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub task_launch_hashes: std::collections::HashMap<Uuid, control::TaskLaunchHash>,
+    /// Public launch permits and pinned verifiers for local tmux task panes.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub task_tmux_launches: std::collections::HashMap<Uuid, tmux::task_launch::TaskLaunch>,
     /// Persisted Tasks panel width in pixels (None = default).
     #[serde(default)]
     pub tasks_panel_width: Option<f32>,

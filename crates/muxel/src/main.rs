@@ -34,6 +34,7 @@ mod skills;
 mod sound;
 mod split;
 mod stt;
+mod task_launch;
 #[cfg(test)]
 mod test_support;
 mod theme;
@@ -255,6 +256,13 @@ impl log::Log for LaunchLogger {
 }
 
 fn main() {
+    let mut raw_args = std::env::args_os().skip(1);
+    if raw_args
+        .next()
+        .is_some_and(|arg| arg == muxel_core::control::TMUX_TASK_LAUNCH_FLAG)
+    {
+        std::process::exit(task_launch::run_in_tmux(raw_args));
+    }
     // `--user-data-dir DIR` moves every setting and file muxel keeps into DIR, for
     // this process and all it starts. First, before any path is read or thread runs.
     let args = match user_data_dir::configure(std::env::args_os().skip(1).collect()) {

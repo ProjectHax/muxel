@@ -24,6 +24,8 @@ pub fn bind_peer_sessions(
     );
 }
 
+pub mod task_launch;
+
 /// A stable tmux session name for an instance, e.g. `muxel_myproj_1a2b3c4d`.
 pub fn session_name(project: &str, instance: Uuid) -> String {
     let slug: String = project
@@ -135,7 +137,7 @@ where
 
 /// A session name and the server that owns it. `None` is legacy metadata whose
 /// location must be resolved once before operating on it; it never means both.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionTarget {
     pub name: String,
     pub socket: Option<Socket>,
@@ -1010,13 +1012,14 @@ pub fn launch_session_args(
 /// (`new-session -e NAME=VALUE`, which tmux 3.2 added: see
 /// [`session_env_supported`]) and without the variables named in `unset`.
 ///
-/// tmux starts a new session's program from its server's environment, not from
-/// the environment of the client that asked for the session, so `-e` is the only
-/// way to hand the program a variable of its own. The server's environment is
+/// tmux starts a new session's program from its server and session environments.
+/// `-e` sets a session variable on creation without changing the server's
+/// `update-environment` settings. The server's environment is
 /// whatever the process that started it had, so `unset` is first removed from it
 /// (`set-environment -g -u`, which every tmux has, and which every session on that
-/// server shares). A session `-A` attaches to instead keeps the environment it
-/// started with.
+/// server shares). When `-A` attaches, the existing program keeps the environment
+/// it started with. The server may update the session environment for future
+/// processes.
 ///
 /// The values land in the client's command line, where any process can read
 /// them, so pass nothing private and no project paths (see [`start_server_args`]).
@@ -1025,6 +1028,18 @@ pub fn launch_session_args_with_env(
     cwd: Option<&str>,
     program: Option<&str>,
     args: &[String],
+    env: &[(String, String)],
+    unset: &[&str],
+) -> Vec<String> {
+    let command = program.map(|program| control_pane_program(program, args));
+    launch_session_args_with_command(session, cwd, command.as_deref(), env, unset)
+}
+
+/// Launch an already wrapped command, or let tmux start its default shell.
+pub fn launch_session_args_with_command(
+    session: &str,
+    cwd: Option<&str>,
+    command: Option<&[String]>,
     env: &[(String, String)],
     unset: &[&str],
 ) -> Vec<String> {
@@ -1048,10 +1063,9 @@ pub fn launch_session_args_with_env(
     {
         v.extend(["set-environment", "-g", "-u", name, ";"].map(String::from));
     }
-    let command = program.map(|program| control_pane_program(program, args));
-    let mut new = match command {
-        Some(command) => new_session_args(session, cwd, Some(&command[0]), &command[1..]),
-        None => new_session_args(session, cwd, None, args),
+    let mut new = match command.and_then(<[_]>::split_first) {
+        Some((program, args)) => new_session_args(session, cwd, Some(program), args),
+        None => new_session_args(session, cwd, None, &[]),
     };
     // With `new-session`'s other options: after `-A -s NAME`, before `--`.
     let options = env
@@ -1445,14 +1459,47 @@ pub fn control_pane_program(program: &str, args: &[String]) -> Vec<String> {
     let mut command = vec![
         "sh".into(),
         "-c".into(),
-        format!(
-            "tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\" 2>/dev/null; {launch}"
-        ),
+        format!("{MARK_CONTROL_PANE}; {launch}"),
         "muxel-agent".into(),
         program.into(),
     ];
     command.extend_from_slice(args);
     command
+}
+
+const MARK_CONTROL_PANE: &str =
+    "tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\" 2>/dev/null";
+
+/// Extend the same creation-only wrapper with a public launch id and a
+/// helper. The helper invokes the original shell semantics with its proof
+/// in the child environment.
+pub fn task_pane_program(
+    helper: &str,
+    id: &str,
+    command: Option<(&str, &[String])>,
+) -> Vec<String> {
+    let script = match command {
+        None => "exec \"${SHELL:-/bin/sh}\" -l",
+        Some((_, [])) => "exec \"${SHELL:-/bin/sh}\" -c \"$1\"",
+        Some(_) => "exec \"$@\"",
+    };
+    let flag = crate::control::TMUX_TASK_LAUNCH_FLAG;
+    let mut wrapped = vec![
+        "sh".into(),
+        "-c".into(),
+        format!(
+            "{MARK_CONTROL_PANE}; helper=$1; id=$2; script=$3; shift 3; exec \"$helper\" {flag} \"$id\" sh -c \"$script\" muxel-agent \"$@\""
+        ),
+        "muxel-task".into(),
+        helper.into(),
+        id.into(),
+        script.into(),
+    ];
+    if let Some((program, args)) = command {
+        wrapped.push(program.into());
+        wrapped.extend_from_slice(args);
+    }
+    wrapped
 }
 
 /// Guard a write in tmux's own command queue. The check and write share a

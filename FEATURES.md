@@ -1060,12 +1060,15 @@ feature is added or changed, update the matching entry here in the same change**
 - **`muxel ctl task`** — `list`, `show`, `take` and
   `progress TASK TEXT [--percent N] [--status in_progress|blocked|done]`. TASK
   is an id or its first characters. An agent started on a task is told to
-  report progress this way, and it may do so on its own task even with
-  outside control off: while such a pane is open, the control server keeps
-  running for task commands only. Everything else still needs outside
-  control. The pane is identified by the id it declares, so this keeps an
-  agent to its own task by default but doesn't stop another program running as
-  you from naming a different task pane.
+  report progress this way. With outside control off, a live local task pane
+  can use these commands on its own task, including when it runs in local tmux.
+  The exception needs the pane's environment to reach the agent's tools.
+  Relaunch older task panes to get a launch proof. The CLI sends the proof from
+  the pane's environment, and muxel saves only its hash. Reading the profile
+  and knowing a pane's id is insufficient to act as that pane. A program that can
+  read its environment, control its tmux pane, or alter the state muxel trusts
+  can still act with its authority. Muxel trusts write access to the tmux server
+  during enrolment.
 
 ## Built-in browser
 
@@ -1264,10 +1267,10 @@ feature is added or changed, update the matching entry here in the same change**
   Approvals expire 120 seconds after admission (`approval_timeout`), including
   time behind another card; denial returns `approval_denied`. Turning creation
   or outside control off refuses every pending request and removes its card.
-  Outside control off also stops the server (unless a pane started on a muxel
-  Cloud task is open, when it keeps answering only `ctl task` and
-  `new-status`), so polling callers receive `host_unavailable` after
-  connection retries. Connection, host-availability
+  With outside control off, the server stays up only while a local
+  task pane is live. It answers authenticated, scoped `ctl task` requests
+  and `new-status` polls. After the server closes, polling callers receive
+  `host_unavailable` after connection retries. Connection, host-availability
   and `busy` failures retry up to three times against the same UUID; the CLI never reissues creation.
   Exhausted retries and uncoded status errors name the UUID to query with
   `new-status` and advise against repeating `new` while the original may still wait.
@@ -1488,7 +1491,8 @@ feature is added or changed, update the matching entry here in the same change**
 - **Local and owner-only** — the running app listens on a random loopback port and
   writes it, with a fresh random token, to `control.json` in muxel's data directory,
   readable only by the user; nothing is reachable from the network, and a request
-  without the token is refused. Turning the setting off (or quitting) closes it.
+  without the token is refused. Quitting closes the listener. With outside
+  control off it stays up only while a local task pane is live.
   Before connecting, `muxel ctl` checks that the process that wrote `control.json`
   is still running, so a file left behind by a muxel that was killed isn't
   trusted. The check goes by process id alone, so if that id has since gone to

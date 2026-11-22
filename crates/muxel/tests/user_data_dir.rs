@@ -7,8 +7,12 @@
 //! names it. The test answers whichever one `muxel ctl` connects to, and the
 //! reply says which that was. No window opens: `ctl` exits before the app starts.
 
-use muxel_core::control::{ENDPOINT_FILE, Endpoint, PROTOCOL_VERSION, Request, Response};
+use muxel_core::control::{
+    ENDPOINT_FILE, Endpoint, PROTOCOL_VERSION, Request, Response, TASK_LAUNCH_TOKEN_ENV,
+    TaskLaunchToken,
+};
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::{Ipv4Addr, TcpListener};
@@ -17,6 +21,159 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const WAIT: Duration = Duration::from_secs(30);
+
+#[cfg(unix)]
+#[test]
+fn task_launch_real_tmux_wrapper_reattaches_and_replaces_the_pin() {
+    use muxel_core::cloud::tasks::task_hash_matches;
+    use muxel_core::tmux::task_launch::{TaskLaunch, observation_args};
+    use muxel_core::tmux::{self, SessionTarget, Socket};
+
+    let supported = Command::new("tmux").arg("-V").output().is_ok_and(|out| {
+        out.status.success() && tmux::session_env_supported(&String::from_utf8_lossy(&out.stdout))
+    });
+    if !supported {
+        eprintln!("skipping task launch fixture: tmux 3.2 or newer is unavailable");
+        return;
+    }
+
+    struct Server {
+        socket: PathBuf,
+        clients: Vec<std::process::Child>,
+    }
+    impl Server {
+        fn command(&self) -> Command {
+            let mut cmd = Command::new("tmux");
+            cmd.arg("-S")
+                .arg(&self.socket)
+                .args(["-f", "/dev/null"])
+                .env_remove("TMUX")
+                .env_remove("TMUX_PANE")
+                .env_remove(TASK_LAUNCH_TOKEN_ENV);
+            cmd
+        }
+        fn launch(&mut self, root: &Path, permit: &str) {
+            let wrapper = tmux::task_pane_program(
+                env!("CARGO_BIN_EXE_muxel"),
+                permit,
+                Some((
+                    "sh",
+                    &[
+                        "-c".into(),
+                        format!(
+                            "test -n \"${TASK_LAUNCH_TOKEN_ENV}\" && : > ready || exit 42; exec sleep 60"
+                        ),
+                    ],
+                )),
+            );
+            let client = self
+                .command()
+                .current_dir(root)
+                .arg("-C")
+                .args(tmux::launch_session_args_with_command(
+                    "task",
+                    None,
+                    Some(&wrapper),
+                    &[],
+                    &[],
+                ))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start tmux control client");
+            self.clients.push(client);
+        }
+    }
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.command().arg("kill-server").output();
+            for mut client in self.clients.drain(..) {
+                let _ = client.kill();
+                let _ = client.wait();
+            }
+        }
+    }
+    fn wait_for<T>(mut read: impl FnMut() -> Option<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(value) = read() {
+                return value;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "tmux fixture did not reach the expected state"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    // Keep the socket path short enough for macOS's Unix socket address.
+    let name = uuid::Uuid::new_v4().simple().to_string();
+    let directory = std::env::temp_dir().join(format!("mxl-{}", &name[..12]));
+    std::fs::create_dir(&directory).unwrap();
+    let root = Root(directory);
+    let mut server = Server {
+        socket: root.0.join("s"),
+        clients: Vec::new(),
+    };
+    let target = SessionTarget::new("task", Some(Socket::Private));
+    let mut launch = TaskLaunch::new(target.clone());
+    let first = launch.issue(&target).unwrap();
+    server.launch(&root.0, &first);
+    let observe = |server: &Server, launch: &mut TaskLaunch| {
+        let out = server
+            .command()
+            .args(observation_args("task"))
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        launch.observe(&target, std::str::from_utf8(&out.stdout).ok()?)
+    };
+    let ready = root.0.join("ready");
+    wait_for(|| ready.exists().then_some(()));
+    let old = wait_for(|| observe(&server, &mut launch));
+    let mut restored: TaskLaunch =
+        serde_json::from_str(&serde_json::to_string(&launch).unwrap()).unwrap();
+    let reattach = restored.issue(&target).unwrap();
+    server.launch(&root.0, &reattach);
+    wait_for(|| {
+        let out = server
+            .command()
+            .args(["list-clients", "-t", "=task", "-F", "#{client_name}"])
+            .output()
+            .ok()?;
+        (out.status.success() && String::from_utf8_lossy(&out.stdout).lines().count() == 2)
+            .then_some(())
+    });
+    assert_eq!(observe(&server, &mut restored), Some(old));
+
+    assert!(
+        server
+            .command()
+            .args([
+                "set",
+                "-g",
+                "exit-empty",
+                "off",
+                ";",
+                "kill-session",
+                "-t",
+                "=task"
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    std::fs::remove_file(&ready).unwrap();
+    let replacement = restored.issue(&target).unwrap();
+    server.launch(&root.0, &replacement);
+    wait_for(|| ready.exists().then_some(()));
+    let current = wait_for(|| observe(&server, &mut restored));
+    assert!(!task_hash_matches(&current, &old));
+}
 
 /// A fresh directory, removed afterwards.
 struct Root(PathBuf);
@@ -40,6 +197,7 @@ struct FakeMuxel {
     name: &'static str,
     listener: TcpListener,
     token: String,
+    task_launch_token: RefCell<Option<TaskLaunchToken>>,
 }
 
 impl FakeMuxel {
@@ -63,6 +221,7 @@ impl FakeMuxel {
             name,
             listener,
             token,
+            task_launch_token: RefCell::new(None),
         }
     }
 
@@ -85,6 +244,7 @@ impl FakeMuxel {
             "{} got another's token",
             self.name
         );
+        *self.task_launch_token.borrow_mut() = request.task_launch_token;
         let mut reply = serde_json::to_string(&Response::ok(json!({ "muxel": self.name })))
             .expect("encode reply");
         reply.push('\n');
@@ -145,6 +305,37 @@ fn reached(args: &[OsString], env: &[(&str, &Path)], fakes: &[&FakeMuxel]) -> St
                 String::from_utf8_lossy(&output.stderr)
             )
         })
+}
+
+#[test]
+fn task_launch_authentication_cli_sends_the_environment_token_only_for_task_commands() {
+    let root = Root::new();
+    let fake = FakeMuxel::publish("fixture", &root.0.join("data").join(ENDPOINT_FILE));
+    let token = "fixture-task-launch-token";
+    let prefix = [
+        OsString::from("--user-data-dir"),
+        root.0.as_os_str().to_owned(),
+        OsString::from("ctl"),
+    ];
+    for (suffix, expected) in [
+        (&["task", "list"][..], Some(TaskLaunchToken(token.into()))),
+        (&["projects"][..], None),
+    ] {
+        let args: Vec<_> = prefix
+            .iter()
+            .cloned()
+            .chain(suffix.iter().copied().map(OsString::from))
+            .collect();
+        assert_eq!(
+            reached(
+                &args,
+                &[(TASK_LAUNCH_TOKEN_ENV, Path::new(token))],
+                &[&fake]
+            ),
+            "fixture"
+        );
+        assert_eq!(fake.task_launch_token.take(), expected);
+    }
 }
 
 #[test]

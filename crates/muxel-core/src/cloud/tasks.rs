@@ -405,10 +405,8 @@ pub fn panel_groups(
 /// Which tasks a `muxel ctl task` caller may see and change.
 ///
 /// With outside control on, every task the app can show. With it off, the
-/// control server runs only for panes started on a task, and each such pane
-/// may reach only its own task. The caller's pane id is self-declared, so this
-/// keeps an agent that reports its own id to its own task; it doesn't stop a
-/// program running as the same user from declaring another task pane's id.
+/// control server accepts task commands only from authenticated local
+/// launches of task panes, and each may reach only its own task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CtlTaskScope {
     All,
@@ -417,7 +415,7 @@ pub enum CtlTaskScope {
 }
 
 impl CtlTaskScope {
-    /// `linked` is the task linked to the caller's pane, if any.
+    /// `linked` is the task linked to the caller's authenticated live launch.
     pub fn of(outside_control: bool, linked: Option<Uuid>) -> Self {
         match (outside_control, linked) {
             (true, _) => Self::All,
@@ -432,6 +430,102 @@ impl CtlTaskScope {
             Self::Only(own) => own == task,
             Self::Refused => false,
         }
+    }
+}
+
+impl crate::Workspace {
+    pub fn authenticated_task_link(
+        &self,
+        pane: Uuid,
+        presented_hash: Option<&crate::control::TaskLaunchHash>,
+    ) -> Option<Uuid> {
+        let expected = self.task_launch_hashes.get(&pane)?;
+        if task_hash_matches(expected, presented_hash?) {
+            self.task_links.get(&pane).copied()
+        } else {
+            None
+        }
+    }
+
+    /// Publish the verifier of the installed launch, or retire the old one.
+    pub fn set_task_launch_hash(
+        &mut self,
+        pane: Uuid,
+        hash: Option<crate::control::TaskLaunchHash>,
+    ) -> bool {
+        if let Some(hash) = hash.filter(|_| self.task_links.contains_key(&pane)) {
+            let retired = self.task_tmux_launches.remove(&pane).is_some();
+            let changed = self.task_launch_hashes.insert(pane, hash) != Some(hash);
+            retired || changed
+        } else {
+            self.task_launch_hashes.remove(&pane).is_some()
+        }
+    }
+
+    pub fn retain_task_links(&mut self, mut keep: impl FnMut(Uuid, Uuid) -> bool) -> bool {
+        let before = self.task_links.len();
+        let hashes_before = self.task_launch_hashes.len();
+        let tmux_before = self.task_tmux_launches.len();
+        self.task_links.retain(|pane, task| keep(*pane, *task));
+        self.task_launch_hashes
+            .retain(|pane, _| self.task_links.contains_key(pane));
+        self.task_tmux_launches
+            .retain(|pane, _| self.task_links.contains_key(pane));
+        self.task_links.len() != before
+            || self.task_launch_hashes.len() != hashes_before
+            || self.task_tmux_launches.len() != tmux_before
+    }
+}
+
+pub fn task_hash_matches(
+    expected: &crate::control::TaskLaunchHash,
+    presented: &crate::control::TaskLaunchHash,
+) -> bool {
+    use subtle::ConstantTimeEq as _;
+    bool::from(expected.ct_eq(presented))
+}
+
+#[cfg(test)]
+mod launch_authentication_tests {
+    use super::CtlTaskScope;
+    use crate::Workspace;
+    use uuid::Uuid;
+
+    #[test]
+    fn task_launch_authentication_refuses_missing_and_wrong_credentials() {
+        let pane = Uuid::from_u128(1);
+        let task = Uuid::from_u128(2);
+        let hash = [42u8; 32];
+        let workspace: Workspace = serde_json::from_value(serde_json::json!({
+            "projects": [], "active_project": null, "instances": [],
+            "task_links": { (pane): task },
+            "task_launch_hashes": { (pane): hash },
+        }))
+        .unwrap();
+        let scope =
+            |presented| CtlTaskScope::of(false, workspace.authenticated_task_link(pane, presented));
+        let wrong = [43u8; 32];
+        assert_eq!(scope(Some(&hash)), CtlTaskScope::Only(task));
+        assert_eq!(
+            (scope(None), scope(Some(&wrong))),
+            (CtlTaskScope::Refused, CtlTaskScope::Refused)
+        );
+    }
+
+    #[test]
+    fn task_launch_authentication_loads_legacy_links_without_authorizing_them() {
+        let pane = Uuid::from_u128(1);
+        let task = Uuid::from_u128(2);
+        let workspace: Workspace = serde_json::from_value(serde_json::json!({
+            "projects": [], "active_project": null, "instances": [],
+            "task_links": { (pane): task },
+        }))
+        .unwrap();
+        assert_eq!(workspace.task_links.get(&pane), Some(&task));
+        assert_eq!(
+            workspace.authenticated_task_link(pane, Some(&[42; 32])),
+            None
+        );
     }
 }
 
