@@ -5,7 +5,7 @@ use super::session_discovery::{
     inject_codex_resume_lookup,
 };
 use crate::theme;
-use gpui::{TestAppContext, WindowHandle};
+use gpui::{Entity, TestAppContext, WindowHandle};
 use muxel_core::{AgentPreset, CodexResumePath, CodexSession, Instance, Project, RemoteRef};
 use muxel_terminal::{CommandSpec, TerminalLaunch, TerminalSession};
 use std::path::{Path, PathBuf};
@@ -148,19 +148,25 @@ pub(super) fn with_app(run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelA
 /// `more`) isn't killed at all. It ends when the pane's console closes after
 /// the child exits, later still.
 pub(super) fn stop_pane_processes(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) {
-    let sessions: Vec<Arc<TerminalSession>> = window
-        .update(cx, |app, _, cx| {
-            let popouts = app
-                .popouts
-                .values()
-                .filter_map(|popout| popout.terminal_view());
-            app.terminals
-                .values()
-                .chain(popouts)
-                .map(|view| view.read(cx).session().clone())
-                .collect()
-        })
-        .unwrap_or_default();
+    if let Ok(app) = window.entity(&*cx) {
+        stop_app_processes(cx, &app);
+    }
+}
+
+/// [`stop_pane_processes`] for the app itself, as a test holds it when its
+/// window shows it inside a gpui-component `Root`.
+pub(super) fn stop_app_processes(cx: &mut TestAppContext, app: &Entity<MuxelApp>) {
+    let sessions: Vec<Arc<TerminalSession>> = app.read_with(cx, |app, cx| {
+        let popouts = app
+            .popouts
+            .values()
+            .filter_map(|popout| popout.terminal_view());
+        app.terminals
+            .values()
+            .chain(popouts)
+            .map(|view| view.read(cx).session().clone())
+            .collect()
+    });
     for session in sessions {
         let Some(pid) = session.child_pid() else {
             continue;

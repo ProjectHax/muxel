@@ -429,22 +429,6 @@ impl PopoutView {
         cx.notify();
     }
 
-    /// Keys while this pop-out shows its close confirm, ahead of its pane: the
-    /// confirm is modal, so no key reaches the pane, and Escape cancels it.
-    pub(super) fn central_close_confirm_key(
-        &mut self,
-        event: &KeyDownEvent,
-        cx: &mut Context<Self>,
-    ) {
-        if self.close_confirm.is_none() {
-            return;
-        }
-        cx.stop_propagation();
-        if event.keystroke.key == "escape" && !event.keystroke.modifiers.modified() {
-            self.cancel_central_close_confirm(cx);
-        }
-    }
-
     pub(super) fn render_central_close_confirm(
         &self,
         cx: &mut Context<Self>,
@@ -457,12 +441,6 @@ impl PopoutView {
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| this.cancel_central_close_confirm(cx)),
                 )
-                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                    if event.keystroke.key == "escape" {
-                        this.cancel_central_close_confirm(cx);
-                        cx.stop_propagation();
-                    }
-                }))
                 .child(
                     div()
                         .w(px(480.0))

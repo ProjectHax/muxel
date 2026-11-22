@@ -2220,9 +2220,15 @@ feature is added or changed, update the matching entry here in the same change**
   confirmation, "Ask before closing a busy terminal" (on by default; see
   Recoverable terminal close), and auto-close a pane when its process exits
   **cleanly** (an abnormal exit always leaves a tombstone pane instead). While
-  a confirmation or the quit dialog shows, keys pressed in its window, a
-  pop-out's included, stay out of the pane behind it, and Esc cancels the
-  dialog.
+  a confirmation or the Quit question shows, muxel intercepts key-down
+  events in that window before they reach the pane or trigger a shortcut. This
+  applies in the main window, project windows, pop-outs, and floating Settings.
+  Esc cancels, the quit shortcut still quits, and clicking a button answers.
+  A text field drawn over the dialog, such as the SSH password prompt, keeps
+  its keys while it has focus, and the window's shortcuts work as usual
+  meanwhile. If nothing has focus, the main and project workspace roots take
+  it so shortcuts work after dismissal. Releasing a push-to-hold dictation
+  chord still ends the recording.
 - **Local tmux by default** — General → "Run in a tmux session" defaults **on**
   whenever `tmux` is installed, so local panes survive a muxel restart and reattach
   (matching remote panes); the toggle greys out and has no effect when tmux isn't
