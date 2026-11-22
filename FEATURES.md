@@ -309,6 +309,12 @@ feature is added or changed, update the matching entry here in the same change**
   Restart retries) and the error lands in the NOTIFICATIONS feed.
   Outside-created panes show the requested program's launch failure directly;
   their approved command is never replaced with a shell.
+- **Pane identity for Codex tools** — eligible local Codex launches pass the
+  pane ID and any required isolated profile route to tool processes under
+  restricted inheritance. The profile paths appear in launch arguments, as
+  they already do for isolated tmux. Preset and other inherited values stay
+  out of those arguments. The Codex include allowlist can still filter the
+  forwarded values.
 - **Session resume** — resume-capable agents reopen their prior conversation after
   a muxel restart. Two shapes, both configurable per preset:
   - **Host-minted** (Claude, Grok): `session_id_flag` + `resume_flag` — muxel

@@ -1562,7 +1562,10 @@ fn is_codex_program(program: &str) -> bool {
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    matches!(leaf.as_str(), "codex" | "codex.exe" | "codex.cmd")
+    matches!(
+        leaf.as_str(),
+        "codex" | "codex.exe" | "codex.cmd" | "codex.bat"
+    )
 }
 
 /// One-run Codex title contract consumed by Muxel's lifecycle parser.
@@ -1572,6 +1575,97 @@ pub fn codex_terminal_title_override() -> &'static str {
     // `/resume` selects a named thread), so it cannot durably identify the
     // conversation. `thread-id` stays the rollout UUID in every title frame.
     "tui.terminal_title=['thread-id','run-state','activity']"
+}
+
+/// Give Codex's tool runner the pane identity and any required local profile route.
+/// A tmux attach ignores the creation argv, keeping the running agent's policy.
+pub fn prepend_codex_pane_env(
+    instance: &Instance,
+    local_project: bool,
+    user_data_root: Option<&Path>,
+    args: &mut Vec<String>,
+) {
+    if !local_project
+        || instance.literal_argv
+        || !instance.program.as_deref().is_some_and(is_codex_program)
+        || codex_has_explicit_tool_environment(args)
+    {
+        return;
+    }
+
+    let mut overrides = Vec::new();
+    // Explicit set re-admits names the user's exclusions would drop. Use only
+    // the pane ID and the selected profile paths. The paths are visible in argv,
+    // as they already are for isolated tmux. Keep preset and other inherited
+    // values, including secrets, out of argv.
+    let mut set = |name, value| {
+        overrides.extend([
+            "-c".to_string(),
+            format!("shell_environment_policy.set.{name}={value}"),
+        ]);
+    };
+    set(
+        crate::control::INSTANCE_ID_ENV,
+        format!("'{}'", instance.id),
+    );
+    if let Some(root) = user_data_root.filter(|root| !root.as_os_str().is_empty()) {
+        let Some(root_arg) = codex_route_value(root) else {
+            return;
+        };
+        set("MUXEL_USER_DATA_DIR", root_arg);
+        if instance.tmux_session.is_some() {
+            let endpoint = crate::isolated_root::control_endpoint(root);
+            let Some(endpoint_arg) = codex_route_value(&endpoint) else {
+                return;
+            };
+            set("MUXEL_CONTROL", endpoint_arg);
+        }
+    }
+    // Commit the whole route before any user-supplied option terminator.
+    args.splice(..0, overrides);
+}
+
+fn codex_has_explicit_tool_environment(args: &[String]) -> bool {
+    let mut args = args
+        .iter()
+        .map(String::as_str)
+        .take_while(|arg| *arg != "--");
+    while let Some(arg) = args.next() {
+        if arg == "--remote" || arg.starts_with("--remote=") {
+            return true;
+        }
+        let value = match arg {
+            "-c" | "--config" => args.next(),
+            _ => arg.strip_prefix("--config=").or_else(|| {
+                arg.strip_prefix("-c")
+                    .map(|value| value.strip_prefix('=').unwrap_or(value))
+            }),
+        };
+        if value
+            .and_then(|value| value.split_once('='))
+            .is_some_and(|(key, _)| {
+                key.trim().split('.').next() == Some("shell_environment_policy")
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn codex_route_value(path: &Path) -> Option<String> {
+    let path = path.to_str()?;
+    if cfg!(windows) {
+        // Even a native-looking Codex command can resolve to a batch shim.
+        // Keep the alphabet verified through that runner and TOML literal quoting.
+        path.chars()
+            .all(|ch| {
+                ch.is_alphanumeric() || matches!(ch, ' ' | ':' | '/' | '\\' | '.' | '_' | '-')
+            })
+            .then(|| format!("'{path}'"))
+    } else {
+        Some(toml::Value::String(path.to_string()).to_string())
+    }
 }
 
 /// Seed contents written when a project's `MEMORY.md` is first created. Delegates to
@@ -1708,6 +1802,127 @@ mod tests {
             session_resume_args(&preset, &pane),
             Some(vec!["resume".to_string(), session_id])
         );
+    }
+
+    #[test]
+    fn codex_pane_environment_forwards_only_the_owned_launch_route() {
+        let root = Path::new(if cfg!(windows) {
+            r"C:\fixture root\pane_1-2.3"
+        } else {
+            "/fixture root/pane_1-2.3"
+        });
+        let id_only = &["MUXEL_INSTANCE_ID"][..];
+        let direct = &["MUXEL_INSTANCE_ID", "MUXEL_USER_DATA_DIR"][..];
+        let tmux = &["MUXEL_INSTANCE_ID", "MUXEL_USER_DATA_DIR", "MUXEL_CONTROL"][..];
+        for (local_tmux, isolated, restored, expected) in [
+            (false, false, false, id_only),
+            (false, true, false, direct),
+            (false, true, true, direct),
+            (true, false, false, id_only),
+            (true, true, false, tmux),
+            (true, true, true, tmux),
+        ] {
+            let preset = AgentPreset::codex();
+            let mut pane = instance(&preset, None);
+            pane.tmux_session = local_tmux.then(|| "fixture-session".into());
+            pane.session_started = restored;
+            pane.session_id = restored.then(|| "11111111-1111-4111-8111-111111111111".into());
+            pane.env.push(EnvVar {
+                key: "PANE_FIXTURE_TOKEN".into(),
+                value: "neutral".into(),
+            });
+            let mut original = session_resume_args(&preset, &pane).unwrap_or_default();
+            original.extend(resolve_launch_for_session(&pane, restored).args);
+            let mut args = original.clone();
+            prepend_codex_pane_env(&pane, true, isolated.then_some(root), &mut args);
+            assert!(args.ends_with(&original));
+            assert_eq!(args.len(), original.len() + expected.len() * 2);
+            let id = pane.id.to_string();
+            let endpoint = root.join("data").join("control.json");
+            let actual_values = [
+                id.as_str(),
+                root.to_str().unwrap(),
+                endpoint.to_str().unwrap(),
+            ];
+            for ((pair, name), value) in args[..expected.len() * 2]
+                .chunks_exact(2)
+                .zip(expected)
+                .zip(actual_values)
+            {
+                assert_eq!(pair[0], "-c");
+                let prefix = format!("shell_environment_policy.set.{name}=");
+                let encoded = pair[1].strip_prefix(&prefix).unwrap();
+                let decoded: toml::Table = toml::from_str(&format!("value={encoded}")).unwrap();
+                assert_eq!(decoded["value"].as_str(), Some(value));
+            }
+        }
+    }
+
+    #[test]
+    fn codex_pane_environment_preserves_explicit_policy_and_other_launches() {
+        let cases: &[(&str, bool, bool, &[&str])] = &[
+            ("codex", false, false, &[]), // also an unresolved remote host's fallback
+            ("codex", true, true, &[]),
+            ("sh", true, false, &[]),
+            ("codex", true, false, &["--remote", "ws://example.invalid"]),
+            ("codex", true, false, &["--remote=ws://example.invalid"]),
+            (
+                "codex",
+                true,
+                false,
+                &["-c", "shell_environment_policy.inherit=none"],
+            ),
+            (
+                "codex",
+                true,
+                false,
+                &["--config", "shell_environment_policy={}"],
+            ),
+            (
+                "codex",
+                true,
+                false,
+                &["--config=shell_environment_policy.set.X=x"],
+            ),
+            (
+                "codex",
+                true,
+                false,
+                &["-cshell_environment_policy.inherit=none"],
+            ),
+        ];
+        for &(program, local, literal, original) in cases {
+            let mut pane = instance(&AgentPreset::codex(), None);
+            pane.program = Some(program.into());
+            pane.literal_argv = literal;
+            let mut args: Vec<_> = original.iter().map(|arg| (*arg).to_string()).collect();
+            prepend_codex_pane_env(&pane, local, Some(Path::new("/fixture")), &mut args);
+            assert_eq!(args, original);
+        }
+        let pane = instance(&AgentPreset::codex(), None);
+        let original = ["--", "--remote", "--config=shell_environment_policy={}"];
+        let mut args = original.map(str::to_string).to_vec();
+        prepend_codex_pane_env(&pane, true, None, &mut args);
+        assert_eq!(&args[2..], original);
+    }
+
+    #[test]
+    fn codex_pane_environment_drops_the_entire_unrepresentable_isolated_route() {
+        #[cfg(windows)]
+        let root = PathBuf::from(r"C:\unsafe!root");
+        #[cfg(unix)]
+        let root = {
+            use std::os::unix::ffi::OsStringExt as _;
+            PathBuf::from(std::ffi::OsString::from_vec(b"/fixture/\xff".to_vec()))
+        };
+        for local_tmux in [false, true] {
+            let mut pane = instance(&AgentPreset::codex(), None);
+            pane.tmux_session = local_tmux.then(|| "fixture-session".into());
+            let mut args = resolve_launch(&pane).args;
+            let original = args.clone();
+            prepend_codex_pane_env(&pane, true, Some(&root), &mut args);
+            assert_eq!(args, original);
+        }
     }
 
     #[test]
