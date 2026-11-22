@@ -96,41 +96,35 @@ impl MuxelApp {
         self.commit_keybindings(&before, cx);
     }
 
-    /// Wait for the next key press and bind it to row `id`. Every keystroke is
-    /// intercepted before the keymap sees it, so pressing a chord that is
-    /// already a shortcut records it rather than running it.
-    fn start_key_recording(&mut self, id: String, cx: &mut Context<Self>) {
+    /// Wait for the next key press and bind it to row `id`. The app-wide
+    /// keystroke interceptor routes keys to [`Self::record_keystroke`] ahead of
+    /// the keymap (and behind [`Self::dialog_keystroke`]), so pressing a chord
+    /// that is already a shortcut records it rather than running it.
+    pub(super) fn start_key_recording(&mut self, id: String, cx: &mut Context<Self>) {
         self.settings_ui.kb_recording = Some(id);
-        if self.key_recorder.is_none() {
-            let app = cx.weak_entity();
-            self.key_recorder = Some(cx.intercept_keystrokes(move |event, _window, cx| {
-                let keystroke = event.keystroke.clone();
-                let handled = app
-                    .update(cx, |this, cx| this.record_keystroke(&keystroke, cx))
-                    .unwrap_or(false);
-                if handled {
-                    cx.stop_propagation();
-                }
-            }));
-        }
         cx.notify();
     }
 
     /// Stop waiting for a key press, if a row was.
     pub(super) fn stop_key_recording(&mut self, cx: &mut Context<Self>) {
         self.settings_ui.kb_recording = None;
-        // The interceptor may be the caller; let it return before it is dropped.
-        if let Some(recorder) = self.key_recorder.take() {
-            cx.defer(move |_| drop(recorder));
-        }
         cx.notify();
     }
 
     /// A key pressed while a row is recording. Returns whether it was consumed.
-    fn record_keystroke(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
+    pub(super) fn record_keystroke(
+        &mut self,
+        keystroke: &Keystroke,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(id) = self.settings_ui.kb_recording.clone() else {
             return false;
         };
+        // While a question waits for an answer, in any window, a key binds
+        // nothing, even one typed into a field drawn above the question.
+        if self.confirm.is_some() || self.main_draws_quit() {
+            return false;
+        }
         if !self.show_settings {
             self.stop_key_recording(cx);
             return false;

@@ -7141,8 +7141,6 @@ pub struct MuxelApp {
     settings_rem: Pixels,
     /// Something differs from when Settings opened, so Revert has work to do.
     settings_dirty: bool,
-    /// Intercepts key presses while a Keybindings row is recording.
-    key_recorder: Option<Subscription>,
     /// Settings' own window, while it floats outside the main one.
     settings_window: Option<WindowHandle<gpui_component::Root>>,
     /// That window is the one the user is in, so a confirmation asked for from
@@ -8285,8 +8283,13 @@ impl Render for PopoutView {
             .relative()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _w, cx| {
-                this.central_close_confirm_key(event, cx)
+            // Behind the app's keystroke interceptor, which answers the close
+            // confirm: gpui replays a timed-out multi-key prefix without calling
+            // interceptors, and this keeps such a key from the pane.
+            .capture_key_down(cx.listener(|this, _: &KeyDownEvent, _w, cx| {
+                if this.central_close_confirm(cx).is_some() {
+                    cx.stop_propagation();
+                }
             }))
             .on_action(cx.listener(|_, _: &UndoClose, window, cx| {
                 if let Some(app) = cx
@@ -9024,6 +9027,22 @@ impl MuxelApp {
         })
         .detach();
 
+        // Intercept key-down events before GPUI matches bindings. Let a dialog
+        // handle the key before Settings' shortcut recorder sees it.
+        let app = cx.entity().downgrade();
+        cx.intercept_keystrokes(move |event, window, cx| {
+            if app
+                .update(cx, |app, cx| {
+                    app.dialog_keystroke(event, window, cx)
+                        || app.record_keystroke(&event.keystroke, cx)
+                })
+                .unwrap_or(false)
+            {
+                cx.stop_propagation();
+            }
+        })
+        .detach();
+
         // Install the global handle so menu-dispatched actions can reach us.
         let weak = cx.weak_entity();
         cx.set_global(MuxelHandle(weak));
@@ -9494,7 +9513,6 @@ impl MuxelApp {
             settings_pane_w: px(560.0),
             settings_rem: px(16.0),
             settings_dirty: false,
-            key_recorder: None,
             settings_window: None,
             settings_window_active: false,
             settings_ui_window: Some(window.window_handle().window_id()),
@@ -23030,10 +23048,13 @@ impl MuxelApp {
     /// open main-window-only chrome raise the main window first.
     fn attach_workspace_actions<E: InteractiveElement>(&self, el: E, cx: &mut Context<Self>) -> E {
         el
-            // A dialog this window shows is modal: no key reaches the panes
-            // behind it.
-            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                this.dialog_key(event, window, cx)
+            // Behind the app's keystroke interceptor (`dialog_keystroke`): gpui
+            // replays a timed-out multi-key prefix without calling
+            // interceptors, and this keeps such a key from the panes.
+            .capture_key_down(cx.listener(|this, _: &KeyDownEvent, window, cx| {
+                if this.dialog_shown_in(window, cx) {
+                    cx.stop_propagation();
+                }
             }))
             // While a tab/pane is dragged, this fires first (capture phase) each
             // move and clears the drop indicators; the element under the cursor
@@ -23333,7 +23354,10 @@ impl MuxelApp {
         }))
         // "Close terminal?" and friends act on a pane in *this* window, so the
         // dialog has to appear here, not over on the main window's monitor.
-        .children((self.confirm_window_pid() == Some(pid)).then(|| self.render_confirm_modal(cx)))
+        .children(
+            self.secondary_draws_confirm(pid)
+                .then(|| self.render_confirm_modal(cx)),
+        )
         .children(
             (self.auto_message_window_pid() == Some(pid))
                 .then(|| self.render_auto_message_popup(cx)),
@@ -23778,47 +23802,134 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// Whether the confirm dialog draws in `window`. A pop-out answers its
-    /// own, and Settings' own window has no pane under it.
-    fn confirm_shown_in(&self, window: &Window) -> bool {
+    /// Whether the main window is currently drawing the confirm modal.
+    fn main_draws_confirm(&self) -> bool {
+        !self.show_terms
+            && self.confirm.is_some()
+            && self.confirm_window_pid().is_none()
+            && self.confirm_popout_iid().is_none()
+            && !self.confirm_in_settings()
+    }
+
+    /// Whether the main window is currently drawing the Quit modal.
+    fn main_draws_quit(&self) -> bool {
+        !self.show_terms && !self.show_workspace_selector && self.show_quit_confirm
+    }
+
+    /// Whether project window `pid` is currently drawing the confirm modal.
+    fn secondary_draws_confirm(&self, pid: Uuid) -> bool {
         self.confirm.is_some()
             && self.confirm_popout_iid().is_none()
             && !self.confirm_in_settings()
-            && match self.confirm_window_pid() {
-                Some(pid) => self.secondary_pid_for(window) == Some(pid),
-                None => self.is_main_window(window),
+            && self.confirm_window_pid() == Some(pid)
+    }
+
+    /// Whether an input `window` draws above its dialog holds the keyboard, so
+    /// the keys are that input's. The auto-message editor draws above either
+    /// dialog. The main window draws its other overlays with a text field (the
+    /// SSH password prompt, the git, remote-project, worktree-dispose and run
+    /// dialogs, and the terminal search and broadcast bars) above the Quit
+    /// question but below the confirm. Each counts only while it is drawn.
+    fn input_above_dialog(&self, window: &Window, cx: &App) -> bool {
+        let holds = |input: &Entity<InputState>| input.read(cx).focus_handle(cx).is_focused(window);
+        let main = self.is_main_window(window) && !self.show_terms && !self.show_workspace_selector;
+        let auto_message_here = match self.auto_message_window_pid() {
+            Some(pid) => self.secondary_pid_for(window) == Some(pid),
+            None => main,
+        };
+        if self.auto_message_popup.is_some() && auto_message_here && holds(&self.auto_message_input)
+        {
+            return true;
+        }
+        // As `render_remote_project_modal` and `render_worktree_dispose_modal`
+        // decide whether to draw their fields.
+        let remote_fields = self.show_new_remote && !self.remotes.is_empty();
+        let commit_field = self
+            .pending_worktree_dispose
+            .front()
+            .is_some_and(|d| d.changed > 0);
+        let run_field = self.show_run_dialog && self.run_dialog_content().is_some();
+        main && !self.main_draws_confirm()
+            && [
+                (self.password_prompt.is_some(), &self.password_prompt_input),
+                (self.git_modal.is_some(), &self.git_action_input),
+                (remote_fields, &self.nr_dir),
+                (remote_fields, &self.nr_name),
+                (commit_field, &self.dispose_commit_input),
+                (run_field, &self.runner_input),
+                (self.term_search.is_some(), &self.term_search_input),
+                (self.broadcasting, &self.broadcast_input),
+            ]
+            .into_iter()
+            .any(|(shown, input)| shown && holds(input))
+    }
+
+    /// Whether `window` shows the confirm: the main or project window it is
+    /// about, the pop-out showing its pane, or floating Settings while that is
+    /// the window in use.
+    fn confirm_in(&self, window: &Window) -> bool {
+        let here = window.window_handle().window_id();
+        let drawn = match self.secondary_pid_for(window) {
+            Some(pid) => self.secondary_draws_confirm(pid),
+            None => self.is_main_window(window) && self.main_draws_confirm(),
+        };
+        drawn
+            || self
+                .confirm_popout_iid()
+                .and_then(|iid| self.popouts.get(&iid))
+                .is_some_and(|popout| popout.window.window_id() == here)
+            || (self.confirm_in_settings()
+                && self
+                    .settings_window
+                    .as_ref()
+                    .is_some_and(|settings| settings.window_id() == here))
+    }
+
+    /// Whether `window` shows a dialog on top: the confirm, or the Quit
+    /// question, with no input drawn above it holding the keyboard.
+    fn dialog_shown_in(&self, window: &Window, cx: &App) -> bool {
+        (self.confirm_in(window) || (self.main_draws_quit() && self.is_main_window(window)))
+            && !self.input_above_dialog(window, cx)
+    }
+
+    /// Handle a key-down event before GPUI matches bindings or calls key-down
+    /// listeners. While a dialog shows, Escape cancels it and the Quit shortcut
+    /// still quits (a second press answers the Quit question). Return true to
+    /// consume Escape and every other key-down event except Quit.
+    fn dialog_keystroke(
+        &mut self,
+        event: &KeystrokeEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.dialog_shown_in(window, cx) {
+            return false;
+        }
+        let keystroke = &event.keystroke;
+        if keystroke.key == "escape" && !keystroke.modifiers.modified() {
+            if self.confirm_in(window) {
+                self.cancel_confirm(cx);
+            } else {
+                self.show_quit_confirm = false;
+                cx.notify();
             }
-    }
-
-    /// Whether `window` shows the confirm dialog or the Quit question.
-    fn dialog_shown_in(&self, window: &Window) -> bool {
-        self.confirm_shown_in(window) || (self.show_quit_confirm && self.is_main_window(window))
-    }
-
-    /// Keys while `window` shows a dialog. The dialog is modal: no key reaches
-    /// the pane under it, and Escape cancels it. Key bindings, such as Ctrl+Q,
-    /// have already run.
-    fn dialog_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.dialog_shown_in(window) {
-            return;
+            return true;
         }
-        cx.stop_propagation();
-        if event.keystroke.key != "escape" || event.keystroke.modifiers.modified() {
-            return;
-        }
-        if self.confirm_shown_in(window) {
-            self.cancel_confirm(cx);
-        } else {
-            self.show_quit_confirm = false;
-            cx.notify();
-        }
+        let (bindings, _) = cx
+            .key_bindings()
+            .borrow()
+            .bindings_for_input(std::slice::from_ref(keystroke), &event.context_stack);
+        !bindings
+            .first()
+            .is_some_and(|binding| binding.action().partial_eq(&Quit))
     }
 
     /// A key goes from the window's root to the focused element, so with
     /// nothing under `root` focused it never reaches the root's handlers.
-    /// While a dialog shows, `root` takes focus then, so Escape answers it.
+    /// While a dialog shows, `root` takes focus then, so the window's
+    /// shortcuts work once the dialog goes.
     fn focus_root_for_dialog(&self, root: &FocusHandle, window: &mut Window, cx: &mut App) {
-        if self.dialog_shown_in(window) && !root.contains_focused(window, cx) {
+        if self.dialog_shown_in(window, cx) && !root.contains_focused(window, cx) {
             window.focus(root, cx);
         }
     }
@@ -33368,17 +33479,22 @@ impl MuxelApp {
             .into_any_element()
     }
 
+    fn run_dialog_content(&self) -> Option<(&str, &str)> {
+        match self.active_runner.as_ref()? {
+            ActiveRunner::Local(i) => self
+                .runners
+                .get(*i)
+                .map(|runner| (runner.name.as_str(), runner.prompt.as_str())),
+            ActiveRunner::Library { key, shown } => {
+                Some((key.name.as_str(), shown.prompt.as_str()))
+            }
+        }
+    }
+
     /// Run-dialog: show the runner's prompt + collect extra details, then run.
     fn render_run_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
-        let (name, prompt) = match self.active_runner.as_ref() {
-            Some(ActiveRunner::Local(i)) => match self.runners.get(*i) {
-                Some(r) => (r.name.as_str(), r.prompt.as_str()),
-                None => return div().into_any_element(),
-            },
-            Some(ActiveRunner::Library { key, shown }) => {
-                (key.name.as_str(), shown.prompt.as_str())
-            }
-            None => return div().into_any_element(),
+        let Some((name, prompt)) = self.run_dialog_content() else {
+            return div().into_any_element();
         };
         let title = tf("Run: {name}", &[("name", name)]);
         let preview = prompt.replace("{{input}}", "…").trim().to_string();
@@ -34735,6 +34851,13 @@ impl Render for MuxelApp {
                 .flex()
                 .flex_col()
                 .bg(cx.theme().background)
+                // As on the workspace root: a replayed key stays out of the
+                // name field under "Delete workspace?".
+                .capture_key_down(cx.listener(|this, _: &KeyDownEvent, window, cx| {
+                    if this.dialog_shown_in(window, cx) {
+                        cx.stop_propagation();
+                    }
+                }))
                 .child(self.render_minimal_titlebar(cx))
                 .child(
                     div()
@@ -34743,8 +34866,7 @@ impl Render for MuxelApp {
                         .relative()
                         .child(self.render_workspace_selector(cx))
                         .children(
-                            self.confirm
-                                .is_some()
+                            self.main_draws_confirm()
                                 .then(|| self.render_confirm_modal(cx)),
                         ),
                 )
@@ -35139,7 +35261,7 @@ impl Render for MuxelApp {
                     .then(|| ov(|| self.render_tmux_install(window, cx))),
             )
             .children(
-                self.show_quit_confirm
+                self.main_draws_quit()
                     .then(|| ov(|| self.render_quit_modal(cx))),
             )
             .children(
@@ -35208,11 +35330,8 @@ impl Render for MuxelApp {
             // A pane-scoped confirm belongs to the window showing that pane; when
             // that's a project window on another monitor, it draws there instead.
             .children(
-                (self.confirm.is_some()
-                    && self.confirm_window_pid().is_none()
-                    && self.confirm_popout_iid().is_none()
-                    && !self.confirm_in_settings())
-                .then(|| ov(|| self.render_confirm_modal(cx))),
+                self.main_draws_confirm()
+                    .then(|| ov(|| self.render_confirm_modal(cx))),
             )
             .children(
                 self.show_close_list
