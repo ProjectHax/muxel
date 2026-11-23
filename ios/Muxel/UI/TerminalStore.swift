@@ -13,6 +13,9 @@ import NIOCore
 /// stay `@MainActor` (UIView access), while `run()`/`withPTY` run off-main like before.
 final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizerDelegate {
     let view: TerminalView
+    /// True for headless background status monitors (`tmux attach-session -r`).
+    /// Never mounted in a UIView and never sends size nudges or input.
+    let isReadOnly: Bool
     /// True while the PTY task is live; flips false when the channel ends or
     /// `disconnect()` is called, so the store can recycle a dead session (e.g. after
     /// an iOS background TCP drop) and re-attach fresh.
@@ -34,11 +37,16 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
     /// the view every frame, and sending a window-change per frame floods SSH + reflows
     /// tmux each time. We coalesce to one send once the size settles.
     private var resizeDebounce: Task<Void, Never>?
+    /// Nudges the remote PTY size on attach/re-focus so tmux always fits the phone's
+    /// viewport (even when desktop was previously the active client).
+    private var syncSizeTask: Task<Void, Never>?
+    private var didInitialSizeSync = false
     /// Single-finger scroll gesture, the pan translation already converted to wheel
     /// ticks, and the post-lift momentum loop.
     private weak var scrollGesture: UIPanGestureRecognizer?
     private var scrollConsumedY: CGFloat = 0
     private var momentumTask: Task<Void, Never>?
+    private var scrollToBottomTask: Task<Void, Never>?
     private let pointsPerTick: CGFloat = 18
     /// Focuses the terminal (shows the keyboard) on the first tap without waiting for
     /// SwiftTerm's double/triple-tap disambiguation.
@@ -49,12 +57,34 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
     /// Fires with the final snapped size when a pinch ends; the store persists it
     /// and re-fonts every other live terminal.
     var onFontSizeCommitted: ((CGFloat) -> Void)?
+    /// Fires with the live snapped font size during a pinch (nil when the gesture
+    /// ends) so the pane can show a brief point-size HUD pill.
+    var onFontSizePreview: ((CGFloat?) -> Void)?
+    /// Fires (main actor) when the user scrolls up into tmux scrollback (true) or
+    /// returns to the live bottom (false), driving the floating jump-to-bottom pill.
+    var onScrolledBackChanged: ((Bool) -> Void)?
+    /// Fires (main actor) when the user taps or starts typing while scrolled up in
+    /// tmux scrollback, so the pane exits tmux copy-mode and keystrokes land in the
+    /// agent's input box instead of being eaten by copy-mode.
+    var onExitCopyModeRequested: (() -> Void)?
+    /// Net upward scroll ticks sent since the last return to bottom / key input.
+    private var scrollUpTicks = 0
     /// Fires (main actor) when the PTY ends **unexpectedly** — a transport drop, not a
     /// user-initiated `disconnect()`. Drives the pane's reconnect overlay + retry.
     var onConnectionLost: (() -> Void)?
     /// Fires when the user taps into this terminal — the deterministic focus hook the
     /// split UI uses to move keyboard/toolbar focus to this pane's leaf.
     var onFocusRequested: (() -> Void)?
+    /// Fires (main actor, debounced) after the first PTY bytes arrive so background
+    /// monitors can re-classify live status immediately once the screen paints.
+    var onFirstOutput: (() -> Void)?
+    private var didNotifyFirstOutput = false
+    private var firstOutputNotifyTask: Task<Void, Never>?
+    /// Buffers pre-tmux login shell banner / prompt bytes until tmux enters alternate
+    /// screen (`\e[?1049h`) so the `export PATH=…` prelude never flashes on screen.
+    private var awaitingTmuxScreen = true
+    private var preTmuxBuffer: [UInt8] = []
+    private var preTmuxFallbackTask: Task<Void, Never>?
     /// Set by `disconnect()` so the terminal `run()` completing after a deliberate
     /// teardown (Close pane / host edit / quit) doesn't read as a drop.
     private var intentionallyClosed = false
@@ -82,17 +112,21 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
         case changeSize(cols: Int, rows: Int)
     }
 
-    init(view: TerminalView, connection: SSHConnection, command: String, openGate: PTYOpenGate? = nil) {
+    init(view: TerminalView, connection: SSHConnection, command: String,
+         openGate: PTYOpenGate? = nil, isReadOnly: Bool = false) {
         self.view = view
         self.connection = connection
         self.command = command
         self.openGate = openGate
+        self.isReadOnly = isReadOnly
         super.init()
-        installGestures()
-        // Replace SwiftTerm's stock gray accessory bar with the themed muxel row.
-        // Installed before the view can ever become first responder, so no
-        // reloadInputViews() dance is needed.
-        view.inputAccessoryView = TerminalAccessoryRow(session: self)
+        if !isReadOnly {
+            installGestures()
+            // Replace SwiftTerm's stock gray accessory bar with the themed muxel row.
+            // Installed before the view can ever become first responder, so no
+            // reloadInputViews() dance is needed.
+            view.inputAccessoryView = TerminalAccessoryRow(session: self)
+        }
     }
 
     // MARK: Single-finger fluid scroll → tmux mouse wheel
@@ -143,13 +177,18 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
             scrollGesture?.isEnabled = false
             scrollGesture?.isEnabled = true
             pinchBaseSize = view.font.pointSize
+            onFontSizePreview?(pinchBaseSize)
         case .changed:
             let snapped = TerminalKeys.snappedFontSize(pinchBaseSize * g.scale)
             if snapped != view.font.pointSize {
                 view.font = .monospacedSystemFont(ofSize: snapped, weight: .regular)
             }
+            onFontSizePreview?(snapped)
         case .ended:
             onFontSizeCommitted?(view.font.pointSize)
+            onFontSizePreview?(nil)
+        case .cancelled, .failed:
+            onFontSizePreview?(nil)
         default:
             break
         }
@@ -163,6 +202,10 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
 
     @objc private func handleFocusTap(_ g: UITapGestureRecognizer) {
         if !view.isFirstResponder { _ = view.becomeFirstResponder() }
+        if scrollUpTicks > 0 {
+            resetScrollbackIndicator()
+            onExitCopyModeRequested?()
+        }
         onFocusRequested?()
     }
 
@@ -170,6 +213,7 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
         switch g.state {
         case .began:
             momentumTask?.cancel(); momentumTask = nil
+            scrollToBottomTask?.cancel(); scrollToBottomTask = nil
             scrollConsumedY = 0
         case .changed:
             emitTicks(forTranslation: g.translation(in: view).y)
@@ -213,6 +257,55 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
         let row = max(1, rows / 2)
         let seq = "\u{1b}[<\(up ? 64 : 65);\(col);\(row)M"
         events.continuation.yield(.send(ByteBuffer(string: seq)))
+        let wasScrolled = scrollUpTicks > 0
+        if up {
+            scrollUpTicks += 1
+        } else {
+            scrollUpTicks = max(0, scrollUpTicks - 1)
+        }
+        let nowScrolled = scrollUpTicks > 0
+        if nowScrolled != wasScrolled { onScrolledBackChanged?(nowScrolled) }
+    }
+
+    /// Clear scroll momentum and reset the scrolled-back indicator (called when the
+    /// user taps the Jump to bottom pill or sends keyboard input).
+    @MainActor func resetScrollbackIndicator() {
+        momentumTask?.cancel()
+        momentumTask = nil
+        if scrollUpTicks > 0 {
+            scrollUpTicks = 0
+            onScrolledBackChanged?(false)
+        }
+    }
+
+    /// Jump back to the live bottom for mouse-aware TUIs (Grok, OpenCode, etc.) that
+    /// consume tmux wheel events directly instead of entering tmux copy-mode: cancels
+    /// momentum, resets the indicator, and emits paced SGR wheel-down chunks (so TUI
+    /// event loops don't drop or coalesce a single huge write) all the way to the bottom.
+    @MainActor func scrollToBottom() {
+        let ticks = scrollUpTicks
+        resetScrollbackIndicator()
+        scrollToBottomTask?.cancel()
+        scrollToBottomTask = nil
+        let total = TerminalKeys.scrollToBottomTicks(forScrollUpTicks: ticks)
+        guard total > 0 else { return }
+        let cols = lastSize?.cols ?? 80
+        let rows = lastSize?.rows ?? 24
+        let col = max(1, cols / 2)
+        let row = max(1, rows / 2)
+        let one = "\u{1b}[<65;\(col);\(row)M"
+        let batchSize = 20
+        scrollToBottomTask = Task { @MainActor [weak self] in
+            var remaining = total
+            while remaining > 0, !Task.isCancelled, let self {
+                let count = min(remaining, batchSize)
+                self.events.continuation.yield(.send(ByteBuffer(string: String(repeating: one, count: count))))
+                remaining -= count
+                if remaining > 0 {
+                    try? await Task.sleep(nanoseconds: 15_000_000)
+                }
+            }
+        }
     }
 
     /// Only begin for predominantly-vertical pans, so horizontal swipes (the edge
@@ -253,13 +346,21 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
         }
     }
 
+    /// Start a headless background monitor without waiting for UIView layout.
+    @MainActor func startHeadless(cols: Int = 120, rows: Int = 40) {
+        guard task == nil else { return }
+        startRequested = true
+        lastSize = (cols, rows)
+        launch(cols: cols, rows: rows)
+    }
+
     /// Open the PTY at `cols`×`rows`. Idempotent (guards on `task`).
     private func launch(cols: Int, rows: Int) {
         guard task == nil else { return }
         isConnected = true
         task = Task { [weak self] in
             await self?.run(cols: cols, rows: rows)
-            await self?.markDisconnected()
+            self?.markDisconnected()
         }
     }
 
@@ -270,8 +371,17 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
         isConnected = false
         momentumTask?.cancel()
         momentumTask = nil
+        scrollToBottomTask?.cancel()
+        scrollToBottomTask = nil
         resizeDebounce?.cancel()
         resizeDebounce = nil
+        syncSizeTask?.cancel()
+        syncSizeTask = nil
+        firstOutputNotifyTask?.cancel()
+        firstOutputNotifyTask = nil
+        preTmuxFallbackTask?.cancel()
+        preTmuxFallbackTask = nil
+        preTmuxBuffer.removeAll()
         events.continuation.finish()
         task?.cancel()
         task = nil
@@ -286,7 +396,7 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
 
     private func run(cols: Int, rows: Int) async {
         guard let client = try? await connection.sshClient() else {
-            await feedText("\r\n[no live terminal in this build]\r\n")
+            feedText("\r\n[no live terminal in this build]\r\n")
             return
         }
         // Bound concurrent channel opens: acquire before opening, release once the
@@ -298,7 +408,10 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
                 .init(wantReply: true, term: "xterm-256color",
                       terminalCharacterWidth: cols, terminalRowHeight: rows,
                       terminalPixelWidth: 0, terminalPixelHeight: 0,
-                      terminalModes: .init([.ECHO: 5]))
+                      // ECHO off on the bootstrap shell so the `export PATH=…; exec tmux`
+                      // command is never echoed; tmux sets raw mode and creates a normal
+                      // echoing inner PTY for the agent/shell pane.
+                      terminalModes: .init([.ECHO: 0]))
             ) { [command, stream = events.stream, releaser] inbound, outbound in
                 await releaser.release()  // channel established
                 // Replace the PTY's login shell with tmux (attach / new-session -A).
@@ -329,14 +442,89 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
             }
         } catch {
             await releaser.release()  // release if the open itself failed
-            await feedText("\r\n[disconnected: \(error.localizedDescription)]\r\n")
+            feedText("\r\n[disconnected: \(error.localizedDescription)]\r\n")
         }
         await releaser.release()  // safety: no-op once released
     }
 
     @MainActor private func feed(_ bytes: ArraySlice<UInt8>) {
+        if awaitingTmuxScreen {
+            preTmuxBuffer.append(contentsOf: bytes)
+            if let offset = TerminalKeys.tmuxAttachScreenOffset(in: preTmuxBuffer) {
+                awaitingTmuxScreen = false
+                preTmuxFallbackTask?.cancel()
+                preTmuxFallbackTask = nil
+                let slice = preTmuxBuffer[offset...]
+                preTmuxBuffer.removeAll()
+                deliverToTerminal(slice)
+                return
+            }
+            // Fallback: if tmux doesn't take over within 1.8s (e.g. error message or
+            // missing tmux), flush buffered output so errors are never hidden.
+            if preTmuxFallbackTask == nil {
+                preTmuxFallbackTask = Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 1_800_000_000)
+                    guard let self, !Task.isCancelled, self.awaitingTmuxScreen else { return }
+                    self.awaitingTmuxScreen = false
+                    self.preTmuxFallbackTask = nil
+                    let buffered = self.preTmuxBuffer
+                    self.preTmuxBuffer.removeAll()
+                    if !buffered.isEmpty {
+                        self.deliverToTerminal(buffered[...])
+                    }
+                }
+            }
+            return
+        }
+        deliverToTerminal(bytes)
+    }
+
+    @MainActor private func deliverToTerminal(_ bytes: ArraySlice<UInt8>) {
         lastOutputAt = Date().timeIntervalSince1970
         view.feed(byteArray: bytes)
+        if !isReadOnly, !didInitialSizeSync {
+            didInitialSizeSync = true
+            syncRemoteSize(delayMs: 80)
+        }
+        if !didNotifyFirstOutput, let notify = onFirstOutput {
+            didNotifyFirstOutput = true
+            firstOutputNotifyTask = Task { @MainActor [weak self] in
+                // Re-classify twice: once quickly (~600ms) and once after full screen
+                // settle (~1500ms) so live status updates immediately.
+                try? await Task.sleep(nanoseconds: 600_000_000)
+                guard let self, !Task.isCancelled, self.isConnected else { return }
+                notify()
+                try? await Task.sleep(nanoseconds: 900_000_000)
+                guard !Task.isCancelled, self.isConnected else { return }
+                notify()
+            }
+        }
+    }
+
+    /// Force the remote tmux client to receive a `SIGWINCH` and resize the window to
+    /// fit this device's exact `(cols, rows)` without needing the user to tap first.
+    /// Nudges `cols - 1` → `cols` because Linux/macOS kernels suppress `SIGWINCH`
+    /// when `TIOCSWINSZ` sees identical dimensions.
+    @MainActor func syncRemoteSize(delayMs: UInt64 = 0) {
+        guard isConnected else { return }
+        syncSizeTask?.cancel()
+        syncSizeTask = Task { @MainActor [weak self] in
+            if delayMs > 0 {
+                try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
+            }
+            guard let self, !Task.isCancelled, self.isConnected else { return }
+            let size = self.lastSize ?? {
+                let t = self.view.getTerminal()
+                return (t.cols, t.rows)
+            }()
+            guard size.cols > 1, size.rows > 0 else { return }
+            self.events.continuation.yield(.changeSize(cols: size.cols - 1, rows: size.rows))
+            try? await Task.sleep(nanoseconds: 60_000_000)
+            guard !Task.isCancelled, self.isConnected else { return }
+            let finalSize = self.lastSize ?? size
+            guard finalSize.cols > 0, finalSize.rows > 0 else { return }
+            self.events.continuation.yield(.changeSize(cols: finalSize.cols, rows: finalSize.rows))
+        }
     }
 
     @MainActor private func feedText(_ text: String) {
@@ -364,30 +552,39 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
     /// can never extend a delete run).
     @MainActor func sendKey(_ bytes: [UInt8]) {
         deleteStreak = 0
+        view.unmarkText()
+        if scrollUpTicks > 0 {
+            resetScrollbackIndicator()
+            onExitCopyModeRequested?()
+        }
         events.continuation.yield(.send(ByteBuffer(bytes: bytes)))
     }
 
     // MARK: TerminalViewDelegate
 
     func send(source: TerminalView, data: ArraySlice<UInt8>) {
+        if scrollUpTicks > 0 {
+            resetScrollbackIndicator()
+            onExitCopyModeRequested?()
+        }
         events.continuation.yield(.send(ByteBuffer(bytes: data)))
 
         // Accelerate held backspace. iOS repeats `deleteBackward` at a flat rate for a
         // custom key-input view (it doesn't apply the delete acceleration it gives
         // normal text fields), so holding backspace deletes slowly. On a sustained run
-        // of backspace bytes, send extra backspaces straight to the PTY — ramping up the
-        // longer it's held. We send raw bytes rather than calling `deleteBackward()`
-        // again: re-entering it mid-edit corrupts SwiftTerm's text-input range and
-        // crashes ("String index is out of bounds"). The remote deletes the chars and
-        // the screen follows via echo. Single taps reset the streak.
+        // of backspace bytes (30ms–200ms apart), send extra backspaces straight to the
+        // PTY — ramping up the longer it's held. Rapid bursts (<30ms, e.g. UIKit's
+        // `replace(_:withText:)` deleting a word) are never accelerated so we never
+        // over-delete and overwrite earlier prompt text.
         guard data.count == 1, let b = data.first, b == 0x7f || b == 0x08 else {
             deleteStreak = 0
             return
         }
         let now = ProcessInfo.processInfo.systemUptime
-        deleteStreak = (now - lastDeleteAt < 0.2) ? deleteStreak + 1 : 0
+        let (nextStreak, extra) = TerminalKeys.acceleratedBackspaces(
+            interval: now - lastDeleteAt, streak: deleteStreak)
+        deleteStreak = nextStreak
         lastDeleteAt = now
-        let extra = min(deleteStreak / 3, 5) // 0 at first, ramping to +5 (≈6× on hold)
         for _ in 0..<extra {
             events.continuation.yield(.send(ByteBuffer(bytes: [b])))
         }
@@ -412,6 +609,8 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
         } else {
             // Already running → forward as a live resize, debounced so a divider drag
             // (many size changes) sends one window-change once it settles, not per frame.
+            syncSizeTask?.cancel()
+            syncSizeTask = nil
             resizeDebounce?.cancel()
             resizeDebounce = Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 150_000_000)
@@ -424,7 +623,10 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
     func setTerminalTitle(source: TerminalView, title: String) {}
     func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
     func scrolled(source: TerminalView, position: Double) {}
-    func requestOpenLink(source: TerminalView, link: String, params: [String: String]) {}
+    func requestOpenLink(source: TerminalView, link: String, params: [String: String]) {
+        guard let url = TerminalKeys.openableURL(link) else { return }
+        UIApplication.shared.open(url)
+    }
 
     /// The remote rang the bell — a warning haptic, throttled so a BEL-per-keystroke
     /// TUI can't buzz continuously.
@@ -491,6 +693,12 @@ final class TerminalStore {
         return g
     }
 
+    /// Whether any of `instanceIds` currently holds a live connected PTY session
+    /// (actively streaming & marker-monitored in the background).
+    func hasLiveSession(for instanceIds: [String]) -> Bool {
+        instanceIds.contains { entries[$0]?.session.isConnected == true }
+    }
+
     /// Whether the instance's live session has produced any PTY output yet — the
     /// readiness oracle for startup injection. False if no session is attached.
     func hasOutput(for instanceId: String) -> Bool {
@@ -508,24 +716,292 @@ final class TerminalStore {
                           bell: e.session.recentBell)
     }
 
-    /// The live session for `instanceId`, or nil if none — recycling (dropping) a
-    /// session whose PTY has died so the caller re-creates a fresh attach.
+    /// Max concurrent read-only background monitor channels per host. OpenSSH defaults
+    /// to `MaxSessions 10` per TCP connection, so capping at 6 leaves ample headroom for
+    /// serialized exec polls and interactive panes.
+    static let maxBackgroundMonitorsPerHost = 6
+
+    /// The live **interactive** session for `instanceId`, or nil if none — recycling a
+    /// session whose PTY has died so the caller re-creates a fresh attach. Read-only
+    /// background monitors return nil here so opening a tab upgrades cleanly to an
+    /// interactive session.
     func existing(_ instanceId: String) -> TerminalSession? {
         guard let e = entries[instanceId] else { return nil }
         if !e.session.isConnected {
             entries[instanceId] = nil
             return nil
         }
+        if e.session.isReadOnly { return nil }
         return e.session
     }
 
-    /// Get-or-create the session for `instanceId`, starting its PTY on first creation.
-    /// The view is created at the stored font size so the deferred first-size attach
-    /// opens the PTY at the right grid — no post-hoc resize.
+    /// Start a headless read-only monitor (`tmux attach-session -r`) for `instanceId`
+    /// if it isn't already attached (interactive or read-only) and the host is within
+    /// `maxBackgroundMonitorsPerHost`. When `evictIdleIfNeeded` is true and the host is
+    /// already at its monitor cap, evicts the longest-idle (>60s) read-only monitor to
+    /// make room for a newly active agent. Returns true if a new monitor was started.
+    @discardableResult
+    func startBackgroundMonitor(
+        for instanceId: String,
+        hostId: UUID,
+        connection: SSHConnection,
+        command: String,
+        evictIdleIfNeeded: Bool = false,
+        onReady: @escaping () -> Void
+    ) -> Bool {
+        if let e = entries[instanceId] {
+            if e.session.isConnected { return false }
+            entries[instanceId] = nil
+        }
+        let activeMonitors = entries.filter {
+            $0.value.hostId == hostId && $0.value.session.isReadOnly && $0.value.session.isConnected
+        }
+        if activeMonitors.count >= Self.maxBackgroundMonitorsPerHost {
+            guard evictIdleIfNeeded,
+                  let victim = activeMonitors
+                    .filter({ $0.value.session.idleFor > 60 })
+                    .max(by: { $0.value.session.idleFor < $1.value.session.idleFor })
+            else { return false }
+            victim.value.session.disconnect()
+            entries[victim.key] = nil
+        }
+
+        let view = MuxelTerminalView(frame: CGRect(x: 0, y: 0, width: 960, height: 640),
+                                     font: TerminalFontPreference.font)
+        let session = TerminalSession(view: view, connection: connection, command: command,
+                                      openGate: gate(for: hostId), isReadOnly: true)
+        view.terminalDelegate = session
+        session.onFirstOutput = onReady
+        entries[instanceId] = Entry(hostId: hostId, session: session)
+        session.startHeadless(cols: 120, rows: 40)
+        return true
+    }
+
+    /// Attach a headless read-only monitor (`tmux -u attach-session -r`) for
+    /// `instanceId` and wait until its initial tmux screen paints (or times out),
+    /// returning the live `LiveScreen` snapshot. Leaves the session in `entries` so
+    /// the caller can either keep it running (for working/watched projects) or call
+    /// `disconnectReadOnly(_:)` (for idle unwatched projects).
+    func probeLiveScreen(
+        for instanceId: String,
+        hostId: UUID,
+        connection: SSHConnection,
+        command: String,
+        timeoutSecs: TimeInterval = 2.4,
+        onReady: @escaping () -> Void
+    ) async -> LiveScreen? {
+        if let e = entries[instanceId], e.session.isConnected, e.session.hasOutput {
+            return liveScreen(for: instanceId)
+        }
+        let session: TerminalSession
+        if let e = entries[instanceId], e.session.isConnected {
+            session = e.session
+        } else {
+            let view = MuxelTerminalView(frame: CGRect(x: 0, y: 0, width: 960, height: 640),
+                                         font: TerminalFontPreference.font)
+            let created = TerminalSession(view: view, connection: connection, command: command,
+                                          openGate: gate(for: hostId), isReadOnly: true)
+            view.terminalDelegate = created
+            created.onFirstOutput = onReady
+            entries[instanceId] = Entry(hostId: hostId, session: created)
+            created.startHeadless(cols: 120, rows: 40)
+            session = created
+        }
+
+        let start = Date()
+        var firstOutputAt: Date? = session.hasOutput ? start : nil
+        while session.isConnected && Date().timeIntervalSince(start) < timeoutSecs {
+            if session.hasOutput {
+                if firstOutputAt == nil { firstOutputAt = Date() }
+                let sinceFirst = Date().timeIntervalSince(firstOutputAt!)
+                // Wait at least 0.75s after the first byte (login shell + tmux attach)
+                // and let output settle (~0.35s quiet or 1.4s total after first output).
+                if sinceFirst >= 1.4 || (sinceFirst >= 0.75 && session.idleFor >= 0.35) {
+                    break
+                }
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        guard session.isConnected, session.hasOutput else { return nil }
+        return liveScreen(for: instanceId)
+    }
+
+    /// Probe multiple running tmux sessions on a single host over **one** SSH PTY
+    /// channel (reusing the single pooled `SSHConnection`). Already-live sessions in
+    /// `entries` are returned immediately with zero network traffic; remaining targets
+    /// are snapshotted sequentially (~150ms each) inside one PTY and decoded offscreen
+    /// with a pure SwiftTerm `Terminal` (no `UIView` allocation, no `capture-pane`).
+    func batchProbeScreens(
+        targets: [(id: String, session: String, socket: String?, idle: TimeInterval, bell: Bool)],
+        connection: SSHConnection
+    ) async -> [String: LiveScreen] {
+        var results: [String: LiveScreen] = [:]
+        var toProbe: [(id: String, session: String, socket: String?, idle: TimeInterval, bell: Bool)] = []
+        for t in targets {
+            if let existing = liveScreen(for: t.id), !existing.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                results[t.id] = existing
+            } else {
+                toProbe.append(t)
+            }
+        }
+        guard !toProbe.isEmpty else { return results }
+        let probed = await Self.batchProbeScreensOffscreen(targets: toProbe, connection: connection)
+        for (id, screen) in probed { results[id] = screen }
+        return results
+    }
+
+    /// Offscreen single-PTY batched read-only screen probe callable from any actor
+    /// (including `StatusPoller` background refreshes). Never creates UIViews or runs
+    /// `capture-pane`.
+    nonisolated static func batchProbeScreensOffscreen(
+        targets: [(id: String, session: String, socket: String?, idle: TimeInterval, bell: Bool)],
+        connection: SSHConnection
+    ) async -> [String: LiveScreen] {
+        guard !targets.isEmpty else { return [:] }
+        guard let client = try? await connection.sshClient() else { return [:] }
+
+        let nonce = UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8).lowercased()
+        let cmd = TmuxCommands.batchProbeReadOnlyPTYCommand(
+            targets: targets.map { ($0.session, $0.socket) },
+            nonce: nonce)
+        let doneMarker = Array("__MUXEL_PD_\(nonce)__".utf8)
+        let maxDurationNs = UInt64(max(4.0, Double(targets.count) * 1.2) * 1_000_000_000)
+
+        let captured: [UInt8] = await withTaskGroup(of: [UInt8].self) { group in
+            group.addTask {
+                var buffer: [UInt8] = []
+                do {
+                    try await client.withPTY(
+                        .init(wantReply: true, term: "xterm-256color",
+                              terminalCharacterWidth: 120, terminalRowHeight: 40,
+                              terminalPixelWidth: 0, terminalPixelHeight: 0,
+                              terminalModes: .init([.ECHO: 0]))
+                    ) { inbound, outbound in
+                        try await outbound.write(ByteBuffer(string: cmd + "\n"))
+                        for try await chunk in inbound {
+                            if Task.isCancelled { break }
+                            switch chunk {
+                            case .stdout(var buf), .stderr(var buf):
+                                if let bytes = buf.readBytes(length: buf.readableBytes) {
+                                    buffer.append(contentsOf: bytes)
+                                    if Self.containsMarker(doneMarker, in: buffer) {
+                                        return
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch {
+                    // Best-effort: return whatever slices already arrived before drop/cancel.
+                }
+                return buffer
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: maxDurationNs)
+                return []
+            }
+            let first = await group.next() ?? []
+            group.cancelAll()
+            return first
+        }
+
+        var results: [String: LiveScreen] = [:]
+        let slices = Self.parseBatchProbeOutput(captured, count: targets.count, nonce: nonce)
+        for (idx, target) in targets.enumerated() {
+            guard let raw = slices[idx], !raw.isEmpty,
+                  // Require a real tmux alt-screen paint (`\e[?1049h` / `\e[?47h`); a
+                  // bare `[detached (from session …)]` line with no screen paint would
+                  // otherwise look like a marker-free screen and falsely trigger `.done`.
+                  TerminalKeys.tmuxAttachScreenOffset(in: raw) != nil else { continue }
+            let text = Self.renderScreenText(from: raw, cols: 120, rows: 40)
+            if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                results[target.id] = LiveScreen(text: text, idle: target.idle, bell: target.bell)
+            }
+        }
+        return results
+    }
+
+    /// Pure parser for `batchProbeReadOnlyPTYCommand` output: extracts each target's
+    /// raw PTY byte slice between `__MUXEL_PB_<nonce>_<i>__` and `__MUXEL_PE_<nonce>_<i>__`.
+    nonisolated static func parseBatchProbeOutput(
+        _ bytes: [UInt8], count: Int, nonce: String
+    ) -> [Int: [UInt8]] {
+        var out: [Int: [UInt8]] = [:]
+        var searchFrom = 0
+        for idx in 0..<count {
+            let begin = Array("__MUXEL_PB_\(nonce)_\(idx)__".utf8)
+            let end = Array("__MUXEL_PE_\(nonce)_\(idx)__".utf8)
+            guard let bPos = indexOf(begin, in: bytes, from: searchFrom) else { continue }
+            let payloadStart = bPos + begin.count
+            guard let ePos = indexOf(end, in: bytes, from: payloadStart) else { continue }
+            out[idx] = Array(bytes[payloadStart..<ePos])
+            searchFrom = ePos + end.count
+        }
+        return out
+    }
+
+    /// Render a single probed tmux byte slice into plain visible screen text using an
+    /// offscreen SwiftTerm `Terminal` (zero UIView/Metal overhead).
+    nonisolated static func renderScreenText(from bytes: [UInt8], cols: Int = 120, rows: Int = 40) -> String {
+        let delegate = SilentTerminalDelegate()
+        let terminal = Terminal(delegate: delegate, options: TerminalOptions(cols: cols, rows: rows))
+        let slice = TerminalKeys.tmuxAltScreenSlice(in: bytes)
+        terminal.feed(buffer: slice)
+        var lines: [String] = []
+        lines.reserveCapacity(terminal.rows)
+        for row in 0..<terminal.rows {
+            if let line = terminal.getLine(row: row) {
+                lines.append(line.translateToString(trimRight: true))
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private nonisolated static func containsMarker(_ marker: [UInt8], in bytes: [UInt8]) -> Bool {
+        let start = max(0, bytes.count - marker.count - 128)
+        return indexOf(marker, in: bytes, from: start) != nil
+    }
+
+    private nonisolated static func indexOf(_ needle: [UInt8], in haystack: [UInt8], from start: Int) -> Int? {
+        guard !needle.isEmpty, haystack.count >= start + needle.count else { return nil }
+        let limit = haystack.count - needle.count
+        let first = needle[0]
+        for i in start...limit where haystack[i] == first {
+            var matched = true
+            for j in 1..<needle.count where haystack[i + j] != needle[j] {
+                matched = false
+                break
+            }
+            if matched { return i }
+        }
+        return nil
+    }
+
+    /// Disconnect `instanceId` only if it is a background read-only monitor (never
+    /// disconnects a real interactive terminal the user opened).
+    func disconnectReadOnly(_ instanceId: String) {
+        guard let e = entries[instanceId], e.session.isReadOnly else { return }
+        e.session.disconnect()
+        entries[instanceId] = nil
+    }
+
+    /// Number of currently connected read-only background monitors on `hostId`.
+    func activeReadOnlyMonitorCount(on hostId: UUID) -> Int {
+        entries.values.filter {
+            $0.hostId == hostId && $0.session.isReadOnly && $0.session.isConnected
+        }.count
+    }
+
+    /// Get-or-create the interactive session for `instanceId`, starting its PTY on first
+    /// creation. Upgrades (disconnects) any existing read-only background monitor first.
     func session(for instanceId: String, hostId: UUID,
                  connection: SSHConnection, command: String) -> TerminalSession {
         if let s = existing(instanceId) { return s }
-        let view = TerminalView(frame: .zero, font: TerminalFontPreference.font)
+        if let e = entries[instanceId], e.session.isReadOnly {
+            e.session.disconnect()
+            entries[instanceId] = nil
+        }
+        let view = MuxelTerminalView(frame: .zero, font: TerminalFontPreference.font)
         let session = TerminalSession(view: view, connection: connection, command: command,
                                       openGate: gate(for: hostId))
         view.terminalDelegate = session
@@ -537,6 +1013,13 @@ final class TerminalStore {
         entries[instanceId] = Entry(hostId: hostId, session: session)
         session.start()
         return session
+    }
+
+    /// Persist a new terminal font size (from Settings) and apply it to every live pane.
+    func setFontSize(_ size: CGFloat) {
+        let snapped = TerminalKeys.snappedFontSize(size)
+        TerminalFontPreference.size = snapped
+        applyFontSize(snapped)
     }
 
     /// Re-font every other live terminal after a pinch commits (each one's font
@@ -557,6 +1040,59 @@ final class TerminalStore {
             e.session.disconnect()
             entries[id] = nil
         }
+    }
+}
+
+/// Minimal no-op delegate for offscreen SwiftTerm `Terminal` screen-snapshot decoding.
+private final class SilentTerminalDelegate: TerminalDelegate {
+    func showCursor(source: Terminal) {}
+    func hideCursor(source: Terminal) {}
+    func send(source: Terminal, data: ArraySlice<UInt8>) {}
+}
+
+/// TerminalView configured for reliable iOS & Deskflow agent input:
+/// - Disables SwiftTerm's mouse reporting so taps/drags never send stray clicks into
+///   tmux/TUI panels that steal focus from the agent's text box or trigger copy-mode
+///   (vertical scrolling still works via `TerminalSession`'s SGR wheel gesture, and
+///   OSC-8 links / long-press selection stay intact).
+/// - Disables iOS inline predictions / math completions / smart replacements so UIKit
+///   doesn't call `replace(_:withText:)` against stale local storage and overwrite
+///   prompt text.
+private final class MuxelTerminalView: TerminalView {
+    override init(frame: CGRect, font: UIFont?) {
+        super.init(frame: frame, font: font)
+        configureTerminalInputTraits()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureTerminalInputTraits()
+    }
+
+    @available(iOS 17.0, *)
+    var inlinePredictionType: UITextInlinePredictionType {
+        get { .no }
+        set {}
+    }
+
+    @available(iOS 18.0, *)
+    var mathExpressionCompletionType: UITextMathExpressionCompletionType {
+        get { .no }
+        set {}
+    }
+
+    private func configureTerminalInputTraits() {
+        allowMouseReporting = false
+        // Pixel-aligned box-drawing and half/shade block glyphs (for smooth RGB
+        // block gradients and TUI borders) plus full bright ANSI colors.
+        customBlockGlyphs = true
+        useBrightColors = true
+        autocapitalizationType = .none
+        autocorrectionType = .no
+        spellCheckingType = .no
+        smartQuotesType = .no
+        smartDashesType = .no
+        smartInsertDeleteType = .no
     }
 }
 

@@ -55,6 +55,42 @@ final class ThemeTerminalTests: XCTestCase {
         }
     }
 
+    func testStatusDotStyleDistinguishesRunningStates() {
+        XCTAssertEqual(StatusDotStyle.resolve(status: .idle, running: false), .stopped)
+        XCTAssertEqual(StatusDotStyle.resolve(status: .working, running: false), .stopped)
+        XCTAssertEqual(StatusDotStyle.resolve(status: .idle, running: true), .idle)
+        XCTAssertEqual(StatusDotStyle.resolve(status: .working, running: true), .working)
+        XCTAssertEqual(StatusDotStyle.resolve(status: .done, running: true), .done)
+        XCTAssertEqual(StatusDotStyle.resolve(status: .blocked, running: true), .blocked)
+    }
+
+    func testStatusDotsStayLegibleAcrossEveryThemeAndSurface() {
+        let cases: [(StatusDotStyle, Bool?)] = [
+            (.blocked, true), (.working, true), (.done, true), (.idle, true), (.stopped, false),
+        ]
+        for theme in MuxelTheme.all {
+            for surface in [theme.bg, theme.surface, theme.accent] {
+                let bg = StatusDotContrast.RGB(hex: surface)
+                for (style, running) in cases {
+                    let raw = StatusDotContrast.rawHex(for: style, running: running, in: theme)
+                    let minContrast = style == .stopped ? 2.8 : 3.4
+                    let adjusted = StatusDotContrast.legibleRGB(hex: raw, on: surface, minContrast: minContrast)
+                    let ratio = StatusDotContrast.contrastRatio(adjusted, bg)
+                    XCTAssertGreaterThanOrEqual(
+                        ratio, minContrast - 0.05,
+                        "\(theme.name) (\(style) on \(surface)): contrast \(ratio) too low")
+                }
+            }
+        }
+    }
+
+    func testExitCopyModeCommandShape() {
+        XCTAssertEqual(TmuxCommands.exitCopyMode(session: "muxel_box_12345678"),
+                       ["copy-mode", "-q", "-t", "=muxel_box_12345678:"])
+        XCTAssertEqual(TmuxCommands.setWindowSizeLatest(session: "muxel_box_12345678"),
+                       ["set-option", "-w", "-t", "=muxel_box_12345678:", "window-size", "latest"])
+    }
+
     /// Rough relative luminance (0 = black, 1 = white) from a `#rrggbb` hex.
     private func luminance(_ hex: String) -> Double {
         let (r, g, b, _) = muxelHexComponents(hex)

@@ -7,7 +7,7 @@ import Foundation
 /// The iOS app only knows the running instance's `program` (not the desktop's
 /// per-preset marker overrides), so custom presets fall back to these defaults or
 /// the heuristic — fine for the marker agents (claude, opencode).
-func defaultMarkers(program: String?) -> (working: [String], blocked: [String]) {
+func defaultMarkers(program: String?, args: [String] = []) -> (working: [String], blocked: [String]) {
     guard
         let program,
         let base = program.split(whereSeparator: { $0 == "/" || $0 == "\\" }).last.map(String.init)
@@ -19,6 +19,15 @@ func defaultMarkers(program: String?) -> (working: [String], blocked: [String]) 
     }
     if base.contains("opencode") {
         return (["esc interrupt"], ["Permission required"])
+    }
+    if base == "ollama", args.contains(where: { $0.contains("opencode") }) {
+        return (["esc interrupt"], ["Permission required"])
+    }
+    if base.contains("grok") {
+        return (["[stop]", "Thinking ("], ["Action Required"])
+    }
+    if base.contains("codex") {
+        return (["esc to interrupt", "Esc to interrupt"], [])
     }
     return ([], [])
 }

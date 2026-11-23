@@ -23,6 +23,57 @@ enum RemoteLayoutStore {
         return layout
     }
 
+    /// Batch-read `<root>/.muxel/workspace.json` for many projects on one host in a
+    /// **single** SSH round trip (instead of N serial execs through the command mutex).
+    /// Returns `nil` when the remote did not run the batch loop (e.g. a unit-test mock
+    /// that only matches single-file `f=…` reads), so callers can fall back to `read`.
+    static func readMany(_ conn: SSHConnection, roots: [String]) async -> [String: RemoteLayout]? {
+        guard roots.count > 1 else { return nil }
+        let nonce = UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8)
+        let begin = "__MUXEL_B_\(nonce)__"
+        let end = "__MUXEL_E_\(nonce)__"
+        let done = "__MUXEL_D_\(nonce)__"
+        let quoted = roots.map(Shell.quote).joined(separator: " ")
+        let cmd = "for r in \(quoted); do "
+            + "f=\"$r/.muxel/workspace.json\"; "
+            + "if [ -f \"$f\" ] && [ \"$(wc -c < \"$f\")\" -le 2000000 ]; then "
+            + "printf '%s\\n%s\\n' '\(begin)' \"$r\"; "
+            + "cat \"$f\"; "
+            + "printf '\\n%s\\n' '\(end)'; "
+            + "fi; "
+            + "done; "
+            + "printf '%s\\n' '\(done)'"
+        guard let output = try? await conn.run(cmd) else { return nil }
+        return parseReadMany(output, begin: begin, end: end, done: done)
+    }
+
+    /// Pure parser for `readMany`'s delimited stdout. Returns `nil` if `done` is absent
+    /// (truncated/unexecuted output); otherwise returns every valid decoded layout keyed
+    /// by its `root`.
+    static func parseReadMany(
+        _ output: String, begin: String, end: String, done: String
+    ) -> [String: RemoteLayout]? {
+        let normalized = output.replacingOccurrences(of: "\r\n", with: "\n")
+        guard normalized.contains(done) else { return nil }
+        var out: [String: RemoteLayout] = [:]
+        var cursor = normalized.startIndex
+        while let bRange = normalized.range(of: "\(begin)\n", range: cursor..<normalized.endIndex) {
+            let afterBegin = bRange.upperBound
+            guard let nl = normalized[afterBegin...].firstIndex(of: "\n") else { break }
+            let root = String(normalized[afterBegin..<nl]).trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
+            let bodyStart = normalized.index(after: nl)
+            guard let eRange = normalized.range(of: "\n\(end)", range: bodyStart..<normalized.endIndex) else { break }
+            cursor = eRange.upperBound
+            let json = normalized[bodyStart..<eRange.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !json.isEmpty, let data = json.data(using: .utf8),
+                  let layout = try? MuxelJSON.decoder.decode(RemoteLayout.self, from: data),
+                  layout.isValid(forRoot: root)
+            else { continue }
+            out[root] = layout
+        }
+        return out
+    }
+
     /// Prepare `.muxel/` and atomically write `layout`. Port of remote_push_prep_cmd
     /// + write_remote_file (using a quoted heredoc instead of ssh stdin so it works
     /// over a one-shot exec channel; portable POSIX sh).

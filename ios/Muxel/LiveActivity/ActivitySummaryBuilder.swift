@@ -21,18 +21,20 @@ enum ActivitySummaryBuilder {
     }
 
     static func row(
-        id: String, name: String, project: String, status: AgentStatus, running: Bool
+        id: String, name: String, project: String, status: AgentStatus, running: Bool,
+        lastActiveAt: TimeInterval? = nil
     ) -> MuxelActivityAttributes.InstanceRow {
         .init(
             id: id, name: String(name.prefix(nameCap)),
             project: String(project.prefix(nameCap)),
-            state: state(status: status, running: running))
+            state: state(status: status, running: running),
+            lastActiveAt: lastActiveAt)
     }
 
     /// Fold instance rows into a `ContentState`: counts, and an attention-priority sort
-    /// (needsInput → finished → working → idle, then project, then name) that puts
-    /// agents waiting for you at the very top. Caps the list (overflow kept in
-    /// `instanceCount`).
+    /// (needsInput → finished → working → idle, then most-recently-worked first, then
+    /// project, then name) that keeps agents waiting for you and what was working last
+    /// at the very top. Caps the list (overflow kept in `instanceCount`).
     static func contentState(
         rows: [MuxelActivityAttributes.InstanceRow], now: Date
     ) -> MuxelActivityAttributes.ContentState {
@@ -49,6 +51,9 @@ enum ActivitySummaryBuilder {
         }
         let sorted = rows.sorted {
             if rank($0.state) != rank($1.state) { return rank($0.state) < rank($1.state) }
+            let a = $0.lastActiveAt ?? 0
+            let b = $1.lastActiveAt ?? 0
+            if a != b { return a > b }
             if $0.project != $1.project { return $0.project < $1.project }
             return $0.name < $1.name
         }
@@ -58,6 +63,73 @@ enum ActivitySummaryBuilder {
             finishedCount: count(.finished),
             workingCount: count(.working),
             instanceCount: rows.count, updatedAt: now)
+    }
+}
+
+/// Persists the most recent Unix timestamp (seconds) each instance was observed
+/// working / needing input / finishing, so the Live Activity keeps whatever was
+/// working last pinned to the top even after it finishes or goes idle.
+enum LastWorkedStore {
+    private static let key = "liveactivity.lastWorkedAt"
+    private static let maxEntries = 100
+
+    static func record(_ statuses: [InstanceStatus], now: TimeInterval = Date().timeIntervalSince1970,
+                       defaults: UserDefaults = .standard) {
+        let activeIds = statuses.compactMap { s -> String? in
+            guard s.running, s.status == .working || s.status == .blocked || s.status == .done else {
+                return nil
+            }
+            return s.instanceId
+        }
+        guard !activeIds.isEmpty else { return }
+        var map = load(defaults: defaults)
+        for id in activeIds {
+            map[id] = now
+        }
+        if map.count > maxEntries {
+            let trimmed = map.sorted { $0.value > $1.value }.prefix(maxEntries)
+            map = Dictionary(uniqueKeysWithValues: trimmed.map { ($0.key, $0.value) })
+        }
+        defaults.set(map, forKey: key)
+    }
+
+    static func timestamp(for instanceId: String, defaults: UserDefaults = .standard) -> TimeInterval? {
+        load(defaults: defaults)[instanceId]
+    }
+
+    /// Best recency timestamp for an instance: the latest of our persisted
+    /// last-worked timestamp, desktop's persisted `activity` timestamps (ms → s),
+    /// and the live tmux pane's last activity (`now - row.idle`).
+    static func effectiveLastActiveAt(
+        instance: Instance?,
+        status: AgentStatus,
+        running: Bool,
+        paneIdle: TimeInterval?,
+        now: TimeInterval = Date().timeIntervalSince1970,
+        defaults: UserDefaults = .standard
+    ) -> TimeInterval? {
+        var best: TimeInterval? = instance.flatMap { timestamp(for: $0.id, defaults: defaults) }
+        if running, status == .working || status == .blocked || status == .done {
+            best = max(best ?? 0, now)
+        }
+        if let act = instance?.activity {
+            let desktopMs = [act.workStartedAt, act.completedAt, act.blockedAt].compactMap { $0 }.max()
+            if let desktopMs {
+                let secs = TimeInterval(desktopMs) / 1000.0
+                best = max(best ?? 0, secs)
+            }
+        }
+        if let paneIdle, paneIdle.isFinite {
+            let tmuxAt = max(0, now - paneIdle)
+            if best == nil {
+                best = tmuxAt
+            }
+        }
+        return best
+    }
+
+    private static func load(defaults: UserDefaults) -> [String: TimeInterval] {
+        defaults.dictionary(forKey: key) as? [String: TimeInterval] ?? [:]
     }
 }
 

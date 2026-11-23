@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import SwiftUI
 
 /// A migration carries the exact binding observed while its probes ran. Ordinary
@@ -32,6 +33,9 @@ final class AppState: ObservableObject {
     /// Load state of the selected project's shared layout — lets the detail view
     /// distinguish "can't reach the host" from a genuinely empty project.
     @Published var layoutLoad: LayoutLoadState = .idle
+    /// True while a manual or initial `refreshLayout()` round-trip is in flight,
+    /// driving the toolbar refresh spinner.
+    @Published var isRefreshingLayout = false
     @Published var statuses: [String: AgentStatus] = [:]
     /// Instance ids with a live tmux session right now (from the latest poll of the
     /// selected project).
@@ -51,6 +55,9 @@ final class AppState: ObservableObject {
     /// Id of the most recently launched instance — the detail view selects it so its
     /// live terminal opens (and creates the session attached).
     @Published var lastLaunched: String?
+    /// Instance id currently visible on screen in `ProjectDetailView` (nil on the home
+    /// screen). Suppresses redundant notifications for the pane the user is already viewing.
+    var activeViewedInstanceId: String?
 
     /// Outcome of testing a host's saved credential. Returned inline by the in-form
     /// draft test (`testConnection(draft:…)`); the saved-host test reports a banner.
@@ -68,13 +75,29 @@ final class AppState: ObservableObject {
         case failed(String)
     }
 
-    /// Live agent counts for one project (sidebar badges). `running` = instances
-    /// with a live tmux session; `blocked` = those signalling needs-input;
-    /// `done` = finished (exited/bell latched).
+    /// One terminal agent inside a project, listed under its project on the home
+    /// screen with its status dot so the user can see at a glance what needs attention.
+    struct AgentSummary: Equatable, Identifiable {
+        let id: String
+        var name: String
+        var status: AgentStatus
+        var running: Bool
+
+        var needsAttention: Bool {
+            running && (status == .blocked || status == .done)
+        }
+    }
+
+    /// Live agent counts + per-agent status summaries for one project (sidebar rows).
+    /// `agentStatuses` has one entry per live tmux session; `agents` lists every
+    /// terminal agent in the project (running and stopped), sorted by attention
+    /// priority (`blocked` → `working` → `done` → running `idle` → stopped).
     struct ProjectActivity: Equatable {
         var running: Int
         var blocked: Int
         var done: Int
+        var agentStatuses: [AgentStatus] = []
+        var agents: [AgentSummary] = []
     }
 
     /// A changed host key awaiting the user's decision — drives the trust-prompt
@@ -92,6 +115,28 @@ final class AppState: ObservableObject {
     /// True when the user has explicitly denied notification permission — the
     /// sidebar shows a quiet Settings pointer (`.notDetermined` must not nag).
     @Published var notificationsDenied = false
+    /// Host sections currently collapsed in the sidebar; persisted in `UserDefaults`
+    /// so relaunching restores the user's expanded/collapsed layout.
+    @Published private(set) var collapsedHostIds: Set<UUID> = []
+    /// Projects the user has opened, promoted near the top of their host's list.
+    /// Newly opened projects join at index 0; reopening an already-opened project
+    /// never reshuffles this list. Persisted in `UserDefaults`.
+    @Published private(set) var openedProjectIds: [UUID] = []
+    /// Projects actively being watched/monitored right now (highlighted folder icon
+    /// + faster 5s home-screen polling + prioritized sweeps). Populated from
+    /// `autoWatchProjectIds` on launch, manual watch toggles, and active-work scans.
+    @Published private(set) var watchedProjectIds: Set<UUID> = []
+    /// Projects pinned to automatically start watching whenever the app launches.
+    /// Persisted in `UserDefaults`.
+    @Published private(set) var autoWatchProjectIds: Set<UUID> = []
+    /// When enabled, launching the app automatically scans all projects and starts
+    /// watching any whose agents are actively working or need attention.
+    @Published private(set) var autoWatchActiveOnLaunch: Bool = false
+    /// True while a scan for actively working projects is running.
+    @Published private(set) var isScanningActiveProjects = false
+    /// Human-readable live progress / outcome of the active-project scan, surfaced
+    /// inline inside Settings (which sits above the root banner) and on the home screen.
+    @Published private(set) var scanStatusText: String? = nil
 
     /// Injectable so previews/tests use `MockSSHConnection`. The second argument
     /// carries the host's resolved credentials — target (nil = the host's inline
@@ -102,12 +147,32 @@ final class AppState: ObservableObject {
     }
 
     private let store: LocalStore
+    private let defaults: UserDefaults
+    private static let sidebarLog = Logger(subsystem: "dev.muxel.ios", category: "SidebarPoll")
+    private static let collapsedHostsKey = "muxel.collapsedHostIds"
+    private static let openedProjectsKey = "muxel.openedProjectIds"
+    private static let autoWatchProjectsKey = "muxel.autoWatchProjectIds"
+    private static let autoWatchActiveOnLaunchKey = "muxel.autoWatchActiveOnLaunch"
+    private var didStartLaunchMonitoring = false
+    /// True while launch-time monitoring (`scanAndWatchWorkingProjects` /
+    /// `probeWatchedProjects`) is running, preventing `SidebarView.onAppear` or
+    /// `scenePhase == .active` from cancelling or racing the launch sweep.
+    private var isLaunchMonitoringActive = false
+    /// Projects the user explicitly unwatched in this session so ongoing auto-scans
+    /// respect their choice instead of immediately re-watching them.
+    private var manuallyUnwatchedProjectIds: Set<UUID> = []
     private var connections: [UUID: SSHConnection] = [:]
     /// Live PTY terminals, owned here (not by the SwiftUI views) so a pane stays
     /// connected across navigation until the instance is closed or the app quits.
     let terminals = TerminalStore()
     private let poll = PollService()
     private var pollLoop: Task<Void, Never>?
+    /// Gentle foreground poll loop while viewing the home screen (`selectedProject == nil`)
+    /// so per-project status dots stay live across all reachable hosts.
+    private var sidebarPollLoop: Task<Void, Never>?
+    /// Latest Live Activity rows per project from foreground sweeps (so the Lock Screen
+    /// widget reflects every project, not only the currently selected one).
+    private var summaryRowsByProject: [UUID: [MuxelActivityAttributes.InstanceRow]] = [:]
     /// Serializes the phone's own layout write-backs so two rapid mutations can't
     /// interleave their read-modify-write pairs (the SSH command mutex serializes
     /// individual commands, not whole RMW sequences).
@@ -117,14 +182,67 @@ final class AppState: ObservableObject {
     private var pendingLaunches: Set<String> = []
     /// Foreground poll counter — used to re-read the shared layout only every Nth poll.
     private var pollTick = 0
+    /// True once `runPollOnce()` has populated `running`/`statuses` for the currently
+    /// selected project (prevents `deselect()` from overwriting cached sidebar dots
+    /// with an empty snapshot if the user backs out before the first poll returns).
+    private var hasPolledSelectedProject = false
     /// Cache of each non-selected project's terminal instances (`project.id` →
     /// instances + fetch time) so the cross-project sweep rarely re-reads layouts.
     private var instanceCache: [UUID: (instances: [Instance], at: TimeInterval)] = [:]
-    private let instanceCacheTTL: TimeInterval = 45
+    /// Cache of each project's full `RemoteLayout` from recent sweeps/opens so
+    /// switching into a project renders its tabs and opens its terminal immediately
+    /// while a background refresh verifies any peer edits.
+    private var layoutCache: [UUID: RemoteLayout] = [:]
+    private let instanceCacheTTL: TimeInterval = 15
+    /// Latest tmux pane rows per host (plus capture timestamp) so background monitors
+    /// reclassify immediately and opening an already-confirmed live agent can attach
+    /// without waiting for redundant pre-flight round trips.
+    private var lastPaneRowsByHost: [UUID: [PaneRow]] = [:]
+    private var lastPaneRowsAtByHost: [UUID: TimeInterval] = [:]
+    /// Short-lived cache of screens captured via `batchProbeScreens` so intermediate
+    /// reclassifications (e.g. a sibling monitor painting) never clobber a freshly
+    /// detected desktop-started `.working` agent back to `.idle`.
+    private var probedScreensCache: [String: (screen: LiveScreen, at: TimeInterval)] = [:]
+    /// Per-instance last `.idle` probe timestamp + tmux `window_activity` epoch so
+    /// quiet idle agents incur zero probes and noisy animating idle TUIs are rate-limited.
+    private var idleProbeState: [String: (at: TimeInterval, activityTimestamp: TimeInterval?)] = [:]
+    /// Last observed live status per instance, used to keep probing/monitoring agents
+    /// that are `.working` or `.blocked` until they finish.
+    private var lastObservedStatusByInstance: [String: AgentStatus] = [:]
+    /// Throttle for immediate layout cache invalidation when tmux reports an unknown
+    /// `muxel_*` session (e.g. a brand-new pane just opened on desktop).
+    private var lastUnmatchedRefreshByHost: [UUID: TimeInterval] = [:]
+    /// Optional test override for single-PTY screen probing (`terminals.batchProbeScreens`).
+    var screenProber: (([(id: String, session: String, socket: String?, idle: TimeInterval, bell: Bool)], SSHConnection) async -> [String: LiveScreen])?
 
-    init(store: LocalStore = LocalStore()) {
+    init(store: LocalStore = LocalStore(), defaults: UserDefaults = .standard) {
         self.store = store
-        self.doc = (try? store.load()) ?? StoreDocument()
+        self.defaults = defaults
+        let loaded = (try? store.load()) ?? StoreDocument()
+        self.doc = loaded
+        let savedCollapsed = Set(
+            (defaults.stringArray(forKey: Self.collapsedHostsKey) ?? []).compactMap(UUID.init(uuidString:))
+        )
+        self.collapsedHostIds = savedCollapsed.intersection(Set(loaded.hosts.map(\.id)))
+        let validProjectIds = Set(loaded.projects.map(\.id))
+        var seenOpened = Set<UUID>()
+        self.openedProjectIds = (defaults.stringArray(forKey: Self.openedProjectsKey) ?? [])
+            .compactMap(UUID.init(uuidString:))
+            .filter { validProjectIds.contains($0) && seenOpened.insert($0).inserted }
+        // Load auto-watch preferences from atomic `store.json` first, migrating from
+        // `UserDefaults` if `store.json` predates these fields.
+        let legacyAutoWatch = Set(
+            (defaults.stringArray(forKey: Self.autoWatchProjectsKey) ?? []).compactMap(UUID.init(uuidString:))
+        )
+        let savedAutoWatch = loaded.autoWatchProjectIds.isEmpty
+            ? legacyAutoWatch
+            : Set(loaded.autoWatchProjectIds)
+        self.autoWatchProjectIds = savedAutoWatch.intersection(validProjectIds)
+        self.watchedProjectIds = self.autoWatchProjectIds
+        self.autoWatchActiveOnLaunch = loaded.autoWatchActiveOnLaunch
+            || defaults.bool(forKey: Self.autoWatchActiveOnLaunchKey)
+        self.doc.autoWatchProjectIds = self.autoWatchProjectIds.sorted { $0.uuidString < $1.uuidString }
+        self.doc.autoWatchActiveOnLaunch = self.autoWatchActiveOnLaunch
         // A failed load preserved the damaged file and recorded a pending notice
         // (a background task may also have recorded one before the app launched) —
         // take it once and tell the user instead of silently starting empty.
@@ -182,9 +300,420 @@ final class AppState: ObservableObject {
 
     func host(for project: RemoteProject) -> Host? { doc.hosts.first { $0.id == project.hostId } }
     func host(id: UUID) -> Host? { doc.hosts.first { $0.id == id } }
-    func projects(for host: Host) -> [RemoteProject] { doc.projects.filter { $0.hostId == host.id } }
+    /// Projects under `host`, with user-opened projects promoted near the top in
+    /// stable order (reopening an already-opened project does not reshuffle them).
+    func projects(for host: Host) -> [RemoteProject] {
+        Self.orderedProjects(doc.projects.filter { $0.hostId == host.id }, openedIds: openedProjectIds)
+    }
+    func isProjectOpened(_ projectId: UUID) -> Bool { openedProjectIds.contains(projectId) }
     func status(_ instanceId: String) -> AgentStatus { statuses[instanceId] ?? .idle }
     func isRunning(_ instanceId: String) -> Bool { running.contains(instanceId) }
+
+    /// Pure ordering: opened projects first (matching `openedIds` order), then the
+    /// remaining unopened projects in their original order.
+    nonisolated static func orderedProjects(_ projects: [RemoteProject], openedIds: [UUID]) -> [RemoteProject] {
+        guard !openedIds.isEmpty else { return projects }
+        let rank = Dictionary(uniqueKeysWithValues: openedIds.enumerated().map { ($0.element, $0.offset) })
+        var opened: [(Int, RemoteProject)] = []
+        var rest: [RemoteProject] = []
+        for p in projects {
+            if let r = rank[p.id] { opened.append((r, p)) } else { rest.append(p) }
+        }
+        opened.sort { $0.0 < $1.0 }
+        return opened.map(\.1) + rest
+    }
+
+    /// Record that the user opened `projectId`. Only newly opened projects move to the
+    /// top; reopening a project already in `openedProjectIds` leaves the order unchanged.
+    func markProjectOpened(_ projectId: UUID) {
+        guard !openedProjectIds.contains(projectId) else { return }
+        openedProjectIds.insert(projectId, at: 0)
+        persistOpenedProjects()
+    }
+
+    private func pruneOpenedProjects(removing ids: Set<UUID>) {
+        let before = openedProjectIds.count
+        openedProjectIds.removeAll { ids.contains($0) }
+        if openedProjectIds.count != before { persistOpenedProjects() }
+        watchedProjectIds.subtract(ids)
+        let beforeAuto = autoWatchProjectIds.count
+        autoWatchProjectIds.subtract(ids)
+        if autoWatchProjectIds.count != beforeAuto { persistAutoWatchProjects() }
+    }
+
+    private func persistOpenedProjects() {
+        defaults.set(openedProjectIds.map(\.uuidString), forKey: Self.openedProjectsKey)
+    }
+
+    // MARK: Project watching & auto-monitoring
+
+    /// True whenever `projectId` is actively watched or monitored — either explicitly
+    /// watched/pinned/auto-detected, or holding at least one live connected terminal
+    /// session whose screen is actively monitored. Drives the folder icon color so
+    /// every monitored project is styled consistently.
+    func isProjectWatched(_ projectId: UUID) -> Bool {
+        if watchedProjectIds.contains(projectId) { return true }
+        let ids: [String]
+        if selectedProject?.id == projectId, let layout {
+            ids = layout.orderedTerminalInstances.map(\.id)
+        } else if let cached = instanceCache[projectId]?.instances {
+            ids = cached.map(\.id)
+        } else if let agents = projectActivity[projectId]?.agents {
+            ids = agents.map(\.id)
+        } else {
+            return false
+        }
+        return terminals.hasLiveSession(for: ids)
+    }
+
+    func isProjectAutoWatched(_ projectId: UUID) -> Bool {
+        autoWatchProjectIds.contains(projectId)
+    }
+
+    func setProjectWatched(_ projectId: UUID, _ watched: Bool) {
+        if watched {
+            manuallyUnwatchedProjectIds.remove(projectId)
+            watchedProjectIds.insert(projectId)
+            if selectedProject == nil {
+                startSidebarPolling(force: true)
+            } else {
+                Task { await refreshSidebarStatuses(connectIfNeeded: true) }
+            }
+        } else {
+            manuallyUnwatchedProjectIds.insert(projectId)
+            watchedProjectIds.remove(projectId)
+            // If the user explicitly stops watching a backgrounded project, also tear
+            // down its idle live PTY attachments so active monitoring genuinely stops.
+            if selectedProject?.id != projectId {
+                let ids = instanceCache[projectId]?.instances.map(\.id)
+                    ?? projectActivity[projectId]?.agents.map(\.id)
+                    ?? []
+                if terminals.hasLiveSession(for: ids) {
+                    objectWillChange.send()
+                    for id in ids { terminals.disconnect(id) }
+                }
+            }
+        }
+    }
+
+    func toggleProjectWatched(_ projectId: UUID) {
+        setProjectWatched(projectId, !isProjectWatched(projectId))
+    }
+
+    /// Pin or unpin `projectId` to automatically start monitoring on every launch.
+    /// Enabling it also starts watching immediately; disabling it stops watching if
+    /// the project isn't currently open.
+    func setProjectAutoWatched(_ projectId: UUID, _ enabled: Bool) {
+        let changed = enabled
+            ? autoWatchProjectIds.insert(projectId).inserted
+            : (autoWatchProjectIds.remove(projectId) != nil)
+        if changed { persistAutoWatchProjects() }
+        if enabled {
+            setProjectWatched(projectId, true)
+        } else if selectedProject?.id != projectId {
+            setProjectWatched(projectId, false)
+        }
+    }
+
+    func toggleProjectAutoWatched(_ projectId: UUID) {
+        setProjectAutoWatched(projectId, !autoWatchProjectIds.contains(projectId))
+    }
+
+    /// Toggle whether launching the app automatically scans all projects and starts
+    /// watching any that are actively working on something. Persists atomically to
+    /// `store.json` (plus UserDefaults) and kicks off a live scan immediately when enabled.
+    func setAutoWatchActiveOnLaunch(_ enabled: Bool) {
+        guard autoWatchActiveOnLaunch != enabled else { return }
+        autoWatchActiveOnLaunch = enabled
+        doc.autoWatchActiveOnLaunch = enabled
+        defaults.set(enabled, forKey: Self.autoWatchActiveOnLaunchKey)
+        persist()
+        if enabled {
+            Task { _ = await scanAndWatchWorkingProjects(announce: false) }
+        }
+    }
+
+    private func persistAutoWatchProjects() {
+        let sorted = autoWatchProjectIds.sorted { $0.uuidString < $1.uuidString }
+        doc.autoWatchProjectIds = sorted
+        defaults.set(sorted.map(\.uuidString), forKey: Self.autoWatchProjectsKey)
+        persist()
+    }
+
+    /// Kick off launch-time monitoring once per app run: activate all pinned
+    /// auto-watch projects and, if enabled, connect to each project's live agents to
+    /// inspect whether they're idle or working and watch active ones.
+    @discardableResult
+    func startMonitoringOnLaunch() -> Bool {
+        guard !didStartLaunchMonitoring else { return false }
+        didStartLaunchMonitoring = true
+        watchedProjectIds.formUnion(autoWatchProjectIds)
+        Self.sidebarLog.info("launchMonitoring autoWatchActive=\(self.autoWatchActiveOnLaunch) pinned=\(self.autoWatchProjectIds.count)")
+        if autoWatchActiveOnLaunch {
+            isLaunchMonitoringActive = true
+            isScanningActiveProjects = true
+            scanStatusText = "Scanning active projects…"
+            sidebarPollLoop?.cancel()
+            sidebarPollLoop = nil
+            Task {
+                defer { isLaunchMonitoringActive = false }
+                _ = await scanAndWatchWorkingProjects(announce: false)
+                if selectedProject == nil {
+                    startSidebarPolling(force: false, initialDelay: true)
+                }
+            }
+            return true
+        }
+        if !watchedProjectIds.isEmpty {
+            isLaunchMonitoringActive = true
+            sidebarPollLoop?.cancel()
+            sidebarPollLoop = nil
+            Task {
+                defer { isLaunchMonitoringActive = false }
+                await probeWatchedProjects()
+                if selectedProject == nil {
+                    startSidebarPolling(force: false, initialDelay: true)
+                }
+            }
+            return selectedProject == nil
+        }
+        return false
+    }
+
+    /// Connect to each pinned/watched project's live agents over a single batched PTY
+    /// probe so their real screen status (working / needs input / done / idle) appears
+    /// right when the app opens without requiring the user to tap into each project.
+    func probeWatchedProjects() async {
+        let targets = watchedProjectIds
+        guard !targets.isEmpty else { return }
+        for host in doc.hosts {
+            let allHostProjects = projects(for: host)
+            let watchedOnHost = allHostProjects.filter { targets.contains($0.id) }
+            guard !watchedOnHost.isEmpty else { continue }
+            let conn = connection(for: host)
+            guard (try? await conn.connect()) != nil else { continue }
+            // Sweep all projects on this host in one round trip (watched projects are
+            // prioritized first by `sweepHostProjects`) so the whole home screen populates.
+            _ = await sweepHostProjects(host: host, projects: allHostProjects,
+                                        connectIfNeeded: true, attachMonitors: false)
+            let rows = lastPaneRowsByHost[host.id] ?? []
+            var instancesByProject: [UUID: [Instance]] = [:]
+            for p in watchedOnHost {
+                if let cached = instanceCache[p.id]?.instances { instancesByProject[p.id] = cached }
+            }
+            var probeTargets: [(id: String, session: String, socket: String?, idle: TimeInterval, bell: Bool)] = []
+            for p in watchedOnHost {
+                for inst in instancesByProject[p.id] ?? [] where inst.kind == .terminal {
+                    guard let row = PollService.resolveRow(for: inst, in: rows),
+                          !row.exited, inst.program != nil else { continue }
+                    probeTargets.append((inst.id, row.session, row.socket ?? inst.tmuxSocket, row.idle, row.bell))
+                }
+            }
+            let probedScreens = await terminals.batchProbeScreens(targets: probeTargets, connection: conn)
+            applyProjectSweep(projects: watchedOnHost, instancesByProject: instancesByProject,
+                              rows: rows, extraScreens: probedScreens)
+            attachMonitorsForWatchedProjects(on: host, projects: watchedOnHost,
+                                             instancesByProject: instancesByProject,
+                                             rows: rows, conn: conn)
+        }
+        syncLiveActivity()
+    }
+
+    /// Pure heuristic: whether a project currently has at least one live agent
+    /// actively working or needing attention (explicit working/blocked/done status,
+    /// or recent tmux pane output within `activeWindowSecs`).
+    nonisolated static func isActivelyWorking(
+        results: [InstanceStatus],
+        rows: [PaneRow],
+        instances: [Instance],
+        activeWindowSecs: TimeInterval = 120
+    ) -> Bool {
+        let byId = Dictionary(instances.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        for r in results where r.running {
+            if r.status == .working || r.status == .blocked || r.status == .done {
+                return true
+            }
+            if let inst = byId[r.instanceId],
+               let row = PollService.resolveRow(for: inst, in: rows),
+               !row.exited, row.idle <= activeWindowSecs {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Connect to all hosts, read every project's layout + live tmux sessions, and
+    /// actually connect read-only (`tmux -u attach-session -r`) to each running agent
+    /// to inspect its live screen (working / needs input / done vs idle). Projects
+    /// actively working or needing attention stay watched with live monitors; purely
+    /// idle unpinned projects release their temporary probe channels cleanly.
+    @discardableResult
+    func scanAndWatchWorkingProjects(announce: Bool = false) async -> Int {
+        guard !doc.projects.isEmpty else {
+            let msg = "No projects to scan yet."
+            scanStatusText = msg
+            if announce { report(msg, duration: 3) }
+            return 0
+        }
+        isScanningActiveProjects = true
+        scanStatusText = "Connecting to hosts…"
+        defer { isScanningActiveProjects = false }
+
+        var activeIds = Set<UUID>()
+        var checkedProjects = 0
+        var checkedAgents = 0
+        var connectedHosts = 0
+        var totalConfiguredAgents = 0
+        var totalTmuxRows = 0
+        var discoveredSockets = Set<String>()
+
+        for host in doc.hosts {
+            let hostProjects = projects(for: host)
+            guard !hostProjects.isEmpty else { continue }
+            let conn = connection(for: host)
+            guard (try? await conn.connect()) != nil else { continue }
+            connectedHosts += 1
+
+            // 1. Fetch all layouts + tmux pane rows on this host in one sweep over the
+            // single pooled SSH connection (deferring persistent monitor attaches until
+            // after we know which projects are actually working).
+            let heuristicWorking = await sweepHostProjects(
+                host: host,
+                projects: hostProjects,
+                connectIfNeeded: true,
+                detectWorking: true,
+                attachMonitors: false)
+            let rows = lastPaneRowsByHost[host.id] ?? []
+            totalTmuxRows += rows.count
+            for r in rows { discoveredSockets.insert(r.socket ?? "default") }
+
+            var instancesByProject: [UUID: [Instance]] = [:]
+            for p in hostProjects {
+                if selectedProject?.id == p.id, let layout {
+                    instancesByProject[p.id] = layout.orderedTerminalInstances
+                } else if let cached = instanceCache[p.id]?.instances {
+                    instancesByProject[p.id] = cached
+                }
+                totalConfiguredAgents += (instancesByProject[p.id] ?? []).count
+            }
+
+            // 2. Identify every project with at least one live running agent in tmux.
+            var projectProbes: [(project: RemoteProject, agents: [(inst: Instance, row: PaneRow)])] = []
+            var allProbeTargets: [(id: String, session: String, socket: String?, idle: TimeInterval, bell: Bool)] = []
+            for p in hostProjects {
+                let liveAgents: [(Instance, PaneRow)] = (instancesByProject[p.id] ?? []).compactMap { inst in
+                    guard inst.kind == .terminal,
+                          let row = PollService.resolveRow(for: inst, in: rows),
+                          !row.exited else { return nil }
+                    return (inst, row)
+                }
+                // Prefer non-shell agent programs for screen probing; include all live panes if needed.
+                let preferred = liveAgents.filter { $0.0.program != nil }
+                let toProbe = preferred.isEmpty ? liveAgents : preferred
+                if !toProbe.isEmpty {
+                    projectProbes.append((p, toProbe))
+                    for (inst, row) in toProbe {
+                        allProbeTargets.append((inst.id, row.session, row.socket ?? inst.tmuxSocket, row.idle, row.bell))
+                    }
+                }
+            }
+
+            // 3. Snapshot EVERY live agent across ALL projects on this host over ONE
+            // single SSH PTY channel (~150ms per agent, zero extra connections, zero
+            // capture-pane), then classify all projects at once and only attach
+            // persistent monitors to projects that are actually active or pinned.
+            if !allProbeTargets.isEmpty {
+                scanStatusText = "Checking \(allProbeTargets.count) live \(allProbeTargets.count == 1 ? "agent" : "agents") on \(host.name)…"
+            }
+            let probedScreens = await terminals.batchProbeScreens(targets: allProbeTargets, connection: conn)
+            checkedProjects += projectProbes.count
+            checkedAgents += allProbeTargets.count
+
+            var liveProbedActive = Set<UUID>()
+            for entry in projectProbes {
+                let project = entry.project
+                let allInsts = instancesByProject[project.id] ?? []
+                var screens = liveScreens(for: allInsts)
+                var gotScreen = false
+                for inst in allInsts {
+                    if let s = probedScreens[inst.id] {
+                        screens[inst.id] = s
+                        gotScreen = true
+                    }
+                }
+                let results = poll.classify(rows: rows, instances: allInsts, liveScreens: screens)
+                let now = Date().timeIntervalSince1970
+                recordObservedProbeOutcomes(results: results, probedIds: Set(probedScreens.keys), rows: rows, instances: allInsts, now: now)
+                LastWorkedStore.record(results, now: now, defaults: defaults)
+                StatusPoller.recordObservedStatuses(results, defaults: defaults)
+                projectActivity[project.id] = Self.aggregate(results, instances: allInsts)
+                let byId = Dictionary(allInsts.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+                summaryRowsByProject[project.id] = results.compactMap { r in
+                    guard r.running else { return nil }
+                    let inst = byId[r.instanceId]
+                    let name = inst?.displayName ?? "agent"
+                    let paneIdle = inst.flatMap { PollService.resolveRow(for: $0, in: rows)?.idle }
+                    let lastActive = LastWorkedStore.effectiveLastActiveAt(
+                        instance: inst, status: r.status, running: r.running,
+                        paneIdle: paneIdle, now: now, defaults: defaults)
+                    return ActivitySummaryBuilder.row(
+                        id: r.instanceId, name: name, project: project.name,
+                        status: r.status, running: r.running, lastActiveAt: lastActive)
+                }
+
+                let screenSaysWorking = results.contains {
+                    $0.running && ($0.status == .working || $0.status == .blocked || $0.status == .done)
+                }
+                // Trust real live screens when captured; fall back to tmux activity
+                // when no PTY is available (e.g. unit-test mocks).
+                let isWorking = gotScreen ? screenSaysWorking : heuristicWorking.contains(project.id)
+                if isWorking {
+                    liveProbedActive.insert(project.id)
+                    manuallyUnwatchedProjectIds.remove(project.id)
+                    watchedProjectIds.insert(project.id)
+                }
+            }
+
+            let watchedHere = hostProjects.filter { watchedProjectIds.contains($0.id) }
+            if !watchedHere.isEmpty {
+                attachMonitorsForWatchedProjects(
+                    on: host, projects: watchedHere, instancesByProject: instancesByProject,
+                    rows: rows, conn: conn)
+            }
+
+            activeIds.formUnion(liveProbedActive)
+        }
+
+        if !activeIds.isEmpty, selectedProject == nil {
+            startSidebarPolling(force: false, initialDelay: true)
+        }
+        syncLiveActivity()
+
+        let summary: String
+        if checkedAgents == 0 {
+            if connectedHosts == 0 {
+                summary = "Couldn't connect to host."
+            } else if totalConfiguredAgents == 0 {
+                summary = "No agents configured in projects."
+            } else if totalTmuxRows == 0 {
+                let errSuffix = poll.lastError.map { " — \($0)" } ?? ""
+                summary = "0 tmux sessions found (\(totalConfiguredAgents) agents configured)\(errSuffix)."
+            } else {
+                let socks = discoveredSockets.sorted().joined(separator: ", ")
+                summary = "Found \(totalTmuxRows) tmux sessions (\(socks)), 0 matched \(totalConfiguredAgents) agents."
+            }
+        } else if activeIds.isEmpty {
+            summary = "Checked \(checkedAgents) \(checkedAgents == 1 ? "agent" : "agents") across \(checkedProjects) \(checkedProjects == 1 ? "project" : "projects") — all idle."
+        } else {
+            let n = activeIds.count
+            summary = "Watching \(n) active \(n == 1 ? "project" : "projects") (\(checkedAgents) \(checkedAgents == 1 ? "agent" : "agents") checked)."
+        }
+        scanStatusText = summary
+        if announce {
+            report(summary, style: activeIds.isEmpty ? .error : .success, duration: 4)
+        }
+        return activeIds.count
+    }
 
     /// Live running-instance count for `project`. The selected project uses the live
     /// `running` set; others use the latest cross-project sweep (`nil` = unknown, e.g.
@@ -194,22 +723,119 @@ final class AppState: ObservableObject {
         return projectActivity[project.id]?.running
     }
 
-    /// Full activity counts for `project` (running / blocked / done) for the sidebar.
-    /// The selected project is derived live; others come from the sweep. `nil` when
-    /// unknown so the row shows no badge rather than a misleading zero.
+    /// Full activity for `project` (running / blocked / done + per-agent summaries
+    /// and dots) for the sidebar. The selected project is derived live; others come
+    /// from the latest snapshot/sweep. `nil` when unknown so the row shows no badge.
     func activity(for project: RemoteProject) -> ProjectActivity? {
         if selectedProject?.id == project.id {
-            var a = ProjectActivity(running: running.count, blocked: 0, done: 0)
-            for id in running {
-                switch statuses[id] {
-                case .blocked: a.blocked += 1
-                case .done: a.done += 1
-                default: break
-                }
-            }
-            return a
+            return liveSelectedActivity() ?? projectActivity[project.id]
         }
         return projectActivity[project.id]
+    }
+
+    private func liveSelectedActivity() -> ProjectActivity? {
+        guard let layout else { return nil }
+        let instances = layout.orderedTerminalInstances
+        if hasPolledSelectedProject {
+            let results = instances.map { inst in
+                InstanceStatus(instanceId: inst.id,
+                               status: statuses[inst.id] ?? .idle,
+                               running: running.contains(inst.id))
+            }
+            return Self.aggregate(results, instances: instances)
+        }
+        // Before the first poll returns after selecting, preserve any previously polled
+        // statuses for matching instances rather than flickering everything to stopped.
+        let prior = selectedProject
+            .flatMap { projectActivity[$0.id]?.agents }
+            .map { Dictionary($0.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a }) } ?? [:]
+        let results = instances.map { inst in
+            if let prev = prior[inst.id] {
+                return InstanceStatus(instanceId: inst.id, status: prev.status, running: prev.running)
+            }
+            return InstanceStatus(instanceId: inst.id,
+                                  status: inst.activity?.currentState ?? .idle,
+                                  running: false)
+        }
+        return Self.aggregate(results, instances: instances)
+    }
+
+    /// Attention-priority sort for per-project status dots: blocked (needs input) →
+    /// working → done → idle, keeping the row stable across polls.
+    nonisolated static func sortAgentStatuses(_ list: [AgentStatus]) -> [AgentStatus] {
+        func rank(_ s: AgentStatus) -> Int {
+            switch s {
+            case .blocked: return 0
+            case .working: return 1
+            case .done: return 2
+            case .idle: return 3
+            }
+        }
+        return list.sorted { rank($0) < rank($1) }
+    }
+
+    /// Attention-priority sort for per-project agent rows: running `blocked` →
+    /// running `working` → running `done` → running `idle` → stopped, preserving
+    /// tab order within the same priority tier.
+    nonisolated static func sortAgents(_ list: [AgentSummary]) -> [AgentSummary] {
+        func rank(_ a: AgentSummary) -> Int {
+            guard a.running else { return 4 }
+            switch a.status {
+            case .blocked: return 0
+            case .working: return 1
+            case .done: return 2
+            case .idle: return 3
+            }
+        }
+        return list.enumerated()
+            .sorted { lhs, rhs in
+                let rl = rank(lhs.element), rr = rank(rhs.element)
+                return rl != rr ? rl < rr : lhs.offset < rhs.offset
+            }
+            .map(\.element)
+    }
+
+    func isHostCollapsed(_ hostId: UUID) -> Bool {
+        collapsedHostIds.contains(hostId)
+    }
+
+    func toggleHostCollapsed(_ hostId: UUID) {
+        setHostCollapsed(hostId, !collapsedHostIds.contains(hostId))
+    }
+
+    func setHostCollapsed(_ hostId: UUID, _ collapsed: Bool) {
+        let changed = collapsed
+            ? collapsedHostIds.insert(hostId).inserted
+            : (collapsedHostIds.remove(hostId) != nil)
+        guard changed else { return }
+        persistCollapsedHosts()
+    }
+
+    private func persistCollapsedHosts() {
+        let sorted = collapsedHostIds.map(\.uuidString).sorted()
+        defaults.set(sorted, forKey: Self.collapsedHostsKey)
+    }
+
+    /// Rolled-up live activity counts + sorted per-agent statuses across every project
+    /// under `host` — shown on a collapsed host header so agent dots stay visible.
+    func hostActivity(for host: Host) -> ProjectActivity? {
+        var total = ProjectActivity(running: 0, blocked: 0, done: 0)
+        var statuses: [AgentStatus] = []
+        var agents: [AgentSummary] = []
+        var anyKnown = false
+        for project in projects(for: host) {
+            if let a = activity(for: project) {
+                anyKnown = true
+                total.running += a.running
+                total.blocked += a.blocked
+                total.done += a.done
+                statuses.append(contentsOf: a.agentStatuses)
+                agents.append(contentsOf: a.agents)
+            }
+        }
+        total.agentStatuses = Self.sortAgentStatuses(statuses)
+        total.agents = Self.sortAgents(agents)
+        return anyKnown ? total : nil
     }
 
     // MARK: Host / project CRUD
@@ -224,6 +850,7 @@ final class AppState: ObservableObject {
                 + "you may need to re-add it or check the device's Keychain access.",
                 duration: 8)
         }
+        Task { await requestNotificationsIfNeeded() }
     }
 
     /// Connect to `host` with a *fresh* connection (re-reading its Keychain secret) to
@@ -312,8 +939,14 @@ final class AppState: ObservableObject {
         HostKeyStore().clear(for: host.id)
         terminals.disconnect(forHost: host.id)
         connections[host.id] = nil
+        let removedProjects = Set(doc.projects.filter { $0.hostId == host.id }.map(\.id))
         doc.projects.removeAll { $0.hostId == host.id }
         doc.hosts.removeAll { $0.id == host.id }
+        pruneOpenedProjects(removing: removedProjects)
+        setHostCollapsed(host.id, false)
+        if let sel = selectedProject, sel.hostId == host.id {
+            deselect()
+        }
         persist()
     }
 
@@ -363,6 +996,7 @@ final class AppState: ObservableObject {
 
     func addProject(_ project: RemoteProject) {
         doc.projects.append(project)
+        setHostCollapsed(project.hostId, false)
         persist()
         // Onboarding: land on the project you just added (its empty layout shows the
         // "Launch one" CTA, completing the add-host → add-project → launch chain).
@@ -397,15 +1031,27 @@ final class AppState: ObservableObject {
             doc.projects.append(project)
             added.append(project)
         }
+        if !added.isEmpty { setHostCollapsed(host.id, false) }
         persist()
         // Importing exactly one project opens it; multiple stay in the sidebar (which
         // one to open is ambiguous, and the fresh badges are the payoff there).
-        if added.count == 1 { select(added[0]) }
+        if added.count == 1 {
+            select(added[0])
+        } else if !added.isEmpty, selectedProject == nil {
+            startSidebarPolling()
+        }
     }
 
     func deleteProject(_ project: RemoteProject) {
         doc.projects.removeAll { $0.id == project.id }
-        if selectedProject?.id == project.id { selectedProject = nil; layout = nil }
+        pruneOpenedProjects(removing: [project.id])
+        projectActivity[project.id] = nil
+        layoutCache[project.id] = nil
+        instanceCache[project.id] = nil
+        if selectedProject?.id == project.id { deselect() }
+        else if UserDefaults.standard.string(forKey: Self.lastSelectedProjectKey) == project.id.uuidString {
+            UserDefaults.standard.removeObject(forKey: Self.lastSelectedProjectKey)
+        }
         persist()
     }
 
@@ -439,17 +1085,31 @@ final class AppState: ObservableObject {
     /// background `StatusPoller` refines it with a full multi-project scan.
     func currentSummarySnapshot() -> MuxelActivityAttributes.ContentState? {
         var rows: [MuxelActivityAttributes.InstanceRow] = []
-        var selectedIds = Set<String>()
+        var seenIds = Set<String>()
         if let sel = selectedProject, let layout {
+            let hostRows = lastPaneRowsByHost[sel.hostId] ?? []
+            let now = Date().timeIntervalSince1970
             for inst in layout.orderedTerminalInstances {
-                selectedIds.insert(inst.id)
+                seenIds.insert(inst.id)
+                let st = statuses[inst.id] ?? .idle
+                let isRun = running.contains(inst.id)
+                let paneIdle = PollService.resolveRow(for: inst, in: hostRows)?.idle
+                let lastActive = LastWorkedStore.effectiveLastActiveAt(
+                    instance: inst, status: st, running: isRun,
+                    paneIdle: paneIdle, now: now, defaults: defaults)
                 rows.append(ActivitySummaryBuilder.row(
                     id: inst.id, name: inst.displayName, project: sel.name,
-                    status: statuses[inst.id] ?? .idle, running: running.contains(inst.id)))
+                    status: st, running: isRun, lastActiveAt: lastActive))
             }
         }
-        // Carry other projects' instances from the last full background scan.
-        for r in SummaryCache.load()?.instances ?? [] where !selectedIds.contains(r.id) {
+        // Overlay fresh rows from foreground sidebar/sibling sweeps across all projects.
+        for (projectId, projectRows) in summaryRowsByProject where projectId != selectedProject?.id {
+            for r in projectRows where seenIds.insert(r.id).inserted {
+                rows.append(r)
+            }
+        }
+        // Fall back to the last cached background scan for any project not yet swept.
+        for r in SummaryCache.load()?.instances ?? [] where seenIds.insert(r.id).inserted {
             rows.append(r)
         }
         let state = ActivitySummaryBuilder.contentState(rows: rows, now: Date())
@@ -464,37 +1124,135 @@ final class AppState: ObservableObject {
     func syncLiveActivity() {
         let state = currentSummarySnapshot()
             ?? ActivitySummaryBuilder.contentState(rows: [], now: Date())
+        if !state.isEmpty { SummaryCache.save(state) }
         Task { await LiveActivityController.apply(state) }
     }
 
     // MARK: Selecting a project (connect + read layout + poll)
 
-    func select(_ project: RemoteProject) {
+    private static let lastSelectedProjectKey = "muxel.lastSelectedProjectId"
+    private var didRestoreLastProject = false
+
+    /// Restore the project the user last had open (called once from the UI on launch,
+    /// so unit tests constructing `AppState` don't auto-dial).
+    func restoreLastProjectIfNeeded(defaults: UserDefaults = .standard) {
+        guard !didRestoreLastProject else { return }
+        didRestoreLastProject = true
+        guard selectedProject == nil,
+              let raw = defaults.string(forKey: Self.lastSelectedProjectKey),
+              let id = UUID(uuidString: raw),
+              let project = doc.projects.first(where: { $0.id == id })
+        else { return }
+        select(project)
+    }
+
+    /// Deep-link from a tapped notification: jump straight to the notified project and
+    /// focus the exact agent tab, clearing its done latch.
+    func openNotificationRoute(_ route: NotificationRoute) {
+        guard let project = doc.projects.first(where: { $0.id == route.projectId }) else { return }
+        if isHostCollapsed(project.hostId) {
+            toggleHostCollapsed(project.hostId)
+        }
+        attend(route.instanceId)
+        select(project, focusingInstance: route.instanceId)
+    }
+
+    func select(_ project: RemoteProject, focusingInstance: String? = nil) {
+        if let prev = selectedProject, prev.id != project.id,
+           let snapshot = liveSelectedActivity() {
+            projectActivity[prev.id] = snapshot
+        }
+        markProjectOpened(project.id)
+        if let focusingInstance {
+            lastLaunched = focusingInstance
+        }
+        if selectedProject?.id == project.id {
+            if let focusingInstance,
+               layout?.orderedPaneInstances.contains(where: { $0.id == focusingInstance }) != true {
+                Task { await refreshLayout() }
+            }
+            return
+        }
         selectedProject = project
-        layout = nil
-        layoutLoad = .loading
-        statuses = [:]
-        running = []
+        UserDefaults.standard.set(project.id.uuidString, forKey: Self.lastSelectedProjectKey)
+        if let cached = layoutCache[project.id] {
+            layout = cached
+            layoutLoad = .loaded
+            if let prior = projectActivity[project.id] {
+                var nextStatuses: [String: AgentStatus] = [:]
+                var nextRunning = Set<String>()
+                for agent in prior.agents {
+                    nextStatuses[agent.id] = agent.status
+                    if agent.running { nextRunning.insert(agent.id) }
+                }
+                statuses = nextStatuses
+                running = nextRunning
+            } else {
+                statuses = [:]
+                running = []
+            }
+        } else {
+            layout = nil
+            layoutLoad = .loading
+            statuses = [:]
+            running = []
+        }
+        pollTick = 0
+        hasPolledSelectedProject = false
+        sidebarPollLoop?.cancel()
+        sidebarPollLoop = nil
         Task { await refreshLayout() }
         startPolling()
+    }
+
+    /// Returns a confirmed live `(session, socket)` target for `instance` from a
+    /// recent host sweep (within 20s) when the instance already has a matching durable
+    /// binding and no pending local layout write — allowing `TerminalPaneView` to
+    /// open the PTY immediately without waiting for extra pre-flight SSH round trips.
+    func fastAttachTarget(for instance: Instance, in project: RemoteProject, hostId: UUID) -> TmuxCommands.SessionTarget? {
+        guard !instance.literalArgv,
+              !pendingLaunches.contains(instance.id),
+              layoutWriteChain == nil,
+              let recordedName = instance.tmuxSession, !recordedName.isEmpty,
+              let recordedSocket = instance.tmuxSocket,
+              let fetchedAt = lastPaneRowsAtByHost[hostId],
+              Date().timeIntervalSince1970 - fetchedAt <= 20,
+              let rows = lastPaneRowsByHost[hostId],
+              let row = TmuxCommands.resolveTarget(instance, in: rows,
+                                                   name: { $0.session }, socket: { $0.socket }),
+              !row.exited,
+              row.session == recordedName,
+              (row.socket ?? recordedSocket) == recordedSocket
+        else { return nil }
+        return TmuxCommands.SessionTarget(name: recordedName, socket: recordedSocket)
     }
 
     /// Leave the active project (the detail was popped on iPhone). Clearing the
     /// selection is what lets the *same* project be re-selected: the sidebar binds
     /// navigation to `selectedProject?.id`, so if it stays set, the row reads as
-    /// already-selected and tapping it again does nothing. Stops the foreground poll;
-    /// background notifications stay on the `StatusPoller`.
+    /// already-selected and tapping it again does nothing. Switches to gentle
+    /// home-screen polling so per-project status dots stay fresh.
     func deselect() {
+        if let prev = selectedProject, let snapshot = liveSelectedActivity() {
+            projectActivity[prev.id] = snapshot
+        }
         selectedProject = nil
+        activeViewedInstanceId = nil
+        UserDefaults.standard.removeObject(forKey: Self.lastSelectedProjectKey)
         layout = nil
         layoutLoad = .idle
         statuses = [:]
         running = []
-        stopPolling()
+        hasPolledSelectedProject = false
+        pollLoop?.cancel()
+        pollLoop = nil
+        startSidebarPolling(force: true)
     }
 
     func refreshLayout() async {
         guard let project = selectedProject, let host = host(for: project) else { return }
+        isRefreshingLayout = true
+        defer { isRefreshingLayout = false }
         // Only show the loading state when nothing is loaded yet — a refresh of
         // already-visible panes shouldn't flicker the terminal away.
         if layout == nil { layoutLoad = .loading }
@@ -505,6 +1263,13 @@ final class AppState: ObservableObject {
             guard selectedProject?.id == project.id else { return }
             layout = fresh
             layoutLoad = .loaded
+            if let fresh {
+                layoutCache[project.id] = fresh
+                instanceCache[project.id] = (fresh.orderedTerminalInstances, Date().timeIntervalSince1970)
+                if let snapshot = liveSelectedActivity() {
+                    projectActivity[project.id] = snapshot
+                }
+            }
             await runPollOnce()
         } catch {
             guard selectedProject?.id == project.id else { return }
@@ -528,34 +1293,359 @@ final class AppState: ObservableObject {
         }
     }
 
-    func stopPolling() { pollLoop?.cancel(); pollLoop = nil }
+    func stopPolling() {
+        pollLoop?.cancel(); pollLoop = nil
+        sidebarPollLoop?.cancel(); sidebarPollLoop = nil
+    }
 
-    /// Foreground return: restart the poll loop and re-read the layout. `startPolling`
-    /// is otherwise only reached via `select`, and `.background` cancels the loop — so
-    /// without this the 3s status loop stays dead after the first backgrounding until
-    /// the user re-selects a project, leaving status dots and the Live Activity stale.
+    /// Ensure the home-screen poll loop is active whenever the sidebar appears with
+    /// projects and no project currently selected. Skips while launch monitoring or an
+    /// active-project scan is already sweeping hosts so cold-launch sweeps never race.
+    func ensureSidebarPolling() {
+        guard selectedProject == nil,
+              sidebarPollLoop == nil,
+              !isScanningActiveProjects,
+              !isLaunchMonitoringActive,
+              !doc.projects.isEmpty else { return }
+        startSidebarPolling(force: false)
+    }
+
+    /// Foreground home-screen poll loop while no project is open: polls every 5s when
+    /// any project is actively watched, or gently every 12s otherwise. When `force` is
+    /// false and a loop is already active, leaves the in-flight sweep running so
+    /// redundant lifecycle callbacks (`scenePhase == .active`) never cancel an SSH read.
+    private func startSidebarPolling(force: Bool = false, initialDelay: Bool = false) {
+        if !force, sidebarPollLoop != nil { return }
+        sidebarPollLoop?.cancel()
+        guard selectedProject == nil, !doc.projects.isEmpty else {
+            sidebarPollLoop = nil
+            return
+        }
+        sidebarPollLoop = Task { [weak self] in
+            if !initialDelay {
+                await self?.refreshSidebarStatuses(connectIfNeeded: true)
+            }
+            while !Task.isCancelled {
+                let intervalNs: UInt64 = (self?.watchedProjectIds.isEmpty ?? true)
+                    ? 12_000_000_000
+                    : 5_000_000_000
+                try? await Task.sleep(nanoseconds: intervalNs)
+                guard !Task.isCancelled else { break }
+                await self?.refreshSidebarStatuses(connectIfNeeded: true)
+            }
+        }
+    }
+
+    /// Foreground return: restart the active project poll loop, or kick off a
+    /// home-screen status sweep across reachable hosts when no project is open.
     func resumeForeground() {
-        guard selectedProject != nil else { return }
-        startPolling()
-        Task { await refreshLayout() }
+        if selectedProject != nil {
+            startPolling()
+            Task { await refreshLayout() }
+        } else if !isScanningActiveProjects, !isLaunchMonitoringActive {
+            startSidebarPolling(force: false)
+        }
     }
 
     /// Pull-to-refresh from the sidebar: refresh notification permission, re-read the
-    /// selected layout, and force an immediate cross-project badge sweep (not gated on
-    /// the poll tick).
+    /// selected layout, and force an immediate cross-project status sweep across all
+    /// hosts (connecting if needed so agents and status dots populate right away).
     func refreshAll() async {
+        instanceCache.removeAll()
         await refreshNotificationStatus()
         if selectedProject != nil { await refreshLayout() }
-        if let host = selectedProject.flatMap({ host(for: $0) }) {
-            let conn = connection(for: host)
-            let instances = await hostInstances(on: host.id, conn: conn)
-            let rows = await poll.fetchPaneRows(conn, instances: instances.values.flatMap { $0 })
-            await sweepOtherProjects(selectedHostId: host.id, selectedRows: rows,
-                                     selectedInstances: instances)
-        } else {
-            // No selection → sweep every host that already has a pooled connection.
-            await sweepOtherProjects(selectedHostId: UUID(), selectedRows: [])
+        await refreshSidebarStatuses(connectIfNeeded: true)
+    }
+
+    /// Sweep every host with projects in parallel (connecting silently if needed) so
+    /// the home screen displays per-project agents + status dots for all reachable hosts.
+    /// Projects are swept in watched/opened-first order in small chunks so the top of
+    /// each host populates immediately even when dozens of projects exist. When
+    /// `autoWatchActiveOnLaunch` is enabled, newly-working projects are also watched.
+    func refreshSidebarStatuses(connectIfNeeded: Bool) async {
+        let selectedProjectId = selectedProject?.id
+        let hostsWithProjects = doc.hosts.compactMap { host -> (Host, [RemoteProject])? in
+            let list = projects(for: host).filter { $0.id != selectedProjectId }
+            return list.isEmpty ? nil : (host, list)
         }
+        guard !hostsWithProjects.isEmpty else { return }
+        let autoDetect = autoWatchActiveOnLaunch
+        var newlyWorking = Set<UUID>()
+        await withTaskGroup(of: Set<UUID>.self) { group in
+            for (host, projects) in hostsWithProjects {
+                group.addTask { @MainActor [weak self] in
+                    guard let self else { return [] }
+                    return await self.sweepHostProjects(
+                        host: host,
+                        projects: projects,
+                        connectIfNeeded: connectIfNeeded,
+                        detectWorking: autoDetect)
+                }
+            }
+            for await found in group {
+                newlyWorking.formUnion(found)
+            }
+        }
+        if autoDetect {
+            let eligible = newlyWorking.subtracting(manuallyUnwatchedProjectIds)
+            if !eligible.isEmpty {
+                watchedProjectIds.formUnion(eligible)
+            }
+        }
+        syncLiveActivity()
+    }
+
+    /// Incrementally read layouts + poll tmux status for `projects` on `host`.
+    /// Watched and cached projects update first; uncached projects update progressively
+    /// in small chunks. When `detectWorking` is true, returns the ids of projects with
+    /// an agent currently working or needing attention.
+    @discardableResult
+    private func sweepHostProjects(
+        host: Host,
+        projects: [RemoteProject],
+        connectIfNeeded: Bool,
+        preFetchedRows: [PaneRow]? = nil,
+        detectWorking: Bool = false,
+        attachMonitors: Bool = true
+    ) async -> Set<UUID> {
+        let conn: SSHConnection
+        if let existing = existingConnection(for: host.id) {
+            conn = existing
+        } else if connectIfNeeded {
+            conn = connection(for: host)
+        } else {
+            return []
+        }
+        if connectIfNeeded {
+            // Silently skip unreachable hosts so one offline box never
+            // blocks dots on other hosts or spams error banners.
+            guard (try? await conn.connect()) != nil else { return [] }
+        }
+
+        // Prioritize watched projects ahead of non-watched ones so monitored projects
+        // refresh first on hosts with many repos.
+        let ordered = projects.filter { watchedProjectIds.contains($0.id) }
+            + projects.filter { !watchedProjectIds.contains($0.id) }
+
+        let now = Date().timeIntervalSince1970
+        var cachedProjects: [RemoteProject] = []
+        var cachedInstancesByProject: [UUID: [Instance]] = [:]
+        var stale: [RemoteProject] = []
+        for project in ordered {
+            if selectedProject?.id == project.id, let layout {
+                cachedProjects.append(project)
+                cachedInstancesByProject[project.id] = layout.orderedTerminalInstances
+            } else if let hit = instanceCache[project.id], now - hit.at < instanceCacheTTL {
+                cachedProjects.append(project)
+                cachedInstancesByProject[project.id] = hit.instances
+            } else {
+                stale.append(project)
+            }
+        }
+
+        let chunkSize = 10
+        var totalLayouts = cachedInstancesByProject.values.filter { !$0.isEmpty }.count
+        var rows: [PaneRow]? = preFetchedRows
+        var queriedSockets = Set([TmuxCommands.socketName, "default"]
+            + cachedInstancesByProject.values.flatMap { $0 }.compactMap(\.tmuxSocket))
+        var knownInstances: [Instance] = cachedInstancesByProject.values.flatMap { $0 }
+        var workingProjectIds = Set<UUID>()
+
+        // If we already have cached projects, refresh them immediately in one round trip.
+        if !cachedProjects.isEmpty {
+            if rows == nil {
+                rows = await poll.fetchPaneRows(conn, instances: knownInstances)
+            }
+            // If tmux reports a live `muxel_*` session not matched by any cached
+            // instance (e.g. desktop just opened a new pane/prompt), re-read cached
+            // layouts immediately instead of waiting for `instanceCacheTTL`.
+            if let currentRows = rows,
+               Self.hasUnmatchedLiveMuxelSession(rows: currentRows, knownInstances: knownInstances),
+               now - (lastUnmatchedRefreshByHost[host.id] ?? 0) > 5 {
+                lastUnmatchedRefreshByHost[host.id] = now
+                let refreshable = cachedProjects.filter { $0.id != selectedProject?.id }
+                for p in refreshable { instanceCache.removeValue(forKey: p.id) }
+                stale.insert(contentsOf: refreshable, at: 0)
+            }
+            let cachedProbed = attachMonitors
+                ? await probeActiveUnattachedAgents(
+                    instances: cachedInstancesByProject.values.flatMap { $0 },
+                    rows: rows ?? [],
+                    conn: conn)
+                : [:]
+            let found = applyProjectSweep(projects: cachedProjects,
+                                          instancesByProject: cachedInstancesByProject,
+                                          rows: rows ?? [],
+                                          detectWorking: detectWorking,
+                                          extraScreens: cachedProbed,
+                                          probedIds: Set(cachedProbed.keys))
+            workingProjectIds.formUnion(found)
+        }
+
+        // Read uncached layouts in small chunks (watched/opened projects first) BEFORE
+        // fetching pane rows if we haven't fetched yet, so custom recorded sockets on
+        // this host are included in the very first `list-panes` query.
+        var offset = 0
+        while offset < stale.count {
+            guard !Task.isCancelled else { break }
+            let end = min(offset + chunkSize, stale.count)
+            let chunk = Array(stale[offset..<end])
+            offset = end
+
+            let chunkInstances = await readProjectChunk(chunk, conn: conn, now: Date().timeIntervalSince1970)
+            let chunkFlat = chunkInstances.values.flatMap { $0 }
+            knownInstances.append(contentsOf: chunkFlat)
+            totalLayouts += chunkInstances.values.filter { !$0.isEmpty }.count
+
+            let chunkSockets = Set(chunkFlat.compactMap(\.tmuxSocket))
+            if rows == nil || (rows?.isEmpty == true && !chunkFlat.isEmpty) || !chunkSockets.subtracting(queriedSockets).isEmpty {
+                queriedSockets.formUnion(chunkSockets)
+                rows = await poll.fetchPaneRows(conn, instances: knownInstances)
+            }
+            let chunkProbed = attachMonitors
+                ? await probeActiveUnattachedAgents(instances: chunkFlat, rows: rows ?? [], conn: conn)
+                : [:]
+            let found = applyProjectSweep(projects: chunk,
+                                          instancesByProject: chunkInstances,
+                                          rows: rows ?? [],
+                                          detectWorking: detectWorking,
+                                          extraScreens: chunkProbed,
+                                          probedIds: Set(chunkProbed.keys))
+            workingProjectIds.formUnion(found)
+        }
+
+        let finalRows = rows ?? []
+        lastPaneRowsByHost[host.id] = finalRows
+        lastPaneRowsAtByHost[host.id] = Date().timeIntervalSince1970
+        var allInstancesByProject = cachedInstancesByProject
+        for p in ordered {
+            if let cached = instanceCache[p.id]?.instances {
+                allInstancesByProject[p.id] = cached
+            }
+        }
+        let watchedHere = ordered.filter { watchedProjectIds.contains($0.id) || workingProjectIds.contains($0.id) }
+        if attachMonitors, !watchedHere.isEmpty {
+            attachMonitorsForWatchedProjects(
+                on: host, projects: watchedHere, instancesByProject: allInstancesByProject,
+                rows: finalRows, conn: conn)
+        }
+
+        let activeCount = ordered.filter { (projectActivity[$0.id]?.running ?? 0) > 0 }.count
+        let withAgents = ordered.filter { !(projectActivity[$0.id]?.agents.isEmpty ?? true) }.count
+        Self.sidebarLog.info("host=\(host.name, privacy: .public) projects=\(ordered.count) layouts=\(totalLayouts) tmuxRows=\(finalRows.count) withAgents=\(withAgents) activeProjects=\(activeCount)")
+        return workingProjectIds
+    }
+
+    /// Attach lightweight read-only (`tmux attach-session -r`, i.e. `read-only,ignore-size`)
+    /// background monitors for live running agents inside watched projects so the home
+    /// screen shows real screen-marker `working` / `needs input` / `done` status without
+    /// opening the project and without resizing desktop's tmux window.
+    private func attachMonitorsForWatchedProjects(
+        on host: Host,
+        projects: [RemoteProject],
+        instancesByProject: [UUID: [Instance]],
+        rows: [PaneRow],
+        conn: SSHConnection
+    ) {
+        guard !rows.isEmpty else { return }
+        // Prioritize actively working / blocked / recently-active marker-bearing agents
+        // ahead of long-idle agents so monitor slots always go where work is happening.
+        var candidates: [(activeRank: Int, markerRank: Int, inst: Instance, row: PaneRow)] = []
+        for project in projects where project.id != selectedProject?.id {
+            guard let instances = instancesByProject[project.id] else { continue }
+            for inst in instances where inst.kind == .terminal {
+                guard let row = PollService.resolveRow(for: inst, in: rows),
+                      !row.exited else { continue }
+                let (w, b) = defaultMarkers(program: inst.program, args: inst.args)
+                let markerRank = !(w.isEmpty && b.isEmpty) ? 0 : (inst.program != nil ? 1 : 2)
+                let observed = lastObservedStatusByInstance[inst.id]
+                let activeRank: Int
+                if observed == .working || observed == .blocked {
+                    activeRank = 0
+                } else if row.idle <= 20 {
+                    activeRank = 1
+                } else {
+                    activeRank = 2
+                }
+                candidates.append((activeRank, markerRank, inst, row))
+            }
+        }
+        candidates.sort {
+            if $0.activeRank != $1.activeRank { return $0.activeRank < $1.activeRank }
+            return $0.markerRank < $1.markerRank
+        }
+        for item in candidates where item.markerRank < 2 {
+            let cmd = TmuxCommands.attachReadOnlyPTYCommand(
+                session: item.row.session,
+                socket: item.row.socket ?? item.inst.tmuxSocket)
+            terminals.startBackgroundMonitor(
+                for: item.inst.id, hostId: host.id, connection: conn, command: cmd,
+                evictIdleIfNeeded: item.activeRank < 2
+            ) { [weak self] in
+                self?.reclassifyMonitoredProjects(on: host.id)
+            }
+        }
+    }
+
+    /// Re-run local classification on cached instances + rows for `hostId` using the
+    /// latest live screens (0 extra SSH round trips) right after a background monitor
+    /// finishes its initial screen paint.
+    private func reclassifyMonitoredProjects(on hostId: UUID) {
+        guard let host = host(id: hostId) else { return }
+        let rows = lastPaneRowsByHost[hostId] ?? []
+        let hostProjects = projects(for: host).filter { $0.id != selectedProject?.id }
+        var map: [UUID: [Instance]] = [:]
+        for p in hostProjects {
+            if let cached = instanceCache[p.id]?.instances { map[p.id] = cached }
+        }
+        guard !map.isEmpty else { return }
+        applyProjectSweep(projects: hostProjects, instancesByProject: map, rows: rows)
+        syncLiveActivity()
+    }
+
+    private func readProjectChunk(
+        _ chunk: [RemoteProject],
+        conn: SSHConnection,
+        now: TimeInterval
+    ) async -> [UUID: [Instance]] {
+        var result: [UUID: [Instance]] = [:]
+        if chunk.count > 1 {
+            let roots = chunk.map(\.remoteRoot)
+            var batched = await RemoteLayoutStore.readMany(conn, roots: roots)
+            if batched == nil, (try? await conn.connect()) != nil {
+                batched = await RemoteLayoutStore.readMany(conn, roots: roots)
+            }
+            if let batched {
+                for project in chunk {
+                    if let layout = batched[project.remoteRoot] {
+                        layoutCache[project.id] = layout
+                        let list = layout.orderedTerminalInstances
+                        instanceCache[project.id] = (list, now)
+                        result[project.id] = list
+                    } else if let prev = instanceCache[project.id], !prev.instances.isEmpty {
+                        // A project that previously had agents didn't show up in the batch —
+                        // verify with a single read before dropping its cached agents.
+                        if let verified = try? await RemoteLayoutStore.read(conn, root: project.remoteRoot) {
+                            layoutCache[project.id] = verified
+                            let list = verified.orderedTerminalInstances
+                            instanceCache[project.id] = (list, now)
+                            result[project.id] = list
+                        } else {
+                            result[project.id] = prev.instances
+                        }
+                    } else {
+                        layoutCache[project.id] = nil
+                        instanceCache[project.id] = ([], now)
+                        result[project.id] = []
+                    }
+                }
+                return result
+            }
+        }
+        for project in chunk {
+            result[project.id] = await cachedInstances(for: project, conn: conn)
+        }
+        return result
     }
 
     private func runPollOnce() async {
@@ -573,108 +1663,384 @@ final class AppState: ObservableObject {
             layout = fresh
         }
         guard selectedProject?.id == project.id, let layout else { return }
-        // One batched fetch for the selected host serves both the selected project's
-        // statuses and (on sweep ticks) its sibling projects — no extra round trip.
-        let instances = await hostInstances(on: host.id, conn: conn)
-        let selectedRows = await poll.fetchPaneRows(conn, instances: instances.values.flatMap { $0 })
+        let now = Date().timeIntervalSince1970
+        let terminalInstances = layout.orderedTerminalInstances
+        instanceCache[project.id] = (terminalInstances, now)
+
+        // Include sibling projects' recorded sockets on the selected host so one
+        // `fetchPaneRows` covers the entire host (required for isolated-socket peers).
+        let siblingsOnHost = projects(for: host).filter { $0.id != project.id }
+        var siblingInstances: [Instance] = []
+        let shouldSweepSiblings = pollTick == 1 || pollTick % 4 == 0
+        if shouldSweepSiblings {
+            var staleSiblings: [RemoteProject] = []
+            for sib in siblingsOnHost {
+                if let hit = instanceCache[sib.id], now - hit.at < instanceCacheTTL {
+                    siblingInstances.append(contentsOf: hit.instances)
+                } else {
+                    staleSiblings.append(sib)
+                }
+            }
+            // Read the first batch (up to 10 opened-first siblings) before `fetchPaneRows`
+            // so their recorded sockets are queried in the same single sweep.
+            if !staleSiblings.isEmpty {
+                let firstBatch = Array(staleSiblings.prefix(10))
+                let read = await readProjectChunk(firstBatch, conn: conn, now: Date().timeIntervalSince1970)
+                siblingInstances.append(contentsOf: read.values.flatMap { $0 })
+            }
+        } else {
+            for sib in siblingsOnHost {
+                if let hit = instanceCache[sib.id] {
+                    siblingInstances.append(contentsOf: hit.instances)
+                }
+            }
+        }
+
         guard selectedProject?.id == project.id else { return }
-        let screens = liveScreens(for: layout.orderedTerminalInstances)
+        var terminalInstancesNow = terminalInstances
+        var selectedRows = await poll.fetchPaneRows(conn, instances: terminalInstancesNow + siblingInstances)
+        lastPaneRowsByHost[host.id] = selectedRows
+        lastPaneRowsAtByHost[host.id] = Date().timeIntervalSince1970
+        guard selectedProject?.id == project.id else { return }
+
+        // If desktop just opened a brand-new `muxel_*` pane on this host, refresh
+        // layouts immediately instead of waiting for the next periodic layout read.
+        var forceSiblingSweep = false
+        let pollNow = Date().timeIntervalSince1970
+        if Self.hasUnmatchedLiveMuxelSession(rows: selectedRows, knownInstances: terminalInstancesNow + siblingInstances),
+           pollNow - (lastUnmatchedRefreshByHost[host.id] ?? 0) > 5 {
+            lastUnmatchedRefreshByHost[host.id] = pollNow
+            if pollTick % 2 != 0,
+               let fresh = try? await RemoteLayoutStore.read(conn, root: project.remoteRoot),
+               selectedProject?.id == project.id {
+                self.layout = fresh
+                layoutCache[project.id] = fresh
+                terminalInstancesNow = fresh.orderedTerminalInstances
+                instanceCache[project.id] = (terminalInstancesNow, pollNow)
+            }
+            for sib in siblingsOnHost { instanceCache.removeValue(forKey: sib.id) }
+            forceSiblingSweep = !siblingsOnHost.isEmpty
+            // Re-fetch rows if the newly discovered layout uses a new socket.
+            let freshSockets = Set(terminalInstancesNow.compactMap(\.tmuxSocket))
+            let knownSockets = Set([TmuxCommands.socketName, "default"] + (terminalInstances + siblingInstances).compactMap(\.tmuxSocket))
+            if !freshSockets.subtracting(knownSockets).isEmpty {
+                selectedRows = await poll.fetchPaneRows(conn, instances: terminalInstancesNow + siblingInstances)
+                lastPaneRowsByHost[host.id] = selectedRows
+                lastPaneRowsAtByHost[host.id] = Date().timeIntervalSince1970
+            }
+        }
+
+        // Probe any unattached marker-bearing agent (in this open project's other tabs
+        // OR in sibling projects on this host) that shows fresh tmux output (e.g. a
+        // prompt just started on desktop) or was already working/blocked.
+        let probedScreens = await probeActiveUnattachedAgents(
+            instances: terminalInstancesNow + siblingInstances,
+            rows: selectedRows,
+            conn: conn)
+        guard selectedProject?.id == project.id else { return }
+
+        var screens = liveScreens(for: terminalInstancesNow)
+        for inst in terminalInstancesNow {
+            if screens[inst.id] == nil, let probed = probedScreens[inst.id] {
+                screens[inst.id] = probed
+            }
+        }
+        poll.seedPreviouslyWorking(StatusPoller.persistedWorkingIds(for: terminalInstancesNow, defaults: defaults))
         let results = poll.classify(rows: selectedRows,
-                                    instances: layout.orderedTerminalInstances,
+                                    instances: terminalInstancesNow,
                                     liveScreens: screens)
+        recordObservedProbeOutcomes(results: results,
+                                    probedIds: Set(probedScreens.keys),
+                                    rows: selectedRows,
+                                    instances: terminalInstancesNow,
+                                    now: Date().timeIntervalSince1970)
+        LastWorkedStore.record(results, defaults: defaults)
+        let suppressed: Set<String> = activeViewedInstanceId.map { [$0] } ?? []
+        StatusPoller.processTransitions(
+            results: results,
+            instances: terminalInstancesNow,
+            projectId: project.id,
+            projectName: project.name,
+            rows: selectedRows,
+            suppressIds: suppressed,
+            defaults: defaults)
         for r in results { statuses[r.instanceId] = r.status }
         running = Set(results.filter(\.running).map(\.instanceId))
+        hasPolledSelectedProject = true
+        projectActivity[project.id] = Self.aggregate(results, instances: terminalInstancesNow)
         // Foreground start/refresh — keeps the Live Activity alive so it's on the
         // Lock Screen when the app is minimized (starting must happen here).
         syncLiveActivity()
 
-        // Every ~4th tick (~12s), refresh cross-project sidebar badges for other
-        // projects on already-connected hosts. Gentler than the 3s selected-project
-        // cadence and near-free: one `list-panes -a` per other host + TTL-cached
-        // layout reads. Reuses the selected host's rows.
-        if pollTick % 4 == 0 {
-            await sweepOtherProjects(selectedHostId: host.id, selectedRows: selectedRows,
-                                     selectedInstances: instances)
+        // Sweep sibling projects (including re-reading stale layouts) on the first poll,
+        // every ~4th tick (~12s), or immediately when an unknown `muxel_*` session appeared.
+        // On intermediate 3s ticks, re-classify already-cached sibling projects on THIS host
+        // using `selectedRows` + any freshly probed screens so prompts and short shell
+        // commands in other projects update and notify promptly.
+        if shouldSweepSiblings || forceSiblingSweep {
+            await sweepOtherProjects(selectedHostId: host.id, selectedRows: selectedRows)
+        } else if !siblingsOnHost.isEmpty {
+            var cachedMap: [UUID: [Instance]] = [:]
+            for sib in siblingsOnHost {
+                if let hit = instanceCache[sib.id], !hit.instances.isEmpty {
+                    cachedMap[sib.id] = hit.instances
+                }
+            }
+            if !cachedMap.isEmpty {
+                applyProjectSweep(projects: siblingsOnHost,
+                                  instancesByProject: cachedMap,
+                                  rows: selectedRows,
+                                  extraScreens: probedScreens,
+                                  probedIds: Set(probedScreens.keys))
+                syncLiveActivity()
+            }
         }
     }
 
-    /// Live-screen snapshots for any of `instances` that are currently attached AND
-    /// whose program has status markers — the input that gives `classify` real
-    /// working/blocked state. Marker-less programs are skipped (desktop's same
-    /// optimization: no point scanning a screen with nothing to match).
+    /// True if `rows` contains a live, non-exited `muxel_*` tmux session that doesn't
+    /// match any currently cached `Instance` on that host (e.g. a new pane/prompt just
+    /// created on muxel desktop).
+    nonisolated static func hasUnmatchedLiveMuxelSession(
+        rows: [PaneRow],
+        knownInstances: [Instance]
+    ) -> Bool {
+        for row in rows where !row.exited && row.session.hasPrefix("muxel_") {
+            let matched = knownInstances.contains { inst in
+                PollService.resolveRow(for: inst, in: [row]) != nil
+            }
+            if !matched { return true }
+        }
+        return false
+    }
+
+    /// Pure selection of unattached marker-bearing agents that should be snapshotted
+    /// via a single read-only PTY batch on this poll tick:
+    /// - live, non-exited, non-shell agent with working/blocked markers and no live PTY,
+    /// - AND either already observed `.working`/`.blocked` (so completion is caught
+    ///   promptly) OR showing recent tmux output (`idle <= recentActivityWindow`) since
+    ///   the last idle probe (with a cooldown floor for continuously animating TUIs).
+    nonisolated static func activeProbeCandidates(
+        instances: [Instance],
+        rows: [PaneRow],
+        attachedIds: Set<String>,
+        lastStatuses: [String: AgentStatus],
+        idleProbeState: [String: (at: TimeInterval, activityTimestamp: TimeInterval?)],
+        now: TimeInterval,
+        recentActivityWindow: TimeInterval = 20,
+        idleReprobeCooldown: TimeInterval = 12
+    ) -> [(id: String, session: String, socket: String?, idle: TimeInterval, bell: Bool)] {
+        var targets: [(id: String, session: String, socket: String?, idle: TimeInterval, bell: Bool)] = []
+        var seenIds = Set<String>()
+        for inst in instances where inst.kind == .terminal && !inst.isShell {
+            guard seenIds.insert(inst.id).inserted,
+                  !attachedIds.contains(inst.id) else { continue }
+            let (w, b) = defaultMarkers(program: inst.program, args: inst.args)
+            guard !(w.isEmpty && b.isEmpty) else { continue }
+            guard let row = PollService.resolveRow(for: inst, in: rows),
+                  !row.exited else { continue }
+            let prevStatus = lastStatuses[inst.id]
+            let isOngoing = prevStatus == .working || prevStatus == .blocked
+            if !isOngoing {
+                guard row.idle <= recentActivityWindow else { continue }
+                if let prevIdle = idleProbeState[inst.id] {
+                    if now - prevIdle.at < idleReprobeCooldown { continue }
+                    if let prevAct = prevIdle.activityTimestamp,
+                       let curAct = row.activityTimestamp,
+                       curAct <= prevAct {
+                        continue
+                    }
+                }
+            }
+            targets.append((inst.id, row.session, row.socket ?? inst.tmuxSocket, row.idle, row.bell))
+        }
+        return targets
+    }
+
+    private func probeActiveUnattachedAgents(
+        instances: [Instance],
+        rows: [PaneRow],
+        conn: SSHConnection
+    ) async -> [String: LiveScreen] {
+        guard !rows.isEmpty, !instances.isEmpty else { return [:] }
+        var attachedIds = Set<String>()
+        for inst in instances where terminals.liveScreen(for: inst.id) != nil {
+            attachedIds.insert(inst.id)
+        }
+        var effectiveLastStatuses = lastObservedStatusByInstance
+        for id in StatusPoller.persistedWorkingIds(for: instances, defaults: defaults) {
+            if effectiveLastStatuses[id] == nil {
+                effectiveLastStatuses[id] = .working
+            }
+        }
+        let now = Date().timeIntervalSince1970
+        let targets = Self.activeProbeCandidates(
+            instances: instances,
+            rows: rows,
+            attachedIds: attachedIds,
+            lastStatuses: effectiveLastStatuses,
+            idleProbeState: idleProbeState,
+            now: now)
+        guard !targets.isEmpty else { return [:] }
+        let probed: [String: LiveScreen]
+        if let screenProber {
+            probed = await screenProber(targets, conn)
+        } else {
+            probed = await terminals.batchProbeScreens(targets: targets, connection: conn)
+        }
+        let stamp = Date().timeIntervalSince1970
+        for (id, screen) in probed {
+            probedScreensCache[id] = (screen, stamp)
+        }
+        return probed
+    }
+
+    private func recordObservedProbeOutcomes(
+        results: [InstanceStatus],
+        probedIds: Set<String>,
+        rows: [PaneRow],
+        instances: [Instance],
+        now: TimeInterval
+    ) {
+        let byId = Dictionary(instances.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        for r in results {
+            if r.running {
+                lastObservedStatusByInstance[r.instanceId] = r.status
+                if r.status == .working || r.status == .blocked {
+                    idleProbeState.removeValue(forKey: r.instanceId)
+                } else if probedIds.contains(r.instanceId) {
+                    let act = byId[r.instanceId].flatMap { PollService.resolveRow(for: $0, in: rows)?.activityTimestamp }
+                    idleProbeState[r.instanceId] = (now, act)
+                }
+            } else {
+                lastObservedStatusByInstance.removeValue(forKey: r.instanceId)
+                probedScreensCache.removeValue(forKey: r.instanceId)
+                idleProbeState.removeValue(forKey: r.instanceId)
+            }
+        }
+    }
+
+    /// Live-screen snapshots for any of `instances` that are currently attached in
+    /// `TerminalStore` (or recently snapshotted via `batchProbeScreens`), so both
+    /// attached and freshly probed panes get real marker status.
     private func liveScreens(for instances: [Instance]) -> [String: LiveScreen] {
         var screens: [String: LiveScreen] = [:]
+        let now = Date().timeIntervalSince1970
         for inst in instances {
-            let (working, blocked) = defaultMarkers(program: inst.program)
-            guard !(working.isEmpty && blocked.isEmpty) else { continue }
             if let screen = terminals.liveScreen(for: inst.id) {
                 screens[inst.id] = screen
+            } else if let cached = probedScreensCache[inst.id], now - cached.at <= 15 {
+                screens[inst.id] = cached.screen
             }
         }
         return screens
     }
 
-    /// Aggregate per-instance statuses into a project's badge counts.
-    nonisolated static func aggregate(_ results: [InstanceStatus]) -> ProjectActivity {
+    /// Aggregate per-instance statuses into a project's badge counts, sorted
+    /// per-running-agent status dots, and full per-agent summary list.
+    nonisolated static func aggregate(
+        _ results: [InstanceStatus],
+        instances: [Instance] = []
+    ) -> ProjectActivity {
         var a = ProjectActivity(running: 0, blocked: 0, done: 0)
-        for r in results where r.running {
-            a.running += 1
-            switch r.status {
-            case .blocked: a.blocked += 1
-            case .done: a.done += 1
-            default: break
+        var list: [AgentStatus] = []
+        let byId = Dictionary(instances.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var agents: [AgentSummary] = []
+        agents.reserveCapacity(results.count)
+        for r in results {
+            let name = byId[r.instanceId]?.displayName ?? "agent"
+            agents.append(AgentSummary(id: r.instanceId, name: name, status: r.status, running: r.running))
+            if r.running {
+                a.running += 1
+                list.append(r.status)
+                switch r.status {
+                case .blocked: a.blocked += 1
+                case .done: a.done += 1
+                default: break
+                }
             }
         }
+        a.agentStatuses = sortAgentStatuses(list)
+        a.agents = sortAgents(agents)
         return a
     }
 
     /// Refresh `projectActivity` for every non-selected project on a host we already
-    /// hold a connection to. Never dials (unreachable hosts can't stall the loop); a
-    /// project with no resolvable instances drops its badge.
+    /// hold a connection to (or all hosts when `connectIfNeeded` is true).
     private func sweepOtherProjects(selectedHostId: UUID, selectedRows: [PaneRow],
-                                    selectedInstances: [UUID: [Instance]] = [:]) async {
+                                    connectIfNeeded: Bool = false) async {
         let selectedProjectId = selectedProject?.id
-        let byHost = Dictionary(grouping: doc.projects.filter { $0.id != selectedProjectId },
-                                by: { $0.hostId })
-        for (hostId, projects) in byHost {
-            guard let conn = existingConnection(for: hostId) else { continue }
-            // Collect layouts before fetching so every recorded socket is included,
-            // even when only a sibling project uses that server.
-            let instancesByProject: [UUID: [Instance]]
-            let rows: [PaneRow]
-            if hostId == selectedHostId {
-                instancesByProject = selectedInstances
-                rows = selectedRows
-            } else {
-                instancesByProject = await hostInstances(on: hostId, conn: conn)
-                rows = await poll.fetchPaneRows(conn, instances: instancesByProject.values.flatMap { $0 })
-            }
-            for project in projects {
-                guard let instances = instancesByProject[project.id],
-                      !instances.isEmpty else {
-                    projectActivity[project.id] = nil
-                    continue
-                }
-                // Attached panes of a backgrounded project still get marker status.
-                let results = poll.classify(rows: rows, instances: instances,
-                                            liveScreens: liveScreens(for: instances))
-                projectActivity[project.id] = Self.aggregate(results)
-            }
+        for host in doc.hosts {
+            let hostProjects = projects(for: host).filter { $0.id != selectedProjectId }
+            guard !hostProjects.isEmpty else { continue }
+            await sweepHostProjects(
+                host: host,
+                projects: hostProjects,
+                connectIfNeeded: connectIfNeeded,
+                preFetchedRows: host.id == selectedHostId ? selectedRows : nil)
         }
     }
 
-    /// The complete host input for a sweep. The selected layout is already live;
-    /// sibling layouts use the existing TTL cache and failed-read fallback.
-    private func hostInstances(on hostId: UUID, conn: SSHConnection) async -> [UUID: [Instance]] {
-        var instances: [UUID: [Instance]] = [:]
-        for project in doc.projects where project.hostId == hostId {
-            if selectedProject?.id == project.id, let layout {
-                instances[project.id] = layout.orderedTerminalInstances
-            } else {
-                instances[project.id] = await cachedInstances(for: project, conn: conn)
+    @discardableResult
+    private func applyProjectSweep(
+        projects: [RemoteProject],
+        instancesByProject: [UUID: [Instance]],
+        rows: [PaneRow],
+        detectWorking: Bool = false,
+        extraScreens: [String: LiveScreen] = [:],
+        probedIds: Set<String> = []
+    ) -> Set<UUID> {
+        var working = Set<UUID>()
+        for project in projects {
+            guard let instances = instancesByProject[project.id],
+                  !instances.isEmpty else {
+                projectActivity[project.id] = nil
+                summaryRowsByProject[project.id] = nil
+                continue
+            }
+            // Attached panes of a backgrounded project (plus any freshly batch-probed
+            // snapshots) still get full marker status. Fresh `extraScreens` take
+            // precedence over the short-lived probe cache so transitions land immediately.
+            var screens = liveScreens(for: instances)
+            for inst in instances {
+                if let extra = extraScreens[inst.id], terminals.liveScreen(for: inst.id) == nil {
+                    screens[inst.id] = extra
+                }
+            }
+            poll.seedPreviouslyWorking(StatusPoller.persistedWorkingIds(for: instances, defaults: defaults))
+            let results = poll.classify(rows: rows, instances: instances, liveScreens: screens)
+            let now = Date().timeIntervalSince1970
+            recordObservedProbeOutcomes(results: results, probedIds: probedIds, rows: rows, instances: instances, now: now)
+            LastWorkedStore.record(results, now: now, defaults: defaults)
+            let suppressed: Set<String> = (selectedProject?.id == project.id)
+                ? (activeViewedInstanceId.map { [$0] } ?? [])
+                : []
+            StatusPoller.processTransitions(
+                results: results,
+                instances: instances,
+                projectId: project.id,
+                projectName: project.name,
+                rows: rows,
+                suppressIds: suppressed,
+                defaults: defaults)
+            projectActivity[project.id] = Self.aggregate(results, instances: instances)
+            if detectWorking, Self.isActivelyWorking(results: results, rows: rows, instances: instances) {
+                working.insert(project.id)
+            }
+            let byId = Dictionary(instances.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+            summaryRowsByProject[project.id] = results.compactMap { r in
+                guard r.running else { return nil }
+                let inst = byId[r.instanceId]
+                let name = inst?.displayName ?? "agent"
+                let paneIdle = inst.flatMap { PollService.resolveRow(for: $0, in: rows)?.idle }
+                let lastActive = LastWorkedStore.effectiveLastActiveAt(
+                    instance: inst, status: r.status, running: r.running,
+                    paneIdle: paneIdle, now: now, defaults: defaults)
+                return ActivitySummaryBuilder.row(
+                    id: r.instanceId, name: name, project: project.name,
+                    status: r.status, running: r.running, lastActiveAt: lastActive)
             }
         }
-        return instances
+        return working
     }
 
     /// A non-selected project's terminal instances, cached with a short TTL so a sweep
@@ -688,6 +2054,7 @@ final class AppState: ObservableObject {
         guard let fresh = try? await RemoteLayoutStore.read(conn, root: project.remoteRoot) else {
             return instanceCache[project.id]?.instances
         }
+        layoutCache[project.id] = fresh
         let instances = fresh.orderedTerminalInstances
         instanceCache[project.id] = (instances, now)
         return instances
@@ -700,6 +2067,13 @@ final class AppState: ObservableObject {
     /// in Settings clears the sidebar notice on return).
     func refreshNotificationStatus() async {
         notificationsDenied = await NotificationManager.authorizationStatus() == .denied
+    }
+
+    /// Request notification permission once the user has started setting up a host
+    /// (instead of prompting cold on first launch before they see the app).
+    func requestNotificationsIfNeeded() async {
+        let status = await NotificationManager.requestAuthorizationIfNotDetermined()
+        notificationsDenied = status == .denied
     }
 
     // MARK: Launch a new instance
@@ -956,6 +2330,7 @@ final class AppState: ObservableObject {
     /// the newly selected project's UI and invalidate the sidebar's cached layout.
     private func publishLayout(_ written: RemoteLayout?, for project: RemoteProject) {
         instanceCache[project.id] = nil
+        layoutCache[project.id] = written
         guard selectedProject?.id == project.id else { return }
         layout = written
     }

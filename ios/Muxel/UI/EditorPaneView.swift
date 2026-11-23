@@ -9,7 +9,9 @@ struct EditorPaneView: View {
     let project: RemoteProject
     let instance: Instance
     @State private var lines: [String] = []
+    @State private var rawText = ""
     @State private var status: LoadStatus = .loading
+    @State private var wrapLines = false
 
     enum LoadStatus: Equatable { case loading, loaded, failed(String) }
 
@@ -18,6 +20,8 @@ struct EditorPaneView: View {
             RemoteFileHeader(
                 title: instance.editorPath.map { ($0 as NSString).lastPathComponent } ?? instance.displayName,
                 subtitle: instance.editorPath,
+                wrapLines: $wrapLines,
+                onCopy: rawText.isEmpty ? nil : { UIPasteboard.general.string = rawText },
                 onRefresh: { Task { await load() } })
             Divider()
             content
@@ -36,7 +40,10 @@ struct EditorPaneView: View {
                 Button("Try again") { Task { await load() } }.buttonStyle(.bordered)
             }
         case .loaded:
-            MonoTextScroll(lines: lines, color: { _ in theme.textColor })
+            // Use terminalForeground (always legible on the dark terminalBackground,
+            // including under light chrome themes like Catppuccin Latte).
+            MonoTextScroll(lines: lines, wrapLines: wrapLines,
+                           color: { _ in theme.terminalForeground })
         }
     }
 
@@ -50,6 +57,7 @@ struct EditorPaneView: View {
             let conn = state.connection(for: host)
             try await conn.connect()
             let text = try await RemoteFiles.read(conn, path: path)
+            rawText = text
             lines = text.isEmpty ? ["(empty or too large to show)"] : text.components(separatedBy: "\n")
             status = .loaded
         } catch {

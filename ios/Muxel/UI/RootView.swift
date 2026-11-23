@@ -5,6 +5,7 @@ import SwiftUI
 /// landscape and a push navigation on iPhone for free.
 struct RootView: View {
     @EnvironmentObject var state: AppState
+    @ObservedObject private var notificationRouter = NotificationRouter.shared
     @Environment(\.theme) private var theme
     @Environment(\.horizontalSizeClass) private var hSizeClass
     @State private var showAddHost = false
@@ -38,7 +39,22 @@ struct RootView: View {
                 placeholder
             }
         }
-        .onAppear { KeyboardPrewarmer.warmOnce() }
+        .task {
+            if let route = notificationRouter.consume() {
+                openFromNotification(route)
+            }
+            state.restoreLastProjectIfNeeded()
+            let started = state.startMonitoringOnLaunch()
+            // Cold launch onto the home screen doesn't always fire scenePhase.onChange;
+            // kick off the sidebar status sweep if launch monitoring didn't already start it.
+            if !started, state.selectedProject == nil {
+                state.resumeForeground()
+            }
+        }
+        .onChange(of: notificationRouter.pendingRoute) { _, route in
+            guard route != nil, let consumed = notificationRouter.consume() else { return }
+            openFromNotification(consumed)
+        }
         .sheet(isPresented: $showAddHost, onDismiss: {
             // Chain add-host → scan once the first sheet is fully dismissed.
             if let host = pendingScanHost { pendingScanHost = nil; discoverForHost = host }
@@ -51,6 +67,14 @@ struct RootView: View {
         .sheet(item: $state.hostKeyPrompt) { prompt in HostKeyPromptView(prompt: prompt) }
         .overlay(alignment: .top) { noticeOverlay }
         .animation(.snappy, value: state.notice)
+    }
+
+    private func openFromNotification(_ route: NotificationRoute) {
+        showAddHost = false
+        editHost = nil
+        addProjectForHost = nil
+        discoverForHost = nil
+        state.openNotificationRoute(route)
     }
 
     /// The transient notice banner (errors and confirmations that don't need a

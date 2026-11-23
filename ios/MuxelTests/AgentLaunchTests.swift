@@ -116,6 +116,14 @@ final class AgentLaunchTests: XCTestCase {
         XCTAssertEqual(AgentLaunch.composeArgs(p), ["--model", "opus", "--effort", "high", "--extra"])
     }
 
+    func testComposeArgsSubstitutesPlaceholderFlags() {
+        var codex = Preset.builtins.first { $0.name == "Codex" }!
+        codex.model = "o3"
+        codex.effort = "high"
+        XCTAssertEqual(AgentLaunch.composeArgs(codex),
+                       ["--model", "o3", "--config=model_reasoning_effort=high"])
+    }
+
     func testComposeArgsSkipsUnsetModelAndEffort() {
         let p = Preset(name: "x", program: "claude", args: ["a"], modelFlag: "--model")  // model nil
         XCTAssertEqual(AgentLaunch.composeArgs(p), ["a"])

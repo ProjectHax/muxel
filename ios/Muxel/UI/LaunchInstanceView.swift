@@ -11,19 +11,25 @@ struct LaunchInstanceView: View {
     /// On iPad, the focused leaf to launch into; nil launches into the main pane.
     var targetLeafAnchor: String? = nil
 
+    /// Persisted name of the preset launched most recently so repeated launches
+    /// don't reset back to Shell.
+    @AppStorage("muxel.lastPresetName") private var lastPresetName = ""
     @State private var selected: Preset = Preset.builtins.first!
     @State private var useCustom = false
     @State private var customCommand = ""
     @State private var systemPrompt = ""
     @State private var model = ""
+    @State private var effort = ""
     @State private var newWorktree = false
     @State private var worktreeBranch = ""
+    @State private var launching = false
 
-    /// The picked preset with the sheet's system-prompt / model overrides applied.
+    /// The picked preset with the sheet's system-prompt / model / effort overrides applied.
     private var effectivePreset: Preset {
         var p = selected
         p.systemPrompt = systemPrompt.isEmpty ? nil : systemPrompt
         if selected.modelFlag != nil { p.model = model.isEmpty ? nil : model }
+        if selected.effortFlag != nil { p.effort = effort.isEmpty ? nil : effort }
         return p
     }
 
@@ -65,6 +71,11 @@ struct LaunchInstanceView: View {
                                     .textInputAutocapitalization(.never)
                                     .autocorrectionDisabled()
                             }
+                            if selected.effortFlag != nil {
+                                TextField("effort (e.g. high)", text: $effort)
+                                    .textInputAutocapitalization(.never)
+                                    .autocorrectionDisabled()
+                            }
                             if selected.sessionIdFlag != nil {
                                 Text("session id assigned automatically; reopening resumes it")
                                     .font(.mono(.caption2))
@@ -97,9 +108,15 @@ struct LaunchInstanceView: View {
             .navigationTitle("New instance")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                        .disabled(launching)
+                }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Launch") {
+                    Button {
+                        guard !launching else { return }
+                        launching = true
+                        if !useCustom { lastPresetName = selected.name }
                         Task {
                             await state.launch(
                                 preset: effectivePreset,
@@ -109,12 +126,24 @@ struct LaunchInstanceView: View {
                                 newWorktree: newWorktree,
                                 worktreeBranch: worktreeBranch.isEmpty ? nil : worktreeBranch
                             )
+                            launching = false
                             dismiss()
                         }
+                    } label: {
+                        if launching {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text("Launch")
+                        }
                     }
-                    .disabled(useCustom
+                    .disabled(launching || (useCustom
                         && (customCommand.trimmingCharacters(in: .whitespaces).isEmpty
-                            || !commandParses))
+                            || !commandParses)))
+                }
+            }
+            .onAppear {
+                if let saved = Preset.builtins.first(where: { $0.name == lastPresetName }) {
+                    selected = saved
                 }
             }
         }

@@ -66,4 +66,61 @@ final class ActivitySummaryTests: XCTestCase {
         let back = try JSONDecoder().decode(MuxelActivityAttributes.ContentState.self, from: data)
         XCTAssertEqual(cs, back)
     }
+
+    func testGroupByProjectAggregatesDotsAndHighlightsAttention() {
+        let rows: [MuxelActivityAttributes.InstanceRow] = [
+            .init(id: "1", name: "shell", project: "web", state: .idle),
+            .init(id: "2", name: "codex", project: "api", state: .working),
+            .init(id: "3", name: "claude", project: "muxel", state: .needsInput),
+            .init(id: "4", name: "opencode", project: "muxel", state: .idle),
+            .init(id: "5", name: "amp", project: "muxel", state: .working),
+            .init(id: "6", name: "gemini", project: "api", state: .finished),
+        ]
+        let groups = MuxelActivityAttributes.groupByProject(rows)
+        // Sorted by urgency: needsInput (muxel) → working (api) → idle (web).
+        XCTAssertEqual(groups.map(\.project), ["muxel", "api", "web"])
+        XCTAssertEqual(groups[0].states, [.needsInput, .working, .idle])
+        XCTAssertEqual(groups[0].highlightState, .needsInput)
+        XCTAssertEqual(groups[0].summaryText, "claude: needs input")
+
+        XCTAssertEqual(groups[1].states, [.working, .finished])
+        XCTAssertEqual(groups[1].highlightState, .working)
+        XCTAssertEqual(groups[1].summaryText, "codex working")
+
+        XCTAssertEqual(groups[2].states, [.idle])
+        XCTAssertEqual(groups[2].highlightState, .idle)
+        XCTAssertEqual(groups[2].summaryText, "shell idle")
+    }
+
+    func testMostRecentlyWorkedProjectsAndAgentsSortToTopOfLiveActivity() {
+        let rows: [MuxelActivityAttributes.InstanceRow] = [
+            .init(id: "1", name: "claude", project: "alpha", state: .idle, lastActiveAt: 100),
+            .init(id: "2", name: "shell", project: "zeta", state: .idle, lastActiveAt: 500),
+            .init(id: "3", name: "grok", project: "zeta", state: .idle, lastActiveAt: 900),
+            .init(id: "4", name: "codex", project: "beta", state: .idle, lastActiveAt: 700),
+        ]
+        // ContentState keeps most recently worked agents first within the same tier.
+        let cs = ActivitySummaryBuilder.contentState(rows: rows, now: Date())
+        XCTAssertEqual(cs.instances.map(\.id), ["3", "4", "2", "1"])
+
+        // Project groups sort by most recently worked project first (`zeta` → `beta` → `alpha`),
+        // and highlight the agent that worked most recently (`grok idle`).
+        let groups = MuxelActivityAttributes.groupByProject(rows)
+        XCTAssertEqual(groups.map(\.project), ["zeta", "beta", "alpha"])
+        XCTAssertEqual(groups[0].summaryText, "grok idle")
+    }
+
+    func testLastWorkedStorePersistsActiveWorkTimestamps() throws {
+        let suite = "muxel.tests.lastworked.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        LastWorkedStore.record([
+            InstanceStatus(instanceId: "work-1", status: .working, running: true),
+            InstanceStatus(instanceId: "idle-1", status: .idle, running: true),
+        ], now: 1_700_000_500, defaults: defaults)
+
+        XCTAssertEqual(LastWorkedStore.timestamp(for: "work-1", defaults: defaults), 1_700_000_500)
+        XCTAssertNil(LastWorkedStore.timestamp(for: "idle-1", defaults: defaults))
+    }
 }

@@ -46,7 +46,7 @@ struct LeafPaneView: View {
             RoundedRectangle(cornerRadius: 6)
                 .strokeBorder(isFocused ? theme.accentColor : .clear, lineWidth: 1.5)
         )
-        .onChange(of: tabs) { newTabs in
+        .onChange(of: tabs) { _, newTabs in
             // Desktop moved the selected tab to another leaf → fall back to this leaf's
             // active tab (recomputed from the fresh layout).
             if let sel = selected, !newTabs.contains(sel) { selected = nil }
@@ -54,24 +54,33 @@ struct LeafPaneView: View {
     }
 
     private var strip: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                ForEach(resolved) { inst in
-                    TabChipView(
-                        instance: inst,
-                        isActive: inst.id == current?.id,
-                        onTap: {
-                            selected = inst.id
-                            context.focusedInstance.wrappedValue = inst.id
-                            state.attend(inst.id)
-                        },
-                        menu: menu(for: inst),
-                        dragCoord: context.dragCoord,
-                        onChipDrop: { leaf, zone in context.onChipDrop(inst.id, leaf, zone) })
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(resolved) { inst in
+                        TabChipView(
+                            instance: inst,
+                            isActive: inst.id == current?.id,
+                            onTap: {
+                                selected = inst.id
+                                context.focusedInstance.wrappedValue = inst.id
+                                state.attend(inst.id)
+                            },
+                            menu: menu(for: inst),
+                            dragCoord: context.dragCoord,
+                            onChipDrop: { leaf, zone in context.onChipDrop(inst.id, leaf, zone) })
+                        .id(inst.id)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+            }
+            .onChange(of: current?.id) { _, id in
+                guard let id else { return }
+                withAnimation(.easeOut(duration: 0.2)) {
+                    proxy.scrollTo(id, anchor: .center)
                 }
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
         }
     }
 

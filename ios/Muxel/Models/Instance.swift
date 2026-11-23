@@ -50,6 +50,102 @@ extension InstanceKind: Codable {
     }
 }
 
+/// Persisted desktop activity snapshot decoded from `.muxel/workspace.json`
+/// (`AgentActivity` in `crates/muxel-core/src/lib.rs`). Read-only on iOS: never
+/// re-encoded on write-back so desktop's `ios_write_back_is_not_a_layout_change`
+/// contract stays intact.
+struct PersistedAgentActivity: Equatable {
+    var workStartedAt: Int64?
+    var completedAt: Int64?
+    var blockedAt: Int64?
+    var lastAttendedAt: Int64?
+    var lastState: AgentStatus?
+
+    /// Mirrors `AgentActivity::current_state`: explicit `last_state`, else inferred
+    /// from the latest transition timestamp.
+    var currentState: AgentStatus? {
+        if let lastState { return lastState }
+        let candidates: [(Int64, Int, AgentStatus)] = [
+            workStartedAt.map { ($0, 0, .working) },
+            completedAt.map { ($0, 1, .done) },
+            blockedAt.map { ($0, 2, .blocked) },
+        ].compactMap { $0 }
+        return candidates.max { a, b in
+            a.0 != b.0 ? a.0 < b.0 : a.1 < b.1
+        }?.2
+    }
+
+    /// Mirrors `AgentActivity::has_unattended_completion`: whether a completed turn
+    /// is newer than the last time the pane was attended on desktop.
+    var hasUnattendedCompletion: Bool {
+        guard let completedAt else { return false }
+        guard let lastAttendedAt else { return true }
+        return completedAt > lastAttendedAt
+    }
+
+    /// Live-display / notification state derived from desktop's persisted `activity`:
+    /// - downgrades already-attended `done`/`blocked` states (`last_attended_at` at or
+    ///   after the completion/block timestamp) to `.idle`, because desktop keeps
+    ///   `last_state == "done"` even after the user read the pane;
+    /// - downgrades ancient `done` states whose `completed_at` is older than 5 minutes
+    ///   (and `blocked` older than 30 minutes) to `.idle`, so a tmux resize/attach
+    ///   bumping `window_activity` can never resurrect an hours-old completion.
+    func effectiveLiveState(now: TimeInterval = Date().timeIntervalSince1970) -> AgentStatus? {
+        guard let state = currentState else { return nil }
+        switch state {
+        case .done:
+            if let completedAt {
+                if let lastAttendedAt, lastAttendedAt >= completedAt {
+                    return .idle
+                }
+                let completedSecs = TimeInterval(completedAt) / 1000.0
+                if now - completedSecs > 300 {
+                    return .idle
+                }
+            }
+            return .done
+        case .blocked:
+            if let blockedAt {
+                if let lastAttendedAt, lastAttendedAt >= blockedAt {
+                    return .idle
+                }
+                let blockedSecs = TimeInterval(blockedAt) / 1000.0
+                if now - blockedSecs > 1800 {
+                    return .idle
+                }
+            }
+            return .blocked
+        case .working, .idle:
+            return state
+        }
+    }
+
+    var effectiveLiveState: AgentStatus? {
+        effectiveLiveState()
+    }
+}
+
+extension PersistedAgentActivity: Decodable {
+    private enum CodingKeys: String, CodingKey {
+        case workStartedAt = "work_started_at"
+        case completedAt = "completed_at"
+        case blockedAt = "blocked_at"
+        case lastAttendedAt = "last_attended_at"
+        case lastState = "last_state"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        workStartedAt = try c.decodeIfPresent(Int64.self, forKey: .workStartedAt)
+        completedAt = try c.decodeIfPresent(Int64.self, forKey: .completedAt)
+        blockedAt = try c.decodeIfPresent(Int64.self, forKey: .blockedAt)
+        lastAttendedAt = try c.decodeIfPresent(Int64.self, forKey: .lastAttendedAt)
+        if let raw = try c.decodeIfPresent(String.self, forKey: .lastState) {
+            lastState = AgentStatus(rawValue: raw)
+        }
+    }
+}
+
 /// Persisted metadata for one pane. Port of `Instance`
 /// (`crates/muxel-core/src/lib.rs`). Every field except `id`/`projectId`/`title`
 /// is `#[serde(default)]` in Rust, so decoding tolerates older documents missing
@@ -76,6 +172,8 @@ struct Instance: Codable, Equatable, Identifiable {
     var preset: String = ""
     var presetId: String?
     var env: [EnvVar] = []
+    /// Desktop's persisted activity state (read-only; omitted on encode).
+    var activity: PersistedAgentActivity? = nil
     var useTmux: Bool = false
     var useWorktree: Bool = false
     var tmuxSession: String?
@@ -115,7 +213,7 @@ struct Instance: Codable, Equatable, Identifiable {
         case injection, preset
         case instructionInjection = "instruction_injection"
         case presetId = "preset_id"
-        case env
+        case env, activity
         case useTmux = "use_tmux"
         case useWorktree = "use_worktree"
         case tmuxSession = "tmux_session"
@@ -166,6 +264,7 @@ struct Instance: Codable, Equatable, Identifiable {
         preset = (try c.decodeIfPresent(String.self, forKey: .preset)) ?? ""
         presetId = try c.decodeIfPresent(String.self, forKey: .presetId)
         env = (try c.decodeIfPresent([EnvVar].self, forKey: .env)) ?? []
+        activity = try c.decodeIfPresent(PersistedAgentActivity.self, forKey: .activity)
         useTmux = (try c.decodeIfPresent(Bool.self, forKey: .useTmux)) ?? false
         useWorktree = (try c.decodeIfPresent(Bool.self, forKey: .useWorktree)) ?? false
         tmuxSession = try c.decodeIfPresent(String.self, forKey: .tmuxSession)
@@ -228,6 +327,32 @@ struct Instance: Codable, Equatable, Identifiable {
         try c.encode(sessionPath, forKey: .sessionPath)
         try c.encode(sessionStarted, forKey: .sessionStarted)
     }
+
+    /// True when this terminal pane runs an interactive shell (no explicit agent
+    /// program, or a standard shell binary like `bash`, `zsh`, `fish`, `sh`).
+    var isShell: Bool {
+        guard kind == .terminal else { return false }
+        guard let program, !program.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return true
+        }
+        return Self.isShellCommand(program)
+    }
+
+    /// Whether a program or tmux `#{pane_current_command}` string names a bare shell
+    /// sitting at its prompt (as opposed to a foreground command running inside it).
+    static func isShellCommand(_ command: String) -> Bool {
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let base = (trimmed as NSString).lastPathComponent
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+            .lowercased()
+        return Self.shellNames.contains(base)
+    }
+
+    private static let shellNames: Set<String> = [
+        "sh", "bash", "zsh", "fish", "dash", "ash", "ksh", "mksh", "csh", "tcsh",
+        "nu", "nushell", "elvish", "xonsh", "pwsh", "login",
+    ]
 
     /// The display label shown in the tab bar.
     var displayName: String {

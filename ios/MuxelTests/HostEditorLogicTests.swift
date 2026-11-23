@@ -64,4 +64,45 @@ final class HostEditorLogicTests: XCTestCase {
             hostname: "example.com", usingIdentity: false,
             auth: .password, existingAuth: nil, hasPassword: false, hasKey: false))
     }
+
+    func testParseEndpointSplitsUserHostAndPort() {
+        let full = HostEditorLogic.parseEndpoint("alice@dev.example.com:2222")
+        XCTAssertEqual(full?.user, "alice")
+        XCTAssertEqual(full?.hostname, "dev.example.com")
+        XCTAssertEqual(full?.port, 2222)
+
+        let sshPrefix = HostEditorLogic.parseEndpoint("ssh bob@10.0.0.5")
+        XCTAssertEqual(sshPrefix?.user, "bob")
+        XCTAssertEqual(sshPrefix?.hostname, "10.0.0.5")
+        XCTAssertNil(sshPrefix?.port)
+
+        let hostPort = HostEditorLogic.parseEndpoint("box.local:2200")
+        XCTAssertNil(hostPort?.user)
+        XCTAssertEqual(hostPort?.hostname, "box.local")
+        XCTAssertEqual(hostPort?.port, 2200)
+
+        // Plain hostnames, IPv6 literals, and invalid ports are left untouched.
+        XCTAssertNil(HostEditorLogic.parseEndpoint("example.com"))
+        XCTAssertNil(HostEditorLogic.parseEndpoint("fe80::1"))
+        XCTAssertNil(HostEditorLogic.parseEndpoint("host:99999"))
+        XCTAssertNil(HostEditorLogic.parseEndpoint("@host"))
+    }
+
+    func testSaveDisabledReasonExplainsMissingField() {
+        XCTAssertNotNil(HostEditorLogic.saveDisabledReason(
+            name: "", hostname: "h", jumpValid: true, usingIdentity: true,
+            auth: .password, existingAuth: nil, hasPassword: false, hasKey: false))
+        XCTAssertNotNil(HostEditorLogic.saveDisabledReason(
+            name: "n", hostname: "", jumpValid: true, usingIdentity: true,
+            auth: .password, existingAuth: nil, hasPassword: false, hasKey: false))
+        XCTAssertNotNil(HostEditorLogic.saveDisabledReason(
+            name: "n", hostname: "h", jumpValid: false, usingIdentity: true,
+            auth: .password, existingAuth: nil, hasPassword: false, hasKey: false))
+        XCTAssertNotNil(HostEditorLogic.saveDisabledReason(
+            name: "n", hostname: "h", jumpValid: true, usingIdentity: false,
+            auth: .key, existingAuth: nil, hasPassword: false, hasKey: false))
+        XCTAssertNil(HostEditorLogic.saveDisabledReason(
+            name: "n", hostname: "h", jumpValid: true, usingIdentity: true,
+            auth: .password, existingAuth: nil, hasPassword: false, hasKey: false))
+    }
 }

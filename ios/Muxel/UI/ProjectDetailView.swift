@@ -13,7 +13,9 @@ struct ProjectDetailView: View {
     @State private var selectedTab: String?
     /// The focused leaf's anchor (regular width) — target for launch + keyboard.
     @State private var focusedInstance: String?
+    @AppStorage("muxel.lastPresetName") private var lastPresetName = ""
     @State private var showLaunch = false
+    @State private var quickLaunching = false
     @State private var renameTarget: Instance?
     @State private var renameText = ""
     @State private var closeTarget: Instance?
@@ -28,6 +30,62 @@ struct ProjectDetailView: View {
     private var isRegular: Bool { hSizeClass == .regular }
 
     private var instances: [Instance] { state.layout?.orderedPaneInstances ?? [] }
+
+    private var lastUsedPreset: Preset {
+        if let saved = Preset.builtins.first(where: { $0.name == lastPresetName }) {
+            return saved
+        }
+        if let inferred = state.layout?.orderedTerminalInstances.last
+            .flatMap(AgentLaunch.builtinPreset(for:)) {
+            return inferred
+        }
+        return Preset.builtins.first!
+    }
+
+    /// On iPhone (flat tab strip), anchor new launches to the last prior agent tab's
+    /// leaf so the new tab always appends at the end of the prior agent tabs (even when
+    /// desktop saved a split layout). On iPad, launch into the focused leaf.
+    private var launchTargetAnchor: String? {
+        if isRegular { return focusedInstance }
+        return state.layout?.orderedTerminalInstances.last?.id
+            ?? state.layout?.layout?.allTabs.last
+    }
+
+    private func quickLaunch(_ preset: Preset) {
+        guard !quickLaunching else { return }
+        quickLaunching = true
+        lastPresetName = preset.name
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        let anchor = launchTargetAnchor
+        Task {
+            await state.launch(
+                preset: preset,
+                customCommand: nil,
+                into: project,
+                targetLeafAnchor: anchor)
+            quickLaunching = false
+        }
+    }
+
+    @ViewBuilder private var launchPickerMenu: some View {
+        Button {
+            showLaunch = true
+        } label: {
+            Label("New instance…", systemImage: "slider.horizontal.3")
+        }
+        Divider()
+        ForEach(Preset.builtins) { preset in
+            Button {
+                quickLaunch(preset)
+            } label: {
+                if preset.name == lastUsedPreset.name {
+                    Label(preset.name, systemImage: "checkmark")
+                } else {
+                    Text(preset.name)
+                }
+            }
+        }
+    }
 
     private var current: Instance? {
         instances.first { $0.id == selectedTab } ?? instances.first
@@ -95,11 +153,144 @@ struct ProjectDetailView: View {
     /// The content + chrome (nav, toolbar, keyboard tracking, sheet, onChange). Split
     /// from `body`'s dialog modifiers so the type-checker doesn't time out on one giant
     /// expression.
+    /// Other projects' running/active agents for 1-tap cross-project jumping from the
+    /// navigation title menu (attention-first: needs input → working → done → idle).
+    private var quickJumpAgents: [(project: RemoteProject, agent: AppState.AgentSummary)] {
+        var list: [(RemoteProject, AppState.AgentSummary)] = []
+        for host in state.doc.hosts {
+            for proj in state.projects(for: host) where proj.id != project.id {
+                guard let agents = state.activity(for: proj)?.agents else { continue }
+                for agent in agents where agent.running {
+                    list.append((proj, agent))
+                }
+            }
+        }
+        func rank(_ s: AgentStatus) -> Int {
+            switch s {
+            case .blocked: return 0
+            case .working: return 1
+            case .done: return 2
+            case .idle: return 3
+            }
+        }
+        return list.sorted { rank($0.1.status) < rank($1.1.status) }
+    }
+
+    /// True if any agent in another project currently needs attention (blocked or done).
+    private var otherProjectNeedsAttention: Bool {
+        quickJumpAgents.contains { $0.agent.needsAttention }
+    }
+
+    private func statusBadgeLabel(for agent: AppState.AgentSummary) -> String {
+        guard agent.running else { return "stopped" }
+        switch agent.status {
+        case .blocked: return "needs input"
+        case .working: return "working"
+        case .done: return "done"
+        case .idle: return "idle"
+        }
+    }
+
+    private func statusSymbol(for agent: AppState.AgentSummary) -> String {
+        guard agent.running else { return "circle" }
+        switch agent.status {
+        case .blocked: return "exclamationmark.circle.fill"
+        case .working: return "bolt.circle.fill"
+        case .done: return "checkmark.circle.fill"
+        case .idle: return "circle.fill"
+        }
+    }
+
+    /// 1-tap switcher menu anchored to the navigation title so the user can jump
+    /// straight between projects or directly into any running agent across projects.
+    @ViewBuilder private var projectSwitcherMenu: some View {
+        let activeOthers = Array(quickJumpAgents.prefix(8))
+        if !activeOthers.isEmpty {
+            Section("Active agents") {
+                ForEach(activeOthers, id: \.agent.id) { item in
+                    Button {
+                        UISelectionFeedbackGenerator().selectionChanged()
+                        state.select(item.project, focusingInstance: item.agent.id)
+                    } label: {
+                        Label(
+                            "\(item.project.name) · \(item.agent.name) (\(statusBadgeLabel(for: item.agent)))",
+                            systemImage: statusSymbol(for: item.agent))
+                    }
+                }
+            }
+        }
+        let multiHost = state.doc.hosts.count > 1
+        ForEach(state.doc.hosts) { host in
+            let hostProjects = state.projects(for: host)
+            if !hostProjects.isEmpty {
+                Section(multiHost ? host.name : "Projects") {
+                    ForEach(hostProjects) { proj in
+                        let isCurrent = proj.id == project.id
+                        let agents = state.activity(for: proj)?.agents ?? []
+                        let runningCount = agents.filter(\.running).count
+                        let suffix = runningCount > 0 ? " (\(runningCount) active)" : ""
+                        if !isCurrent, agents.count > 1 {
+                            Menu {
+                                Button {
+                                    UISelectionFeedbackGenerator().selectionChanged()
+                                    state.select(proj)
+                                } label: {
+                                    Label("Open \(proj.name)", systemImage: "folder")
+                                }
+                                Divider()
+                                ForEach(agents) { agent in
+                                    Button {
+                                        UISelectionFeedbackGenerator().selectionChanged()
+                                        state.select(proj, focusingInstance: agent.id)
+                                    } label: {
+                                        Label(
+                                            "\(agent.name) — \(statusBadgeLabel(for: agent))",
+                                            systemImage: statusSymbol(for: agent))
+                                    }
+                                }
+                            } label: {
+                                Label(proj.name + suffix,
+                                      systemImage: state.isProjectWatched(proj.id) ? "folder.fill" : "folder")
+                            }
+                        } else {
+                            Button {
+                                guard !isCurrent else { return }
+                                UISelectionFeedbackGenerator().selectionChanged()
+                                state.select(proj)
+                            } label: {
+                                if isCurrent {
+                                    Label(proj.name, systemImage: "checkmark")
+                                } else {
+                                    Label(proj.name + suffix,
+                                          systemImage: state.isProjectWatched(proj.id) ? "folder.fill" : "folder")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func syncSelectedTabForCurrentProject() {
+        let ids = state.layout?.orderedPaneInstances.map(\.id) ?? []
+        if let target = state.lastLaunched, ids.contains(target) {
+            selectedTab = target
+            focusedInstance = target
+            state.lastLaunched = nil
+        } else if selectedTab == nil || !ids.contains(selectedTab!) {
+            selectedTab = ids.first
+            focusedInstance = ids.first
+        }
+    }
+
     private var decorated: some View {
         content
             .muxelBackground()
             .navigationTitle(project.name)
             .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(theme.background, for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
             .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
                 withAnimation(.easeOut(duration: 0.2)) { keyboardUp = true }
             }
@@ -107,31 +298,93 @@ struct ProjectDetailView: View {
                 withAnimation(.easeOut(duration: 0.2)) { keyboardUp = false }
             }
             .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    Button { showLaunch = true } label: {
-                        Label("New instance", systemImage: "plus.rectangle.on.rectangle")
+                ToolbarItem(placement: .principal) {
+                    Menu {
+                        projectSwitcherMenu
+                    } label: {
+                        HStack(spacing: 5) {
+                            if otherProjectNeedsAttention {
+                                Circle()
+                                    .fill(theme.accentColor)
+                                    .frame(width: 7, height: 7)
+                            }
+                            Text(project.name)
+                                .font(.mono(.subheadline, weight: .semibold))
+                                .foregroundStyle(theme.textColor)
+                                .lineLimit(1)
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(theme.mutedColor)
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
                     }
+                    .accessibilityLabel("Switch project or agent, current \(project.name)")
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Menu {
+                        launchPickerMenu
+                    } label: {
+                        if quickLaunching {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Label("New \(lastUsedPreset.name)", systemImage: "plus")
+                        }
+                    } primaryAction: {
+                        quickLaunch(lastUsedPreset)
+                    }
+                    .disabled(quickLaunching)
+                    .accessibilityLabel("New \(lastUsedPreset.name)")
+                    .accessibilityHint("Tap to launch \(lastUsedPreset.name), or hold to pick another agent")
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button { Task { await state.refreshLayout() } } label: {
-                        Image(systemName: "arrow.clockwise")
+                        if state.isRefreshingLayout {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "arrow.clockwise")
+                        }
                     }
+                    .disabled(state.isRefreshingLayout)
+                    .accessibilityLabel("Refresh layout")
                 }
             }
             .sheet(isPresented: $showLaunch) {
-                // Launch into the focused leaf on iPad; into the main pane on iPhone.
+                // Launch into the focused leaf on iPad; at the end of prior agent tabs on iPhone.
                 LaunchInstanceView(project: project,
-                                   targetLeafAnchor: isRegular ? focusedInstance : nil)
+                                   targetLeafAnchor: launchTargetAnchor)
             }
-            .onChange(of: state.layout?.orderedPaneInstances.map(\.id) ?? []) { ids in
-                if selectedTab == nil || !ids.contains(selectedTab!) { selectedTab = ids.first }
-                if focusedInstance == nil || !ids.contains(focusedInstance!) { focusedInstance = ids.first }
+            .onAppear {
+                syncSelectedTabForCurrentProject()
+                state.activeViewedInstanceId = current?.id
             }
-            .onChange(of: state.lastLaunched) { id in
-                // Auto-open a freshly launched instance's terminal + focus its leaf.
+            .onDisappear {
+                state.activeViewedInstanceId = nil
+            }
+            .onChange(of: current?.id) { _, id in
+                state.activeViewedInstanceId = id
+            }
+            .onChange(of: project.id) { _, _ in
+                selectedTab = nil
+                focusedInstance = nil
+                syncSelectedTabForCurrentProject()
+            }
+            .onChange(of: state.layout?.orderedPaneInstances.map(\.id) ?? []) { _, ids in
+                if let target = state.lastLaunched, ids.contains(target) {
+                    selectedTab = target
+                    focusedInstance = target
+                    state.lastLaunched = nil
+                } else {
+                    if selectedTab == nil || !ids.contains(selectedTab!) { selectedTab = ids.first }
+                    if focusedInstance == nil || !ids.contains(focusedInstance!) { focusedInstance = ids.first }
+                }
+            }
+            .onChange(of: state.lastLaunched) { _, id in
+                // Auto-open a freshly launched or sidebar-tapped instance's terminal + focus its leaf.
                 if let id, instances.contains(where: { $0.id == id }) {
                     selectedTab = id
                     focusedInstance = id
+                    state.lastLaunched = nil
                 }
             }
     }
@@ -238,38 +491,58 @@ struct ProjectDetailView: View {
     }
 
     private var tabBar: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(instances) { inst in
-                    TabChipView(
-                        instance: inst,
-                        isActive: inst.id == current?.id,
-                        onTap: {
-                            selectedTab = inst.id
-                            state.attend(inst.id)
-                        },
-                        menu: compactMenu(for: inst))
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(instances) { inst in
+                        TabChipView(
+                            instance: inst,
+                            isActive: inst.id == current?.id,
+                            onTap: {
+                                selectedTab = inst.id
+                                state.attend(inst.id)
+                            },
+                            menu: compactMenu(for: inst))
+                        .id(inst.id)
+                    }
+                    addTabChip
                 }
-                addTabChip
+                .padding(.horizontal)
+                .padding(.vertical, 8)
             }
-            .padding(.horizontal)
-            .padding(.vertical, 8)
+            .onChange(of: current?.id) { _, id in
+                guard let id else { return }
+                withAnimation(.easeOut(duration: 0.2)) {
+                    proxy.scrollTo(id, anchor: .center)
+                }
+            }
         }
     }
 
-    /// Trailing `+` chip — the natural terminal-tabs affordance for launching a pane
-    /// (mirrors the toolbar button).
+    /// Trailing `+` chip — tap spawns the last-used agent directly; long-press
+    /// picks another preset or opens the full New Instance sheet.
     private var addTabChip: some View {
-        Button { showLaunch = true } label: {
-            Image(systemName: "plus")
-                .font(.mono(.footnote, weight: .semibold))
-                .foregroundStyle(theme.mutedColor)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 7)
-                .paneCard(theme, active: false, radius: 8)
+        Menu {
+            launchPickerMenu
+        } label: {
+            Group {
+                if quickLaunching {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: "plus")
+                        .font(.mono(.footnote, weight: .semibold))
+                        .foregroundStyle(theme.mutedColor)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .paneCard(theme, active: false, radius: 8)
+        } primaryAction: {
+            quickLaunch(lastUsedPreset)
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel("New instance")
+        .disabled(quickLaunching)
+        .accessibilityLabel("New \(lastUsedPreset.name)")
+        .accessibilityHint("Tap to launch \(lastUsedPreset.name), or hold to pick another agent")
     }
 
     private func compactMenu(for inst: Instance) -> TabMenuActions {
@@ -300,11 +573,17 @@ struct ProjectDetailView: View {
                                   onRetry: { Task { await state.refreshLayout() } })
         case .loaded:
             CenteredState(title: "no panes yet", prompt: true, showsGrid: true) {
-                Button { showLaunch = true } label: {
-                    Label("Launch one", systemImage: "plus")
-                        .font(.mono(.footnote, weight: .semibold))
+                VStack(spacing: 8) {
+                    Button { quickLaunch(lastUsedPreset) } label: {
+                        Label("Launch \(lastUsedPreset.name)", systemImage: "plus")
+                            .font(.mono(.footnote, weight: .semibold))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(quickLaunching)
+                    Button("More options…") { showLaunch = true }
+                        .font(.mono(.caption))
+                        .foregroundStyle(theme.mutedColor)
                 }
-                .buttonStyle(.borderedProminent)
             }
         }
     }

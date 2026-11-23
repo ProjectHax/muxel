@@ -36,6 +36,62 @@ enum HostEditorLogic {
                                    existingAuth: existingAuth,
                                    hasPassword: hasPassword, hasKey: hasKey)
     }
+
+    /// Plain-English hint explaining why Save is currently disabled, or `nil` when
+    /// the form is ready to save.
+    static func saveDisabledReason(name: String, hostname: String, jumpValid: Bool,
+                                   usingIdentity: Bool, auth: SshAuthKind,
+                                   existingAuth: SshAuthKind?,
+                                   hasPassword: Bool, hasKey: Bool) -> String? {
+        if !jumpValid { return "Fix the jump host format before saving." }
+        if name.isEmpty { return "Enter a display name for this host." }
+        if hostname.isEmpty { return "Enter a hostname or IP address." }
+        if !hasUsableCredential(usingIdentity: usingIdentity, auth: auth,
+                                existingAuth: existingAuth,
+                                hasPassword: hasPassword, hasKey: hasKey) {
+            return auth == .password
+                ? "Enter a password (or pick a saved login identity)."
+                : "Import a private key (or pick a saved login identity)."
+        }
+        return nil
+    }
+
+    /// Parse a pasted `[ssh ]user@host[:port]` or `host:port` string so pasting an SSH
+    /// target into the Hostname field fills User and Port automatically. Returns `nil`
+    /// for plain hostnames (nothing to split) or IPv6 literals.
+    static func parseEndpoint(_ raw: String) -> (user: String?, hostname: String, port: Int?)? {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.hasPrefix("ssh ") {
+            s = s.dropFirst(4).trimmingCharacters(in: .whitespaces)
+        }
+        guard !s.isEmpty, !s.contains(where: \.isWhitespace) else { return nil }
+        // Don't split bare IPv6 literals like `fe80::1`.
+        if s.filter({ $0 == ":" }).count > 1 && !s.contains("@") { return nil }
+
+        let hadAt = s.contains("@")
+        let hadPort = s.contains(":")
+        guard hadAt || hadPort else { return nil }
+
+        var rest = Substring(s)
+        var user: String?
+        if let at = rest.lastIndex(of: "@") {
+            let u = rest[..<at]
+            guard !u.isEmpty else { return nil }
+            user = String(u)
+            rest = rest[rest.index(after: at)...]
+        }
+
+        var port: Int?
+        if let colon = rest.lastIndex(of: ":"), rest.filter({ $0 == ":" }).count == 1 {
+            guard let n = Int(rest[rest.index(after: colon)...]), (1...65535).contains(n)
+            else { return nil }
+            port = n
+            rest = rest[..<colon]
+        }
+
+        guard !rest.isEmpty else { return nil }
+        return (user, String(rest), port)
+    }
 }
 
 /// Add **or edit** an SSH host. The password / private key + passphrase go straight
@@ -72,6 +128,11 @@ struct HostEditorView: View {
     @State private var askSaveIdentity = false
     @State private var identityName = ""
     @State private var testState: FormTestState = .idle
+    @FocusState private var focusedField: Field?
+
+    private enum Field: Hashable {
+        case name, hostname, port, user, password, passphrase, jumpHost, keepalive
+    }
 
     enum FormTestState: Equatable {
         case idle, testing
@@ -110,18 +171,34 @@ struct HostEditorView: View {
             hasPassword: !password.isEmpty, hasKey: keyData != nil)
     }
 
+    private var saveDisabledReason: String? {
+        HostEditorLogic.saveDisabledReason(
+            name: name, hostname: hostname, jumpValid: jumpValid,
+            usingIdentity: usingIdentity, auth: auth,
+            existingAuth: existingInlineAuth,
+            hasPassword: !password.isEmpty, hasKey: keyData != nil)
+    }
+
     var body: some View {
         NavigationStack {
             Form {
                 MuxelSection("Host") {
                     TextField("Name", text: $name)
-                    TextField("Hostname or IP", text: $hostname)
+                        .focused($focusedField, equals: .name)
+                    TextField("Hostname or IP (or user@host:port)", text: $hostname)
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
-                    TextField("Port (22)", text: $port).keyboardType(.numberPad)
+                        .focused($focusedField, equals: .hostname)
+                        .onChange(of: hostname) { _, value in
+                            applyParsedEndpointIfNeeded(value)
+                        }
+                    TextField("Port (22)", text: $port)
+                        .keyboardType(.numberPad)
+                        .focused($focusedField, equals: .port)
                     if !usingIdentity {
                         TextField("User", text: $user)
                             .textInputAutocapitalization(.never).autocorrectionDisabled()
                             .noPasswordAutoFill()
+                            .focused($focusedField, equals: .user)
                     }
                 }
                 if !state.doc.identities.isEmpty {
@@ -148,18 +225,21 @@ struct HostEditorView: View {
                             SecureField(isEdit ? "New password (blank = keep)" : "Password",
                                         text: $password)
                                 .noPasswordAutoFill()
+                                .focused($focusedField, equals: .password)
                         } else {
                             Button { importingKey = true } label: {
                                 Label(keyLabel, systemImage: "key.fill")
                             }
                             SecureField("Key passphrase (optional)", text: $passphrase)
                                 .noPasswordAutoFill()
+                                .focused($focusedField, equals: .passphrase)
                         }
                     }
                 }
                 MuxelSection("Advanced (optional)") {
                     TextField("Jump host  user@bastion", text: $jumpHost)
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
+                        .focused($focusedField, equals: .jumpHost)
                     if !jumpValid {
                         Label("can't parse — use user@host:port (no chains)",
                               systemImage: "exclamationmark.triangle")
@@ -174,9 +254,18 @@ struct HostEditorView: View {
                             }
                         }
                     }
-                    TextField("Keepalive seconds", text: $keepalive).keyboardType(.numberPad)
+                    TextField("Keepalive seconds", text: $keepalive)
+                        .keyboardType(.numberPad)
+                        .focused($focusedField, equals: .keepalive)
                 }
                 testSection
+                if let reason = saveDisabledReason {
+                    MuxelSection {
+                        EmptyView()
+                    } footer: {
+                        Text(reason)
+                    }
+                }
                 if let existing, existing.name != name, !name.isEmpty {
                     MuxelSection {
                         EmptyView()
@@ -194,6 +283,10 @@ struct HostEditorView: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save", action: attemptSave).disabled(!canSave)
                 }
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Done") { focusedField = nil }
+                }
             }
             .fileImporter(isPresented: $importingKey, allowedContentTypes: [.data, .text, .item]) { result in
                 guard let file = ImportedFile.read(result) else { return }
@@ -210,7 +303,7 @@ struct HostEditorView: View {
                     + "hosts can use them without re-entering.")
             }
             .onAppear(perform: prefill)
-            .onChange(of: formFingerprint) { _ in testState = .idle }
+            .onChange(of: formFingerprint) { _, _ in testState = .idle }
         }
     }
 
@@ -249,6 +342,20 @@ struct HostEditorView: View {
             }
         } footer: {
             Text("Tries the connection with the form's credentials without saving anything.")
+        }
+    }
+
+    private func applyParsedEndpointIfNeeded(_ value: String) {
+        guard let parsed = HostEditorLogic.parseEndpoint(value) else { return }
+        hostname = parsed.hostname
+        if let parsedUser = parsed.user, !usingIdentity, user.isEmpty {
+            user = parsedUser
+        }
+        if let parsedPort = parsed.port, port.isEmpty {
+            port = String(parsedPort)
+        }
+        if name.isEmpty {
+            name = parsed.hostname
         }
     }
 

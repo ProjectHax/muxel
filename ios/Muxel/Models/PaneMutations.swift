@@ -109,7 +109,7 @@ extension PaneNode {
     mutating func normalize() {
         guard case let .split(direction, sizes, children) = self else { return }
 
-        var newChildren = children.map { child -> PaneNode in
+        let newChildren = children.map { child -> PaneNode in
             var c = child
             c.normalize()
             return c

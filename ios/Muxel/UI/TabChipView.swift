@@ -60,7 +60,9 @@ struct TabChipView: View {
     @ViewBuilder private var chipIcon: some View {
         switch instance.kind {
         case .terminal:
-            StatusDot(status: state.status(instance.id), running: state.isRunning(instance.id))
+            StatusDot(status: state.status(instance.id),
+                      running: state.isRunning(instance.id),
+                      surfaceHex: chipBackgroundHex)
         case .editor:
             Image(systemName: "doc.text").font(.caption2).foregroundStyle(chipLabelColor)
         case .diff:

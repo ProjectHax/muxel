@@ -14,15 +14,29 @@ struct LiveTerminalView: UIViewRepresentable {
     /// re-applied via `updateUIView` when the user switches themes.
     var theme: MuxelTheme
 
+    final class Coordinator {
+        var appliedThemeId: String?
+        var appliedViewId: ObjectIdentifier?
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
     func makeUIView(context: Context) -> TerminalView {
         // The same UIView may be re-mounted after navigation; detach from any stale
         // superview so UIKit can re-parent it without asserting.
         session.view.removeFromSuperview()
         theme.apply(to: session.view)
+        context.coordinator.appliedThemeId = theme.id
+        context.coordinator.appliedViewId = ObjectIdentifier(session.view)
         return session.view
     }
 
     func updateUIView(_ uiView: TerminalView, context: Context) {
+        let viewId = ObjectIdentifier(uiView)
+        guard context.coordinator.appliedThemeId != theme.id
+                || context.coordinator.appliedViewId != viewId else { return }
         theme.apply(to: uiView)
+        context.coordinator.appliedThemeId = theme.id
+        context.coordinator.appliedViewId = viewId
     }
 }

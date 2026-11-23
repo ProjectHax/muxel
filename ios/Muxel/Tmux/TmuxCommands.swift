@@ -385,6 +385,46 @@ enum TmuxCommands {
         ["kill-session", "-t", "=\(session)"]
     }
 
+    /// Ensure the remote PTY/shell advertises `TERM=xterm-256color`, 24-bit TrueColor
+    /// (`COLORTERM=truecolor`), and a UTF-8 locale (without overriding an existing
+    /// UTF-8 locale). Citadel's SSH PTY does not send `SendEnv LANG LC_* COLORTERM`,
+    /// and remote shell rc files may reset `TERM`, so without this a remote host
+    /// degrades colors and Unicode glyphs.
+    static var utf8ColorPrelude: String {
+        "export TERM=xterm-256color COLORTERM=truecolor; "
+            + "case \"${LC_ALL:-${LC_CTYPE:-${LANG:-}}}\" in *[Uu][Tt][Ff]*8*) ;; "
+            + "*) if locale -a 2>/dev/null | grep -qiE '^C\\.utf-?8$'; "
+            + "then export LANG=C.UTF-8 LC_CTYPE=C.UTF-8; "
+            + "else export LANG=en_US.UTF-8 LC_CTYPE=en_US.UTF-8; fi ;; esac"
+    }
+
+    /// Enable 256-color `default-terminal` (RHEL 10 `tmux 3.3a` defaults to 8-color
+    /// `screen`), `COLORTERM` propagation, and 24-bit TrueColor passthrough (`RGB`
+    /// for tmux 3.2+, `Tc` for tmux 2.2+) idempotently on the selected tmux server
+    /// before the client attaches, so colors and gradients pass through intact.
+    /// Must follow `selectSocket`.
+    static var enableTrueColorCommand: String {
+        "if infocmp tmux-256color >/dev/null 2>&1; "
+            + "then tmux \"$@\" set-option -g default-terminal tmux-256color 2>/dev/null; "
+            + "else tmux \"$@\" set-option -g default-terminal screen-256color 2>/dev/null; fi; "
+            + "tmux \"$@\" show-options -g update-environment 2>/dev/null | grep -q 'COLORTERM' "
+            + "|| tmux \"$@\" set-option -ga update-environment COLORTERM 2>/dev/null; "
+            + "tmux \"$@\" show-options -s terminal-overrides 2>/dev/null | grep -q 'xterm-256color:Tc' "
+            + "|| tmux \"$@\" set-option -sa terminal-overrides ',xterm-256color:Tc' 2>/dev/null; "
+            + "tmux \"$@\" show-options -s terminal-features 2>/dev/null | grep -q 'xterm-256color:RGB' "
+            + "|| tmux \"$@\" set-option -sa terminal-features 'xterm-256color:RGB' 2>/dev/null"
+    }
+
+    /// Ensure the inner pane process inherits `COLORTERM=truecolor` and a 256-color
+    /// `TERM` even if the tmux server was started earlier with RHEL's 8-color `screen`
+    /// default or without `COLORTERM` in its global environment.
+    private static var innerPaneColorPrelude: String {
+        "export COLORTERM=truecolor; "
+            + "case \"${TERM:-}\" in ''|dumb|screen|tmux) "
+            + "if infocmp tmux-256color >/dev/null 2>&1; then export TERM=tmux-256color; "
+            + "else export TERM=screen-256color; fi ;; esac; "
+    }
+
     /// Raw `tmux new-session` command line that launches `program` inside the user's
     /// **login + interactive** shell (`$SHELL -ilc 'exec …'`), so the agent resolves
     /// on the user's real PATH (nvm / npm-global / `~/.local/bin`, …).
@@ -398,12 +438,14 @@ enum TmuxCommands {
     /// server first (`clearInstanceId`). Creates a missing `cwd` first (`createDir`).
     static func launchAgent(session: String, cwd: String, program: String?, args: [String]) -> String {
         var cmd =
-            "\(pathPrelude); \(selectSocket(session)); \(createDir(cwd)); tmux \"$@\" \(clearProfilerEnvironment()) \(clearInstanceId) "
+            "\(pathPrelude); \(utf8ColorPrelude); \(selectSocket(session)); \(createDir(cwd)); "
+            + "tmux -u \"$@\" \(clearProfilerEnvironment()) \(clearInstanceId) "
             + "new-session -d -s \(Shell.quote(session)) -c \(Shell.quote(cwd))"
         if let program {
             let inner = "exec " + Shell.command([program] + args)
             cmd += " -- sh -c " + Shell.quote(
                 "tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\" 2>/dev/null; "
+                    + innerPaneColorPrelude
                     + remoteExec("\"${SHELL:-/bin/sh}\" -ilc \(Shell.quote(inner))"))
         }
         return cmd
@@ -434,35 +476,89 @@ enum TmuxCommands {
         ["attach-session", "-t", "=\(session)"]
     }
 
-    /// Raw PTY command: `exec tmux attach` to an existing session, so the PTY's shell
+    /// Raw PTY command: `exec tmux -u attach` to an existing session, so the PTY's shell
     /// *becomes* tmux (the pane is the live terminal). For a session that already
     /// exists (created by desktop or a prior launch). The PTY is opened at the phone's
     /// real grid size (see `TerminalSession`), so the attaching client is correctly
-    /// sized from the start. `clear;` wipes the login banner + echoed command so they
-    /// don't bleed through under tmux's redraw. On the server holding the session
-    /// (`selectSocket`).
+    /// sized from the start. `-u` forces UTF-8 output regardless of host locale, and
+    /// `enableTrueColorCommand` ensures 24-bit RGB gradients pass through before attach.
+    /// `clear;` wipes the login banner + echoed command so they don't bleed through
+    /// under tmux's redraw. On the server holding the session (`selectSocket`).
     static func attachPTYCommand(session: String, socket: String? = nil) -> String {
-        "\(pathPrelude); \(selectSocket(session, socket: socket)); clear; "
-            + "exec tmux \"$@\" attach-session -t \(Shell.quote("=\(session)"))"
+        "\(pathPrelude); \(utf8ColorPrelude); \(selectSocket(session, socket: socket)); "
+            + "\(enableTrueColorCommand); clear; "
+            + "exec tmux -u \"$@\" attach-session -t \(Shell.quote("=\(session)"))"
     }
 
-    /// Raw PTY command: `exec tmux new-session -A` **attached** (no `-d`), running
+    /// Headless read-only monitor attach (`-r` = `read-only,ignore-size`): streams the
+    /// live terminal screen into a background SwiftTerm emulator so watched projects get
+    /// accurate working/blocked/done status on the home screen without resizing desktop's
+    /// tmux window, without sending input, and without `capture-pane`.
+    static func attachReadOnlyPTYCommand(session: String, socket: String? = nil) -> String {
+        "\(pathPrelude); \(utf8ColorPrelude); \(selectSocket(session, socket: socket)); "
+            + "exec tmux -u \"$@\" attach-session -r -t \(Shell.quote("=\(session)"))"
+    }
+
+    /// Single-PTY batched read-only screen probe: inspects every target session on one
+    /// host sequentially over **one** SSH PTY channel (reusing the single pooled SSH
+    /// connection). Each target attaches briefly with `-r` (`read-only,ignore-size`,
+    /// never resizing desktop and never calling `capture-pane`), then detaches ONLY
+    /// this probe's own tty (`detach-client -t "$t"`), wrapped in delimiters so the
+    /// client can render every agent's screen in ~150ms each.
+    static func batchProbeReadOnlyPTYCommand(
+        targets: [(session: String, socket: String?)],
+        nonce: String
+    ) -> String {
+        var steps = ["unset TMUX", "t=$(tty)"]
+        for (idx, target) in targets.enumerated() {
+            let sockFlag: String
+            if let sock = target.socket {
+                sockFlag = sock == "default" ? "" : "-L \(Shell.quote(sock)) "
+            } else {
+                sockFlag = "-L \(socketName) "
+            }
+            let begin = "__MUXEL_PB_\(nonce)_\(idx)__"
+            let end = "__MUXEL_PE_\(nonce)_\(idx)__"
+            let targetArg = Shell.quote("=\(target.session)")
+            // Fast detach right after tmux paints the initial screen (~250ms), with
+            // brief retries in case the server is loaded when attaching.
+            let detachLoop = "(for _w in 0.25 0.35 0.5; do "
+                + "sleep $_w 2>/dev/null || sleep 1; "
+                + "tmux \(sockFlag)detach-client -t \"$t\" 2>/dev/null && break; "
+                + "done) & _dp=$!"
+            steps.append(
+                "printf '\\n\(begin)\\n'; "
+                + "\(detachLoop); "
+                + "tmux -u \(sockFlag)attach-session -r -t \(targetArg) 2>/dev/null; "
+                + "wait \"$_dp\" 2>/dev/null; "
+                + "printf '\\n\(end)\\n'"
+            )
+        }
+        steps.append("printf '\\n__MUXEL_PD_\(nonce)__\\n'")
+        let script = "\(pathPrelude); \(utf8ColorPrelude); " + steps.joined(separator: "; ")
+        return "sh -c \(Shell.quote(script)); exit 0"
+    }
+
+    /// Raw PTY command: `exec tmux -u new-session -A` **attached** (no `-d`), running
     /// `program` in a login shell. Attached-at-init is the whole point: interactive
     /// TUI agents (claude) crash if they initialize with no client; over a live PTY
     /// they get one, exactly like desktop's `ssh -t`. `program == nil` → default shell.
-    /// Clears a stale pane id from the server first (`clearInstanceId`). A new session
-    /// goes on muxel's own server; `-A` reattaches one wherever it runs (`selectSocket`).
-    /// Creates a missing `cwd` first (`createDir`).
+    /// Clears a stale pane id from the server first (`clearInstanceId`), forces UTF-8
+    /// (`-u` + `utf8ColorPrelude`), and enables 24-bit TrueColor (`RGB`/`Tc`) before
+    /// attaching. A new session goes on muxel's own server; `-A` reattaches one wherever
+    /// it runs (`selectSocket`). Creates a missing `cwd` first (`createDir`).
     static func newAttachedPTYCommand(session: String, cwd: String, program: String?, args: [String], socket: String? = nil) -> String {
         // `clear;` wipes the login banner + echoed command before tmux takes over.
         var cmd =
-            "\(pathPrelude); \(selectSocket(session, socket: socket)); \(createDir(cwd)); clear; "
-            + "exec tmux \"$@\" \(clearProfilerEnvironment()) \(clearInstanceId) "
+            "\(pathPrelude); \(utf8ColorPrelude); \(selectSocket(session, socket: socket)); "
+            + "\(enableTrueColorCommand); \(createDir(cwd)); clear; "
+            + "exec tmux -u \"$@\" \(clearProfilerEnvironment()) \(clearInstanceId) "
             + "new-session -A -s \(Shell.quote(session)) -c \(Shell.quote(cwd))"
         if let program {
             let inner = "exec " + Shell.command([program] + args)
             cmd += " -- sh -c " + Shell.quote(
                 "tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\" 2>/dev/null; "
+                    + innerPaneColorPrelude
                     + remoteExec("\"${SHELL:-/bin/sh}\" -ilc \(Shell.quote(inner))"))
         }
         return cmd
@@ -503,7 +599,8 @@ enum TmuxCommands {
     /// target; a host with no running server exits non-zero (treat as empty).
     static func allPaneStatuses(socket: String? = nil) -> [String] {
         ["list-panes", "-a", "-F",
-         "#{session_name}\t#{pane_dead}\t#{window_bell_flag}\t#{window_activity}" + (socket.map { "\t\($0)" } ?? "")]
+         "#{session_name}\t#{pane_dead}\t#{window_bell_flag}\t#{window_activity}"
+            + (socket.map { "\t\($0)\t#{pane_current_command}\t#{pane_pid}" } ?? "")]
     }
 
     /// Clear a window's bell flag once we've acted on it (attend equivalent).
@@ -526,6 +623,18 @@ enum TmuxCommands {
     /// (`-s`), enabled best-effort on attach alongside `setMouseOn`.
     static func setClipboardOn() -> [String] {
         ["set-option", "-s", "set-clipboard", "on"]
+    }
+
+    /// Let the most recently active client (iPhone or desktop) size the window so
+    /// switching between devices automatically fits the terminal without manual taps.
+    static func setWindowSizeLatest(session: String) -> [String] {
+        ["set-option", "-w", "-t", paneTarget(session), "window-size", "latest"]
+    }
+
+    /// Exit tmux copy mode (scrollback) cleanly; no-op when the pane is not in copy
+    /// mode, so it never types stray characters into the active agent or shell.
+    static func exitCopyMode(session: String) -> [String] {
+        ["copy-mode", "-q", "-t", paneTarget(session)]
     }
 
     // MARK: Input

@@ -63,6 +63,11 @@ struct MuxelTheme: Identifiable, Equatable {
     /// the muted grey (readable on the dark grid) for light themes.
     var terminalBlackHex: String { isDark ? bg : muted }
     var terminalBackground: Color { Color(hex: terminalBgHex) }
+    /// Readable foreground for surfaces painted with `terminalBackground` (the live
+    /// terminal and read-only code/diff viewers — stays light even under light chrome).
+    var terminalForeground: Color { Color(hex: terminalFgHex) }
+    /// Secondary/muted label color over `terminalBackground`.
+    var terminalMuted: Color { isDark ? mutedColor : Color(hex: terminalFgHex).opacity(0.65) }
 }
 
 extension MuxelTheme {

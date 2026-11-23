@@ -20,13 +20,22 @@ enum AgentLaunch {
     static func composeArgs(_ preset: Preset) -> [String] {
         var out: [String] = []
         if let flag = preset.modelFlag, let model = preset.model, !model.isEmpty {
-            out.append(flag); out.append(model)
+            appendFlag(&out, flag: flag, value: model)
         }
         if let flag = preset.effortFlag, let effort = preset.effort, !effort.isEmpty {
-            out.append(flag); out.append(effort)
+            appendFlag(&out, flag: flag, value: effort)
         }
         out.append(contentsOf: preset.args)
         return out
+    }
+
+    private static func appendFlag(_ out: inout [String], flag: String, value: String) {
+        if flag.contains("{}") {
+            out.append(flag.replacingOccurrences(of: "{}", with: value))
+        } else {
+            out.append(flag)
+            out.append(value)
+        }
     }
 
     /// Resolve an instance into program/args + any TypeIn startup input, applying its

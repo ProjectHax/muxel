@@ -25,6 +25,13 @@ struct TerminalPaneView: View {
     @State private var status: Status = .attaching
     @State private var lastError: String?
     @State private var retryTask: Task<Void, Never>?
+    /// Active tmux target for this pane, used to exit tmux copy mode cleanly.
+    @State private var activeTarget: (name: String, socket: String)?
+    /// Shown briefly as a pill overlay while pinching to resize the terminal font.
+    @State private var zoomHudSize: CGFloat?
+    @State private var zoomHudHideTask: Task<Void, Never>?
+    /// True after the user swipes up into tmux scrollback; drives the ↓ Bottom pill.
+    @State private var scrolledBack = false
 
     enum Status: Equatable {
         case stopped
@@ -84,20 +91,68 @@ struct TerminalPaneView: View {
                     .allowsHitTesting(!dimmed)
             }
             overlay
+            if let size = zoomHudSize {
+                VStack {
+                    Text("\(Int(size)) pt")
+                        .font(.mono(.caption, weight: .semibold))
+                        .foregroundStyle(theme.textColor)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .paneCard(theme, active: true, radius: 14)
+                        .padding(.top, 12)
+                    Spacer()
+                }
+                .allowsHitTesting(false)
+                .transition(.opacity)
+            }
+            if scrolledBack, status == .live {
+                VStack {
+                    Spacer()
+                    Button(action: jumpToBottom) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.down.to.line")
+                                .font(.system(size: 13, weight: .bold))
+                            Text("Jump to bottom")
+                                .font(.mono(.footnote, weight: .bold))
+                        }
+                        .foregroundStyle(theme.readableText(on: theme.accent))
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 9)
+                        .background(Capsule().fill(theme.accentColor))
+                        .overlay(Capsule().strokeBorder(theme.readableText(on: theme.accent).opacity(0.25), lineWidth: 1))
+                        .shadow(color: .black.opacity(0.45), radius: 8, y: 3)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Jump to bottom")
+                    .padding(.bottom, 16)
+                }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
         }
+        .animation(.easeOut(duration: 0.15), value: zoomHudSize != nil)
+        .animation(.easeOut(duration: 0.15), value: scrolledBack)
         .task { await initialAttach() }
-        .onChange(of: scenePhase) { phase in
+        .onChange(of: scenePhase) { _, phase in
             // iOS suspends in the background and the SSH transport can drop; when we
-            // return, reconnect if this pane's session died.
-            if phase == .active, let s = session, !s.isConnected { beginReconnect() }
+            // return, reconnect if this pane's session died, or re-fit tmux if still live.
+            if phase == .active, let s = session {
+                if !s.isConnected {
+                    beginReconnect()
+                } else {
+                    s.syncRemoteSize(delayMs: 100)
+                }
+            }
         }
-        .onChange(of: state.deadPanes.contains(instance.id)) { dead in
+        .onChange(of: state.deadPanes.contains(instance.id)) { _, dead in
             if dead { beginReconnect() }
         }
-        .onChange(of: currentInstance?.literalArgv) { literal in
+        .onChange(of: currentInstance?.literalArgv) { _, literal in
             if literal == true { stopIfLiteral() }
         }
-        .onDisappear { retryTask?.cancel(); retryTask = nil }
+        .onDisappear {
+            retryTask?.cancel(); retryTask = nil
+            zoomHudHideTask?.cancel(); zoomHudHideTask = nil
+        }
     }
 
     @ViewBuilder private var overlay: some View {
@@ -191,13 +246,31 @@ struct TerminalPaneView: View {
               state.layout?.instances.contains(where: { $0.id == instance.id }) == true else { return false }
         guard !stopIfLiteral() else { return false }
         if let live = state.terminals.existing(instance.id) {
-            live.onFocusRequested = onFocus
+            wireSessionHooks(live)
+            if let current = currentInstance, let name = current.tmuxSession, let sock = current.tmuxSocket {
+                activeTarget = (name, sock)
+            }
             session = live
+            live.syncRemoteSize(delayMs: 80)
             return true
         }
         do {
             let conn = state.connection(for: host)
             try await conn.connect()
+            // Fast path: if the recent host sweep already confirmed this pane's
+            // durably-bound tmux session is live on its exact recorded socket, open
+            // the PTY immediately without 2 extra pre-flight SSH round trips.
+            if let current = currentInstance,
+               let fastTarget = state.fastAttachTarget(for: current, in: project, hostId: host.id) {
+                let cmd = TmuxCommands.attachPTYCommand(session: fastTarget.name, socket: fastTarget.socket)
+                let s = state.terminals.session(
+                    for: instance.id, hostId: host.id, connection: conn, command: cmd)
+                wireSessionHooks(s)
+                activeTarget = (fastTarget.name, fastTarget.socket)
+                session = s
+                configureAttachedSession(conn: conn, sessionName: fastTarget.name, socket: fastTarget.socket)
+                return true
+            }
             guard let plan = try await state.prepareTmuxAttachmentPlan(instanceId: instance.id, in: project, prepare: { current in
                 // The name a new session gets: the authoritative one recorded in the
                 // shared layout (`tmux_session`), so we converge with the name desktop
@@ -277,7 +350,8 @@ struct TerminalPaneView: View {
                   current.tmuxSession == plan.sessionName else { stopIfLiteral(); return false }
             let s = state.terminals.session(
                 for: instance.id, hostId: host.id, connection: conn, command: plan.command)
-            s.onFocusRequested = onFocus
+            wireSessionHooks(s)
+            activeTarget = (plan.sessionName, plan.socket)
             session = s
 
             if plan.creating {
@@ -292,15 +366,10 @@ struct TerminalPaneView: View {
                                                    delayMs: plan.startupDelayMs, submit: plan.startupSubmit)
                 }
             }
-            // Enable tmux mouse mode so a touch drag scrolls the pane's scrollback
-            // (copy mode), and OSC-52 forwarding so remote copies land on the phone
-            // clipboard. Best-effort + separate from the attach so they can't break
-            // it; a freshly-created session may not exist yet when this runs, but it
-            // has no history to scroll anyway and picks it up on the next open.
-            Task {
-                _ = try? await conn.tmux(TmuxCommands.setMouseOn(session: plan.sessionName), session: plan.sessionName, socket: plan.socket)
-                _ = try? await conn.tmux(TmuxCommands.setClipboardOn(), session: plan.sessionName, socket: plan.socket)
-            }
+            // Enable tmux mouse mode, latest-client auto-resize, OSC-52 clipboard, and
+            // TrueColor in ONE batched SSH command so switching tabs never queues 5
+            // serial execs on the connection mutex.
+            configureAttachedSession(conn: conn, sessionName: plan.sessionName, socket: plan.socket)
             return true
         } catch {
             guard !Task.isCancelled, state.selectedProject?.id == project.id else { return false }
@@ -309,6 +378,54 @@ struct TerminalPaneView: View {
             // A changed host key needs the trust-prompt sheet, not just inline text.
             if announce { state.surface(error, host: host) }
             return false
+        }
+    }
+
+    /// Batch all post-attach tmux options into a single best-effort SSH round trip.
+    private func configureAttachedSession(conn: SSHConnection, sessionName: String, socket: String) {
+        let target = Shell.quote(TmuxCommands.paneTarget(sessionName))
+        let cmd = "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket(sessionName, socket: socket)); "
+            + "tmux \"$@\" set-option -t \(target) mouse on ';' "
+            + "set-option -w -t \(target) window-size latest ';' "
+            + "set-option -s set-clipboard on ';' "
+            + "set-environment -g COLORTERM truecolor 2>/dev/null; "
+            + "\(TmuxCommands.enableTrueColorCommand); true"
+        Task {
+            _ = try? await conn.run(cmd)
+        }
+    }
+
+    private func wireSessionHooks(_ s: TerminalSession) {
+        s.onFocusRequested = onFocus
+        s.onFontSizePreview = { size in
+            zoomHudHideTask?.cancel()
+            if let size {
+                zoomHudSize = size
+            } else {
+                zoomHudHideTask = Task {
+                    try? await Task.sleep(for: .milliseconds(700))
+                    if !Task.isCancelled { zoomHudSize = nil }
+                }
+            }
+        }
+        s.onScrolledBackChanged = { scrolledBack = $0 }
+        s.onExitCopyModeRequested = { exitCopyMode() }
+    }
+
+    private func jumpToBottom() {
+        UISelectionFeedbackGenerator().selectionChanged()
+        session?.scrollToBottom()
+        scrolledBack = false
+        exitCopyMode()
+    }
+
+    private func exitCopyMode() {
+        guard let target = activeTarget else { return }
+        let conn = state.connection(for: host)
+        Task {
+            _ = try? await conn.tmux(
+                TmuxCommands.exitCopyMode(session: target.name),
+                session: target.name, socket: target.socket)
         }
     }
 

@@ -468,17 +468,97 @@ final class InteropTests: XCTestCase {
     }
 
     func testAggregateProjectActivity() {
+        var instA = Instance(id: "a", projectId: "p", title: "claude", program: "claude", args: [])
+        instA.customName = "Refactor"
+        let instB = Instance(id: "b", projectId: "p", title: "codex", program: "codex", args: [])
+        let instC = Instance(id: "c", projectId: "p", title: "amp", program: "amp", args: [])
+        let instD = Instance(id: "d", projectId: "p", title: "shell", program: nil, args: [])
         let results = [
             InstanceStatus(instanceId: "a", status: .working, running: true),
             InstanceStatus(instanceId: "b", status: .blocked, running: true),
             InstanceStatus(instanceId: "c", status: .done, running: true),
             InstanceStatus(instanceId: "d", status: .idle, running: false),
         ]
-        let a = AppState.aggregate(results)
+        let a = AppState.aggregate(results, instances: [instA, instB, instC, instD])
         XCTAssertEqual(a.running, 3)  // "d" has no live session
         XCTAssertEqual(a.blocked, 1)
         XCTAssertEqual(a.done, 1)
+        XCTAssertEqual(a.agentStatuses, [.blocked, .working, .done])
+        // All 4 agents are listed, ordered by attention priority (running blocked → working → done → stopped).
+        XCTAssertEqual(a.agents.map(\.id), ["b", "a", "c", "d"])
+        XCTAssertEqual(a.agents.map(\.name), ["codex", "Refactor", "amp", "shell"])
+        XCTAssertEqual(a.agents.map(\.running), [true, true, true, false])
+        XCTAssertTrue(a.agents[0].needsAttention)   // blocked
+        XCTAssertFalse(a.agents[1].needsAttention)  // working
+        XCTAssertTrue(a.agents[2].needsAttention)   // done
+        XCTAssertFalse(a.agents[3].needsAttention)  // stopped
         XCTAssertEqual(AppState.aggregate([]).running, 0)
+        XCTAssertTrue(AppState.aggregate([]).agentStatuses.isEmpty)
+        XCTAssertTrue(AppState.aggregate([]).agents.isEmpty)
+    }
+
+    func testPollClassifyUsesLiveScreenWhenTmuxRowAbsent() {
+        let inst = Instance(id: "11111111-1111-1111-1111-111111111111",
+                            projectId: "p", title: "claude", program: "claude", args: [])
+        let screen = LiveScreen(text: "Do you want to proceed? (y/n)", idle: 5, bell: true)
+        let res = PollService().classify(rows: [], instances: [inst], liveScreens: [inst.id: screen])
+        XCTAssertEqual(res.count, 1)
+        XCTAssertTrue(res[0].running)
+        XCTAssertEqual(res[0].status, .blocked)
+    }
+
+    func testFetchPaneRowsFallsBackToLoginShellWhenBareExecEmpty() async {
+        let inst = Instance(id: "11111111-1111-1111-1111-111111111111",
+                            projectId: "p", title: "claude", program: "claude", args: [])
+        let now = Int(Date().timeIntervalSince1970)
+        let conn = MockSSHConnection { cmd in
+            if cmd.contains("-lc") && cmd.contains("lsp -a") {
+                return "muxel_rhel_11111111\t0\t0\t\(now)\tmxl\n"
+            }
+            return ""
+        }
+        let rows = await PollService().fetchPaneRows(conn, instances: [inst])
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows.first?.session, "muxel_rhel_11111111")
+        XCTAssertEqual(rows.first?.socket, "mxl")
+    }
+
+    func testFetchPaneRowsFallsBackWhenUnrelatedSessionExistsButZeroAgentsMatch() async {
+        let inst = Instance(id: "11111111-1111-1111-1111-111111111111",
+                            projectId: "p", title: "claude", program: "claude", args: [])
+        let now = Int(Date().timeIntervalSince1970)
+        let conn = MockSSHConnection { cmd in
+            if cmd.contains("-lc") && cmd.contains("tmux-$uid") {
+                return "muxel_rhel_11111111\t0\t0\t\(now)\tmxl-custom\n"
+            }
+            if cmd.contains("list-panes") {
+                return "personal_shell\t0\t0\t\(now)\tdefault\n"
+            }
+            return ""
+        }
+        let rows = await PollService().fetchPaneRows(conn, instances: [inst])
+        XCTAssertTrue(rows.contains(where: { $0.session == "muxel_rhel_11111111" && $0.socket == "mxl-custom" }))
+        let classified = PollService().classify(rows: rows, instances: [inst])
+        XCTAssertEqual(classified.first?.running, true)
+    }
+
+    func testPollClassifyResolvesUniqueMuxelUUIDSessionAcrossStaleSocket() {
+        var inst = Instance(id: "11111111-1111-1111-1111-111111111111",
+                            projectId: "p", title: "claude", program: "claude", args: [])
+        inst.tmuxSession = "muxel_rhel_11111111"
+        inst.tmuxSocket = "mxl"
+        let movedRow = PaneRow(session: "muxel_rhel_11111111", exited: false, bell: false, idle: 10, socket: "default")
+        let res = PollService().classify(rows: [movedRow], instances: [inst])
+        XCTAssertEqual(res.first?.running, true)
+
+        // Arbitrary non-UUID session names must NEVER match across sockets.
+        var imported = Instance(id: "22222222-2222-2222-2222-222222222222",
+                                projectId: "p", title: "work", program: nil, args: [])
+        imported.tmuxSession = "work"
+        imported.tmuxSocket = "default"
+        let wrongSock = PaneRow(session: "work", exited: false, bell: false, idle: 10, socket: "mxl")
+        let resImported = PollService().classify(rows: [wrongSock], instances: [imported])
+        XCTAssertEqual(resImported.first?.running, false)
     }
 
     func testParseMeta() {
@@ -487,5 +567,210 @@ final class InteropTests: XCTestCase {
         XCTAssertEqual(PollService.parseMeta("0\t1\t0").bell, true)
         let recent = Int(Date().timeIntervalSince1970) - 1
         XCTAssertLessThan(PollService.parseMeta("0\t0\t\(recent)").idle, 5)
+    }
+
+    func testParseReadManyDecodesValidProjectsAndDetectsFallback() throws {
+        var l1 = RemoteLayout(remoteRoot: "/srv/a")
+        l1.addInstanceAsTab(Instance(id: "11111111-1111-1111-1111-111111111111", projectId: "p", title: "claude", program: "claude", args: []), now: 1)
+        var l2 = RemoteLayout(remoteRoot: "/srv/b")
+        l2.addInstanceAsTab(Instance(id: "22222222-2222-2222-2222-222222222222", projectId: "p", title: "shell", program: nil, args: []), now: 2)
+        let j1 = String(decoding: try MuxelJSON.encoder.encode(l1), as: UTF8.self)
+        let j2 = String(decoding: try MuxelJSON.encoder.encode(l2), as: UTF8.self)
+
+        let out = """
+        __B__
+        /srv/a
+        \(j1)
+        __E__
+        __B__
+        /srv/b
+        \(j2)
+        __E__
+        __D__
+        """
+        let parsed = try XCTUnwrap(RemoteLayoutStore.parseReadMany(out, begin: "__B__", end: "__E__", done: "__D__"))
+        XCTAssertEqual(parsed.count, 2)
+        XCTAssertEqual(parsed["/srv/a"]?.instances.count, 1)
+        XCTAssertEqual(parsed["/srv/b"]?.instances.count, 1)
+
+        // Missing done sentinel (e.g. mock ignored the batch command) → nil to trigger fallback.
+        XCTAssertNil(RemoteLayoutStore.parseReadMany("", begin: "__B__", end: "__E__", done: "__D__"))
+    }
+
+    func testPersistedActivityDecodesAndFeedsPollClassification() throws {
+        let json = """
+        {
+          "id": "de16ae04-7c29-48bd-86c0-e2932609c66e",
+          "project_id": "p",
+          "title": "Antigravity",
+          "program": "agy",
+          "tmux_session": "muxel_muxel_de16ae04",
+          "tmux_socket": "mxl",
+          "activity": {
+            "work_started_at": 1795383143890,
+            "last_state": "working"
+          }
+        }
+        """
+        let inst = try MuxelJSON.decoder.decode(Instance.self, from: Data(json.utf8))
+        XCTAssertEqual(inst.activity?.currentState, .working)
+        // Re-encoding must omit `activity` to preserve desktop content_key parity.
+        let encoded = String(decoding: try MuxelJSON.encoder.encode(inst), as: UTF8.self)
+        XCTAssertFalse(encoded.contains("\"activity\""))
+
+        let row = PaneRow(session: "muxel_muxel_de16ae04", exited: false, bell: false, idle: 30, socket: "mxl")
+        let statuses = PollService().classify(rows: [row], instances: [inst])
+        XCTAssertEqual(statuses.first?.running, true)
+        XCTAssertEqual(statuses.first?.status, .working)
+
+        // Attended desktop "done" (last_attended_at >= completed_at) or long-idle stale
+        // "done" must resolve as `.idle`, never triggering spurious "finished" badges/alerts.
+        var attended = inst
+        attended.activity = PersistedAgentActivity(
+            workStartedAt: 1000, completedAt: 2000, blockedAt: nil, lastAttendedAt: 2500, lastState: .done)
+        XCTAssertEqual(attended.activity?.effectiveLiveState, .idle)
+        XCTAssertEqual(PollService().classify(rows: [row], instances: [attended]).first?.status, .idle)
+
+        var staleDone = inst
+        staleDone.activity = PersistedAgentActivity(
+            workStartedAt: 1000, completedAt: 2000, blockedAt: nil, lastAttendedAt: nil, lastState: .done)
+        // Even if an attach/resize bumped tmux `window_activity` to 0s idle, an hours-old
+        // `completedAt` must still resolve as `.idle`, never resurrecting `.done`.
+        let resizedRow = PaneRow(session: "muxel_muxel_de16ae04", exited: false, bell: false, idle: 1, socket: "mxl")
+        XCTAssertEqual(staleDone.activity?.effectiveLiveState(now: 1_700_000_000), .idle)
+        XCTAssertEqual(PollService().classify(rows: [resizedRow], instances: [staleDone]).first?.status, .idle)
+    }
+
+    func testStatusPollerNotificationFilterSuppressesFirstSightAndStaleIdleDone() {
+        // First observation (no baseline yet) must never spam notifications.
+        XCTAssertFalse(StatusPoller.shouldNotify(previous: nil, current: .done, idle: 10))
+        XCTAssertFalse(StatusPoller.shouldNotify(previous: nil, current: .blocked, idle: 10))
+        // Transition from working → done or working → blocked always notifies.
+        XCTAssertTrue(StatusPoller.shouldNotify(previous: .working, current: .done, idle: 60))
+        XCTAssertTrue(StatusPoller.shouldNotify(previous: .working, current: .blocked, idle: 60))
+        // Repeated done/blocked never re-notifies.
+        XCTAssertFalse(StatusPoller.shouldNotify(previous: .done, current: .done, idle: 10))
+        XCTAssertFalse(StatusPoller.shouldNotify(previous: .blocked, current: .blocked, idle: 10))
+        // Idle → done without having been seen working (e.g. attach/resize bumping
+        // window_activity on an hours-old finished agent) must NOT fire a fake alert.
+        XCTAssertFalse(StatusPoller.shouldNotify(previous: .idle, current: .done, idle: 2, exited: false))
+        XCTAssertFalse(StatusPoller.shouldNotify(previous: .idle, current: .done, idle: 1800, exited: false))
+        // A fresh process exit (pane_dead == 1 within 2 min) DOES notify.
+        XCTAssertTrue(StatusPoller.shouldNotify(previous: .idle, current: .done, idle: 15, exited: true))
+        // Shell transitioning working → idle in background (no in-memory latch) DOES notify "finished".
+        XCTAssertEqual(
+            StatusPoller.notificationLabel(previous: .working, current: .idle, idle: 0, isShell: true),
+            "finished")
+        // Non-shell marker agents must confirm completion via `.done` (live screen /
+        // exit / bell) — a screen-less `.working → .idle` fallback must not false-fire.
+        XCTAssertNil(
+            StatusPoller.notificationLabel(previous: .working, current: .idle, idle: 2, isShell: false))
+        XCTAssertNil(
+            StatusPoller.notificationLabel(previous: .working, current: .idle, idle: 10, isShell: false))
+    }
+
+    func testSeedPreviouslyWorkingLatchesDoneAcrossBackgroundPollsAndPreservesStreaming() {
+        let id = "44444444-4444-4444-4444-444444444444"
+        var claude = Instance(id: id, projectId: "p", title: "Claude", program: "claude", args: [])
+        claude.tmuxSession = "muxel_rhel_44444444"
+        claude.tmuxSocket = "mxl"
+
+        // 1. Fresh PollService seeded from persisted `.working` baseline latches `.done`
+        // (not `.idle`) when Claude's probed screen no longer has `esc to interrupt` and
+        // output has settled (`idle >= 5s`).
+        let bgPoll = PollService()
+        bgPoll.seedPreviouslyWorking([id])
+        let finishedRow = PaneRow(session: "muxel_rhel_44444444", exited: false, bell: false, idle: 20, socket: "mxl")
+        let finishedScreen = LiveScreen(text: "Done!\n❯ ", idle: 20, bell: false)
+        let s1 = bgPoll.classify(rows: [finishedRow], instances: [claude], liveScreens: [id: finishedScreen])
+        XCTAssertEqual(s1.first?.status, .done)
+
+        // 2. A 1-frame TUI redraw flicker while still streaming (`idle < 5s`) holds
+        // `.working` on the first miss and only latches `.done` if confirmed on the next poll.
+        let flickerPoll = PollService()
+        flickerPoll.seedPreviouslyWorking([id])
+        let activeRow = PaneRow(session: "muxel_rhel_44444444", exited: false, bell: false, idle: 1, socket: "mxl")
+        let blankTick = LiveScreen(text: "Working on edit…", idle: 1, bell: false)
+        XCTAssertEqual(
+            flickerPoll.classify(rows: [activeRow], instances: [claude], liveScreens: [id: blankTick]).first?.status,
+            .working)
+        // If the working marker returns on the next tick, streak resets cleanly.
+        let backToWork = LiveScreen(text: "esc to interrupt", idle: 0.5, bell: false)
+        XCTAssertEqual(
+            flickerPoll.classify(rows: [activeRow], instances: [claude], liveScreens: [id: backToWork]).first?.status,
+            .working)
+        // Two consecutive marker-less streaming ticks confirm completion → `.done`.
+        XCTAssertEqual(
+            flickerPoll.classify(rows: [activeRow], instances: [claude], liveScreens: [id: blankTick]).first?.status,
+            .working)
+        XCTAssertEqual(
+            flickerPoll.classify(rows: [activeRow], instances: [claude], liveScreens: [id: blankTick]).first?.status,
+            .done)
+
+        // 3. While Claude pauses quietly to think (15s) and a screen probe blips
+        // (`liveScreens: [:]`), never false-latch `.done` without a real screen!
+        let blipPoll = PollService()
+        blipPoll.seedPreviouslyWorking([id])
+        let thinkingRow = PaneRow(session: "muxel_rhel_44444444", exited: false, bell: false, idle: 15, socket: "mxl")
+        XCTAssertEqual(
+            blipPoll.classify(rows: [thinkingRow], instances: [claude], liveScreens: [:]).first?.status,
+            .working)
+
+        // Adaptive BGAppRefreshTask earliestBeginDate asks for 60s when working vs 15 min idle.
+        XCTAssertEqual(AppDelegate.nextBackgroundRefreshDelay(hasWorking: true), 60)
+        XCTAssertEqual(AppDelegate.nextBackgroundRefreshDelay(hasWorking: false), 900)
+    }
+
+    func testShellPaneCommandTracksWorkingAndLatchesDoneOnReturnToPrompt() {
+        let shell = Instance(id: "33333333-3333-3333-3333-333333333333",
+                             projectId: "p", title: "shell", program: nil, args: [])
+        XCTAssertTrue(shell.isShell)
+        XCTAssertTrue(Instance.isShellCommand("-zsh"))
+        XCTAssertTrue(Instance.isShellCommand("/bin/bash"))
+        XCTAssertFalse(Instance.isShellCommand("cargo"))
+
+        let poll = PollService()
+        let now = Int(Date().timeIntervalSince1970)
+        // 1. Running `cargo` inside the shell → `.working`.
+        let runningRows = PollService.parseAllPanes("muxel_rhel_33333333\t0\t0\t\(now)\tmxl\tcargo\n")
+        XCTAssertEqual(runningRows.first?.currentCommand, "cargo")
+        let s1 = poll.classify(rows: runningRows, instances: [shell])
+        XCTAssertEqual(s1.first?.running, true)
+        XCTAssertEqual(s1.first?.status, .working)
+
+        // 2. Command finishes and returns to `zsh` → latches `.done`!
+        let finishedRows = PollService.parseAllPanes("muxel_rhel_33333333\t0\t0\t\(now)\tmxl\tzsh\n")
+        let s2 = poll.classify(rows: finishedRows, instances: [shell])
+        XCTAssertEqual(s2.first?.running, true)
+        XCTAssertEqual(s2.first?.status, .done)
+
+        // 3. After attending, stays `.idle` at prompt.
+        poll.attend(shell.id)
+        let s3 = poll.classify(rows: finishedRows, instances: [shell])
+        XCTAssertEqual(s3.first?.status, .idle)
+
+        // 4. Even when `#{pane_current_command}` reports `bash`/`sh` (e.g. a shell script
+        // or subshell), kernel `foregroundBusy == true` (`pgrp != tpgid`) keeps it `.working`
+        // until `foregroundBusy == false` returns it to prompt and latches `.done`.
+        let scriptRows = PollService.parseAllPanes("muxel_rhel_33333333\t0\t0\t\(now)\tmxl\tbash\t1\n")
+        XCTAssertEqual(scriptRows.first?.foregroundBusy, true)
+        XCTAssertEqual(poll.classify(rows: scriptRows, instances: [shell]).first?.status, .working)
+        let promptRows = PollService.parseAllPanes("muxel_rhel_33333333\t0\t0\t\(now)\tmxl\tbash\t0\n")
+        XCTAssertEqual(promptRows.first?.foregroundBusy, false)
+        XCTAssertEqual(poll.classify(rows: promptRows, instances: [shell]).first?.status, .done)
+    }
+
+    func testAddInstanceAnchoredToLastAgentTabAppendsAtEndOfSplit() {
+        var layout = RemoteLayout(remoteRoot: "/srv/p")
+        let a = Instance(id: "a", projectId: "p", title: "a", program: "claude", args: [])
+        let b = Instance(id: "b", projectId: "p", title: "b", program: "claude", args: [])
+        let c = Instance(id: "c", projectId: "p", title: "c", program: "claude", args: [])
+        layout.instances = [a, b]
+        layout.layout = .split(
+            direction: .horizontal,
+            sizes: [1, 1],
+            children: [.leaf(tabs: ["a"], active: 0), .leaf(tabs: ["b"], active: 0)])
+        layout.addInstanceAsTab(c, now: 2, targetLeafAnchor: layout.orderedTerminalInstances.last?.id)
+        XCTAssertEqual(layout.orderedTerminalInstances.map(\.id), ["a", "b", "c"])
     }
 }

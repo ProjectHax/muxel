@@ -63,6 +63,23 @@ func latchDone(
 struct PaneStatusTracker {
     private var prevRaw: AgentStatus?
     private var latched = false
+    /// Consecutive non-working screen observations while the pane is still actively
+    /// emitting bytes (`idle < 5s`). Requiring 2 consecutive misses prevents a single
+    /// 1-frame TUI status-bar redraw (e.g. Claude switching between tool calls) from
+    /// falsely latching `.done` mid-turn.
+    private var streamingIdleMisses = 0
+
+    /// Whether the most recent raw observation was `.working`.
+    var wasWorking: Bool { prevRaw == .working }
+
+    /// Seed the tracker with a persisted `.working` state from an earlier poll or
+    /// launch so a subsequent `.idle` observation latches `.done` across background
+    /// refreshes instead of dropping straight to `.idle`.
+    mutating func seedWorking() {
+        if prevRaw == nil {
+            prevRaw = .working
+        }
+    }
 
     mutating func update(
         exited: Bool,
@@ -70,17 +87,42 @@ struct PaneStatusTracker {
         working: [String],
         blocked: [String],
         bell: Bool,
-        idle: TimeInterval
+        idle: TimeInterval,
+        allowLatch: Bool? = nil
     ) -> AgentStatus {
+        let canLatch = allowLatch ?? !working.isEmpty
         let raw = classify(
             exited: exited, screen: screen,
             working: working, blocked: blocked,
             bell: bell, idle: idle
         )
+        // Guard against 1-frame TUI redraw flickers: if a marker agent was `.working`
+        // and the pane JUST emitted output (< 5s ago), require 2 consecutive marker-less
+        // polls before latching `.done`. Once output has been quiet >= 5s, latch immediately.
+        if canLatch && prevRaw == .working && raw == .idle && idle < 5 {
+            streamingIdleMisses += 1
+            if streamingIdleMisses < 2 {
+                return .working
+            }
+        } else {
+            streamingIdleMisses = 0
+        }
         let result = latchDone(
             prevRaw: prevRaw, raw: raw,
-            latched: latched, canLatch: !working.isEmpty
+            latched: latched, canLatch: canLatch
         )
+        prevRaw = raw
+        latched = result.latched
+        return result.status
+    }
+
+    /// Update the tracker from an already-determined raw state (e.g. a shell pane
+    /// whose `working` vs `idle` comes deterministically from tmux's
+    /// `#{pane_current_command}` rather than screen markers). Latches `working` →
+    /// `idle` into `done` until `attend()` is called.
+    mutating func updateRaw(_ raw: AgentStatus, canLatch: Bool) -> AgentStatus {
+        streamingIdleMisses = 0
+        let result = latchDone(prevRaw: prevRaw, raw: raw, latched: latched, canLatch: canLatch)
         prevRaw = raw
         latched = result.latched
         return result.status
@@ -89,5 +131,6 @@ struct PaneStatusTracker {
     /// The pane was attended (viewed) — drop the done latch.
     mutating func attend() {
         latched = false
+        streamingIdleMisses = 0
     }
 }

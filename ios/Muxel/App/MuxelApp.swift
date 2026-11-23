@@ -27,7 +27,7 @@ struct MuxelApp: App {
             .tint(themeStore.current.accentColor)
             .preferredColorScheme(themeStore.current.isDark ? .dark : .light)
         }
-        .onChange(of: scenePhase) { phase in
+        .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .background:
                 appLock.noteBackgrounded()
@@ -36,9 +36,10 @@ struct MuxelApp: App {
                 // refresh it before iOS suspends us.
                 let snapshot = state.currentSummarySnapshot()
                 state.stopPolling()
-                appDelegate.scheduleNextPoll()
+                appDelegate.scheduleNextPoll(hasWorking: (snapshot?.workingCount ?? 0) > 0)
                 appDelegate.refreshLiveActivity(with: snapshot)
             case .active:
+                appDelegate.cancelLiveActivityRefresh()
                 appLock.noteActivated()
                 if appLock.isLocked {
                     Task { await appLock.unlock() }
@@ -47,7 +48,13 @@ struct MuxelApp: App {
                 // time ActivityKit permits starting one); it then persists onto the
                 // Lock Screen when minimized. The poll loop keeps refreshing it.
                 state.syncLiveActivity()
-                Task { await state.refreshNotificationStatus() }
+                Task {
+                    if !state.doc.hosts.isEmpty {
+                        await state.requestNotificationsIfNeeded()
+                    } else {
+                        await state.refreshNotificationStatus()
+                    }
+                }
                 // Restart the foreground poll loop (cancelled on background) and
                 // re-read the layout, so status keeps updating after a return.
                 state.resumeForeground()

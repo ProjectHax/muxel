@@ -45,8 +45,9 @@ struct MuxelLiveActivity: Widget {
                     Text("muxel").font(.caption2.weight(.semibold)).foregroundStyle(Brand.accent)
                 }
                 DynamicIslandExpandedRegion(.bottom) {
-                    InstanceList(rows: Array(ctx.state.instances.prefix(4)),
-                                 extra: ctx.state.instanceCount - min(ctx.state.instances.count, 4))
+                    let groups = MuxelActivityAttributes.groupByProject(ctx.state.instances)
+                    ProjectGroupList(groups: Array(groups.prefix(3)),
+                                     extra: max(0, groups.count - 3))
                 }
             } compactLeading: {
                 Image(systemName: "terminal.fill").foregroundStyle(Brand.accent)
@@ -65,13 +66,22 @@ struct MuxelLiveActivity: Widget {
     }
 }
 
-/// Lock Screen / banner presentation — a per-instance list, needs-input first.
+/// Lock Screen / banner presentation — one line per project with multiple status dots
+/// (one per agent) and the project's attention / last-agent status. Sized to stay safely
+/// under iOS's 160 pt Live Activity height cap so the top `❯ muxel` header never clips.
 private struct LockScreenView: View {
     let state: MuxelActivityAttributes.ContentState
-    private static let cap = 6
+    private static let cap = 4
+
+    private var groups: [MuxelActivityAttributes.ProjectGroup] {
+        MuxelActivityAttributes.groupByProject(state.instances)
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let allGroups = groups
+        let shown = Array(allGroups.prefix(Self.cap))
+        let extraProjects = max(0, allGroups.count - shown.count)
+        VStack(alignment: .leading, spacing: 4) {
             HStack {
                 HStack(spacing: 5) {
                     Text("❯").foregroundStyle(Brand.accent)
@@ -81,17 +91,19 @@ private struct LockScreenView: View {
                 Spacer()
                 Text(state.updatedAt, style: .relative)
                     .font(.caption2).foregroundStyle(Brand.idle)
+                    .lineLimit(1)
             }
+            .fixedSize(horizontal: false, vertical: true)
             summaryLine
-            ForEach(Array(state.instances.prefix(Self.cap))) { InstanceRowView(row: $0) }
-            if extra > 0 {
-                Text("+\(extra) more").font(.caption2).foregroundStyle(Brand.idle)
+            ForEach(shown) { ProjectGroupRowView(group: $0) }
+            if extraProjects > 0 {
+                Text("+\(extraProjects) more project\(extraProjects == 1 ? "" : "s")")
+                    .font(.caption2).foregroundStyle(Brand.idle)
             }
         }
-        .padding(12)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
     }
-
-    private var extra: Int { state.instanceCount - min(state.instances.count, Self.cap) }
 
     @ViewBuilder private var summaryLine: some View {
         HStack(spacing: 10) {
@@ -112,17 +124,19 @@ private struct LockScreenView: View {
             }
         }
         .font(.caption2.weight(.semibold))
+        .lineLimit(1)
+        .minimumScaleFactor(0.85)
     }
 }
 
-/// A compact list of instance rows (Dynamic Island bottom region).
-private struct InstanceList: View {
-    let rows: [MuxelActivityAttributes.InstanceRow]
+/// A compact list of grouped project rows (Dynamic Island bottom region).
+private struct ProjectGroupList: View {
+    let groups: [MuxelActivityAttributes.ProjectGroup]
     let extra: Int
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            ForEach(rows) { InstanceRowView(row: $0) }
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(groups) { ProjectGroupRowView(group: $0) }
             if extra > 0 {
                 Text("+\(extra) more").font(.caption2).foregroundStyle(Brand.idle)
             }
@@ -130,22 +144,45 @@ private struct InstanceList: View {
     }
 }
 
-/// One agent instance: a state dot, its name, and (muted) its project.
-private struct InstanceRowView: View {
-    let row: MuxelActivityAttributes.InstanceRow
+/// One project line: multiple status dots (one per agent), project name, and the
+/// highest-priority attention / last-agent status on the trailing edge.
+private struct ProjectGroupRowView: View {
+    let group: MuxelActivityAttributes.ProjectGroup
+    private static let maxDots = 5
 
     var body: some View {
-        HStack(spacing: 7) {
-            Circle().fill(Brand.color(row.state)).frame(width: 7, height: 7)
-            Text(row.name)
-                .font(.caption2.weight(row.needsInput ? .semibold : .regular))
-                .foregroundStyle(row.needsInput ? Brand.attention : Brand.text)
+        let shownDots = Array(group.states.prefix(Self.maxDots))
+        let extraDots = max(0, group.states.count - shownDots.count)
+        HStack(spacing: 6) {
+            HStack(spacing: 3) {
+                ForEach(Array(shownDots.enumerated()), id: \.offset) { _, s in
+                    if s == .idle {
+                        Circle()
+                            .strokeBorder(Brand.done.opacity(0.85), lineWidth: 1.3)
+                            .frame(width: 7, height: 7)
+                    } else {
+                        Circle()
+                            .fill(Brand.color(s))
+                            .frame(width: 7, height: 7)
+                    }
+                }
+                if extraDots > 0 {
+                    Text("+\(extraDots)")
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(Brand.idle)
+                }
+            }
+            .fixedSize(horizontal: true, vertical: false)
+            Text(group.project)
+                .font(.caption2.weight(group.highlightState == .needsInput ? .semibold : .medium))
+                .foregroundStyle(group.highlightState == .needsInput ? Brand.attention : Brand.text)
                 .lineLimit(1)
-            Text(row.project)
-                .font(.caption2)
-                .foregroundStyle(Brand.idle)
+            Spacer(minLength: 4)
+            Text(group.summaryText)
+                .font(.caption2.weight(group.highlightState == .needsInput ? .semibold : .regular))
+                .foregroundStyle(Brand.color(group.highlightState))
                 .lineLimit(1)
-            Spacer(minLength: 2)
+                .truncationMode(.tail)
         }
     }
 }

@@ -94,7 +94,8 @@ final class ProtocolPortTests: XCTestCase {
             "\(TmuxCommands.pathPrelude); \(select); tmux \"$@\" 'set-option' '-t' '=s:' 'mouse' 'on'")
         XCTAssertEqual(
             TmuxCommands.attachPTYCommand(session: "s"),
-            "\(TmuxCommands.pathPrelude); \(select); clear; exec tmux \"$@\" attach-session -t '=s'")
+            "\(TmuxCommands.pathPrelude); \(TmuxCommands.utf8ColorPrelude); \(select); "
+                + "\(TmuxCommands.enableTrueColorCommand); clear; exec tmux -u \"$@\" attach-session -t '=s'")
         for socket in ["mxl", "default"] {
             let cmd = TmuxCommands.commandLine(TmuxCommands.killSession("s"), session: "s", socket: socket)
             XCTAssertFalse(cmd.contains("has-session"))
@@ -183,9 +184,9 @@ final class ProtocolPortTests: XCTestCase {
         let cmd = TmuxCommands.launchAgent(
             session: "muxel_h_abcdef12", cwd: "/work", program: "claude", args: ["--model", "opus"])
         XCTAssertTrue(cmd.hasPrefix(
-            "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("muxel_h_abcdef12")); "
+            "\(TmuxCommands.pathPrelude); \(TmuxCommands.utf8ColorPrelude); \(TmuxCommands.selectSocket("muxel_h_abcdef12")); "
             + "mkdir -p -- '/work'; "
-            + "tmux \"$@\" \(TmuxCommands.clearProfilerEnvironment()) set-environment -g -u MUXEL_INSTANCE_ID ';' "
+            + "tmux -u \"$@\" \(TmuxCommands.clearProfilerEnvironment()) set-environment -g -u MUXEL_INSTANCE_ID ';' "
             + "new-session -d -s 'muxel_h_abcdef12' -c '/work' "
             + "-- sh -c "))
         XCTAssertTrue(cmd.contains("@muxel_control_pane"))
@@ -197,8 +198,8 @@ final class ProtocolPortTests: XCTestCase {
         // No program → tmux's own default login shell, no wrapping.
         XCTAssertEqual(
             TmuxCommands.launchAgent(session: "s", cwd: "/w", program: nil, args: []),
-            "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("s")); mkdir -p -- '/w'; "
-                + "tmux \"$@\" \(TmuxCommands.clearProfilerEnvironment()) set-environment -g -u MUXEL_INSTANCE_ID ';' "
+            "\(TmuxCommands.pathPrelude); \(TmuxCommands.utf8ColorPrelude); \(TmuxCommands.selectSocket("s")); mkdir -p -- '/w'; "
+                + "tmux -u \"$@\" \(TmuxCommands.clearProfilerEnvironment()) set-environment -g -u MUXEL_INSTANCE_ID ';' "
                 + "new-session -d -s 's' -c '/w'")
     }
 
@@ -210,8 +211,9 @@ final class ProtocolPortTests: XCTestCase {
         XCTAssertEqual(TmuxCommands.instanceIdEnv, "MUXEL_INSTANCE_ID")
         XCTAssertEqual(
             TmuxCommands.newAttachedPTYCommand(session: "s", cwd: "/w", program: nil, args: []),
-            "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("s")); mkdir -p -- '/w'; clear; "
-                + "exec tmux \"$@\" \(TmuxCommands.clearProfilerEnvironment()) set-environment -g -u MUXEL_INSTANCE_ID ';' "
+            "\(TmuxCommands.pathPrelude); \(TmuxCommands.utf8ColorPrelude); \(TmuxCommands.selectSocket("s")); "
+                + "\(TmuxCommands.enableTrueColorCommand); mkdir -p -- '/w'; clear; "
+                + "exec tmux -u \"$@\" \(TmuxCommands.clearProfilerEnvironment()) set-environment -g -u MUXEL_INSTANCE_ID ';' "
                 + "new-session -A -s 's' -c '/w'")
         // Cleared in the same tmux command list, ahead of the session it would leak into.
         let clearThenCreate = "set-environment -g -u MUXEL_INSTANCE_ID ';' new-session "
@@ -223,6 +225,27 @@ final class ProtocolPortTests: XCTestCase {
         }
         // Attaching to a session leaves the environment it started with alone.
         XCTAssertFalse(TmuxCommands.attachPTYCommand(session: "s").contains("set-environment"))
+    }
+
+    func testPTYCommandsEnableUTF8AndTrueColorGradients() {
+        for cmd in [
+            TmuxCommands.attachPTYCommand(session: "s"),
+            TmuxCommands.newAttachedPTYCommand(session: "s", cwd: "/w", program: "claude", args: []),
+        ] {
+            XCTAssertTrue(cmd.contains("export TERM=xterm-256color COLORTERM=truecolor"), "missing TERM/COLORTERM: \(cmd)")
+            XCTAssertTrue(cmd.contains("C.UTF-8"), "missing Linux UTF-8 fallback: \(cmd)")
+            XCTAssertTrue(cmd.contains("en_US.UTF-8"), "missing macOS UTF-8 fallback: \(cmd)")
+            XCTAssertTrue(cmd.contains("default-terminal tmux-256color"), "missing 256-color default-terminal: \(cmd)")
+            XCTAssertTrue(cmd.contains("update-environment COLORTERM"), "missing COLORTERM update-environment: \(cmd)")
+            XCTAssertTrue(cmd.contains("xterm-256color:Tc"), "missing tmux Tc override: \(cmd)")
+            XCTAssertTrue(cmd.contains("xterm-256color:RGB"), "missing tmux RGB feature: \(cmd)")
+            XCTAssertTrue(cmd.contains("exec tmux -u "), "missing tmux -u UTF-8 flag: \(cmd)")
+        }
+        let launched = TmuxCommands.newAttachedPTYCommand(session: "s", cwd: "/w", program: "claude", args: [])
+        XCTAssertTrue(launched.contains("export TERM=tmux-256color"), "inner pane should upgrade 8-color TERM: \(launched)")
+        let ro = TmuxCommands.attachReadOnlyPTYCommand(session: "s", socket: "mxl")
+        XCTAssertTrue(ro.contains("exec tmux -u \"$@\" attach-session -r -t '=s'"))
+        XCTAssertFalse(ro.contains("capture-pane"))
     }
 
     func testCommandLineShellQuotes() {

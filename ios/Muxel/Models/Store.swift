@@ -137,12 +137,21 @@ struct Preset: Codable, Identifiable, Equatable, Hashable {
     static let builtins: [Preset] = [
         Preset(name: "Shell", program: nil),
         Preset(name: "Claude", program: "claude", modelFlag: "--model",
+               effortFlag: "--effort",
                injection: .cliFlag(flag: "--append-system-prompt"),
                sessionIdFlag: "--session-id", resumeFlag: "--resume"),
+        Preset(name: "Codex", program: "codex", modelFlag: "--model",
+               effortFlag: "--config=model_reasoning_effort={}",
+               injection: .typeIn, resumeFlag: "resume"),
         Preset(name: "opencode", program: "opencode", modelFlag: "--model",
                injection: .typeIn, startupDelayMs: 6000),
         Preset(name: "Amp", program: "amp", injection: .typeIn),
-        Preset(name: "Grok", program: "grok", modelFlag: "--model", injection: .typeIn),
+        Preset(name: "Grok", program: "grok", modelFlag: "--model",
+               injection: .cliFlag(flag: "--rules"), startupDelayMs: 3000,
+               sessionIdFlag: "--session-id", resumeFlag: "--resume"),
+        Preset(name: "Muse Code", program: "muse", modelFlag: "--model",
+               effortFlag: "--reasoning-effort",
+               injection: .sessionHook, resumeFlag: "resume"),
         Preset(name: "Antigravity", program: "agy", modelFlag: "--model",
                effortFlag: "--effort", injection: .none),
         Preset(name: "Gemini CLI", program: "gemini", modelFlag: "--model", injection: .none),
@@ -182,10 +191,15 @@ struct StoreDocument: Codable, Equatable {
     var hosts: [Host] = []
     var projects: [RemoteProject] = []
     var identities: [Identity] = []
+    /// Projects pinned to automatically start monitoring whenever the app launches.
+    var autoWatchProjectIds: [UUID] = []
+    /// Whether launching the app automatically scans all projects and watches
+    /// whichever ones are actively working on something.
+    var autoWatchActiveOnLaunch: Bool = false
 
     init() {}
 
-    /// Custom decoder so an older `store.json` (written before `identities` existed)
+    /// Custom decoder so an older `store.json` (written before newer fields existed)
     /// still loads: synthesized `Decodable` would throw on the missing key and reset
     /// the whole document to empty. Each field defaults when absent.
     init(from decoder: Decoder) throws {
@@ -193,6 +207,8 @@ struct StoreDocument: Codable, Equatable {
         hosts = try c.decodeIfPresent([Host].self, forKey: .hosts) ?? []
         projects = try c.decodeIfPresent([RemoteProject].self, forKey: .projects) ?? []
         identities = try c.decodeIfPresent([Identity].self, forKey: .identities) ?? []
+        autoWatchProjectIds = try c.decodeIfPresent([UUID].self, forKey: .autoWatchProjectIds) ?? []
+        autoWatchActiveOnLaunch = try c.decodeIfPresent(Bool.self, forKey: .autoWatchActiveOnLaunch) ?? false
     }
 }
 
