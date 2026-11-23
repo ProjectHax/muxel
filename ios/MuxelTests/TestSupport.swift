@@ -54,3 +54,12 @@ enum TestFixtures {
         return (host, project)
     }
 }
+
+/// A thread-safe call counter for mock responders.
+final class CallCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func increment() { lock.withLock { count += 1 } }
+    var value: Int { lock.withLock { count } }
+}

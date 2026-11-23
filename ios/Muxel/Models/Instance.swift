@@ -89,8 +89,13 @@ struct PersistedAgentActivity: Equatable {
     ///   `last_state == "done"` even after the user read the pane;
     /// - downgrades ancient `done` states whose `completed_at` is older than 5 minutes
     ///   (and `blocked` older than 30 minutes) to `.idle`, so a tmux resize/attach
-    ///   bumping `window_activity` can never resurrect an hours-old completion.
-    func effectiveLiveState(now: TimeInterval = Date().timeIntervalSince1970) -> AgentStatus? {
+    ///   bumping `window_activity` can never resurrect an hours-old completion;
+    /// - downgrades `working` to `.idle` once the pane (`paneIdle`, seconds since tmux
+    ///   last saw output) has been silent for `staleWorkingAfter`. Desktop only
+    ///   rewrites `last_state` while it runs, so quitting it mid-turn leaves
+    ///   "working" behind for good — and a working agent's TUI keeps redrawing.
+    func effectiveLiveState(now: TimeInterval = Date().timeIntervalSince1970,
+                            paneIdle: TimeInterval? = nil) -> AgentStatus? {
         guard let state = currentState else { return nil }
         switch state {
         case .done:
@@ -115,10 +120,19 @@ struct PersistedAgentActivity: Equatable {
                 }
             }
             return .blocked
-        case .working, .idle:
-            return state
+        case .working:
+            if let paneIdle, paneIdle > Self.staleWorkingAfter {
+                return .idle
+            }
+            return .working
+        case .idle:
+            return .idle
         }
     }
+
+    /// Seconds of pane silence after which desktop's persisted `working` is stale.
+    /// Matches `PollService`'s 10-minute cap on holding `.working` for a missed probe.
+    static let staleWorkingAfter: TimeInterval = 600
 
     var effectiveLiveState: AgentStatus? {
         effectiveLiveState()

@@ -105,4 +105,41 @@ final class HostEditorLogicTests: XCTestCase {
             name: "n", hostname: "h", jumpValid: true, usingIdentity: true,
             auth: .password, existingAuth: nil, hasPassword: false, hasKey: false))
     }
+
+
+    func testTypingAnEndpointOnlySplitsItOnceComplete() {
+        // Each keystroke adds one character, which is never split on its own:
+        // `host:2` already parses, and splitting it would scramble the port.
+        var typed = ""
+        for ch in "myhost:2222" {
+            let next = typed + String(ch)
+            XCTAssertFalse(HostEditorLogic.isBulkInsert(from: typed, to: next))
+            typed = next
+        }
+        // Pasting (or autofill) adds the whole endpoint at once.
+        XCTAssertTrue(HostEditorLogic.isBulkInsert(from: "", to: "root@box:2200"))
+        XCTAssertFalse(HostEditorLogic.isBulkInsert(from: "root@box:2200", to: "box"))
+
+        // Leaving the field (or saving) splits the finished text.
+        let fields = HostEditorLogic.applyEndpoint(typed, name: "", user: "", port: "", usingIdentity: false)
+        XCTAssertEqual(fields?.hostname, "myhost")
+        XCTAssertEqual(fields?.port, "2222")
+        XCTAssertEqual(fields?.name, "myhost")
+        XCTAssertEqual(fields?.user, "")
+        XCTAssertNil(HostEditorLogic.applyEndpoint("myhost", name: "", user: "", port: "", usingIdentity: false))
+    }
+
+    func testEndpointInHostnameReplacesUserAndPortButKeepsName() {
+        let fields = HostEditorLogic.applyEndpoint(
+            "admin@box:2200", name: "Build box", user: "root", port: "22", usingIdentity: false)
+        XCTAssertEqual(fields?.name, "Build box")
+        XCTAssertEqual(fields?.hostname, "box")
+        XCTAssertEqual(fields?.user, "admin")
+        XCTAssertEqual(fields?.port, "2200")
+        // A shared identity supplies the user, so the typed one isn't taken.
+        let identity = HostEditorLogic.applyEndpoint(
+            "admin@box", name: "", user: "", port: "22", usingIdentity: true)
+        XCTAssertEqual(identity?.user, "")
+        XCTAssertEqual(identity?.port, "22")
+    }
 }

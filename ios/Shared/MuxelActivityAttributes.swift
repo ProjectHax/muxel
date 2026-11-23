@@ -31,8 +31,17 @@ struct MuxelActivityAttributes: ActivityAttributes {
         /// needing attention / producing activity, so recently-active agents and
         /// projects stay pinned to the top of the Live Activity.
         var lastActiveAt: TimeInterval? = nil
+        /// Short id of the owning project (`projectKey(for:)`), so projects that share
+        /// a (truncated) name stay separate. nil on rows cached by older builds.
+        var projectKey: String? = nil
 
         var needsInput: Bool { state == .needsInput }
+
+        /// The first 8 characters of a project's UUID: unique enough across one
+        /// user's projects while keeping the ~4 KB payload small.
+        static func projectKey(for projectId: UUID) -> String {
+            String(projectId.uuidString.prefix(8))
+        }
     }
 
     /// The dynamic content, refreshed on every poll.
@@ -54,7 +63,9 @@ struct MuxelActivityAttributes: ActivityAttributes {
     /// multiple status dots (one per agent) plus the highest-priority attention/last
     /// status text (e.g. "claude: needs input", "codex working", "claude finished", "idle").
     struct ProjectGroup: Equatable, Identifiable {
-        var id: String { project }
+        var id: String { key }
+        /// The rows' `projectKey`, or the project name for rows without one.
+        var key: String
         var project: String
         var states: [InstanceState]
         var highlightState: InstanceState
@@ -74,10 +85,11 @@ struct MuxelActivityAttributes: ActivityAttributes {
             case .idle: return 3
             }
         }
-        let grouped = Dictionary(grouping: instances, by: \.project)
+        let grouped = Dictionary(grouping: instances, by: { $0.projectKey ?? $0.project })
         var out: [ProjectGroup] = []
         out.reserveCapacity(grouped.count)
-        for (project, rawRows) in grouped {
+        for (key, rawRows) in grouped {
+            let project = rawRows[0].project
             let rows = rawRows.sorted {
                 if rank($0.state) != rank($1.state) { return rank($0.state) < rank($1.state) }
                 let a = $0.lastActiveAt ?? 0
@@ -115,6 +127,7 @@ struct MuxelActivityAttributes: ActivityAttributes {
                 }
             }
             out.append(ProjectGroup(
+                key: key,
                 project: project,
                 states: states,
                 highlightState: highlight,
@@ -128,7 +141,8 @@ struct MuxelActivityAttributes: ActivityAttributes {
             let a = $0.lastActiveAt ?? 0
             let b = $1.lastActiveAt ?? 0
             if a != b { return a > b }
-            return $0.project < $1.project
+            if $0.project != $1.project { return $0.project < $1.project }
+            return $0.key < $1.key
         }
     }
 }

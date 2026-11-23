@@ -359,4 +359,79 @@ final class ProtocolPortTests: XCTestCase {
         XCTAssertTrue(defaultMarkers(program: "bash").working.isEmpty)
         XCTAssertTrue(defaultMarkers(program: nil).working.isEmpty)
     }
+
+
+    // MARK: Grok question card (port of view.rs is_grok_question)
+
+    /// Grok's unanswered `ask_user_question` card, from desktop's
+    /// `provider-state-screens.json` (`providers/grok/blocked`).
+    private let grokQuestionCard = [
+        "     ♦ Thought for 6.6s",
+        "     ♦ Ask Which option do you want?",
+        "   ♦ Waiting on answers for Which option do you want?                  9.2s ↓13.7k [stop]",
+        "  │",
+        "  │  Which option do you want?",
+        "  │",
+        "  │  1 (○) Alpha (Recommended)  Choose Alpha.                                     █",
+        "  │  2 (○) Beta                 Choose Beta.                                      █",
+        "  │  z (○) Type your answer here",
+        "  │",
+        "  │  ↑/↓ navigate · y copy                                          Enter:submit",
+        "  │",
+        "  Tab:next answer  │  Esc:scrollback  │  Shift+x:dismiss",
+    ].joined(separator: "\n")
+
+    /// Grok's idle composer, which follows any card quoted in the transcript.
+    private let grokComposer = [
+        "  ╭──────────────────────────────────────────────────────────────╮",
+        "  │ >                                                            │",
+        "  ╰──────────────────────────── Grok 4.7 (xhigh) · always-approve ─╯",
+        "  Shift+Tab:mode  │  Ctrl+x:shortcuts",
+    ].joined(separator: "\n")
+
+    func testGrokQuestionCardIsBlockedDespiteItsStopMarker() {
+        let (working, blocked) = defaultMarkers(program: "grok")
+        XCTAssertTrue(grokQuestionCard.contains("[stop]"), "the card carries the working marker")
+        XCTAssertTrue(isGrokQuestion(grokQuestionCard))
+        XCTAssertEqual(
+            classify(exited: false, screen: grokQuestionCard + "\n\n\n",
+                     working: working, blocked: blocked, bell: false, idle: 10),
+            .blocked)
+        // iOS reads the screen without Grok's title, so a tmux status bar under the
+        // card doesn't hide it.
+        let underStatusBar = grokQuestionCard + "\n[0] 0:grok*                    \"host\" 14:32 29-Oct-26"
+        XCTAssertTrue(isGrokQuestion(underStatusBar))
+    }
+
+    func testGrokQuestionCardQuotedAboveTheComposerIsNotBlocked() {
+        let (working, blocked) = defaultMarkers(program: "grok")
+        let quoted = grokQuestionCard + "\n\n" + grokComposer
+        XCTAssertFalse(isGrokQuestion(quoted))
+        // A turn still running (`[stop]`) reads as working.
+        XCTAssertEqual(
+            classify(exited: false, screen: quoted, working: working, blocked: blocked, bell: false, idle: 10),
+            .working)
+        // A working turn with no card is unchanged.
+        let turn = "   - Waiting for response… 1.4s                          1.9s ↓1.77k [stop]\n"
+            + grokComposer.replacingOccurrences(of: "Shift+Tab:mode  │  Ctrl+x:shortcuts",
+                                                with: "Shift+Tab:mode  │  Ctrl+c:cancel  │  Ctrl+x:shortcuts")
+        XCTAssertFalse(isGrokQuestion(turn))
+        XCTAssertEqual(
+            classify(exited: false, screen: turn, working: working, blocked: blocked, bell: false, idle: 10),
+            .working)
+        // A card needs at least two numbered options.
+        let oneOption = grokQuestionCard.replacingOccurrences(of: "  │  2 (○) Beta", with: "  │  Beta")
+        XCTAssertFalse(isGrokQuestion(oneOption))
+    }
+
+    func testTrueColorOnlyRaisesTheBasicDefaultTerminal() {
+        let cmd = TmuxCommands.enableTrueColorCommand
+        // The user's own `default-terminal` (tmux-direct, alacritty, …) is left alone;
+        // only RHEL's 8-color `screen` (or an unset/`tmux` value) is raised.
+        XCTAssertTrue(cmd.hasPrefix(
+            "case \"$(tmux \"$@\" show-options -gv default-terminal 2>/dev/null)\" in ''|screen|tmux) "),
+            cmd)
+        XCTAssertTrue(cmd.contains("set-option -g default-terminal tmux-256color 2>/dev/null; else "), cmd)
+        XCTAssertTrue(cmd.contains("fi ;; esac; "), cmd)
+    }
 }

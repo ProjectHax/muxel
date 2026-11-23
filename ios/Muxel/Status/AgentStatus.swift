@@ -12,11 +12,12 @@ enum AgentStatus: String, Codable, Equatable, CaseIterable {
 /// Decide an agent's state from its signals. Faithful port of `classify`
 /// (view.rs). Priority, highest first:
 /// 1. exited → done
-/// 2. a working marker on screen → working
-/// 3. a blocked marker on screen → blocked
-/// 4. bell rang → done
-/// 5. (marker-less only) output within the last 2s → working
-/// 6. otherwise → idle
+/// 2. Grok's question card on screen → blocked (`isGrokQuestion`)
+/// 3. a working marker on screen → working
+/// 4. a blocked marker on screen → blocked
+/// 5. bell rang → done
+/// 6. (marker-less only) output within the last 2s → working
+/// 7. otherwise → idle
 func classify(
     exited: Bool,
     screen: String,
@@ -26,6 +27,8 @@ func classify(
     idle: TimeInterval
 ) -> AgentStatus {
     if exited { return .done }
+    // Grok's question card also shows its `[stop]` working marker.
+    if isGrokQuestion(screen) { return .blocked }
     if working.contains(where: { screen.contains($0) }) { return .working }
     if blocked.contains(where: { screen.contains($0) }) { return .blocked }
     if bell { return .done }

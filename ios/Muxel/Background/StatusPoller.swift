@@ -197,7 +197,7 @@ struct StatusPoller {
             // `.working` so finishing in the background latches `.done` (instead of
             // dropping straight to `.idle`) in both notifications and the Live Activity.
             poll.seedPreviouslyWorking(Self.persistedWorkingIds(for: allHostInstances, defaults: defaults))
-            let paneRows = await poll.fetchPaneRows(conn, instances: allHostInstances)
+            let paneRows = await poll.fetchPaneRows(conn, instances: allHostInstances, hostId: host.id)
             // Probe any marker-bearing agent that shows recent tmux output (e.g. a
             // prompt just started on desktop) or was previously working/blocked so
             // background refreshes & Live Activity pick up live state immediately.
@@ -237,7 +237,7 @@ struct StatusPoller {
                         instance: inst, status: s.status, running: s.running,
                         paneIdle: paneIdle, now: now, defaults: defaults)
                     rows.append(ActivitySummaryBuilder.row(
-                        id: s.instanceId, name: name, project: project.name,
+                        id: s.instanceId, name: name, project: project.name, projectId: project.id,
                         status: s.status, running: s.running, lastActiveAt: lastActive))
                 }
             }

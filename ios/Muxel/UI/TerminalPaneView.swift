@@ -409,7 +409,7 @@ struct TerminalPaneView: View {
             }
         }
         s.onScrolledBackChanged = { scrolledBack = $0 }
-        s.onExitCopyModeRequested = { exitCopyMode() }
+        s.onExitCopyModeRequested = { done in exitCopyMode(then: done) }
     }
 
     private func jumpToBottom() {
@@ -419,13 +419,19 @@ struct TerminalPaneView: View {
         exitCopyMode()
     }
 
-    private func exitCopyMode() {
-        guard let target = activeTarget else { return }
+    /// Leave tmux copy-mode, then call `done` (also when there's nothing to exit or
+    /// the command fails) so input held by the session can go out.
+    private func exitCopyMode(then done: (@MainActor () -> Void)? = nil) {
+        guard let target = activeTarget else {
+            done?()
+            return
+        }
         let conn = state.connection(for: host)
         Task {
             _ = try? await conn.tmux(
                 TmuxCommands.exitCopyMode(session: target.name),
                 session: target.name, socket: target.socket)
+            await MainActor.run { done?() }
         }
     }
 

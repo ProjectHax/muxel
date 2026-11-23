@@ -773,4 +773,55 @@ final class InteropTests: XCTestCase {
         layout.addInstanceAsTab(c, now: 2, targetLeafAnchor: layout.orderedTerminalInstances.last?.id)
         XCTAssertEqual(layout.orderedTerminalInstances.map(\.id), ["a", "b", "c"])
     }
+
+
+    func testDesktopWorkingStateExpiresOnceThePaneGoesQuiet() {
+        // Desktop quit mid-turn: `last_state` stays "working" in workspace.json.
+        let activity = PersistedAgentActivity(
+            workStartedAt: 1000, completedAt: nil, blockedAt: nil, lastAttendedAt: nil, lastState: .working)
+        XCTAssertEqual(activity.effectiveLiveState(paneIdle: nil), .working)
+        XCTAssertEqual(activity.effectiveLiveState(paneIdle: 30), .working)
+        XCTAssertEqual(activity.effectiveLiveState(paneIdle: PersistedAgentActivity.staleWorkingAfter + 1), .idle)
+
+        var amp = Instance(id: "22222222-2222-2222-2222-222222222222",
+                           projectId: "p", title: "amp", program: "amp", args: [])
+        amp.activity = activity
+        let busy = PaneRow(session: "muxel_p_22222222", exited: false, bell: false, idle: 30)
+        let quiet = PaneRow(session: "muxel_p_22222222", exited: false, bell: false, idle: 3600)
+        XCTAssertEqual(PollService().classify(rows: [busy], instances: [amp]).first?.status, .working)
+        XCTAssertEqual(PollService().classify(rows: [quiet], instances: [amp]).first?.status, .idle)
+    }
+
+    func testDiscoveryFallbackBacksOffWhileItFindsNoAgents() {
+        let host = UUID()
+        var schedule = DiscoveryFallbackSchedule()
+        XCTAssertTrue(schedule.mayRun(host, now: 0))
+        schedule.record(host, foundAgents: false, now: 0)
+        XCTAssertFalse(schedule.mayRun(host, now: 1))
+        XCTAssertFalse(schedule.mayRun(host, now: DiscoveryFallbackSchedule.retryAfter - 1))
+        XCTAssertTrue(schedule.mayRun(host, now: DiscoveryFallbackSchedule.retryAfter))
+        XCTAssertTrue(schedule.mayRun(UUID(), now: 1), "other hosts are unaffected")
+        // A host whose agents only show up through the fallback keeps using it.
+        schedule.record(host, foundAgents: true, now: 100)
+        XCTAssertTrue(schedule.mayRun(host, now: 101))
+    }
+
+    func testFetchPaneRowsSkipsTheLoginShellFallbackDuringBackoff() async {
+        let inst = Instance(id: "33333333-3333-3333-3333-333333333333",
+                            projectId: "p", title: "claude", program: "claude", args: [])
+        let counter = CallCounter()
+        let conn = MockSSHConnection { cmd in
+            if cmd.contains("-lc") && cmd.contains("lsp -a") { counter.increment() }
+            return ""
+        }
+        let host = UUID()
+        let poll = PollService()
+        _ = await poll.fetchPaneRows(conn, instances: [inst], hostId: host)
+        _ = await poll.fetchPaneRows(conn, instances: [inst], hostId: host)
+        _ = await PollService().fetchPaneRows(conn, instances: [inst], hostId: host)
+        XCTAssertEqual(counter.value, 1, "the agent is stopped: one login shell, then back off")
+        // Without a host there's nothing to key the backoff on.
+        _ = await poll.fetchPaneRows(conn, instances: [inst])
+        XCTAssertEqual(counter.value, 2)
+    }
 }

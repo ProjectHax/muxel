@@ -92,6 +92,29 @@ enum HostEditorLogic {
         guard !rest.isEmpty else { return nil }
         return (user, String(rest), port)
     }
+
+    /// The form fields after splitting a `user@host:port` in the Hostname field, or
+    /// nil when there's nothing to split. A user or port written there replaces the
+    /// separate field, since the user just wrote it. The user is only taken when the
+    /// host logs in with its own credentials, not a shared identity. An empty name
+    /// defaults to the bare hostname.
+    static func applyEndpoint(_ raw: String, name: String, user: String, port: String,
+                              usingIdentity: Bool)
+        -> (name: String, hostname: String, user: String, port: String)? {
+        guard let parsed = parseEndpoint(raw) else { return nil }
+        return (name: name.isEmpty ? parsed.hostname : name,
+                hostname: parsed.hostname,
+                user: (usingIdentity ? nil : parsed.user) ?? user,
+                port: parsed.port.map(String.init) ?? port)
+    }
+
+    /// Whether a Hostname edit added several characters at once (a paste or
+    /// autofill), which is split straight away. Typing waits until the field loses
+    /// focus or the form is saved: a half-typed `host:2` already parses, and
+    /// splitting it would send the remaining digits into the hostname.
+    static func isBulkInsert(from old: String, to new: String) -> Bool {
+        new.count - old.count > 1
+    }
 }
 
 /// Add **or edit** an SSH host. The password / private key + passphrase go straight
@@ -188,9 +211,15 @@ struct HostEditorView: View {
                     TextField("Hostname or IP (or user@host:port)", text: $hostname)
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
                         .focused($focusedField, equals: .hostname)
-                        .onChange(of: hostname) { _, value in
-                            applyParsedEndpointIfNeeded(value)
+                        .onChange(of: hostname) { old, new in
+                            if HostEditorLogic.isBulkInsert(from: old, to: new) {
+                                applyParsedEndpointIfNeeded()
+                            }
                         }
+                        .onChange(of: focusedField) { old, _ in
+                            if old == .hostname { applyParsedEndpointIfNeeded() }
+                        }
+                        .onSubmit { applyParsedEndpointIfNeeded() }
                     TextField("Port (22)", text: $port)
                         .keyboardType(.numberPad)
                         .focused($focusedField, equals: .port)
@@ -345,21 +374,18 @@ struct HostEditorView: View {
         }
     }
 
-    private func applyParsedEndpointIfNeeded(_ value: String) {
-        guard let parsed = HostEditorLogic.parseEndpoint(value) else { return }
-        hostname = parsed.hostname
-        if let parsedUser = parsed.user, !usingIdentity, user.isEmpty {
-            user = parsedUser
-        }
-        if let parsedPort = parsed.port, port.isEmpty {
-            port = String(parsedPort)
-        }
-        if name.isEmpty {
-            name = parsed.hostname
-        }
+    private func applyParsedEndpointIfNeeded() {
+        guard let fields = HostEditorLogic.applyEndpoint(
+            hostname, name: name, user: user, port: port, usingIdentity: usingIdentity)
+        else { return }
+        name = fields.name
+        hostname = fields.hostname
+        user = fields.user
+        port = fields.port
     }
 
     private func runTest() {
+        applyParsedEndpointIfNeeded()
         testState = .testing
         let draft = makeHost(withCredentials: !usingIdentity)
         let idRef = identityId
@@ -413,6 +439,7 @@ struct HostEditorView: View {
     }
 
     private func attemptSave() {
+        applyParsedEndpointIfNeeded()
         if isEdit || usingIdentity {
             // Editing, or already using a shared identity — nothing new to offer.
             saveHostOnly()

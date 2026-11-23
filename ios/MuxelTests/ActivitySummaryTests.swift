@@ -123,4 +123,44 @@ final class ActivitySummaryTests: XCTestCase {
         XCTAssertEqual(LastWorkedStore.timestamp(for: "work-1", defaults: defaults), 1_700_000_500)
         XCTAssertNil(LastWorkedStore.timestamp(for: "idle-1", defaults: defaults))
     }
+
+
+    func testSameNamedProjectsStaySeparate() {
+        let a = UUID(), b = UUID()
+        let rows = [
+            ActivitySummaryBuilder.row(id: "1", name: "claude", project: "api", projectId: a,
+                                       status: .blocked, running: true),
+            ActivitySummaryBuilder.row(id: "2", name: "codex", project: "api", projectId: b,
+                                       status: .working, running: true),
+        ]
+        XCTAssertEqual(rows[0].projectKey, MuxelActivityAttributes.InstanceRow.projectKey(for: a))
+        let groups = MuxelActivityAttributes.groupByProject(rows)
+        XCTAssertEqual(groups.count, 2)
+        XCTAssertEqual(Set(groups.map(\.id)).count, 2, "ForEach needs distinct ids")
+        XCTAssertEqual(groups.map(\.project), ["api", "api"])
+        XCTAssertEqual(groups.map(\.summaryText), ["claude: needs input", "codex working"])
+    }
+
+    func testRowsWithoutProjectKeyStillGroupByName() throws {
+        // A summary cached by an older build has no `projectKey`.
+        let legacy = #"{"id":"1","name":"claude","project":"web","state":"idle"}"#
+        let row = try JSONDecoder().decode(MuxelActivityAttributes.InstanceRow.self, from: Data(legacy.utf8))
+        XCTAssertNil(row.projectKey)
+        XCTAssertEqual(MuxelActivityAttributes.groupByProject([row]).map(\.id), ["web"])
+    }
+
+    func testKeepingRowsDropsRemovedProjects() {
+        let kept = UUID(), deleted = UUID()
+        let rows: [MuxelActivityAttributes.InstanceRow] = [
+            ActivitySummaryBuilder.row(id: "1", name: "a", project: "api", projectId: kept,
+                                       status: .working, running: true),
+            ActivitySummaryBuilder.row(id: "2", name: "b", project: "gone", projectId: deleted,
+                                       status: .working, running: true),
+            // Older cached rows, matched by name.
+            .init(id: "3", name: "c", project: "api", state: .idle),
+            .init(id: "4", name: "d", project: "gone", state: .idle),
+        ]
+        let left = ActivitySummaryBuilder.keepingRows(rows, ofProjects: [(id: kept, name: "api")])
+        XCTAssertEqual(left.map(\.id), ["1", "3"])
+    }
 }

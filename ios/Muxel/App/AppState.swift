@@ -353,6 +353,9 @@ final class AppState: ObservableObject {
     /// every monitored project is styled consistently.
     func isProjectWatched(_ projectId: UUID) -> Bool {
         if watchedProjectIds.contains(projectId) { return true }
+        // Unwatching keeps the user's interactive terminals open, so their live
+        // sessions alone mustn't flip the toggle straight back to "watched".
+        if manuallyUnwatchedProjectIds.contains(projectId) { return false }
         let ids: [String]
         if selectedProject?.id == projectId, let layout {
             ids = layout.orderedTerminalInstances.map(\.id)
@@ -383,14 +386,15 @@ final class AppState: ObservableObject {
             manuallyUnwatchedProjectIds.insert(projectId)
             watchedProjectIds.remove(projectId)
             // If the user explicitly stops watching a backgrounded project, also tear
-            // down its idle live PTY attachments so active monitoring genuinely stops.
+            // down its read-only background monitors so active monitoring genuinely
+            // stops. Interactive terminals the user opened stay connected.
             if selectedProject?.id != projectId {
                 let ids = instanceCache[projectId]?.instances.map(\.id)
                     ?? projectActivity[projectId]?.agents.map(\.id)
                     ?? []
                 if terminals.hasLiveSession(for: ids) {
                     objectWillChange.send()
-                    for id in ids { terminals.disconnect(id) }
+                    for id in ids { terminals.disconnectReadOnly(id) }
                 }
             }
         }
@@ -549,15 +553,17 @@ final class AppState: ObservableObject {
     /// idle unpinned projects release their temporary probe channels cleanly.
     @discardableResult
     func scanAndWatchWorkingProjects(announce: Bool = false) async -> Int {
+        // Launch monitoring raises the flag before calling in, so clear it on every
+        // exit, the early one included.
+        isScanningActiveProjects = true
+        defer { isScanningActiveProjects = false }
         guard !doc.projects.isEmpty else {
             let msg = "No projects to scan yet."
             scanStatusText = msg
             if announce { report(msg, duration: 3) }
             return 0
         }
-        isScanningActiveProjects = true
         scanStatusText = "Connecting to hosts…"
-        defer { isScanningActiveProjects = false }
 
         var activeIds = Set<UUID>()
         var checkedProjects = 0
@@ -657,7 +663,7 @@ final class AppState: ObservableObject {
                         instance: inst, status: r.status, running: r.running,
                         paneIdle: paneIdle, now: now, defaults: defaults)
                     return ActivitySummaryBuilder.row(
-                        id: r.instanceId, name: name, project: project.name,
+                        id: r.instanceId, name: name, project: project.name, projectId: project.id,
                         status: r.status, running: r.running, lastActiveAt: lastActive)
                 }
 
@@ -943,10 +949,13 @@ final class AppState: ObservableObject {
         doc.projects.removeAll { $0.hostId == host.id }
         doc.hosts.removeAll { $0.id == host.id }
         pruneOpenedProjects(removing: removedProjects)
+        lastPaneRowsByHost[host.id] = nil
+        lastPaneRowsAtByHost[host.id] = nil
         setHostCollapsed(host.id, false)
         if let sel = selectedProject, sel.hostId == host.id {
             deselect()
         }
+        forgetProjects(removedProjects)
         persist()
     }
 
@@ -1045,14 +1054,27 @@ final class AppState: ObservableObject {
     func deleteProject(_ project: RemoteProject) {
         doc.projects.removeAll { $0.id == project.id }
         pruneOpenedProjects(removing: [project.id])
-        projectActivity[project.id] = nil
-        layoutCache[project.id] = nil
-        instanceCache[project.id] = nil
         if selectedProject?.id == project.id { deselect() }
         else if UserDefaults.standard.string(forKey: Self.lastSelectedProjectKey) == project.id.uuidString {
             UserDefaults.standard.removeObject(forKey: Self.lastSelectedProjectKey)
         }
+        forgetProjects([project.id])
         persist()
+    }
+
+    /// Drop every per-project cache of removed projects and refresh the Live Activity,
+    /// so their agents don't stay on the Lock Screen. Runs after `deselect()`, which
+    /// may snapshot the outgoing project's activity.
+    private func forgetProjects(_ ids: Set<UUID>) {
+        guard !ids.isEmpty else { return }
+        for id in ids {
+            projectActivity[id] = nil
+            layoutCache[id] = nil
+            instanceCache[id] = nil
+            summaryRowsByProject[id] = nil
+        }
+        manuallyUnwatchedProjectIds.subtract(ids)
+        syncLiveActivity()
     }
 
     private func persist() {
@@ -1098,18 +1120,26 @@ final class AppState: ObservableObject {
                     instance: inst, status: st, running: isRun,
                     paneIdle: paneIdle, now: now, defaults: defaults)
                 rows.append(ActivitySummaryBuilder.row(
-                    id: inst.id, name: inst.displayName, project: sel.name,
+                    id: inst.id, name: inst.displayName, project: sel.name, projectId: sel.id,
                     status: st, running: isRun, lastActiveAt: lastActive))
             }
         }
         // Overlay fresh rows from foreground sidebar/sibling sweeps across all projects.
-        for (projectId, projectRows) in summaryRowsByProject where projectId != selectedProject?.id {
+        // A sweep that was in flight when a project was deleted can still write its
+        // rows back, so only take rows of projects that exist.
+        let projectIds = Set(doc.projects.map(\.id))
+        for (projectId, projectRows) in summaryRowsByProject
+        where projectId != selectedProject?.id && projectIds.contains(projectId) {
             for r in projectRows where seenIds.insert(r.id).inserted {
                 rows.append(r)
             }
         }
         // Fall back to the last cached background scan for any project not yet swept.
-        for r in SummaryCache.load()?.instances ?? [] where seenIds.insert(r.id).inserted {
+        // Skip cached rows of projects deleted since (or whose host was removed).
+        let cached = ActivitySummaryBuilder.keepingRows(
+            SummaryCache.load()?.instances ?? [],
+            ofProjects: doc.projects.map { (id: $0.id, name: $0.name) })
+        for r in cached where seenIds.insert(r.id).inserted {
             rows.append(r)
         }
         let state = ActivitySummaryBuilder.contentState(rows: rows, now: Date())
@@ -1454,7 +1484,7 @@ final class AppState: ObservableObject {
         // If we already have cached projects, refresh them immediately in one round trip.
         if !cachedProjects.isEmpty {
             if rows == nil {
-                rows = await poll.fetchPaneRows(conn, instances: knownInstances)
+                rows = await poll.fetchPaneRows(conn, instances: knownInstances, hostId: host.id)
             }
             // If tmux reports a live `muxel_*` session not matched by any cached
             // instance (e.g. desktop just opened a new pane/prompt), re-read cached
@@ -1500,7 +1530,7 @@ final class AppState: ObservableObject {
             let chunkSockets = Set(chunkFlat.compactMap(\.tmuxSocket))
             if rows == nil || (rows?.isEmpty == true && !chunkFlat.isEmpty) || !chunkSockets.subtracting(queriedSockets).isEmpty {
                 queriedSockets.formUnion(chunkSockets)
-                rows = await poll.fetchPaneRows(conn, instances: knownInstances)
+                rows = await poll.fetchPaneRows(conn, instances: knownInstances, hostId: host.id)
             }
             let chunkProbed = attachMonitors
                 ? await probeActiveUnattachedAgents(instances: chunkFlat, rows: rows ?? [], conn: conn)
@@ -1698,7 +1728,8 @@ final class AppState: ObservableObject {
 
         guard selectedProject?.id == project.id else { return }
         var terminalInstancesNow = terminalInstances
-        var selectedRows = await poll.fetchPaneRows(conn, instances: terminalInstancesNow + siblingInstances)
+        var selectedRows = await poll.fetchPaneRows(
+            conn, instances: terminalInstancesNow + siblingInstances, hostId: host.id)
         lastPaneRowsByHost[host.id] = selectedRows
         lastPaneRowsAtByHost[host.id] = Date().timeIntervalSince1970
         guard selectedProject?.id == project.id else { return }
@@ -1724,7 +1755,8 @@ final class AppState: ObservableObject {
             let freshSockets = Set(terminalInstancesNow.compactMap(\.tmuxSocket))
             let knownSockets = Set([TmuxCommands.socketName, "default"] + (terminalInstances + siblingInstances).compactMap(\.tmuxSocket))
             if !freshSockets.subtracting(knownSockets).isEmpty {
-                selectedRows = await poll.fetchPaneRows(conn, instances: terminalInstancesNow + siblingInstances)
+                selectedRows = await poll.fetchPaneRows(
+                    conn, instances: terminalInstancesNow + siblingInstances, hostId: host.id)
                 lastPaneRowsByHost[host.id] = selectedRows
                 lastPaneRowsAtByHost[host.id] = Date().timeIntervalSince1970
             }
@@ -2036,7 +2068,7 @@ final class AppState: ObservableObject {
                     instance: inst, status: r.status, running: r.running,
                     paneIdle: paneIdle, now: now, defaults: defaults)
                 return ActivitySummaryBuilder.row(
-                    id: r.instanceId, name: name, project: project.name,
+                    id: r.instanceId, name: name, project: project.name, projectId: project.id,
                     status: r.status, running: r.running, lastActiveAt: lastActive)
             }
         }

@@ -40,6 +40,25 @@ struct LiveScreen: Equatable {
     let bell: Bool
 }
 
+/// When a host's login-shell discovery fallback (`PollService.fetchPaneRows`) may
+/// run again. A run that finds none of the host's agents backs off for
+/// `retryAfter`, since that's the normal state when they're all stopped and the
+/// fallback starts a full login shell. A run that finds them keeps the host on
+/// it every poll: its sessions can only be seen that way.
+struct DiscoveryFallbackSchedule {
+    static let retryAfter: TimeInterval = 60
+    private var nextAllowedAt: [UUID: TimeInterval] = [:]
+
+    func mayRun(_ hostId: UUID, now: TimeInterval) -> Bool {
+        guard let next = nextAllowedAt[hostId] else { return true }
+        return now >= next
+    }
+
+    mutating func record(_ hostId: UUID, foundAgents: Bool, now: TimeInterval) {
+        nextAllowedAt[hostId] = foundAgents ? nil : now + Self.retryAfter
+    }
+}
+
 /// Computes per-instance `AgentStatus` over an SSH connection without an attached
 /// PTY — the engine behind status badges and background notifications.
 ///
@@ -58,6 +77,9 @@ struct LiveScreen: Equatable {
 /// still shows full agent state when a pane is open.
 final class PollService {
     private static let log = Logger(subsystem: "dev.muxel.ios", category: "PollService")
+    /// Shared by every instance: background refreshes build a fresh `PollService`.
+    private static var fallbackSchedule = DiscoveryFallbackSchedule()
+    private static let fallbackScheduleLock = NSLock()
     private var trackers: [String: PaneStatusTracker] = [:]
     /// Last SSH error encountered during `fetchPaneRows`, cleared on a successful read.
     private(set) var lastError: String?
@@ -79,8 +101,10 @@ final class PollService {
     /// Fetch one host-wide sweep from the legacy servers and every server recorded
     /// by its projects (including named servers used by isolated desktop profiles).
     /// Each socket is queried once, retaining its owner tag beside each pane row.
-    /// A server that isn't running contributes nothing.
-    func fetchPaneRows(_ conn: SSHConnection, instances: [Instance]) async -> [PaneRow] {
+    /// A server that isn't running contributes nothing. `hostId` rate-limits the
+    /// login-shell fallback (`DiscoveryFallbackSchedule`); nil runs it every time.
+    func fetchPaneRows(_ conn: SSHConnection, instances: [Instance],
+                       hostId: UUID? = nil) async -> [PaneRow] {
         var seen = Set<String>()
         let sockets = ([TmuxCommands.socketName, "default"] + instances.compactMap(\.tmuxSocket))
             .filter { seen.insert($0).inserted }
@@ -111,6 +135,13 @@ final class PollService {
         if terminalInstances.isEmpty || anyMatched {
             return parsed
         }
+        let now = Date().timeIntervalSince1970
+        if let hostId {
+            let mayRun = Self.fallbackScheduleLock.withLock {
+                Self.fallbackSchedule.mayRun(hostId, now: now)
+            }
+            if !mayRun { return parsed }
+        }
         // Deep discovery fallback when bare non-login SSH exec matched 0 configured
         // agents (even if another unrelated socket had rows): reconnect if needed and
         // query via the user's login shell (`$SHELL -lc`) plus scan standard tmux
@@ -130,6 +161,12 @@ final class PollService {
         } catch {
             Self.log.warning("fetchPaneRows fallback failed: \(error.localizedDescription, privacy: .public)")
             lastError = error.localizedDescription
+        }
+        if let hostId {
+            let found = terminalInstances.contains { Self.resolveRow(for: $0, in: parsed) != nil }
+            Self.fallbackScheduleLock.withLock {
+                Self.fallbackSchedule.record(hostId, foundAgents: found, now: now)
+            }
         }
         return parsed
     }
@@ -332,7 +369,8 @@ final class PollService {
             // blocked / done agents show accurate dots without screen scraping.
             if row.bell && !row.exited {
                 effective = .blocked
-            } else if !row.exited, let desktopState = inst.activity?.effectiveLiveState {
+            } else if !row.exited,
+                      let desktopState = inst.activity?.effectiveLiveState(paneIdle: row.idle) {
                 // Don't keep showing a stale desktop "done" badge for an agent that has
                 // been completely idle for >5 minutes; treat it as idle instead.
                 if desktopState == .done && row.idle > 300 {

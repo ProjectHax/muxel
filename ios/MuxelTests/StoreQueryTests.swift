@@ -493,4 +493,27 @@ final class StoreQueryTests: XCTestCase {
         XCTAssertEqual(w, ["esc interrupt"])
         XCTAssertEqual(b, ["Permission required"])
     }
+
+
+    @MainActor
+    func testLaunchScanWithNoProjectsClearsTheScanningFlag() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("muxel-scan-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let suiteName = "muxel.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let state = AppState(store: LocalStore(directory: dir), defaults: defaults)
+        state.connectionFactory = { _, _ in MockSSHConnection() }
+        state.setAutoWatchActiveOnLaunch(true)
+        XCTAssertTrue(state.startMonitoringOnLaunch())
+        XCTAssertTrue(state.isScanningActiveProjects)
+        for _ in 0..<100 where state.isScanningActiveProjects {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertFalse(state.isScanningActiveProjects)
+        XCTAssertEqual(state.scanStatusText, "No projects to scan yet.")
+    }
 }

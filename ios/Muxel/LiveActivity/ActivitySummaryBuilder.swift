@@ -21,14 +21,29 @@ enum ActivitySummaryBuilder {
     }
 
     static func row(
-        id: String, name: String, project: String, status: AgentStatus, running: Bool,
-        lastActiveAt: TimeInterval? = nil
+        id: String, name: String, project: String, projectId: UUID? = nil,
+        status: AgentStatus, running: Bool, lastActiveAt: TimeInterval? = nil
     ) -> MuxelActivityAttributes.InstanceRow {
         .init(
             id: id, name: String(name.prefix(nameCap)),
             project: String(project.prefix(nameCap)),
             state: state(status: status, running: running),
-            lastActiveAt: lastActiveAt)
+            lastActiveAt: lastActiveAt,
+            projectKey: projectId.map { MuxelActivityAttributes.InstanceRow.projectKey(for: $0) })
+    }
+
+    /// Drop rows whose project no longer exists (deleted, or its host removed), so a
+    /// cached summary can't keep them on the Live Activity. Rows cached before rows
+    /// carried a `projectKey` are matched by project name instead.
+    static func keepingRows(
+        _ rows: [MuxelActivityAttributes.InstanceRow], ofProjects projects: [(id: UUID, name: String)]
+    ) -> [MuxelActivityAttributes.InstanceRow] {
+        let keys = Set(projects.map { MuxelActivityAttributes.InstanceRow.projectKey(for: $0.id) })
+        let names = Set(projects.map { String($0.name.prefix(nameCap)) })
+        return rows.filter { row in
+            if let key = row.projectKey { return keys.contains(key) }
+            return names.contains(row.project)
+        }
     }
 
     /// Fold instance rows into a `ContentState`: counts, and an attention-priority sort

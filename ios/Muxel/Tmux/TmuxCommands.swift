@@ -402,11 +402,14 @@ enum TmuxCommands {
     /// `screen`), `COLORTERM` propagation, and 24-bit TrueColor passthrough (`RGB`
     /// for tmux 3.2+, `Tc` for tmux 2.2+) idempotently on the selected tmux server
     /// before the client attaches, so colors and gradients pass through intact.
-    /// Must follow `selectSocket`.
+    /// `default-terminal` is only raised from the 8-color `screen`/`tmux` defaults:
+    /// the server may be the user's own, and any other value is their choice
+    /// (`tmux-direct`, `alacritty`, …). Must follow `selectSocket`.
     static var enableTrueColorCommand: String {
-        "if infocmp tmux-256color >/dev/null 2>&1; "
+        "case \"$(tmux \"$@\" show-options -gv default-terminal 2>/dev/null)\" in ''|screen|tmux) "
+            + "if infocmp tmux-256color >/dev/null 2>&1; "
             + "then tmux \"$@\" set-option -g default-terminal tmux-256color 2>/dev/null; "
-            + "else tmux \"$@\" set-option -g default-terminal screen-256color 2>/dev/null; fi; "
+            + "else tmux \"$@\" set-option -g default-terminal screen-256color 2>/dev/null; fi ;; esac; "
             + "tmux \"$@\" show-options -g update-environment 2>/dev/null | grep -q 'COLORTERM' "
             + "|| tmux \"$@\" set-option -ga update-environment COLORTERM 2>/dev/null; "
             + "tmux \"$@\" show-options -s terminal-overrides 2>/dev/null | grep -q 'xterm-256color:Tc' "

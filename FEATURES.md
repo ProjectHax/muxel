@@ -2112,6 +2112,8 @@ feature is added or changed, update the matching entry here in the same change**
   the session name when the peer didn't record one). Opening a folder that another
   machine already has as a remote project (or the iOS app works in) brings up its
   saved panes, attached to their running agents, instead of a fresh pane.
+- **iOS companion** — the iOS app (`ios/`) peers with a desktop over SSH/tmux;
+  its features are listed under **iOS companion** below.
 - **Reconnect on failure** — when a remote project's SSH connection fails (or
   drops), the pane area shows the error with **Reconnect** (re-runs the connect
   pre-flight, re-syncs the layout, respawns panes) and **Scan for projects**
@@ -2132,6 +2134,47 @@ feature is added or changed, update the matching entry here in the same change**
   (gitignore-aware via `git ls-files`, else `find`); opening a file reads it over
   SSH into the editor and Ctrl+S writes it back. Open-in-terminal opens a remote
   shell in that directory.
+
+## iOS companion
+
+- **Background status monitoring** — watched projects get read-only tmux
+  monitors (up to 6 per host, working agents first) that read the live screen
+  without resizing the desktop's window or using `capture-pane`, so working,
+  needs-input and finished states show on the home screen. A prompt started on
+  the desktop or a newly created pane is picked up automatically. Grok's
+  question card reads as needs input even though it still shows Grok's `[stop]`
+  marker. A "working" state left behind when the desktop quit mid-turn expires
+  after 10 minutes with no pane output.
+- **Watching projects** — swipe a project to **Watch**/**Unwatch** it, pin it
+  to **Auto-watch on launch**, or turn on **Auto-watch working projects** in
+  Settings to scan every project at launch and watch the busy ones (**Scan &
+  watch active projects now** runs it on demand). Unwatching stops the
+  background monitors but leaves terminal tabs you opened connected.
+- **Shell command tracking** — a shell pane is working while any foreground
+  command runs (kernel job control, then tmux's current command) and finishes
+  (with a notification) when the prompt returns.
+- **Notification deep links** — tapping an agent notification opens its project
+  and focuses that agent's tab, whether the app was in the foreground, the
+  background or not running.
+- **Live Activity** — the Lock Screen / Dynamic Island shows one line per
+  project with a dot per agent, the projects and agents that worked most
+  recently pinned to the top. Projects with the same name stay on separate
+  lines, and a deleted project (or one under a removed host) leaves it right
+  away.
+- **Quick switching** — a one-tap menu in the project header switches between
+  projects and agents, and cached layouts open a project's tabs immediately.
+- **Scrollback** — scrolling up enters tmux scrollback, with a **Jump to
+  bottom** pill to return. Typing while scrolled up leaves scrollback first and
+  holds the keys until it has, so they reach the agent instead of tmux.
+- **Pasting SSH targets** — pasting `user@host:port` (or `ssh user@host`) into a
+  host's Hostname field fills User and Port. Typed text is split when you leave
+  the field or save, never on each keystroke.
+- **Shared tmux servers** — attaching only raises tmux's `default-terminal` from
+  the 8-color `screen`/`tmux` defaults, so a value you set yourself is kept.
+- **Discovery fallback** — when no configured agent shows up in the usual tmux
+  servers, the app searches through your login shell and the tmux socket
+  folders. While that finds nothing (all agents stopped), it waits a minute
+  between tries.
 
 ## Workspaces & persistence
 

@@ -65,10 +65,18 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
     var onScrolledBackChanged: ((Bool) -> Void)?
     /// Fires (main actor) when the user taps or starts typing while scrolled up in
     /// tmux scrollback, so the pane exits tmux copy-mode and keystrokes land in the
-    /// agent's input box instead of being eaten by copy-mode.
-    var onExitCopyModeRequested: (() -> Void)?
+    /// agent's input box instead of being eaten by copy-mode. The handler calls its
+    /// argument once the exit has finished (or failed).
+    var onExitCopyModeRequested: ((@escaping @MainActor () -> Void) -> Void)?
     /// Net upward scroll ticks sent since the last return to bottom / key input.
     private var scrollUpTicks = 0
+    /// Input typed while scrolled up, held until tmux has left copy-mode (nil when
+    /// nothing is held). See `sendInput`.
+    private var heldInput: [ByteBuffer]?
+    /// Releases `heldInput` if the copy-mode exit never reports back.
+    private var heldInputTimeout: Task<Void, Never>?
+    /// Identifies the current hold, so a late exit callback can't release a newer one.
+    private var heldInputGeneration = 0
     /// Fires (main actor) when the PTY ends **unexpectedly** — a transport drop, not a
     /// user-initiated `disconnect()`. Drives the pane's reconnect overlay + retry.
     var onConnectionLost: (() -> Void)?
@@ -204,7 +212,7 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
         if !view.isFirstResponder { _ = view.becomeFirstResponder() }
         if scrollUpTicks > 0 {
             resetScrollbackIndicator()
-            onExitCopyModeRequested?()
+            onExitCopyModeRequested?({})
         }
         onFocusRequested?()
     }
@@ -382,6 +390,9 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
         preTmuxFallbackTask?.cancel()
         preTmuxFallbackTask = nil
         preTmuxBuffer.removeAll()
+        heldInputTimeout?.cancel()
+        heldInputTimeout = nil
+        heldInput = nil
         events.continuation.finish()
         task?.cancel()
         task = nil
@@ -553,21 +564,53 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
     @MainActor func sendKey(_ bytes: [UInt8]) {
         deleteStreak = 0
         view.unmarkText()
-        if scrollUpTicks > 0 {
-            resetScrollbackIndicator()
-            onExitCopyModeRequested?()
+        sendInput(ByteBuffer(bytes: bytes))
+    }
+
+    /// Forward typed input to the PTY, first leaving tmux copy-mode if the user had
+    /// scrolled up. The exit runs over a separate SSH exec that lands a round trip
+    /// after bytes written to the PTY, so input is held until it finishes (or a 2s
+    /// timeout). Otherwise copy-mode reads the first keys: `/` opens its search
+    /// prompt and the rest of the message never reaches the agent.
+    @MainActor private func sendInput(_ buffer: ByteBuffer) {
+        if heldInput != nil {
+            heldInput?.append(buffer)
+            return
         }
-        events.continuation.yield(.send(ByteBuffer(bytes: bytes)))
+        guard scrollUpTicks > 0 else {
+            events.continuation.yield(.send(buffer))
+            return
+        }
+        resetScrollbackIndicator()
+        guard let exitCopyMode = onExitCopyModeRequested else {
+            events.continuation.yield(.send(buffer))
+            return
+        }
+        heldInputGeneration += 1
+        let generation = heldInputGeneration
+        heldInput = [buffer]
+        heldInputTimeout = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.releaseHeldInput(generation)
+        }
+        exitCopyMode { [weak self] in self?.releaseHeldInput(generation) }
+    }
+
+    @MainActor private func releaseHeldInput(_ generation: Int) {
+        guard generation == heldInputGeneration, let held = heldInput else { return }
+        heldInputTimeout?.cancel()
+        heldInputTimeout = nil
+        heldInput = nil
+        for buffer in held {
+            events.continuation.yield(.send(buffer))
+        }
     }
 
     // MARK: TerminalViewDelegate
 
     func send(source: TerminalView, data: ArraySlice<UInt8>) {
-        if scrollUpTicks > 0 {
-            resetScrollbackIndicator()
-            onExitCopyModeRequested?()
-        }
-        events.continuation.yield(.send(ByteBuffer(bytes: data)))
+        sendInput(ByteBuffer(bytes: data))
 
         // Accelerate held backspace. iOS repeats `deleteBackward` at a flat rate for a
         // custom key-input view (it doesn't apply the delete acceleration it gives
@@ -586,7 +629,7 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
         deleteStreak = nextStreak
         lastDeleteAt = now
         for _ in 0..<extra {
-            events.continuation.yield(.send(ByteBuffer(bytes: [b])))
+            sendInput(ByteBuffer(bytes: [b]))
         }
     }
 
@@ -867,7 +910,10 @@ final class TerminalStore {
         let doneMarker = Array("__MUXEL_PD_\(nonce)__".utf8)
         let maxDurationNs = UInt64(max(4.0, Double(targets.count) * 1.2) * 1_000_000_000)
 
-        let captured: [UInt8] = await withTaskGroup(of: [UInt8].self) { group in
+        // Kept outside the reader task so a timeout still decodes the screens that
+        // arrived before it, rather than dropping them all.
+        let capture = ProbeCapture()
+        await withTaskGroup(of: Void.self) { group in
             group.addTask {
                 var buffer: [UInt8] = []
                 do {
@@ -884,6 +930,7 @@ final class TerminalStore {
                             case .stdout(var buf), .stderr(var buf):
                                 if let bytes = buf.readBytes(length: buf.readableBytes) {
                                     buffer.append(contentsOf: bytes)
+                                    capture.append(bytes)
                                     if Self.containsMarker(doneMarker, in: buffer) {
                                         return
                                     }
@@ -892,18 +939,16 @@ final class TerminalStore {
                         }
                     }
                 } catch {
-                    // Best-effort: return whatever slices already arrived before drop/cancel.
+                    // Best-effort: keep whatever slices already arrived before drop/cancel.
                 }
-                return buffer
             }
             group.addTask {
                 try? await Task.sleep(nanoseconds: maxDurationNs)
-                return []
             }
-            let first = await group.next() ?? []
+            _ = await group.next()
             group.cancelAll()
-            return first
         }
+        let captured = capture.bytes
 
         var results: [String: LiveScreen] = [:]
         let slices = Self.parseBatchProbeOutput(captured, count: targets.count, nonce: nonce)
@@ -1040,6 +1085,20 @@ final class TerminalStore {
             e.session.disconnect()
             entries[id] = nil
         }
+    }
+}
+
+/// PTY bytes read so far by `batchProbeScreensOffscreen`, shared with its timeout.
+private final class ProbeCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [UInt8] = []
+
+    func append(_ more: [UInt8]) {
+        lock.withLock { stored.append(contentsOf: more) }
+    }
+
+    var bytes: [UInt8] {
+        lock.withLock { stored }
     }
 }
 
