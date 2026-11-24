@@ -1,8 +1,7 @@
-//! Quote-aware shell-word splitting for user-typed command lines (a preset's
-//! extra args, a custom command). Byte-for-byte port of the iOS companion's
-//! `Shell.splitWords` (`ios/Muxel/Util/Shell.swift`) — the two must stay in
-//! lockstep (see the protocol-contract table in `ios/README.md`) — and the
-//! decoding inverse of [`crate::ssh::sh_quote`]-joined lines.
+//! The POSIX parser [`split_words`] is a byte-for-byte port of `Shell.splitWords`
+//! in `ios/Muxel/Util/Shell.swift`. Keep the two in lockstep (see the protocol
+//! contract in `ios/README.md`). [`join_words`] uses POSIX shell quoting.
+//! The desktop preset editor also supports Windows path and quote rules.
 
 use crate::ssh::sh_quote;
 
@@ -13,9 +12,19 @@ use crate::ssh::sh_quote;
 /// kept literally); a backslash outside quotes escapes the next character.
 /// Adjacent segments concatenate into one word (`a"b c"` → `ab c`) and `''`
 /// yields an empty word. `None` on an unbalanced quote or trailing backslash.
-///
-/// For quote-free input this is exactly `str::split_whitespace` over ASCII.
 pub fn split_words(line: &str) -> Option<Vec<String>> {
+    split(line, false)
+}
+
+/// Split a preset's extra arguments on the editor's platform. On Windows
+/// both quote styles group words, but backslashes are ordinary path characters
+/// except before a double quote outside single quotes. There, each pair gives
+/// one backslash and an odd leftover makes the quote literal.
+pub fn split_preset_args(line: &str) -> Option<Vec<String>> {
+    split(line, cfg!(windows))
+}
+
+fn split(line: &str, windows_paths: bool) -> Option<Vec<String>> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut in_word = false;
@@ -50,6 +59,9 @@ pub fn split_words(line: &str) -> Option<Vec<String>> {
                 let mut closed = false;
                 while let Some(c) = chars.next() {
                     match c {
+                        '\\' if windows_paths => {
+                            push_windows_backslashes(&mut current, &mut chars);
+                        }
                         '\\' => {
                             let escaped = chars.next()?;
                             if escaped == '"' || escaped == '\\' {
@@ -74,7 +86,11 @@ pub fn split_words(line: &str) -> Option<Vec<String>> {
             }
             '\\' => {
                 in_word = true;
-                current.push(chars.next()?);
+                if windows_paths {
+                    push_windows_backslashes(&mut current, &mut chars);
+                } else {
+                    current.push(chars.next()?);
+                }
             }
             _ => {
                 in_word = true;
@@ -86,16 +102,70 @@ pub fn split_words(line: &str) -> Option<Vec<String>> {
     Some(words)
 }
 
+/// The first backslash has already been consumed. Leave an unescaped quote
+/// for the caller to open or close a double-quoted segment.
+fn push_windows_backslashes(
+    word: &mut String,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) {
+    let mut count = 1;
+    while chars.next_if_eq(&'\\').is_some() {
+        count += 1;
+    }
+    if chars.peek() == Some(&'"') {
+        word.extend(std::iter::repeat_n('\\', count / 2));
+        if count % 2 == 1 {
+            chars.next();
+            word.push('"');
+        }
+    } else {
+        word.extend(std::iter::repeat_n('\\', count));
+    }
+}
+
 /// Join argv words into a single line that [`split_words`] parses back to the
-/// same words (each one [`sh_quote`]d; bare-safe words stay unquoted). Used to
-/// render a preset's saved args for editing, so `["-p", "be terse"]` round-trips
-/// instead of silently re-splitting into three words.
+/// same words (each one [`sh_quote`]d; bare-safe words stay unquoted).
 pub fn join_words(words: &[String]) -> String {
     words
         .iter()
         .map(|w| sh_quote(w))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Render saved arguments for editing with [`split_preset_args`].
+pub fn join_preset_args(words: &[String]) -> String {
+    if cfg!(windows) {
+        join_windows_words(words)
+    } else {
+        join_words(words)
+    }
+}
+
+fn join_windows_words(words: &[String]) -> String {
+    let mut line = String::new();
+    for word in words {
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        if !word.is_empty() && !word.contains([' ', '\t', '\r', '\n', '\'', '"']) {
+            line.push_str(word);
+            continue;
+        }
+        line.push('"');
+        let mut backslashes = 0;
+        for c in word.chars() {
+            if c == '"' {
+                line.extend(std::iter::repeat_n('\\', backslashes + 1));
+            }
+            line.push(c);
+            backslashes = if c == '\\' { backslashes + 1 } else { 0 };
+        }
+        // Double the final run so the closing quote still closes.
+        line.extend(std::iter::repeat_n('\\', backslashes));
+        line.push('"');
+    }
+    line
 }
 
 #[cfg(test)]
@@ -192,5 +262,36 @@ mod tests {
                 "round-trip failed for {ws:?}"
             );
         }
+    }
+
+    #[test]
+    fn windows_preset_quotes_preserve_paths_and_argument_boundaries() {
+        assert_eq!(
+            super::split(r#"-Command Write-Host \"hi\""#, true),
+            words(&["-Command", "Write-Host", r#""hi""#]),
+        );
+        assert_eq!(
+            super::split(r#"pre\\"two words" 'a\"b'"#, true),
+            words(&[r"pre\two words", r#"a\"b"#]),
+        );
+        assert_eq!(
+            super::split(
+                r#"'be terse' "say \"yes\"" "some dir\\" \\host\share"#,
+                true
+            ),
+            words(&["be terse", r#"say "yes""#, r"some dir\", r"\\host\share"]),
+        );
+        let argv = words(&[
+            "",
+            "with space",
+            "it's",
+            r#"a\"b"#,
+            r"two slashes \\",
+            r"\\host\shared folder",
+        ])
+        .unwrap();
+        assert_eq!(split_words(&join_words(&argv)).unwrap(), argv);
+        let line = super::join_windows_words(&argv);
+        assert_eq!(super::split(&line, true).unwrap(), argv);
     }
 }

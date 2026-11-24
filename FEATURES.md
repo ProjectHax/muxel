@@ -237,6 +237,8 @@ feature is added or changed, update the matching entry here in the same change**
   **Git Bash** offered as additional presets (instead of the single "Shell"). A
   preset is either a terminal agent or a **Browser** (opens a browser pane at its
   homepage) — switch the type and edit the fields in Settings → Agents.
+  For a direct local launch, leaving Program blank passes the preset's arguments
+  to the default shell.
 - **Git Bash on Windows** — when Git for Windows is installed, a **Git Bash**
   preset runs its `bash.exe` as an interactive login shell, so the pane gets the
   MSYS tools (`ls`, `grep`, `ssh`, …) rather than a bare shell. muxel finds bash
@@ -285,14 +287,18 @@ feature is added or changed, update the matching entry here in the same change**
   `gemini --resume`; automatic conversation capture on pane restart is not yet
   integrated.
 - **Configurable launch** — per agent: program, model + model flag, effort +
-  effort flag, extra args (shell-style quoting: `--append-system-prompt "be terse"`
-  stays one argument, matching the iOS companion's parser; an unbalanced quote
-  falls back to space-splitting with a feed warning), environment variables,
+  effort flag, extra args, environment variables,
   system-prompt injection
   (via a CLI flag or by typing it in at startup), and a runner startup delay
   (ms to wait after the agent's first output before a runner types — for slow
   starters like opencode, and for Grok, whose animated welcome screen never goes
   quiet; 0 = auto-wait until output goes quiet).
+  Single or double quotes group extra arguments on every desktop. On Windows,
+  drive and UNC paths keep their backslashes. Outside single quotes, each pair
+  of backslashes immediately before a double quote gives one backslash, and
+  an odd extra backslash makes the quote literal. Unix uses the same shell-style
+  escapes as the iOS companion. An unbalanced quote falls back to splitting
+  on whitespace and adds a feed warning.
 - **Installed-binary autodetect** — agents whose binary isn't on `PATH` are hidden
   from the new-agent menus and marked "not installed" in settings; they reappear
   automatically once installed. A GUI launch reconstructs the bin dirs the desktop

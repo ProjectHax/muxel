@@ -10816,9 +10816,14 @@ impl MuxelApp {
                     )
                 }
                 None => (
-                    match resolved.program.clone() {
-                        Some(program) => CommandSpec::program(program, resolved.args.clone()),
-                        None => CommandSpec::shell(),
+                    match resolved.program {
+                        Some(program) => CommandSpec::program(program, resolved.args),
+                        None => CommandSpec {
+                            // The pane stores its configured argv before agent resume
+                            // and prompt flags are added for launch.
+                            args: inst.map(|pane| pane.args.clone()).unwrap_or_default(),
+                            ..CommandSpec::shell()
+                        },
                     }
                     .with_launch_prefix(self.pane_scope_prefix(instance_id)),
                     Vec::new(),
@@ -32035,7 +32040,7 @@ impl MuxelApp {
         // Quote-aware render so a saved `["-p", "be terse"]` round-trips through
         // the editor instead of silently re-splitting into three words.
         ui.p_args.update(cx, |s, cx| {
-            s.set_value(muxel_core::join_words(&p.args), window, cx)
+            s.set_value(muxel_core::join_preset_args(&p.args), window, cx)
         });
         ui.p_prompt.update(cx, |s, cx| {
             s.set_value(p.system_prompt.clone().unwrap_or_default(), window, cx)
@@ -32116,7 +32121,7 @@ impl MuxelApp {
             .trim()
             .to_string();
         let args_raw = self.settings_ui.p_args.read(cx).value().to_string();
-        if muxel_core::split_words(&args_raw).is_none() {
+        let args = muxel_core::split_preset_args(&args_raw).unwrap_or_else(|| {
             // Unbalanced quote: the preset still saves (whitespace split), but
             // tell the user their quoting didn't take.
             self.add_event(
@@ -32127,8 +32132,8 @@ impl MuxelApp {
                     &[("args", &args_raw)],
                 ),
             );
-        }
-        let args = settings_view::parse_args(&args_raw);
+            args_raw.split_whitespace().map(str::to_owned).collect()
+        });
         let prompt = self.settings_ui.p_prompt.read(cx).value().to_string();
         let env = settings_view::parse_env(&self.settings_ui.p_env.read(cx).value());
         let working_markers =
