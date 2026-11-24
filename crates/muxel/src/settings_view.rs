@@ -262,6 +262,7 @@ pub struct SettingsUi {
     pub font_family: Entity<InputState>,
 
     // Behavior.
+    pub default_shell_command: Entity<InputState>,
     /// What a pane's Auto toggle types to resume a stalled agent.
     pub auto_continue_message: Entity<InputState>,
     pub cloud_api_key: Entity<InputState>,
@@ -592,6 +593,8 @@ impl SettingsUi {
             }),
             cloud_recovery: cx
                 .new(|cx| InputState::new(window, cx).placeholder("MXL-XXXX-XXXX-…".to_string())),
+            default_shell_command: cx
+                .new(|cx| InputState::new(window, cx).placeholder(t("System shell"))),
             auto_continue_message: cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder(muxel_core::autopilot::AUTO_CONTINUE_MESSAGE.to_string())

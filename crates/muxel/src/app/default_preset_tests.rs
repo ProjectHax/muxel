@@ -2,11 +2,14 @@
 
 use super::MuxelApp;
 use crate::theme;
-use gpui::TestAppContext;
+use gpui::{Context, TestAppContext, Window};
 use muxel_core::{AgentPreset, Instance, Project, Settings};
 use uuid::Uuid;
 
-fn with_app<R>(settings: &Settings, run: impl FnOnce(&mut MuxelApp) -> R) -> R {
+fn with_app<R>(
+    settings: &Settings,
+    run: impl FnOnce(&mut MuxelApp, &mut Window, &mut Context<MuxelApp>) -> R,
+) -> R {
     let root = std::env::temp_dir().join(format!("muxel-default-preset-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     let storage = muxel_store::test_support::set_root(root.clone());
@@ -21,7 +24,9 @@ fn with_app<R>(settings: &Settings, run: impl FnOnce(&mut MuxelApp) -> R) -> R {
         theme::apply_initial_theme("", cx);
     });
     let window = cx.add_window(MuxelApp::new);
-    let result = window.update(&mut cx, |app, _, _| run(app)).unwrap();
+    let result = window
+        .update(&mut cx, |app, window, cx| run(app, window, cx))
+        .unwrap();
     // The app and its tasks go first, then its files, then the lease.
     drop(cx);
     std::fs::remove_dir_all(root).unwrap();
@@ -46,7 +51,7 @@ fn the_default_preset_opened_with_is_the_starred_one_by_id_or_name() {
         } else {
             codex.to_string()
         };
-        let (opened, starred) = with_app(&settings, |app| {
+        let (opened, starred) = with_app(&settings, |app, _, _| {
             (
                 app.presets[app.current_preset].id,
                 app.active_default_preset_id(),
@@ -143,7 +148,7 @@ fn add_shell_copy(app: &mut MuxelApp, mut preset: AgentPreset) -> Uuid {
 
 #[test]
 fn default_shell_launch_receives_preset_arguments() {
-    let args = with_app(&Settings::default(), |app| {
+    let args = with_app(&Settings::default(), |app, _, _| {
         let preset = AgentPreset {
             model: Some("small".into()),
             effort: Some("low".into()),
@@ -168,7 +173,7 @@ fn default_shell_launch_receives_preset_arguments() {
 
 #[test]
 fn cleared_agent_program_opens_a_plain_shell_on_launch_and_restore() {
-    let (fresh, restored) = with_app(&Settings::default(), |app| {
+    let (fresh, restored) = with_app(&Settings::default(), |app, _, _| {
         let iid = add_shell_copy(app, AgentPreset::claude());
         let fresh = app.command_for(iid, None).unwrap().0.args;
         let pane = app.workspace.instance_mut(iid).unwrap();
@@ -188,4 +193,108 @@ fn cleared_agent_program_opens_a_plain_shell_on_launch_and_restore() {
         (fresh, restored),
         (Vec::<String>::new(), Vec::<String>::new())
     );
+}
+
+#[test]
+fn new_default_shell_pane_keeps_the_configured_command_and_arguments() {
+    let mut settings = Settings::default();
+    let index = settings
+        .presets
+        .iter()
+        .position(|p| p.program.is_none())
+        .unwrap();
+    settings.presets[index].args = vec!["extra argument".into()];
+    let mut persisted = serde_json::to_value(settings).unwrap();
+    persisted["default_shell_command"] =
+        serde_json::json!(["custom-cli", "--profile", "test profile"]);
+    let settings: Settings = serde_json::from_value(persisted).unwrap();
+    let (program, args) = with_app(&settings, |app, window, cx| {
+        let project = app
+            .workspace
+            .add_project(Project::new("fixture", muxel_store::data_dir().unwrap()));
+        app.workspace.active_project = Some(project);
+        app.use_tmux = false;
+        app.use_worktree = false;
+        app.place_with_preset(None, super::PlacementMode::Tab, index, window, cx);
+        let iid = app
+            .workspace
+            .project(project)
+            .unwrap()
+            .first_instance()
+            .unwrap();
+        let spec = app.command_for(iid, None).unwrap().0;
+        (spec.program, spec.args)
+    });
+    assert_eq!(program, "custom-cli");
+    assert_eq!(args, ["--profile", "test profile", "extra argument"]);
+}
+
+#[test]
+fn default_shell_command_editor_saves_quoted_arguments_and_rejects_invalid_input() {
+    use super::settings_shell::TextSetting;
+
+    with_app(&Settings::default(), |app, window, cx| {
+        app.show_settings = true;
+        let input = app.settings_ui.default_shell_command.clone();
+        let command = r#""custom cli" --profile "test profile""#;
+        input.update(cx, |field, cx| field.set_value(command, window, cx));
+        app.apply_text_setting(TextSetting::DefaultShellCommand, window, cx);
+        let saved = || {
+            muxel_store::try_load_settings()
+                .unwrap()
+                .unwrap()
+                .default_shell_command
+        };
+        assert_eq!(saved(), ["custom cli", "--profile", "test profile"]);
+
+        input.update(cx, |field, cx| field.set_value(r#""unclosed"#, window, cx));
+        app.apply_text_setting(TextSetting::DefaultShellCommand, window, cx);
+        assert_eq!(saved(), ["custom cli", "--profile", "test profile"]);
+        assert_eq!(
+            muxel_core::split_preset_args(input.read(cx).value().as_ref()).unwrap(),
+            saved(),
+        );
+
+        #[cfg(not(windows))]
+        {
+            input.update(cx, |field, cx| {
+                field.set_value("custom-cli value\\ ", window, cx)
+            });
+            app.apply_text_setting(TextSetting::DefaultShellCommand, window, cx);
+            assert_eq!(saved(), ["custom-cli", "value "]);
+        }
+
+        input.update(cx, |field, cx| field.set_value("", window, cx));
+        app.apply_text_setting(TextSetting::DefaultShellCommand, window, cx);
+        assert!(saved().is_empty());
+    });
+}
+
+#[test]
+fn default_shell_command_leaves_remote_and_explicit_programs_to_their_presets() {
+    let settings = Settings {
+        default_shell_command: vec!["custom-cli".into(), "--profile".into()],
+        ..Settings::default()
+    };
+    with_app(&settings, |app, _, _| {
+        let mut remote = Project::new("remote", "/tmp/remote");
+        remote.remote = Some(muxel_core::RemoteRef {
+            host_id: Uuid::new_v4(),
+            remote_root: "/tmp/remote".into(),
+        });
+        let remote = app.workspace.add_project(remote);
+        let local = app
+            .workspace
+            .add_project(Project::new("local", "/tmp/local"));
+        let preset = AgentPreset::codex();
+        assert_eq!(
+            app.instance_from_preset(local, &preset).program,
+            preset.program
+        );
+        assert!(
+            app.instance_from_preset(remote, &AgentPreset::shell())
+                .program
+                .is_none()
+        );
+    });
 }

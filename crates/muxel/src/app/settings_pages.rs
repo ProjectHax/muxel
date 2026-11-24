@@ -497,6 +497,9 @@ impl MuxelApp {
                 Row::new(t("Default preset"), default_preset)
                     .desc(t("The agent launched when you don't pick one."))
                     .keywords("agent"),
+                Row::new(t("Default shell command"), form.input(&self.settings_ui.default_shell_command))
+                    .desc(t("Program and arguments for new local panes whose preset leaves Program blank. Blank uses your system shell."))
+                    .keywords("executable cli startup"),
                 tmux_row,
                 Row::narrow(
                     t("Use a git worktree"),
