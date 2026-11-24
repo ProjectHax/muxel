@@ -215,7 +215,8 @@ actor CitadelSSHConnection: SSHConnection {
                     // The validator's failure can also surface wrapped — unwrap it
                     // before stringifying the transport error.
                     if let ssh = Self.unwrapSSHError(error) { throw ssh }
-                    throw SSHError.connection(Self.describeTransport(error))
+                    throw SSHError.connection(await Self.describeConnectFailure(
+                        error, host: host.hostname, port: host.displayPort))
                 }
             }
 
@@ -238,8 +239,8 @@ actor CitadelSSHConnection: SSHConnection {
                     + Self.describe(error, auth: jump.authKind))
             } catch {
                 if let ssh = Self.unwrapSSHError(error) { throw ssh }
-                throw SSHError.connection("Jump host \(jump.spec.host): "
-                    + Self.describeTransport(error))
+                throw SSHError.connection("Jump host: " + (await Self.describeConnectFailure(
+                    error, host: jump.spec.host, port: jump.spec.port)))
             }
 
             // Hop 2: the target, tunneled. On any failure the bastion must not
@@ -397,7 +398,17 @@ actor CitadelSSHConnection: SSHConnection {
         }
     }
 
-    /// Readable text for NIO/transport-level connect failures.
+    /// Readable text for a failed connect to `host`, with the device's network
+    /// state folded in when it can explain the failure (cellular data off for
+    /// muxel, a LAN-only address while on cellular).
+    private static func describeConnectFailure(_ error: Error, host: String, port: Int) async -> String {
+        let failure = ConnectFailure(error)
+        let network = failure.dependsOnNetwork ? await NetworkSnapshot.current() : nil
+        return failure.message(host: host, port: port, network: network)
+    }
+
+    /// Readable text for NIO/transport-level failures on an established session
+    /// (or through the jump host's tunnel).
     private static func describeTransport(_ error: Error) -> String {
         guard let ch = error as? ChannelError else { return error.localizedDescription }
         switch ch {
