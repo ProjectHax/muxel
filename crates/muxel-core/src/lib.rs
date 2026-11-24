@@ -74,7 +74,7 @@ pub use pane::{
     swap_panes,
 };
 pub use readaloud::{ReadAloudAuto, ReadAloudScope};
-pub use shell::{join_words, split_words};
+pub use shell::{join_preset_args, join_words, split_preset_args, split_words};
 pub use stt::SttEngine;
 pub use tts::TtsEngine;
 pub use url::{normalize_url, same_resource_url};
