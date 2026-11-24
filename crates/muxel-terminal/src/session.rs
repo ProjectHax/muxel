@@ -869,6 +869,8 @@ pub struct CommandSpec {
     /// Fixed delay (ms) after the agent's first output before startup automation
     /// types into it. 0 = auto (wait for output to go quiet instead).
     pub startup_delay_ms: u32,
+    /// Whether the view forwards macOS draft shortcuts after this command starts.
+    pub forward_macos_agent_edit_keys: bool,
     /// The provider conversation this launch opens, if muxel knows it.
     pub binding: LaunchBinding,
     /// Whether the command actually resumes an existing provider conversation.
@@ -913,6 +915,7 @@ impl CommandSpec {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            forward_macos_agent_edit_keys: false,
             binding: LaunchBinding::Unknown,
             launch_resumed: false,
             memory_limit: None,
@@ -944,6 +947,7 @@ impl CommandSpec {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            forward_macos_agent_edit_keys: false,
             binding: LaunchBinding::Unknown,
             launch_resumed: false,
             memory_limit: None,

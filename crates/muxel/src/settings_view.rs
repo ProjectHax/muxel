@@ -164,6 +164,7 @@ pub struct SettingsUi {
     pub p_working_markers: Entity<InputState>,
     pub p_blocked_markers: Entity<InputState>,
     pub p_startup_delay: Entity<InputState>,
+    pub p_forward_macos_agent_edit_keys: bool,
 
     // Runner editor.
     pub selected_runner: Option<usize>,
@@ -449,6 +450,7 @@ impl SettingsUi {
             selected_preset: None,
             p_injection: InjectionMode::None,
             p_kind: PresetKind::Terminal,
+            p_forward_macos_agent_edit_keys: false,
             p_name: cx.new(|cx| InputState::new(window, cx).placeholder(t("Name"))),
             p_url: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t("https://duckduckgo.com"))),

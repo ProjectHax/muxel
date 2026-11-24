@@ -213,6 +213,23 @@ impl MuxelApp {
             Row::new(t("Effort"), pair(&ui.p_effort, &ui.p_effort_flag)),
             Row::new(t("Extra arguments"), form.input(&ui.p_args)).desc(t("Quotes group words.")),
         ]);
+        if cfg!(target_os = "macos") {
+            launch.push(
+                Row::narrow(
+                    t("Forward agent editing shortcuts"),
+                    form.switch(
+                        "preset-forward-macos-agent-edit-keys",
+                        ui.p_forward_macos_agent_edit_keys,
+                        true,
+                        cx.listener(|this, on: &bool, _, cx| {
+                            this.settings_ui.p_forward_macos_agent_edit_keys = *on;
+                            cx.notify();
+                        }),
+                    ),
+                )
+                .desc(t("On pane launch, send Cmd+A as Shift+F1 and Cmd+C as Ctrl+Insert. Enable only for a compatible agent. Cmd+C copies selected terminal text first.")),
+            );
+        }
         col = col.child(form.group(Group::new(t("Launch"), launch), &[]));
 
         let inj_seg = |label: SharedString, selected: bool, mode: InjectionMode| {

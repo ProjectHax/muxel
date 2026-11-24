@@ -2878,9 +2878,6 @@ pub struct Settings {
     /// for other shapes (e.g. `ctrl-shift-p`) or custom rebinds.
     #[serde(default = "default_passthrough_keys")]
     pub terminal_passthrough_keys: Vec<String>,
-    /// Forward macOS Cmd+A and Cmd+C to terminal apps with compatible bindings.
-    #[serde(default)]
-    pub forward_macos_agent_edit_keys: bool,
     /// Saved SSH remote hosts for remote development.
     #[serde(default)]
     pub remotes: Vec<RemoteHost>,
@@ -3408,7 +3405,6 @@ impl Default for Settings {
             snippets: Snippet::defaults(),
             loops: Vec::new(),
             terminal_passthrough_keys: default_passthrough_keys(),
-            forward_macos_agent_edit_keys: false,
             remotes: Vec::new(),
             identities: Vec::new(),
             editor_font_family: String::new(),

@@ -56,5 +56,4 @@ pub use view::{
     TerminalFocusProfile, TerminalLaunch, TerminalMouseMode, TerminalNotifyCause,
     TerminalRuntimeSnapshot, TerminalStatusCoverage, TerminalStatusReason, TerminalView,
     TextPasteErrorHandler, clean_agent_title, pane_grid, paste_clipboard_into_session,
-    set_forward_macos_agent_edit_keys,
 };

@@ -105,6 +105,9 @@ pub struct AgentPreset {
     /// draw (e.g. opencode). 0 = auto: wait until output goes quiet instead.
     #[serde(default)]
     pub startup_delay_ms: u32,
+    /// Forward macOS Cmd+A and Cmd+C to agents that bind Shift+F1 and Ctrl+Insert.
+    #[serde(default)]
+    pub forward_macos_agent_edit_keys: bool,
     /// CLI flag that starts a conversation with a chosen session ID (e.g. Claude's
     /// `--session-id <uuid>`). When set with [`Self::resume_flag`], muxel mints a
     /// stable id per pane and passes it on first launch. When `None` but
@@ -147,6 +150,7 @@ impl AgentPreset {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            forward_macos_agent_edit_keys: false,
             session_id_flag: None,
             resume_flag: None,
         }
@@ -173,6 +177,7 @@ impl AgentPreset {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            forward_macos_agent_edit_keys: false,
             session_id_flag: None,
             resume_flag: None,
         }
@@ -208,6 +213,7 @@ impl AgentPreset {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            forward_macos_agent_edit_keys: false,
             session_id_flag: None,
             resume_flag: None,
         }
@@ -237,6 +243,7 @@ impl AgentPreset {
             working_markers: vec!["esc to interrupt".to_string()],
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            forward_macos_agent_edit_keys: false,
             session_id_flag: Some("--session-id".to_string()),
             resume_flag: Some("--resume".to_string()),
         }
@@ -261,6 +268,7 @@ impl AgentPreset {
             blocked_markers: Vec::new(),
             // opencode keeps loading well after its first draw; wait before typing.
             startup_delay_ms: 6000,
+            forward_macos_agent_edit_keys: false,
             session_id_flag: None,
             resume_flag: None,
         }
@@ -285,6 +293,7 @@ impl AgentPreset {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            forward_macos_agent_edit_keys: false,
             session_id_flag: None,
             resume_flag: None,
         }
@@ -309,6 +318,7 @@ impl AgentPreset {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            forward_macos_agent_edit_keys: false,
             session_id_flag: None,
             resume_flag: None,
         }
@@ -345,6 +355,7 @@ impl AgentPreset {
             // The launched agent (opencode) keeps loading after its first draw, on
             // top of ollama's own connect — wait before any runner types into it.
             startup_delay_ms: 6000,
+            forward_macos_agent_edit_keys: false,
             session_id_flag: None,
             resume_flag: None,
         }
@@ -368,6 +379,7 @@ impl AgentPreset {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            forward_macos_agent_edit_keys: false,
             session_id_flag: None,
             resume_flag: None,
         }
@@ -392,6 +404,7 @@ impl AgentPreset {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            forward_macos_agent_edit_keys: false,
             session_id_flag: None,
             resume_flag: None,
         }
@@ -425,6 +438,7 @@ impl AgentPreset {
             // full cap before a runner typed anything. Its prompt is ready about a
             // second and a half after the first draw.
             startup_delay_ms: 3000,
+            forward_macos_agent_edit_keys: false,
             session_id_flag: Some("--session-id".to_string()),
             resume_flag: Some("--resume".to_string()),
         }
@@ -451,6 +465,7 @@ impl AgentPreset {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            forward_macos_agent_edit_keys: false,
             // Agent-owned id: leave session_id_flag unset; resume is a subcommand.
             session_id_flag: None,
             resume_flag: Some("resume".to_string()),
@@ -476,6 +491,7 @@ impl AgentPreset {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            forward_macos_agent_edit_keys: false,
             session_id_flag: None,
             resume_flag: Some("resume".to_string()),
         }
@@ -502,6 +518,7 @@ impl AgentPreset {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            forward_macos_agent_edit_keys: false,
             // `effective_resume_flag` also supports existing saved presets.
             session_id_flag: None,
             resume_flag: None,
@@ -529,6 +546,7 @@ impl AgentPreset {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            forward_macos_agent_edit_keys: false,
             // gemini can resume via `--resume <id|latest>`, but muxel does not capture its id.
             session_id_flag: None,
             resume_flag: None,
@@ -555,6 +573,7 @@ impl AgentPreset {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            forward_macos_agent_edit_keys: false,
             session_id_flag: None,
             resume_flag: None,
         }

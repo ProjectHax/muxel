@@ -4476,7 +4476,6 @@ fn keybinding_for(action: &str, keystroke: &str, context: Option<&str>) -> Optio
 /// Bind default keybindings, applying any overrides from settings.
 pub fn install_keybindings(settings: &muxel_core::Settings, cx: &mut App) {
     use std::collections::HashMap;
-    muxel_terminal::set_forward_macos_agent_edit_keys(settings.forward_macos_agent_edit_keys, cx);
     let overrides: HashMap<&str, &str> = settings
         .keybindings
         .iter()
@@ -10968,6 +10967,8 @@ impl MuxelApp {
             .filter(|v| !v.is_empty())
             .unwrap_or(def_blocked);
         let startup_delay = preset.map(|p| p.startup_delay_ms).unwrap_or(0);
+        spec.forward_macos_agent_edit_keys =
+            preset.is_some_and(|p| p.forward_macos_agent_edit_keys);
         let owner = match self.terminal_launching.get(&instance_id) {
             Some(ticket) => ticket.startup.clone(),
             None => self.claim_control_startup(instance_id),
@@ -32352,6 +32353,7 @@ impl MuxelApp {
         self.settings_ui.selected_preset = Some(idx);
         self.settings_ui.p_injection = p.injection.clone();
         self.settings_ui.p_kind = p.kind;
+        self.settings_ui.p_forward_macos_agent_edit_keys = p.forward_macos_agent_edit_keys;
         let inj_flag = match &p.injection {
             InjectionMode::CliFlag { flag } => flag.clone(),
             _ => String::new(),
@@ -32547,6 +32549,7 @@ impl MuxelApp {
         p.working_markers = working_markers;
         p.blocked_markers = blocked_markers;
         p.startup_delay_ms = startup_delay_ms;
+        p.forward_macos_agent_edit_keys = self.settings_ui.p_forward_macos_agent_edit_keys;
         self.persist_settings();
         cx.notify();
     }

@@ -157,8 +157,8 @@ pub fn key_to_bytes(
         _ => {}
     }
 
-    let unhandled_cmd_a = cfg!(target_os = "macos") && key == "a" && mods.is_platform_only();
-    if key.len() == 1 && !unhandled_cmd_a {
+    // Unhandled Command chords must not turn into literal terminal input.
+    if key.len() == 1 && !(cfg!(target_os = "macos") && mods.platform) {
         return Some(key.as_bytes().to_vec());
     }
 
@@ -278,12 +278,19 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn unforwarded_cmd_a_is_not_typed_into_the_terminal() {
+    fn unhandled_command_letters_are_not_typed_into_the_terminal() {
         let mods = KeyModifiers {
             platform: true,
             ..KeyModifiers::default()
         };
-        assert_eq!(key_to_bytes("a", None, &mods, false), None);
+        for key in ["a", "b", "x"] {
+            assert_eq!(key_to_bytes(key, None, &mods, false), None, "Cmd+{key}");
+        }
+        let shifted = KeyModifiers {
+            shift: true,
+            ..mods
+        };
+        assert_eq!(key_to_bytes("x", None, &shifted, false), None);
     }
 
     #[test]

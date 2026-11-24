@@ -458,35 +458,21 @@ impl MuxelApp {
         }
 
         if filter.is_empty() {
-            let mut rows = vec![
-                Row::new(
-                    t("Keys muxel leaves to the focused terminal"),
-                    form.input(&self.settings_ui.passthrough_keys),
-                )
-                .desc(t(
-                    "Extra chords, comma-separated, such as ctrl-shift-p. Plain Ctrl+letter shortcuts already yield to a terminal, so agents receive them (Ctrl+S stash, and so on). Applies when you leave the field.",
-                )),
-            ];
-            if cfg!(target_os = "macos") {
-                rows.push(
-                    Row::narrow(
-                        t("Forward agent editing shortcuts"),
-                        form.switch(
-                            "forward-macos-agent-edit-keys",
-                            self.settings.forward_macos_agent_edit_keys,
-                            true,
-                            cx.listener(|this, on: &bool, _, cx| {
-                                this.settings.forward_macos_agent_edit_keys = *on;
-                                muxel_terminal::set_forward_macos_agent_edit_keys(*on, cx);
-                                this.persist_settings();
-                                cx.notify();
-                            }),
-                        ),
-                    )
-                    .desc(t("Send Cmd+A and Cmd+C to compatible agents. Cmd+C copies terminal text when it is selected.")),
-                );
-            }
-            col = col.child(form.group(Group::new(t("Terminal passthrough"), rows), &[]));
+            col = col.child(form.group(
+                Group::new(
+                    t("Terminal passthrough"),
+                    vec![
+                        Row::new(
+                            t("Keys muxel leaves to the focused terminal"),
+                            form.input(&self.settings_ui.passthrough_keys),
+                        )
+                        .desc(t(
+                            "Extra chords, comma-separated, such as ctrl-shift-p. Plain Ctrl+letter shortcuts already yield to a terminal, so agents receive them (Ctrl+S stash, and so on). Applies when you leave the field.",
+                        )),
+                    ],
+                ),
+                &[],
+            ));
         }
         col.into_any_element()
     }

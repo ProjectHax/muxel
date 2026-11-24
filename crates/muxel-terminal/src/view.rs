@@ -2421,18 +2421,10 @@ fn coalesce_pending(
     }
 }
 
-struct ForwardMacosAgentEditKeys(bool);
-
-impl Global for ForwardMacosAgentEditKeys {}
-
-/// Update key forwarding for all terminal views, including detached panes.
-pub fn set_forward_macos_agent_edit_keys(enabled: bool, cx: &mut App) {
-    cx.set_global(ForwardMacosAgentEditKeys(enabled));
-}
-
 pub struct TerminalView {
     instance_id: Uuid,
     session: Arc<TerminalSession>,
+    forward_macos_agent_edit_keys: bool,
     startup_turn: Option<muxel_core::control::StartupTurn>,
     focus_handle: FocusHandle,
     palette: TerminalPalette,
@@ -4061,6 +4053,7 @@ impl TerminalView {
         let mut view = Self {
             instance_id,
             session,
+            forward_macos_agent_edit_keys: spec.forward_macos_agent_edit_keys,
             startup_turn,
             focus_handle,
             palette: TerminalPalette::default(),
@@ -4619,11 +4612,7 @@ impl TerminalView {
             platform: m.platform,
         };
         let macos_command = cfg!(target_os = "macos") && mods.is_platform_only();
-        let forward_edit_key = if macos_command
-            && cx
-                .try_global::<ForwardMacosAgentEditKeys>()
-                .is_some_and(|setting| setting.0)
-        {
+        let forward_edit_key = if macos_command && self.forward_macos_agent_edit_keys {
             crate::keymap::agent_edit_key(key)
         } else {
             None
@@ -5233,7 +5222,7 @@ sleep 30
 
 #[cfg(all(test, target_os = "macos"))]
 mod macos_agent_edit_tests {
-    use super::{TerminalLaunch, TerminalView, set_forward_macos_agent_edit_keys};
+    use super::{TerminalLaunch, TerminalView};
     use crate::CommandSpec;
     use alacritty_terminal::index::{Column, Line, Point, Side};
     use alacritty_terminal::selection::{Selection, SelectionType};
@@ -5242,27 +5231,25 @@ mod macos_agent_edit_tests {
 
     #[test]
     fn agent_shortcuts_are_opt_in_and_terminal_copy_keeps_priority() {
-        let launch =
-            TerminalLaunch::spawn(CommandSpec::program("/bin/cat", vec![]), (80, 24)).unwrap();
+        let spec = CommandSpec {
+            forward_macos_agent_edit_keys: true,
+            ..CommandSpec::program("/bin/cat", vec![])
+        };
+        let launch = TerminalLaunch::spawn(spec, (80, 24)).unwrap();
         let mut cx = TestAppContext::single();
         cx.skip_drawing();
         let window = cx.add_window(|window, cx| {
             TerminalView::new(launch, uuid::Uuid::new_v4(), Instant::now(), window, cx)
         });
+        let shell = cx.add_window(|window, cx| {
+            let launch =
+                TerminalLaunch::spawn(CommandSpec::program("/bin/cat", vec![]), (80, 24)).unwrap();
+            TerminalView::new(launch, uuid::Uuid::new_v4(), Instant::now(), window, cx)
+        });
         window
             .update(&mut cx, |view, window, cx| {
                 let session = view.session().clone();
-                let key = |chord| KeyDownEvent {
-                    keystroke: Keystroke::parse(chord).unwrap(),
-                    is_held: false,
-                    prefer_character_input: false,
-                };
                 let before = session.input_rev();
-                view.on_key_down(&key("cmd-a"), window, cx);
-                view.on_key_down(&key("cmd-c"), window, cx);
-                assert_eq!(session.input_rev(), before);
-
-                set_forward_macos_agent_edit_keys(true, cx);
                 view.on_key_down(&key("cmd-a"), window, cx);
                 view.on_key_down(&key("cmd-c"), window, cx);
                 assert_eq!(session.input_rev(), before + 2);
@@ -5282,6 +5269,26 @@ mod macos_agent_edit_tests {
                 session.kill();
             })
             .unwrap();
+
+        let shell_writes = shell
+            .update(&mut cx, |view, window, cx| {
+                let session = view.session().clone();
+                let before = session.input_rev();
+                view.on_key_down(&key("cmd-a"), window, cx);
+                view.on_key_down(&key("cmd-c"), window, cx);
+                session.kill();
+                session.input_rev() - before
+            })
+            .unwrap();
+        assert_eq!(shell_writes, 0);
+    }
+
+    fn key(chord: &str) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: Keystroke::parse(chord).unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        }
     }
 }
 
