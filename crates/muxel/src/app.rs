@@ -13838,7 +13838,7 @@ impl MuxelApp {
             return pid;
         }
         let preset = self.current_agent_preset();
-        let instance = Instance::from_preset(pid, &preset);
+        let instance = self.instance_from_preset(pid, &preset);
         self.start_new_project_logs(pid, cx);
         // Point the open file browser at the new project right away.
         if self.show_file_browser {
@@ -17586,6 +17586,24 @@ impl MuxelApp {
         }
     }
 
+    /// Capture the desktop's shell command on a new pane, like preset argv.
+    fn instance_from_preset(&self, pid: Uuid, preset: &AgentPreset) -> Instance {
+        let mut instance = Instance::from_preset(pid, preset);
+        if instance.kind == InstanceKind::Terminal
+            && instance.program.is_none()
+            && self
+                .workspace
+                .project(pid)
+                .is_some_and(|project| !project.is_remote())
+            && let Some((program, args)) = self.settings.default_shell_command.split_first()
+            && !program.trim().is_empty()
+        {
+            instance.program = Some(program.clone());
+            instance.args.splice(..0, args.iter().cloned());
+        }
+        instance
+    }
+
     /// Spawn an agent from `preset_idx` and place it (split or tab) at `target`,
     /// in the project `window` shows. The shared body behind every split /
     /// new-tab path.
@@ -17625,7 +17643,7 @@ impl MuxelApp {
             self.place_browser_url(pid, &preset.url, target, placement, window, cx);
             return;
         }
-        let instance = Instance::from_preset(pid, &preset);
+        let instance = self.instance_from_preset(pid, &preset);
         self.place_and_spawn(pid, instance, placement, target, None, window, cx);
     }
 
@@ -17974,7 +17992,7 @@ impl MuxelApp {
             .get(self.current_preset)
             .cloned()
             .unwrap_or_else(AgentPreset::shell);
-        let instance = Instance::from_preset(pid, &preset);
+        let instance = self.instance_from_preset(pid, &preset);
         let target = self.active_instance;
         self.place_and_spawn(
             pid,
@@ -18042,7 +18060,7 @@ impl MuxelApp {
                 .preset_id
                 .and_then(|id| self.presets.iter().find(|p| p.id == id).cloned())
                 .unwrap_or_else(AgentPreset::shell);
-            let instance = Instance::from_preset(pid, &preset);
+            let instance = self.instance_from_preset(pid, &preset);
             let target = self.active_instance;
             self.place_and_spawn(
                 pid,
@@ -27159,7 +27177,7 @@ impl MuxelApp {
         let Some(pid) = self.file_browser_pid.or(self.workspace.active_project) else {
             return;
         };
-        let mut instance = Instance::from_preset(pid, &AgentPreset::shell());
+        let mut instance = self.instance_from_preset(pid, &AgentPreset::shell());
         instance.launch_dir = Some(dir);
         let target = self.active_instance;
         self.place_and_spawn(
@@ -32020,12 +32038,44 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// Seed the Behavior section's text input from the current settings.
+    /// Seed General's text inputs from the current settings.
     fn load_behavior_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let command = muxel_core::join_preset_args(&self.settings.default_shell_command);
+        self.settings_ui
+            .default_shell_command
+            .update(cx, |s, cx| s.set_value(command, window, cx));
         let message = self.settings.auto_continue_message.clone();
         self.settings_ui
             .auto_continue_message
             .update(cx, |s, cx| s.set_value(message, window, cx));
+    }
+
+    fn apply_default_shell_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let input = self.settings_ui.default_shell_command.clone();
+        let typed = input.read(cx).value();
+        match muxel_core::split_preset_args(typed.as_ref()) {
+            Some(command)
+                if command
+                    .first()
+                    .is_none_or(|program| !program.trim().is_empty()) =>
+            {
+                if command != self.settings.default_shell_command {
+                    self.settings.default_shell_command = command;
+                    self.persist_settings();
+                    cx.notify();
+                }
+            }
+            _ => {
+                self.add_event(
+                    NotifKind::Error,
+                    t("Invalid default shell command"),
+                    t("Enter a program with balanced quotes, or leave the field blank."),
+                );
+                let saved = muxel_core::join_preset_args(&self.settings.default_shell_command);
+                input.update(cx, |s, cx| s.set_value(saved, window, cx));
+                cx.notify();
+            }
+        }
     }
 
     /// Read the auto-continue message input and persist it, showing back what was

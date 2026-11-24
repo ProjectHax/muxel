@@ -12,6 +12,7 @@ use crate::settings_model as model;
 pub(super) enum TextSetting {
     TerminalFont,
     EditorFont,
+    DefaultShellCommand,
     AutoContinue,
     SttProvider,
     SttWakePhrase,
@@ -21,9 +22,10 @@ pub(super) enum TextSetting {
 }
 
 impl TextSetting {
-    pub(super) const ALL: [TextSetting; 8] = [
+    pub(super) const ALL: [TextSetting; 9] = [
         Self::TerminalFont,
         Self::EditorFont,
+        Self::DefaultShellCommand,
         Self::AutoContinue,
         Self::SttProvider,
         Self::SttWakePhrase,
@@ -334,6 +336,9 @@ impl MuxelApp {
                 {
                     self.apply_editor_font_family(window, cx);
                 }
+            }
+            TextSetting::DefaultShellCommand => {
+                self.apply_default_shell_command(window, cx);
             }
             TextSetting::AutoContinue => {
                 if ui.auto_continue_message.read(cx).value().as_ref()
@@ -1434,6 +1439,7 @@ pub(super) fn settings_input_subscriptions(
     for (input, which) in [
         (&ui.font_family, TextSetting::TerminalFont),
         (&ui.editor_font_family, TextSetting::EditorFont),
+        (&ui.default_shell_command, TextSetting::DefaultShellCommand),
         (&ui.auto_continue_message, TextSetting::AutoContinue),
         (&ui.stt_provider_url, TextSetting::SttProvider),
         (&ui.stt_provider_model, TextSetting::SttProvider),

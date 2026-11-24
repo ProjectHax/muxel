@@ -239,6 +239,11 @@ feature is added or changed, update the matching entry here in the same change**
   homepage) — switch the type and edit the fields in Settings → Agents.
   For a direct local launch, leaving Program blank passes the preset's arguments
   to the default shell.
+- **Custom default shell command** — Settings → General → Default shell command
+  accepts a program with quoted arguments (for example, `codex --no-daemon`).
+  New local panes opened from the desktop with a blank Program use the command,
+  directly or through tmux. Preset arguments follow the command's own arguments.
+  Clearing the setting restores the system shell for new panes.
 - **Git Bash on Windows** — when Git for Windows is installed, a **Git Bash**
   preset runs its `bash.exe` as an interactive login shell, so the pane gets the
   MSYS tools (`ls`, `grep`, `ssh`, …) rather than a bare shell. muxel finds bash

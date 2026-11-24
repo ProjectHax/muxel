@@ -2811,6 +2811,10 @@ pub struct Settings {
     /// Id (or, for back-compat, name) of the default preset for new agents.
     #[serde(default)]
     pub default_preset: String,
+    /// Command and arguments for new local shell panes opened from the UI.
+    /// Empty keeps the system shell.
+    #[serde(default)]
+    pub default_shell_command: Vec<String>,
     /// The agent preset library.
     #[serde(default = "default_presets")]
     pub presets: Vec<AgentPreset>,
@@ -3385,6 +3389,7 @@ impl Default for Settings {
             tmux_install_offered: false,
             preset_seed_version: PRESET_SEED_VERSION,
             default_preset: String::new(),
+            default_shell_command: Vec::new(),
             presets: AgentPreset::defaults(),
             theme: String::new(),
             theme_mode: String::new(),
