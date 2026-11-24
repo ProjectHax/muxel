@@ -15,6 +15,7 @@ pub mod diff;
 pub mod diff_schedule;
 pub mod file_watch;
 pub mod geometry;
+pub mod git_command;
 mod gui_path;
 pub mod import;
 pub mod isolated_root;

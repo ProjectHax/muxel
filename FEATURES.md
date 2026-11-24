@@ -1860,6 +1860,15 @@ feature is added or changed, update the matching entry here in the same change**
   and stash / pop / drop stash; each runs off the main thread and toasts its
   result. Destructive actions (switching with a dirty tree, pop/drop stash) ask
   first.
+- **Git command** — the project git menu's **Git command…** runs any git command
+  you type (`log --oneline -10`, `rebase --continue`, …; a leading `git` is
+  optional) in the project's repo, on the host for a remote project, and shows
+  its output and exit code in the dialog, which stays open for the next one. The
+  line is split into arguments like a shell would but never runs in one, so
+  `&&`, `|` and `$(…)` reach git as plain text. No terminal is attached: an editor
+  git opens accepts the message it prefilled and a credential prompt fails
+  instead of waiting. Closing the dialog mid-run reports the result as a
+  notification.
 - **Reviewed commit** — the commit dialog lists every changed/untracked file with
   a checkbox (all checked by default); only the checked files are committed, so
   stray files are never swept in. The button shows the count (e.g. *Commit (3)*),
@@ -2123,8 +2132,8 @@ feature is added or changed, update the matching entry here in the same change**
   the project's right-click menu, so a live-but-flaky connection can be retried
   without reselecting the project.
 - **Remote git** — the branch label and the project git menu (switch/new branch,
-  commit, pull, push, fetch, stash) operate on the remote repo over the shared
-  connection; remote status is polled off the UI thread. Every 5 s one ssh call
+  commit, pull, push, fetch, stash, and any typed git command) operate on the
+  remote repo over the shared connection; remote status is polled off the UI thread. Every 5 s one ssh call
   reads a remote project's branch and its branch list together, which needs
   git 1.9 or newer on the host; where the host's git can't list them, an error
   notice says so with git's message, once per host until a poll where every

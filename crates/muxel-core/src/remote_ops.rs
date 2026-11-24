@@ -49,6 +49,40 @@ pub fn git_read_only(os: RemoteOs, repo: &str, args: &[&str]) -> String {
     git_with_policy(os, repo, args, true)
 }
 
+/// The environment a git command the user typed runs in. No terminal is
+/// attached, so an editor git opens (a commit without `-m`, `rebase
+/// --continue`) accepts the message git prefilled, and a credential prompt
+/// fails rather than waiting for input that can't come.
+pub const GIT_UNATTENDED_ENV: &[(&str, &str)] = &[
+    ("GIT_EDITOR", "true"),
+    ("GIT_SEQUENCE_EDITOR", "true"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+];
+
+/// `git -C <repo> <args…>` for a command the user typed, in
+/// [`GIT_UNATTENDED_ENV`]. Each argument is quoted, so none reaches the shell
+/// as syntax.
+pub fn git_unattended(os: RemoteOs, repo: &str, args: &[&str]) -> String {
+    match os {
+        RemoteOs::Unix => {
+            let mut c = String::new();
+            for (k, v) in GIT_UNATTENDED_ENV {
+                c.push_str(&format!("{k}={} ", sh_quote(v)));
+            }
+            c.push_str(&sh_git(repo, args, false));
+            c
+        }
+        RemoteOs::Windows => {
+            let mut body = String::new();
+            for (k, v) in GIT_UNATTENDED_ENV {
+                body.push_str(&format!("$env:{k}={}; ", ps_quote(v)));
+            }
+            body.push_str(&ps_git(repo, args, false));
+            ps(&format!("{body}; exit $LASTEXITCODE"))
+        }
+    }
+}
+
 fn git_with_policy(os: RemoteOs, repo: &str, args: &[&str], read_only: bool) -> String {
     match os {
         RemoteOs::Unix => sh_git(repo, args, read_only),
@@ -558,8 +592,8 @@ pub fn parse_found_programs(out: &str) -> Option<Vec<String>> {
 mod tests {
     use super::{
         BRANCHES_FAILED, branches, ensure_seeded_file, find_programs, git, git_read_only,
-        list_files, parse_found_programs, paste_file_name, push_prep, read_file, scan_projects,
-        test_dir, test_file, upload_paste, write_file,
+        git_unattended, list_files, parse_found_programs, paste_file_name, push_prep, read_file,
+        scan_projects, test_dir, test_file, upload_paste, write_file,
     };
     use crate::RemoteOs;
     use base64::Engine as _;
@@ -858,6 +892,30 @@ mod tests {
         ] {
             assert!(!cmd.contains("GIT_OPTIONAL_LOCKS"), "mutation: {cmd}");
         }
+    }
+
+    #[test]
+    fn a_typed_git_command_runs_unattended_with_every_argument_quoted() {
+        assert_eq!(
+            git_unattended(
+                UNIX,
+                "/srv/a b",
+                &["commit", "-m", "it's done", "&&", "$(id)"]
+            ),
+            "GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true GIT_TERMINAL_PROMPT=0 \
+             git -C '/srv/a b' commit -m 'it'\\''s done' '&&' '$(id)'"
+        );
+        let cmd = git_unattended(WIN, "C:/a b", &["log", "-1", "; Remove-Item x"]);
+        assert_opaque(&cmd);
+        let s = script_of(&cmd);
+        assert!(
+            s.contains(
+                "$env:GIT_EDITOR='true'; $env:GIT_SEQUENCE_EDITOR='true'; \
+                 $env:GIT_TERMINAL_PROMPT='0'; & git -C 'C:/a b' 'log' '-1' '; Remove-Item x'; \
+                 exit $LASTEXITCODE"
+            ),
+            "{s}"
+        );
     }
 
     #[test]

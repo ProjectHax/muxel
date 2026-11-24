@@ -5185,6 +5185,51 @@ pub fn git_stash_drop(loc: &RepoLoc) -> Result<String> {
     git_run_loc(loc, &["stash", "drop"])
 }
 
+/// How a git command the user typed ended.
+#[derive(Debug)]
+pub struct GitCommandRun {
+    /// git's exit status: `Some(0)` for success, `None` when a signal ended it.
+    pub code: Option<i32>,
+    /// What it printed: stdout, then stderr.
+    pub output: String,
+}
+
+/// Run git with the arguments the user typed (from
+/// [`muxel_core::git_command::parse_git_command`]) in the repo at `loc` — over
+/// SSH, on the host, for a remote project — with no terminal and in
+/// [`remote_ops::GIT_UNATTENDED_ENV`]. git failing is still a run, with its
+/// code and message; `Err` is only for git or ssh not running at all, or ssh
+/// failing to reach the host.
+pub fn git_user_command(loc: &RepoLoc, args: &[String]) -> Result<GitCommandRun> {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = match loc {
+        RepoLoc::Local(path) => {
+            let mut cmd = command("git");
+            cmd.arg("-C").arg(path).args(&args);
+            for (k, v) in remote_ops::GIT_UNATTENDED_ENV {
+                cmd.env(k, v);
+            }
+            cmd.profiled_output().context("running git")?
+        }
+        RepoLoc::Remote(c) => {
+            let remote = remote_ops::git_unattended(c.host.os, &c.remote_path, &args);
+            let out = ssh_output(c.host.auth, &mut remote_ssh_command(c, remote))
+                .map_err(|e| ssh_spawn_error(c.host.auth, e))?;
+            if is_ssh_transport_failure(c.host.auth, out.status.code()) {
+                bail!("{}", ssh_error_message(&out));
+            }
+            out
+        }
+    };
+    Ok(GitCommandRun {
+        code: out.status.code(),
+        output: muxel_core::git_command::command_output(
+            &String::from_utf8_lossy(&out.stdout),
+            &String::from_utf8_lossy(&out.stderr),
+        ),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Team libraries: non-interactive git runner with a time limit. Blocking.
 // ---------------------------------------------------------------------------
@@ -6006,6 +6051,32 @@ fn clear_read_only(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A typed command's run carries git's output and exit code whether it
+    /// succeeded or not, and an editor git opens accepts the prefilled message
+    /// instead of waiting on a terminal that isn't there.
+    #[test]
+    fn a_typed_git_command_reports_its_output_and_exit_code() {
+        use muxel_core::git_command::parse_git_command;
+        let repo = crate::test_support::TestRepo::init();
+        repo.commit(&[("a.txt", "one\n")], "first commit");
+        let loc = RepoLoc::Local(repo.path().to_path_buf());
+        let run = |line: &str| git_user_command(&loc, &parse_git_command(line).unwrap()).unwrap();
+
+        let log = run("git log --format=%s");
+        assert_eq!((log.code, log.output.as_str()), (Some(0), "first commit"));
+
+        let bad = run("no-such-subcommand");
+        assert_ne!(bad.code, Some(0));
+        assert!(bad.output.contains("no-such-subcommand"), "{}", bad.output);
+
+        let amend = run(
+            "-c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false \
+             -c core.hooksPath=/dev/null commit --amend",
+        );
+        assert_eq!(amend.code, Some(0), "{}", amend.output);
+        assert_eq!(repo.git(&["log", "--format=%s"]), "first commit");
+    }
 
     /// What the branch poll reads: the branch HEAD names, and the local
     /// branches. Detached, mid-bisect and mid-rebase, HEAD names none, and

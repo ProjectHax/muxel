@@ -7237,9 +7237,12 @@ pub struct MuxelApp {
     deferred_worktree_dispose: HashMap<Uuid, HashMap<Uuid, WorktreeAnswer>>,
     /// Reused commit-message input for the worktree dispose modal.
     dispose_commit_input: Entity<InputState>,
-    /// Project git modal (commit / new branch) + its reused input.
+    /// Project git modal (commit / new branch / git command) + its reused input.
     git_modal: Option<GitModal>,
     git_action_input: Entity<InputState>,
+    /// Numbers Git command runs, so a result that arrives after its dialog
+    /// moved on (closed, or reopened) isn't shown as the new run's.
+    git_command_seq: u64,
     /// New-remote-project wizard: visible flag, chosen host, and its inputs.
     show_new_remote: bool,
     /// The Import window: agents found running, or recorded, outside muxel that
@@ -8056,20 +8059,66 @@ struct PendingConfirm {
     action: ConfirmAction,
 }
 
-/// A single-input git modal (commit message / new branch name) for a project.
+/// A single-input git modal (commit message / new branch name / a git command
+/// to run) for a project.
 #[derive(Clone, Copy)]
 enum GitModalKind {
     Commit,
     NewBranch,
+    /// Any git command, typed; runs in the project's repo (on its host, for a
+    /// remote project) and shows what it printed.
+    Command,
 }
 
 struct GitModal {
     pid: Uuid,
     kind: GitModalKind,
     /// Commit only: every changed/untracked file, and whether each is checked for
-    /// the commit (parallel to `files`). Empty for `NewBranch`.
+    /// the commit (parallel to `files`). Empty otherwise.
     files: Vec<integrations::GitChange>,
     selected: Vec<bool>,
+    /// Command only: the latest run, shown under the input.
+    command: Option<GitCommandShown>,
+}
+
+/// A run of the Git command dialog.
+struct GitCommandShown {
+    /// The line as typed.
+    line: String,
+    /// Tells this run's result from an earlier one's (`MuxelApp::git_command_seq`).
+    seq: u64,
+    /// `None` while git runs; `Err` when it couldn't run (or the line couldn't
+    /// be parsed), with the reason.
+    result: Option<Result<GitCommandDone, SharedString>>,
+}
+
+/// A finished Git command run, prepared once for the dialog to draw each frame.
+struct GitCommandDone {
+    /// git's exit status (`None` when a signal ended it).
+    code: Option<i32>,
+    /// Everything it printed, for **Copy output**.
+    output: SharedString,
+    /// What the dialog shows: the start of `output`, noting a cut.
+    shown: SharedString,
+}
+
+impl GitCommandDone {
+    fn new(run: integrations::GitCommandRun) -> Self {
+        use muxel_core::git_command::{MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES, clip_output};
+        let shown = if run.output.is_empty() {
+            t("(no output)")
+        } else {
+            match clip_output(&run.output, MAX_OUTPUT_LINES, MAX_OUTPUT_BYTES) {
+                (_, false) => run.output.clone().into(),
+                (head, true) => format!("{head}\n{}", t("… (output shortened)")).into(),
+            }
+        };
+        Self {
+            code: run.code,
+            output: run.output.into(),
+            shown,
+        }
+    }
 }
 
 /// A prompt for an SSH password not saved in the keychain. `Connect` stores the
@@ -9587,6 +9636,7 @@ impl MuxelApp {
             deferred_worktree_dispose: HashMap::new(),
             dispose_commit_input,
             git_modal: None,
+            git_command_seq: 0,
             git_action_input,
             show_git_diff: false,
             show_tasks: false,
@@ -21974,10 +22024,10 @@ impl MuxelApp {
         );
     }
 
-    /// Open the single-input git modal (commit message / new branch name). For a
-    /// commit it first lists every changed/untracked file (all checked by default)
-    /// so the user can review and uncheck before committing; if the tree is clean
-    /// it shows a toast and opens nothing.
+    /// Open the single-input git modal (commit message / new branch name / git
+    /// command). For a commit it first lists every changed/untracked file (all
+    /// checked by default) so the user can review and uncheck before committing;
+    /// if the tree is clean it shows a toast and opens nothing.
     fn open_git_modal(
         &mut self,
         pid: Uuid,
@@ -21999,16 +22049,24 @@ impl MuxelApp {
                 let n = files.len();
                 (files, vec![true; n])
             }
-            GitModalKind::NewBranch => (Vec::new(), Vec::new()),
+            GitModalKind::NewBranch | GitModalKind::Command => (Vec::new(), Vec::new()),
         };
         self.git_modal = Some(GitModal {
             pid,
             kind,
             files,
             selected,
+            command: None,
         });
-        self.git_action_input
-            .update(cx, |s, cx| s.set_value("", window, cx));
+        let placeholder = match kind {
+            // A git command, not prose: the same in every language.
+            GitModalKind::Command => SharedString::from("log --oneline -10"),
+            GitModalKind::Commit | GitModalKind::NewBranch => SharedString::default(),
+        };
+        self.git_action_input.update(cx, |s, cx| {
+            s.set_value("", window, cx);
+            s.set_placeholder(placeholder, window, cx);
+        });
         let handle = self.git_action_input.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
         cx.notify();
@@ -22042,6 +22100,13 @@ impl MuxelApp {
             return;
         }
         let (pid, kind) = (m.pid, m.kind);
+        if let GitModalKind::Command = kind {
+            // The dialog stays open to show what git printed; one run at a time.
+            if m.command.as_ref().is_none_or(|c| c.result.is_some()) {
+                self.run_git_command(pid, value, window, cx);
+            }
+            return;
+        }
         let commit_paths: Vec<String> = match kind {
             GitModalKind::Commit => {
                 let paths: Vec<String> = m
@@ -22056,7 +22121,7 @@ impl MuxelApp {
                 }
                 paths
             }
-            GitModalKind::NewBranch => Vec::new(),
+            GitModalKind::NewBranch | GitModalKind::Command => Vec::new(),
         };
 
         self.git_modal = None;
@@ -22077,6 +22142,111 @@ impl MuxelApp {
                 window,
                 cx,
             ),
+            GitModalKind::Command => {}
+        }
+        cx.notify();
+    }
+
+    /// Run `line`, typed into the Git command dialog, as git's arguments in
+    /// project `pid`'s repo — on its host over SSH, for a remote project — off
+    /// the UI thread. The dialog shows what git printed; if it was closed or
+    /// reopened before git finished, a notification reports the result.
+    fn run_git_command(
+        &mut self,
+        pid: Uuid,
+        line: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use muxel_core::git_command::{GitCommandError, parse_git_command};
+        let args = match parse_git_command(&line) {
+            Ok(args) => args,
+            Err(GitCommandError::Empty) => return,
+            Err(GitCommandError::Unbalanced) => {
+                if let Some(m) = self.git_modal.as_mut() {
+                    m.command = Some(GitCommandShown {
+                        line,
+                        seq: 0,
+                        result: Some(Err(t(
+                            "A quote isn't closed (or the line ends in a backslash).",
+                        ))),
+                    });
+                }
+                cx.notify();
+                return;
+            }
+        };
+        let Some(loc) = self.repo_loc(pid) else {
+            return;
+        };
+        self.git_command_seq += 1;
+        let seq = self.git_command_seq;
+        if let Some(m) = self.git_modal.as_mut() {
+            m.command = Some(GitCommandShown {
+                line: line.clone(),
+                seq,
+                result: None,
+            });
+        }
+        cx.notify();
+        cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { integrations::git_user_command(&loc, &args) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.finish_git_command(seq, &line, result, cx)
+            });
+        })
+        .detach();
+    }
+
+    /// Show a Git command run's result in its dialog, or — when the dialog has
+    /// moved on — as a notification.
+    fn finish_git_command(
+        &mut self,
+        seq: u64,
+        line: &str,
+        result: anyhow::Result<integrations::GitCommandRun>,
+        cx: &mut Context<Self>,
+    ) {
+        // Whatever it was, it may have changed a worktree's change count.
+        self.worktree_changes_stale = true;
+        let result = result
+            .map(GitCommandDone::new)
+            .map_err(|e| SharedString::from(format!("{e}")));
+        // A host that refused the connection over a changed key gets the trust
+        // dialog (drawn above this one); the error stays in the dialog as well.
+        let trust_dialog = result
+            .as_ref()
+            .err()
+            .is_some_and(|msg| self.handle_ssh_error(msg, None, SshRetry::None, cx));
+        let shown = self
+            .git_modal
+            .as_mut()
+            .and_then(|m| m.command.as_mut())
+            .filter(|c| c.seq == seq);
+        if let Some(c) = shown {
+            c.result = Some(result);
+        } else if !trust_dialog {
+            let cmd = muxel_core::git_command::command_title(line);
+            match result {
+                Ok(run) if run.code == Some(0) => self.add_event(
+                    NotifKind::Success,
+                    tf("Ran {cmd}", &[("cmd", &cmd)]),
+                    git_notify_detail(&run.output),
+                ),
+                Ok(run) => self.add_event(
+                    NotifKind::Error,
+                    tf("{cmd} failed", &[("cmd", &cmd)]),
+                    git_notify_detail(&run.output),
+                ),
+                Err(msg) => self.add_event(
+                    NotifKind::Error,
+                    tf("Couldn't run {cmd}", &[("cmd", &cmd)]),
+                    msg.to_string(),
+                ),
+            }
         }
         cx.notify();
     }
@@ -22634,19 +22804,20 @@ impl MuxelApp {
         let Some(m) = &self.git_modal else {
             return div().into_any_element();
         };
-        let (title, label) = match m.kind {
-            GitModalKind::Commit => (t("Commit changes"), t("Commit message")),
-            GitModalKind::NewBranch => (t("New branch"), t("Branch name")),
-        };
-        let confirm = match m.kind {
-            GitModalKind::Commit => tf(
-                "Commit ({count})",
-                &[(
-                    "count",
-                    &m.selected.iter().filter(|&&s| s).count().to_string(),
-                )],
+        let (title, label, confirm) = match m.kind {
+            GitModalKind::Commit => (
+                t("Commit changes"),
+                t("Commit message"),
+                tf(
+                    "Commit ({count})",
+                    &[(
+                        "count",
+                        &m.selected.iter().filter(|&&s| s).count().to_string(),
+                    )],
+                ),
             ),
-            GitModalKind::NewBranch => "Create".to_string(),
+            GitModalKind::NewBranch => (t("New branch"), t("Branch name"), "Create".to_string()),
+            GitModalKind::Command => return self.render_git_command_modal(m, cx),
         };
         // For a commit, a scrollable checklist of every changed/untracked file
         // (checked = will be committed), so nothing is staged without the user
@@ -22732,6 +22903,166 @@ impl MuxelApp {
                                 Button::new("git-confirm")
                                     .primary()
                                     .label(confirm)
+                                    .on_click(cx.listener(|this, _e, window, cx| {
+                                        this.confirm_git_modal(window, cx)
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The Git command dialog: `git` + a typed command, where it runs (the
+    /// host, for a remote project), and the latest run's output.
+    fn render_git_command_modal(&self, m: &GitModal, cx: &mut Context<Self>) -> AnyElement {
+        let mono = cx.theme().mono_font_family.clone();
+        let muted = cx.theme().muted_foreground;
+        let project = self.workspace.project(m.pid);
+        let place = match project.and_then(|p| p.remote.as_ref()) {
+            Some(r) => {
+                let host = self
+                    .remotes
+                    .iter()
+                    .find(|h| h.id == r.host_id)
+                    .map(|h| {
+                        if h.name.is_empty() {
+                            h.hostname.clone()
+                        } else {
+                            h.name.clone()
+                        }
+                    })
+                    .unwrap_or_default();
+                tf(
+                    "Runs in {path} on {host}",
+                    &[("path", &r.remote_root), ("host", &host)],
+                )
+            }
+            None => tf(
+                "Runs in {path}",
+                &[(
+                    "path",
+                    &project
+                        .map(|p| p.root_path.display().to_string())
+                        .unwrap_or_default(),
+                )],
+            ),
+        };
+        let running = m.command.as_ref().is_some_and(|c| c.result.is_none());
+        let copyable = m
+            .command
+            .as_ref()
+            .and_then(|c| c.result.as_ref())
+            .and_then(|r| r.as_ref().ok())
+            .map(|run| run.output.clone())
+            .filter(|o| !o.is_empty());
+        let result = m.command.as_ref().map(|c| {
+            let (status, color, body): (SharedString, Hsla, Option<SharedString>) = match &c.result
+            {
+                None => (
+                    tf(
+                        "Running {cmd}…",
+                        &[("cmd", &muxel_core::git_command::command_title(&c.line))],
+                    )
+                    .into(),
+                    muted,
+                    None,
+                ),
+                Some(Ok(run)) => {
+                    let status = match run.code {
+                        Some(0) => t("Done"),
+                        Some(code) => {
+                            tf("Exited with code {code}", &[("code", &code.to_string())]).into()
+                        }
+                        None => t("Stopped by a signal"),
+                    };
+                    let color = if run.code == Some(0) {
+                        muted
+                    } else {
+                        cx.theme().danger
+                    };
+                    (status, color, Some(run.shown.clone()))
+                }
+                Some(Err(msg)) => (msg.clone(), cx.theme().danger, None),
+            };
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_xs().text_color(color).child(status))
+                .children(body.map(|body| {
+                    div()
+                        .id("git-command-output")
+                        .max_h(px(320.0))
+                        .overflow_y_scroll()
+                        .p_2()
+                        .rounded(cx.theme().radius)
+                        .bg(cx.theme().muted)
+                        .font_family(mono.clone())
+                        .text_xs()
+                        .child(body)
+                }))
+        });
+        modal_backdrop()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev, _w, cx| this.close_git_modal(cx)),
+            )
+            .child(
+                div()
+                    .w(px(640.0))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_5()
+                    .bg(cx.theme().background)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded(cx.theme().radius_lg)
+                    .shadow_lg()
+                    .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
+                    .child(div().text_lg().font_semibold().child(t("Git command")))
+                    .child(div().text_xs().text_color(muted).child(place))
+                    .child(
+                        Input::new(&self.git_action_input).w_full().prefix(
+                            div()
+                                .font_family(mono)
+                                .text_sm()
+                                .text_color(muted)
+                                .child("git"),
+                        ),
+                    )
+                    .children(result)
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .pt_2()
+                            .children(copyable.map(|output| {
+                                Button::new("git-command-copy")
+                                    .ghost()
+                                    .icon(IconName::Copy)
+                                    .label(t("Copy output"))
+                                    .on_click(move |_e, _w, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            output.to_string(),
+                                        ))
+                                    })
+                            }))
+                            .child(
+                                Button::new("git-command-close")
+                                    .ghost()
+                                    .label(t("Close"))
+                                    .on_click(
+                                        cx.listener(|this, _e, _w, cx| this.close_git_modal(cx)),
+                                    ),
+                            )
+                            .child(
+                                Button::new("git-command-run")
+                                    .primary()
+                                    .icon(IconName::Play)
+                                    .label(if running { t("Running…") } else { t("Run") })
+                                    .disabled(running)
                                     .on_click(cx.listener(|this, _e, window, cx| {
                                         this.confirm_git_modal(window, cx)
                                     })),
@@ -30488,6 +30819,24 @@ impl MuxelApp {
                                                 &entity,
                                                 move |this, _, _w, cx| {
                                                     this.request_stash_drop(pid, cx)
+                                                },
+                                            )),
+                                    )
+                                    // Anything else: typed, run in the repo (on
+                                    // the host, for a remote project).
+                                    .separator()
+                                    .item(
+                                        PopupMenuItem::new(t("Git command…"))
+                                            .icon(IconName::SquareTerminal)
+                                            .on_click(window.listener_for(
+                                                &entity,
+                                                move |this, _, window, cx| {
+                                                    this.open_git_modal(
+                                                        pid,
+                                                        GitModalKind::Command,
+                                                        window,
+                                                        cx,
+                                                    )
                                                 },
                                             )),
                                     );
