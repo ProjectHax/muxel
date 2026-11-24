@@ -1,4 +1,6 @@
 import XCTest
+import UIKit
+import SwiftTerm
 @testable import muxel
 
 /// The terminal grid must render dark even under a light chrome theme, so remote
@@ -95,5 +97,16 @@ final class ThemeTerminalTests: XCTestCase {
     private func luminance(_ hex: String) -> Double {
         let (r, g, b, _) = muxelHexComponents(hex)
         return 0.2126 * r + 0.7152 * g + 0.0722 * b
+    }
+
+    /// A block cursor's character is drawn in the grid background, so it reads as
+    /// an inverted cell instead of light text on the light accent block.
+    @MainActor
+    func testBlockCursorCharacterUsesTheGridBackground() {
+        let view = TerminalView(frame: CGRect(x: 0, y: 0, width: 320, height: 200))
+        let theme = MuxelTheme.mocha
+        theme.apply(to: view)
+        XCTAssertEqual(view.caretColor, UIColor(muxelHex: theme.accent))
+        XCTAssertEqual(view.caretTextColor, UIColor(muxelHex: theme.terminalBgHex))
     }
 }

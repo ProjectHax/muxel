@@ -46,7 +46,7 @@ jobs:
         run: xcodegen generate
 
       # Swift packages (Citadel, SwiftTerm) are resolved from project.yml's
-      # `from:` ranges; there is no committed Package.resolved to key on.
+      # version ranges; there is no committed Package.resolved to key on.
       - uses: actions/cache@v4
         with:
           path: ios/.spm

@@ -21,10 +21,13 @@ packages:
     url: https://github.com/orlandos-nl/Citadel
     from: "0.12.1"
   # Terminal emulator for the live SSH PTY terminal (renders the tmux/agent UI,
-  # handles VT/ANSI, input, resize).
+  # handles VT/ANSI, input, resize). 1.14 fixes the iOS Metal renderer drawing
+  # every glyph white (and the glyph under the cursor misplaced). 1.19 adds a
+  # build-tool plugin that Xcode makes each developer approve, so stay below it.
   SwiftTerm:
     url: https://github.com/migueldeicaza/SwiftTerm
-    from: "1.13.0"
+    minVersion: "1.14.0"
+    maxVersion: "1.19.0"
 
 settings:
   base:

@@ -28,6 +28,9 @@ extension MuxelTheme {
         view.nativeBackgroundColor = UIColor(muxelHex: terminalBgHex)
         view.nativeForegroundColor = UIColor(muxelHex: terminalFgHex)
         view.caretColor = UIColor(muxelHex: accent)
+        // The character under a block cursor is drawn in the grid background, so
+        // it reads as an inverted cell rather than light text on the light accent.
+        view.caretTextColor = UIColor(muxelHex: terminalBgHex)
         view.installColors(ansi16)
         (view.inputAccessoryView as? TerminalAccessoryRow)?.apply(theme: self)
         // keyboardAppearance is only re-read on reloadInputViews(); guard so the

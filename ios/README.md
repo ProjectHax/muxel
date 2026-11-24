@@ -31,12 +31,13 @@ open Muxel.xcodeproj
 In Xcode: set your signing team, then run on a **real device** (Keychain,
 background refresh, and notifications don't behave correctly in the Simulator).
 
-Dependencies (Swift Package Manager, resolved by Xcode; tracked at their latest
-releases via `from:` in `project.yml`):
+Dependencies (Swift Package Manager, resolved by Xcode from the version ranges in
+`project.yml`):
 - [Citadel](https://github.com/orlandos-nl/Citadel) — SSH client (SwiftNIO SSH);
   0.12+, which sets the iOS 17 floor.
 - [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) — terminal emulator for the
-  live PTY terminal (1.13+).
+  live PTY terminal; 1.14 up to (not including) 1.19. Earlier releases draw all text
+  white under the Metal renderer; 1.19+ adds a build plugin that must be approved.
 
 > The terminal is a **live SSH PTY** (`LiveTerminalView` + SwiftTerm), fed by a
 > Citadel `withPTY` channel that runs `exec tmux attach` / `new-session -A`
