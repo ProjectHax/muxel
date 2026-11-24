@@ -658,8 +658,10 @@ feature is added or changed, update the matching entry here in the same change**
   launch, its glyph-less title names the pane for the rest of that launch without
   supplying lifecycle status; a title in the current root report takes precedence.
   An Antigravity Working report after Enter can confirm `ctl send`.
-  With no reports, an Antigravity pane waiting at a trust, command, file-edit,
-  or question card reads blocked.
+  With no reports, as under tmux, an Antigravity pane reads its footer instead:
+  **working** while `esc to cancel` sits under the composer, **done** when the
+  turn ends, and blocked at a trust, command, file-edit, or question card. Its
+  idle screen's periodic repaint no longer reads as work.
   Windows installers, portable zips, and in-app updates include Microsoft's
   OpenConsole host so direct panes can receive these reports. If Windows rejects
   creation of the bundled console, muxel retries with the built-in host; set
@@ -2143,7 +2145,8 @@ feature is added or changed, update the matching entry here in the same change**
   needs-input and finished states show on the home screen. A prompt started on
   the desktop or a newly created pane is picked up automatically. Grok's
   question card reads as needs input even though it still shows Grok's `[stop]`
-  marker. A "working" state left behind when the desktop quit mid-turn expires
+  marker. Antigravity reads working from its `esc to cancel` footer, idle
+  between turns despite its periodic repaint, and needs input at its cards. A "working" state left behind when the desktop quit mid-turn expires
   after 10 minutes with no pane output.
 - **Watching projects** — swipe a project to **Watch**/**Unwatch** it, pin it
   to **Auto-watch on launch**, or turn on **Auto-watch working projects** in

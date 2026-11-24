@@ -335,6 +335,23 @@ fn antigravity_model_footer(row: &str) -> bool {
         })
 }
 
+/// What Antigravity's footer says about its turn. Read when its status reports
+/// don't arrive (under tmux): `esc to cancel` right below the composer's lower
+/// border runs only while a turn does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AntigravityFooter {
+    /// A turn is running.
+    Working,
+    /// The composer is waiting: `? for shortcuts`, or only the model while a
+    /// draft is typed.
+    Ready,
+}
+
+fn antigravity_rule(row: &str) -> bool {
+    let row = row.trim();
+    !row.is_empty() && row.chars().all(|c| c == '─')
+}
+
 fn antigravity_option(row: &str) -> Option<(u8, bool, &str)> {
     // An unindented continuation can itself begin with a number.
     let body = row.strip_prefix("> ").or_else(|| row.strip_prefix("  "))?;
@@ -390,6 +407,28 @@ fn antigravity_numbered_card(screen: &str) -> Option<()> {
 impl Screen {
     pub(crate) fn antigravity_waiting_for_answer(&self) -> bool {
         self.antigravity_trust_card() || antigravity_numbered_card(&self.text).is_some()
+    }
+
+    /// Antigravity's footer, when it sits right below the composer. A card or a
+    /// menu puts its navigation controls there instead, over the same
+    /// `esc to cancel`, so neither reads as a turn.
+    pub(crate) fn antigravity_footer(&self) -> Option<AntigravityFooter> {
+        let mut rows = self.text.trim_end().lines().rev().map(str::trim_end);
+        let footer = rows.next()?;
+        antigravity_rule(rows.next()?).then_some(())?;
+        let content = footer.trim_start();
+        let after = |label: &str| {
+            content
+                .strip_prefix(label)
+                .is_some_and(|rest| rest.is_empty() || antigravity_model_footer(rest))
+        };
+        if after("esc to cancel") {
+            Some(AntigravityFooter::Working)
+        } else if after("? for shortcuts") || antigravity_model_footer(footer) {
+            Some(AntigravityFooter::Ready)
+        } else {
+            None
+        }
     }
 
     pub(crate) fn antigravity_trust_card(&self) -> bool {

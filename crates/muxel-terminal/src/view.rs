@@ -10,6 +10,7 @@ use crate::program_status::{ProgramState, ProgramStatusKind, ProgramStatusSnapsh
 use crate::session::{
     CommandSpec, ProfiledPtyChunk, ProfiledPtyReceiver, PtyOutput, TerminalSession,
 };
+use crate::startup::AntigravityFooter;
 use alacritty_terminal::term::ClipboardType;
 use anyhow::Context as _;
 use gpui::*;
@@ -311,6 +312,10 @@ struct RuntimeStatusState {
     semantic_title_status: Option<AgentStatus>,
     grok_blocked_at: Option<Instant>,
     grok_screen_working_at: Option<Instant>,
+    /// Antigravity's footer has been read on this pane's screen. Its idle
+    /// screen repaints every couple of seconds, so from then on the footer,
+    /// not recent output, says whether a turn runs.
+    antigravity_ui: bool,
     /// Muse titles name the pane's working directory; a hook can report a new one.
     muse_cwd_label: Option<String>,
     /// Latest state reported by Muse's root-session hooks.
@@ -358,6 +363,7 @@ impl RuntimeStatusState {
             semantic_title_status: None,
             grok_blocked_at: None,
             grok_screen_working_at: None,
+            antigravity_ui: false,
             muse_cwd_label: None,
             muse_hook_state: None,
             deadline: None,
@@ -570,8 +576,14 @@ impl RuntimeStatusState {
                 self.blocked_marker = blocked_markers.iter().any(|marker| screen.contains(marker));
                 (self.provider_screen, self.provider_background) =
                     provider_screen_read(title_provider, &screen);
-                if antigravity_cards && captured.antigravity_waiting_for_answer() {
-                    self.provider_screen = Some(AgentStatus::Blocked);
+                if antigravity_cards {
+                    let footer = captured.antigravity_footer();
+                    if captured.antigravity_waiting_for_answer() {
+                        self.provider_screen = Some(AgentStatus::Blocked);
+                    } else if footer == Some(AntigravityFooter::Working) {
+                        self.provider_screen = Some(AgentStatus::Working);
+                    }
+                    self.antigravity_ui |= footer.is_some();
                 }
             }
             StatusScreenCapture::At(deadline) => next_deadline = Some(deadline),
@@ -595,7 +607,7 @@ impl RuntimeStatusState {
             && match title_provider {
                 TitleProvider::Other => true,
                 TitleProvider::Muse => self.semantic_title_status.is_none(),
-                TitleProvider::Antigravity => !program_status.reported,
+                TitleProvider::Antigravity => !program_status.reported && !self.antigravity_ui,
                 _ => false,
             };
         let base = classify_facts(
@@ -873,7 +885,7 @@ impl RuntimeStatusState {
                 raw,
                 self.done_latch,
                 can_latch_completion(
-                    !working_markers.is_empty(),
+                    !working_markers.is_empty() || self.antigravity_ui,
                     self.semantic_title_status.is_some(),
                 ),
                 self.completion_armed,
@@ -954,7 +966,9 @@ impl RuntimeStatusState {
         let completion_ready = self.provider_settled || submitted_turn;
         let coverage = if program_root.is_some() {
             TerminalStatusCoverage::ProgramStatus
-        } else if title_provider == TitleProvider::Antigravity && program_status.reported {
+        } else if title_provider == TitleProvider::Antigravity
+            && (program_status.reported || self.antigravity_ui)
+        {
             TerminalStatusCoverage::ProviderVisible
         } else {
             self.fallback_coverage
@@ -1342,6 +1356,16 @@ fn provider_screen_read(
 fn antigravity_card_fixture(name: &str) -> String {
     serde_json::from_str::<std::collections::HashMap<String, String>>(include_str!(
         "fixtures/agy-1.5.13-screens.json"
+    ))
+    .unwrap()
+    .remove(name)
+    .unwrap()
+}
+
+#[cfg(test)]
+fn antigravity_screen_fixture(name: &str) -> String {
+    serde_json::from_str::<std::collections::HashMap<String, String>>(include_str!(
+        "fixtures/agy-1.5.14-screens.json"
     ))
     .unwrap()
     .remove(name)
@@ -7982,6 +8006,57 @@ mod provider_switch_tests {
         assert_eq!(status.reason, TerminalStatusReason::RecentOutput);
         assert_eq!(status.coverage, TerminalStatusCoverage::ActivityOnly);
         assert!(deadline.is_some());
+        session.kill();
+    }
+
+    /// Under tmux, where Antigravity's reports don't arrive, its footer says
+    /// whether a turn runs. Its idle screen repaints every couple of seconds, so
+    /// each screen here is fresh output, which alone must not read Working.
+    #[test]
+    fn antigravity_footer_reads_turns_without_reports() {
+        let (session, _receiver) = fixture();
+        let provider = TitleProvider::from_program("agy");
+        let mut runtime = RuntimeStatusState::new(super::status_coverage(provider, &[], &[]));
+        let start = Instant::now();
+        let mut step = 0;
+        let mut read = |name: &str| {
+            let screen = super::antigravity_screen_fixture(name);
+            session.process_probe_output(
+                format!("\x1b[2J\x1b[H{}", screen.replace('\n', "\r\n")).as_bytes(),
+            );
+            step += 1;
+            let now = start + Duration::from_secs(step);
+            runtime.reconcile(&session, provider, &[], &[], false, now);
+            runtime.snapshot(&session)
+        };
+        let idle = read("idle");
+        assert_eq!(idle.status, AgentStatus::Idle);
+        assert_eq!(idle.coverage, TerminalStatusCoverage::ProviderVisible);
+        // A draft and the slash menu (whose controls sit over `esc to cancel`)
+        // aren't turns either.
+        for name in ["draft", "slash_menu", "idle"] {
+            assert_eq!(read(name).status, AgentStatus::Idle, "{name}");
+        }
+        let working = read("working");
+        assert_eq!(working.status, AgentStatus::Working);
+        assert_eq!(working.reason, TerminalStatusReason::ProviderScreen);
+        assert_eq!(read("working_command").status, AgentStatus::Working);
+        // A finished turn reads Done, as it does for a pane with reports.
+        assert_eq!(read("idle").status, AgentStatus::Done);
+        session.kill();
+    }
+
+    #[test]
+    fn antigravity_card_over_its_footer_reads_blocked() {
+        let (session, _receiver) = fixture();
+        let provider = TitleProvider::from_program("agy");
+        let mut runtime = RuntimeStatusState::new(super::status_coverage(provider, &[], &[]));
+        super::paint_antigravity_card(&session, &super::antigravity_screen_fixture("working"));
+        runtime.reconcile(&session, provider, &[], &[], false, Instant::now());
+        super::paint_antigravity_card(&session, &super::antigravity_card_fixture("permission"));
+        let later = Instant::now() + Duration::from_secs(1);
+        runtime.reconcile(&session, provider, &[], &[], false, later);
+        assert_eq!(runtime.snapshot(&session).status, AgentStatus::Blocked);
         session.kill();
     }
 

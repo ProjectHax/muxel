@@ -389,6 +389,59 @@ final class ProtocolPortTests: XCTestCase {
         "  Shift+Tab:mode  │  Ctrl+x:shortcuts",
     ].joined(separator: "\n")
 
+    /// Antigravity 1.5.14's screens under tmux, at a phone's width.
+    private func agyScreen(_ body: [String], footer: String) -> String {
+        let rule = String(repeating: "─", count: 50)
+        let model = "auto · Gemini 4 Neon · high"
+        let padded = footer + String(repeating: " ", count: max(1, 50 - model.count - footer.count)) + model
+        return (body + [rule, ">", rule, padded]).joined(separator: "\n")
+    }
+
+    func testAntigravityFooterReadsItsTurn() {
+        let (working, blocked) = defaultMarkers(program: "/home/me/.local/bin/agy")
+        func status(_ screen: String) -> AgentStatus {
+            classify(exited: false, screen: screen, working: working, blocked: blocked, bell: false, idle: 0.5)
+        }
+        let turn = agyScreen(["> say pong", "⣟  Generating..."], footer: "esc to cancel")
+        XCTAssertEqual(status(turn), .working)
+        XCTAssertEqual(status(turn + "\n[0] 0:agy*                \"host\" 14:32"), .working, "under a tmux status bar")
+        // Idle repaints every couple of seconds; fresh output alone isn't a turn.
+        XCTAssertEqual(status(agyScreen(["  pong"], footer: "? for shortcuts")), .idle)
+        XCTAssertEqual(status(agyScreen(["  pong"], footer: "")), .idle, "a draft shows only the model")
+        let slashMenu = [String(repeating: "─", count: 50), "> /", String(repeating: "─", count: 50),
+                         "  /changelog    Show release notes", "  ↑/↓ Navigate · enter Select · tab Complete",
+                         "esc to cancel        auto · Gemini 4 Neon · high"].joined(separator: "\n")
+        XCTAssertEqual(status(slashMenu), .idle)
+    }
+
+    func testAntigravityCardsAreBlocked() {
+        let (working, blocked) = defaultMarkers(program: "agy")
+        let footer = "esc to cancel        auto · Gemini 4 Neon · high"
+        let cards = [
+            "Do you trust the contents of this project?\n\n> Yes, I trust this folder\n  No, exit\n\n  ↑/↓ Navigate · enter Confirm",
+            "Requesting permission for:\n   rm x\n\nRun this command?\n> 1. Yes, run command\n  2. No, cancel\n\n"
+                + "  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command\n" + footer,
+            "Accept this file edit?\n> 1. Yes, accept this change\n  2. No, reject this change\n\n"
+                + "  ↑/↓ Navigate · f full diff\n" + footer,
+            "Question 1/1: Please choose a color:\n\n> 1. Red\n  2. Blue\n  3. Write-in...\n\n"
+                + "  ↑/↓ Navigate · enter Select · esc Skip\n" + footer,
+        ]
+        for card in cards {
+            XCTAssertEqual(classify(exited: false, screen: card, working: working, blocked: blocked,
+                                    bell: false, idle: 0.5), .blocked, card)
+        }
+    }
+
+    func testAntigravityFinishedTurnLatchesDone() {
+        let (working, blocked) = defaultMarkers(program: "agy")
+        var tracker = PaneStatusTracker()
+        func update(_ screen: String) -> AgentStatus {
+            tracker.update(exited: false, screen: screen, working: working, blocked: blocked, bell: false, idle: 10)
+        }
+        XCTAssertEqual(update(agyScreen(["⣟  Generating..."], footer: "esc to cancel")), .working)
+        XCTAssertEqual(update(agyScreen(["  pong"], footer: "? for shortcuts")), .done)
+    }
+
     func testGrokQuestionCardIsBlockedDespiteItsStopMarker() {
         let (working, blocked) = defaultMarkers(program: "grok")
         XCTAssertTrue(grokQuestionCard.contains("[stop]"), "the card carries the working marker")

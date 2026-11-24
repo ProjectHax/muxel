@@ -29,6 +29,16 @@ func defaultMarkers(program: String?, args: [String] = []) -> (working: [String]
         // `isGrokQuestion` first.
         return (["[stop]", "Thinking ("], ["Action Required"])
     }
+    if base == "agy" || base == "antigravity" {
+        // Antigravity's status reports don't cross tmux, so read its screen.
+        // `esc to cancel` sits right under the composer's lower border only while
+        // a turn runs; a card or the slash menu puts its controls there instead.
+        // Its idle screen repaints every couple of seconds, so having a working
+        // marker also keeps the output-activity fallback off. The blocked
+        // markers are its trust, command, file-edit and question cards.
+        return (["─\nesc to cancel"],
+                ["Do you trust the contents", "Run this command?", "Accept this file edit?", "Write-in..."])
+    }
     if base.contains("codex") {
         return (["esc to interrupt", "Esc to interrupt"], [])
     }
