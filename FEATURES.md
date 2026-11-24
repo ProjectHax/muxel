@@ -1717,6 +1717,11 @@ feature is added or changed, update the matching entry here in the same change**
   `Alt/Option+Backspace` sends `ESC DEL` (delete word), `Ctrl+Backspace` sends
   `Ctrl+W` (delete word) and `Cmd+Backspace` (macOS) sends `Ctrl+U` (delete to
   line start), matching iTerm2's natural text editing and Warp.
+- **Agent draft shortcuts (macOS)** — enable **Forward agent editing shortcuts**
+  in Settings → Keybindings to send `Cmd+A` as xterm F13 and `Cmd+C` as
+  Ctrl+Insert. Compatible terminal agents can use these keys to select and copy
+  their current draft. A selection made in muxel's terminal keeps priority for
+  `Cmd+C`. The option applies to terminal panes, including those running tmux.
 - **Agent-first plain Ctrl+letter** — muxel app shortcuts that are plain
   `Ctrl+A`…`Ctrl+Z` (no Shift) do **not** fire while a terminal is focused, so
   agents receive them as normal C0 chords (Claude `Ctrl+S` stash, shell

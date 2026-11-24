@@ -4476,6 +4476,7 @@ fn keybinding_for(action: &str, keystroke: &str, context: Option<&str>) -> Optio
 /// Bind default keybindings, applying any overrides from settings.
 pub fn install_keybindings(settings: &muxel_core::Settings, cx: &mut App) {
     use std::collections::HashMap;
+    muxel_terminal::set_forward_macos_agent_edit_keys(settings.forward_macos_agent_edit_keys, cx);
     let overrides: HashMap<&str, &str> = settings
         .keybindings
         .iter()

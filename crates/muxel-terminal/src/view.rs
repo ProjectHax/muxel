@@ -2421,6 +2421,15 @@ fn coalesce_pending(
     }
 }
 
+struct ForwardMacosAgentEditKeys(bool);
+
+impl Global for ForwardMacosAgentEditKeys {}
+
+/// Update key forwarding for all terminal views, including detached panes.
+pub fn set_forward_macos_agent_edit_keys(enabled: bool, cx: &mut App) {
+    cx.set_global(ForwardMacosAgentEditKeys(enabled));
+}
+
 pub struct TerminalView {
     instance_id: Uuid,
     session: Arc<TerminalSession>,
@@ -4603,8 +4612,23 @@ impl TerminalView {
             cx.stop_propagation();
             return;
         }
-        let copy_paste = (m.control && m.shift && !m.alt)
-            || (cfg!(target_os = "macos") && m.platform && !m.control && !m.shift && !m.alt);
+        let mods = KeyModifiers {
+            control: m.control,
+            shift: m.shift,
+            alt: m.alt,
+            platform: m.platform,
+        };
+        let macos_command = cfg!(target_os = "macos") && mods.is_platform_only();
+        let forward_edit_key = if macos_command
+            && cx
+                .try_global::<ForwardMacosAgentEditKeys>()
+                .is_some_and(|setting| setting.0)
+        {
+            crate::keymap::agent_edit_key(key)
+        } else {
+            None
+        };
+        let copy_paste = (m.control && m.shift && !m.alt) || macos_command;
         if copy_paste {
             match key {
                 "c" => {
@@ -4612,9 +4636,13 @@ impl TerminalView {
                         && !text.is_empty()
                     {
                         cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        cx.stop_propagation();
+                        return;
                     }
-                    cx.stop_propagation();
-                    return;
+                    if forward_edit_key.is_none() {
+                        cx.stop_propagation();
+                        return;
+                    }
                 }
                 "v" => {
                     paste_clipboard_into_session(&self.session, cx);
@@ -4627,19 +4655,15 @@ impl TerminalView {
             }
         }
 
-        let mods = KeyModifiers {
-            control: m.control,
-            shift: m.shift,
-            alt: m.alt,
-            platform: m.platform,
-        };
-        let app_cursor = self.session.is_app_cursor_mode();
-        if let Some(bytes) = key_to_bytes(
-            &event.keystroke.key,
-            event.keystroke.key_char.as_deref(),
-            &mods,
-            app_cursor,
-        ) {
+        let bytes = forward_edit_key.map(<[u8]>::to_vec).or_else(|| {
+            key_to_bytes(
+                key,
+                event.keystroke.key_char.as_deref(),
+                &mods,
+                self.session.is_app_cursor_mode(),
+            )
+        });
+        if let Some(bytes) = bytes {
             // Typing dismisses any selection highlight. The terminal doesn't
             // echo locally — the typed character is drawn when the PTY echoes it
             // back (which schedules its own repaint), so only repaint here when a
@@ -5204,6 +5228,60 @@ sleep 30
         ));
         drop(probe);
         session.kill();
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_agent_edit_tests {
+    use super::{TerminalLaunch, TerminalView, set_forward_macos_agent_edit_keys};
+    use crate::CommandSpec;
+    use alacritty_terminal::index::{Column, Line, Point, Side};
+    use alacritty_terminal::selection::{Selection, SelectionType};
+    use gpui::{KeyDownEvent, Keystroke, TestAppContext};
+    use std::time::Instant;
+
+    #[test]
+    fn agent_shortcuts_are_opt_in_and_terminal_copy_keeps_priority() {
+        let launch =
+            TerminalLaunch::spawn(CommandSpec::program("/bin/cat", vec![]), (80, 24)).unwrap();
+        let mut cx = TestAppContext::single();
+        cx.skip_drawing();
+        let window = cx.add_window(|window, cx| {
+            TerminalView::new(launch, uuid::Uuid::new_v4(), Instant::now(), window, cx)
+        });
+        window
+            .update(&mut cx, |view, window, cx| {
+                let session = view.session().clone();
+                let key = |chord| KeyDownEvent {
+                    keystroke: Keystroke::parse(chord).unwrap(),
+                    is_held: false,
+                    prefer_character_input: false,
+                };
+                let before = session.input_rev();
+                view.on_key_down(&key("cmd-a"), window, cx);
+                view.on_key_down(&key("cmd-c"), window, cx);
+                assert_eq!(session.input_rev(), before);
+
+                set_forward_macos_agent_edit_keys(true, cx);
+                view.on_key_down(&key("cmd-a"), window, cx);
+                view.on_key_down(&key("cmd-c"), window, cx);
+                assert_eq!(session.input_rev(), before + 2);
+
+                session.process_output(b"terminal history");
+                session.with_term_mut(|term| {
+                    term.selection = Some(Selection::new(
+                        SelectionType::Lines,
+                        Point::new(Line(0), Column(0)),
+                        Side::Left,
+                    ));
+                });
+                view.on_key_down(&key("cmd-c"), window, cx);
+                assert_eq!(session.input_rev(), before + 2);
+                let copied = cx.read_from_clipboard().and_then(|item| item.text());
+                assert_eq!(copied.as_deref().map(str::trim), Some("terminal history"));
+                session.kill();
+            })
+            .unwrap();
     }
 }
 
