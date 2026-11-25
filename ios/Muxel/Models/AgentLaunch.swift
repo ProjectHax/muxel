@@ -14,10 +14,10 @@ struct ResolvedLaunch: Equatable {
 /// Pure ports of agent.rs launch resolution. These decide the exact program/args/
 /// startup-input for a launch, so the iOS command matches what desktop would run.
 enum AgentLaunch {
-    /// Compose `modelFlag model`, then `effortFlag effort`, then the extra args. Each
-    /// pair is skipped unless both flag and value are set + non-empty. Port of
-    /// `compose_args`.
+    /// A default shell gets only extra args. For a program, prepend its configured
+    /// model and effort flags. Port of `compose_args`.
     static func composeArgs(_ preset: Preset) -> [String] {
+        guard preset.program != nil else { return preset.args }
         var out: [String] = []
         if let flag = preset.modelFlag, let model = preset.model, !model.isEmpty {
             appendFlag(&out, flag: flag, value: model)

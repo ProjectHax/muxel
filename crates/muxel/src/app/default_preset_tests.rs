@@ -153,17 +153,7 @@ fn default_shell_launch_receives_preset_arguments() {
         let iid = add_shell_copy(app, preset);
         app.command_for(iid, None).unwrap().0.args
     });
-    assert_eq!(
-        args,
-        [
-            "--model",
-            "small",
-            "--effort",
-            "low",
-            "-NoLogo",
-            "-NoProfile"
-        ]
-    );
+    assert_eq!(args, ["-NoLogo", "-NoProfile"]);
 }
 
 #[test]
