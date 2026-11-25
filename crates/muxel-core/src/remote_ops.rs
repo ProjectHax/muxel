@@ -905,14 +905,20 @@ mod tests {
             "GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true GIT_TERMINAL_PROMPT=0 \
              git -C '/srv/a b' commit -m 'it'\\''s done' '&&' '$(id)'"
         );
-        let cmd = git_unattended(WIN, "C:/a b", &["log", "-1", "; Remove-Item x"]);
+        let args = crate::git_command::parse_git_command(
+            r#"log -1 -- "; Remove-Item x" src\app.rs src\"#,
+            WIN.is_windows(),
+        )
+        .unwrap();
+        let args: Vec<_> = args.iter().map(String::as_str).collect();
+        let cmd = git_unattended(WIN, "C:/a b", &args);
         assert_opaque(&cmd);
         let s = script_of(&cmd);
         assert!(
             s.contains(
                 "$env:GIT_EDITOR='true'; $env:GIT_SEQUENCE_EDITOR='true'; \
-                 $env:GIT_TERMINAL_PROMPT='0'; & git -C 'C:/a b' 'log' '-1' '; Remove-Item x'; \
-                 exit $LASTEXITCODE"
+                 $env:GIT_TERMINAL_PROMPT='0'; & git -C 'C:/a b' 'log' '-1' '--' '; Remove-Item x' \
+                 'src\\app.rs' 'src\\'; exit $LASTEXITCODE"
             ),
             "{s}"
         );

@@ -22177,7 +22177,11 @@ impl MuxelApp {
                         line,
                         seq: 0,
                         result: Some(Err(if windows_paths {
-                            t("A quote isn't closed.")
+                            tf(
+                                "A quote isn't closed. A single backslash before a closing double quote escapes it. \
+                                 For a path ending in a backslash, write {double_quoted} or {single_quoted}.",
+                                &[("double_quoted", r#""old files\\""#), ("single_quoted", r"'old files\'")],
+                            ).into()
                         } else {
                             t("A quote isn't closed (or the line ends in a backslash).")
                         })),

@@ -105,6 +105,29 @@ mod tests {
             parse_git_command(r"add src\", true).unwrap(),
             ["add", r"src\"]
         );
+        assert_eq!(
+            parse_git_command(r#"add "old files\""#, true),
+            Err(GitCommandError::Unbalanced)
+        );
+        for line in [r#"add "old files\\""#, r"add 'old files\'"] {
+            assert_eq!(
+                parse_git_command(line, true).unwrap(),
+                ["add", r"old files\"],
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_backslashes_do_not_escape_spaces_or_apostrophes() {
+        assert_eq!(
+            parse_git_command(r"add my\ file.txt", true).unwrap(),
+            ["add", r"my\", "file.txt"]
+        );
+        assert_eq!(
+            parse_git_command(r"commit -m it\'s", true),
+            Err(GitCommandError::Unbalanced)
+        );
     }
 
     #[test]
