@@ -8,16 +8,15 @@
 pub enum GitCommandError {
     /// Nothing to run: blank, or a bare `git`.
     Empty,
-    /// An unclosed quote or a trailing backslash.
+    /// An unclosed quote, or a trailing escape under POSIX rules.
     Unbalanced,
 }
 
-/// git's arguments in `line`, split as a shell splits words
-/// ([`crate::split_words`]): quotes group, nothing expands, and `;`, `&&` or `|`
-/// are passed to git as arguments rather than run. A leading `git` is dropped,
-/// so `git log -3` and `log -3` run the same command.
-pub fn parse_git_command(line: &str) -> Result<Vec<String>, GitCommandError> {
-    let mut words = crate::split_words(line).ok_or(GitCommandError::Unbalanced)?;
+/// Split the line with the path and quote rules of the machine running git.
+/// Quotes group words, nothing expands, and `;`, `&&` and `|` are ordinary
+/// arguments. A leading `git` is optional.
+pub fn parse_git_command(line: &str, windows_paths: bool) -> Result<Vec<String>, GitCommandError> {
+    let mut words = crate::shell::split(line, windows_paths).ok_or(GitCommandError::Unbalanced)?;
     if words.first().is_some_and(|w| w == "git") {
         words.remove(0);
     }
@@ -82,12 +81,67 @@ mod tests {
     use super::{GitCommandError, clip_output, command_output, command_title, parse_git_command};
 
     fn args(line: &str) -> Vec<String> {
-        parse_git_command(line).unwrap()
+        parse_git_command(line, false).unwrap()
     }
 
     #[test]
     fn plain_words_are_gits_arguments() {
         assert_eq!(args("log --oneline -5"), ["log", "--oneline", "-5"]);
+    }
+
+    #[test]
+    fn windows_paths_keep_their_separators() {
+        let line = r"add src\app.rs";
+        assert_eq!(
+            parse_git_command(line, true).unwrap(),
+            ["add", r"src\app.rs"]
+        );
+        assert_eq!(args(line), ["add", "srcapp.rs"]);
+    }
+
+    #[test]
+    fn windows_paths_can_end_in_a_backslash() {
+        assert_eq!(
+            parse_git_command(r"add src\", true).unwrap(),
+            ["add", r"src\"]
+        );
+        assert_eq!(
+            parse_git_command(r#"add "old files\""#, true),
+            Err(GitCommandError::Unbalanced)
+        );
+        for line in [r#"add "old files\\""#, r"add 'old files\'"] {
+            assert_eq!(
+                parse_git_command(line, true).unwrap(),
+                ["add", r"old files\"],
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_backslashes_do_not_escape_spaces_or_apostrophes() {
+        assert_eq!(
+            parse_git_command(r"add my\ file.txt", true).unwrap(),
+            ["add", r"my\", "file.txt"]
+        );
+        assert_eq!(
+            parse_git_command(r"commit -m it\'s", true),
+            Err(GitCommandError::Unbalanced)
+        );
+    }
+
+    #[test]
+    fn windows_paths_support_quotes_and_unc_shares() {
+        let line = r#"git add "C:\my files\a.rs" 'C:\my files\b.rs' \\server\share\app.rs"#;
+        assert_eq!(
+            parse_git_command(line, true).unwrap(),
+            [
+                "add",
+                r"C:\my files\a.rs",
+                r"C:\my files\b.rs",
+                r"\\server\share\app.rs"
+            ],
+        );
     }
 
     #[test]
@@ -113,29 +167,31 @@ mod tests {
 
     #[test]
     fn shell_operators_are_plain_arguments() {
-        // Nothing reaches a shell: `&&` is an argument git will reject.
-        assert_eq!(
-            args("status && rm -rf x"),
-            ["status", "&&", "rm", "-rf", "x"]
-        );
-        assert_eq!(args("log $(whoami)"), ["log", "$(whoami)"]);
+        for windows_paths in [false, true] {
+            assert_eq!(
+                parse_git_command("git status ; && | $(whoami)", windows_paths).unwrap(),
+                ["status", ";", "&&", "|", "$(whoami)"],
+            );
+        }
     }
 
     #[test]
     fn nothing_to_run_is_empty() {
-        assert_eq!(parse_git_command(""), Err(GitCommandError::Empty));
-        assert_eq!(parse_git_command("   "), Err(GitCommandError::Empty));
-        assert_eq!(parse_git_command("git"), Err(GitCommandError::Empty));
+        for line in ["", "   ", "git"] {
+            assert_eq!(parse_git_command(line, false), Err(GitCommandError::Empty));
+        }
     }
 
     #[test]
     fn an_open_quote_is_unbalanced() {
+        for windows_paths in [false, true] {
+            assert_eq!(
+                parse_git_command("commit -m \"oops", windows_paths),
+                Err(GitCommandError::Unbalanced)
+            );
+        }
         assert_eq!(
-            parse_git_command("commit -m \"oops"),
-            Err(GitCommandError::Unbalanced)
-        );
-        assert_eq!(
-            parse_git_command("log \\"),
+            parse_git_command("log \\", false),
             Err(GitCommandError::Unbalanced)
         );
     }

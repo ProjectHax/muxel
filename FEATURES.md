@@ -1869,8 +1869,11 @@ feature is added or changed, update the matching entry here in the same change**
 - **Git command** — the project git menu's **Git command…** runs any git command
   you type (`log --oneline -10`, `rebase --continue`, …; a leading `git` is
   optional) in the project's repo, on the host for a remote project, and shows
-  its output and exit code in the dialog, which stays open for the next one. The
-  line is split into arguments like a shell would but never runs in one, so
+  its output and exit code in the dialog, which stays open for the next one.
+  When git runs on Windows, type paths with their usual backslashes (e.g. `add src\app.rs`).
+  A backslash escapes only a double quote, so use double quotes around words
+  containing spaces or apostrophes (e.g. `add "my file.txt"` or `commit -m "it's done"`).
+  The line is split into arguments but never runs in a shell, so
   `&&`, `|` and `$(…)` reach git as plain text. No terminal is attached: an editor
   git opens accepts the message it prefilled and a credential prompt fails
   instead of waiting. Closing the dialog mid-run reports the result as a

@@ -1,7 +1,7 @@
 //! The POSIX parser [`split_words`] is a byte-for-byte port of `Shell.splitWords`
 //! in `ios/Muxel/Util/Shell.swift`. Keep the two in lockstep (see the protocol
 //! contract in `ios/README.md`). [`join_words`] uses POSIX shell quoting.
-//! The desktop preset editor also supports Windows path and quote rules.
+//! The desktop preset editor and Git command dialog also support Windows paths.
 
 use crate::ssh::sh_quote;
 
@@ -24,7 +24,7 @@ pub fn split_preset_args(line: &str) -> Option<Vec<String>> {
     split(line, cfg!(windows))
 }
 
-fn split(line: &str, windows_paths: bool) -> Option<Vec<String>> {
+pub(super) fn split(line: &str, windows_paths: bool) -> Option<Vec<String>> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut in_word = false;

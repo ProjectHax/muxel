@@ -125,6 +125,13 @@ pub enum RepoLoc {
 }
 
 impl RepoLoc {
+    pub fn uses_windows_paths(&self) -> bool {
+        match self {
+            Self::Local(_) => cfg!(windows),
+            Self::Remote(c) => c.host.os.is_windows(),
+        }
+    }
+
     pub fn remote(
         host: RemoteHost,
         remote_path: String,
@@ -6059,11 +6066,15 @@ mod tests {
     fn a_typed_git_command_reports_its_output_and_exit_code() {
         use muxel_core::git_command::parse_git_command;
         let repo = crate::test_support::TestRepo::init();
-        repo.commit(&[("a.txt", "one\n")], "first commit");
+        repo.commit(&[("src/app.rs", "one\n")], "first commit");
         let loc = RepoLoc::Local(repo.path().to_path_buf());
-        let run = |line: &str| git_user_command(&loc, &parse_git_command(line).unwrap()).unwrap();
+        let run = |line: &str| {
+            let args = parse_git_command(line, loc.uses_windows_paths()).unwrap();
+            git_user_command(&loc, &args).unwrap()
+        };
 
-        let log = run("git log --format=%s");
+        let path = Path::new("src").join("app.rs");
+        let log = run(&format!("git log --format=%s -- {}", path.display()));
         assert_eq!((log.code, log.output.as_str()), (Some(0), "first commit"));
 
         let bad = run("no-such-subcommand");
@@ -6076,6 +6087,21 @@ mod tests {
         );
         assert_eq!(amend.code, Some(0), "{}", amend.output);
         assert_eq!(repo.git(&["log", "--format=%s"]), "first commit");
+    }
+
+    #[test]
+    fn a_remote_typed_git_command_uses_the_hosts_path_rules() {
+        use muxel_core::git_command::parse_git_command;
+        for (os, path) in [
+            (RemoteOs::Unix, "srcapp.rs"),
+            (RemoteOs::Windows, r"src\app.rs"),
+        ] {
+            let mut host = RemoteHost::new("host", "host");
+            host.os = os;
+            let loc = RepoLoc::remote(host, "/repo".into(), String::new(), None);
+            let args = parse_git_command(r"add src\app.rs", loc.uses_windows_paths()).unwrap();
+            assert_eq!(args, ["add", path]);
+        }
     }
 
     /// What the branch poll reads: the branch HEAD names, and the local

@@ -22166,7 +22166,11 @@ impl MuxelApp {
         cx: &mut Context<Self>,
     ) {
         use muxel_core::git_command::{GitCommandError, parse_git_command};
-        let args = match parse_git_command(&line) {
+        let Some(loc) = self.repo_loc(pid) else {
+            return;
+        };
+        let windows_paths = loc.uses_windows_paths();
+        let args = match parse_git_command(&line, windows_paths) {
             Ok(args) => args,
             Err(GitCommandError::Empty) => return,
             Err(GitCommandError::Unbalanced) => {
@@ -22174,17 +22178,20 @@ impl MuxelApp {
                     m.command = Some(GitCommandShown {
                         line,
                         seq: 0,
-                        result: Some(Err(t(
-                            "A quote isn't closed (or the line ends in a backslash).",
-                        ))),
+                        result: Some(Err(if windows_paths {
+                            tf(
+                                "A quote isn't closed. A single backslash before a closing double quote escapes it. \
+                                 For a path ending in a backslash, write {double_quoted} or {single_quoted}.",
+                                &[("double_quoted", r#""old files\\""#), ("single_quoted", r"'old files\'")],
+                            ).into()
+                        } else {
+                            t("A quote isn't closed (or the line ends in a backslash).")
+                        })),
                     });
                 }
                 cx.notify();
                 return;
             }
-        };
-        let Some(loc) = self.repo_loc(pid) else {
-            return;
         };
         self.git_command_seq += 1;
         let seq = self.git_command_seq;
