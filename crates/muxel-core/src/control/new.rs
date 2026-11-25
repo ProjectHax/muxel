@@ -178,6 +178,15 @@ impl NewOptions {
                 ),
             ] {
                 if let Some(value) = value {
+                    if preset.program.is_none() {
+                        return Err(Error::new(
+                            ErrorCode::ParameterUnsupported,
+                            format!(
+                                "preset '{}' has no program to receive a {name} override",
+                                preset.name
+                            ),
+                        ));
+                    }
                     let flag = flag.as_deref().filter(|flag| !flag.trim().is_empty());
                     if flag.is_none_or(|flag| parameter_in_args(&preset.args, flag)) {
                         return Err(Error::new(

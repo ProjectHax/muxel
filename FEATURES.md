@@ -1171,8 +1171,8 @@ feature is added or changed, update the matching entry here in the same change**
   that project's toolbar preset. Run from one of that project's panes, the tab
   joins the caller's own group; otherwise it joins the focused group.
   `--model M` and `--effort E` select per-pane values for plain and prompt
-  launches, retained on restart. The preset needs Model flag /
-  Effort flag configured and absent from Extra args; literal argv cannot use
+  launches, retained on restart. The preset needs a Program and the corresponding
+  flag must be configured and absent from Extra args. Literal argv also rejects
   these options (`parameter_unsupported`). Values are 1–64 characters from
   `[A-Za-z0-9._:/@+-]` without a leading `-`. Ask displays the choices before
   directory details; preset overrides remain Allow-eligible. Flag templates

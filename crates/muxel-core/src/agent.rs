@@ -600,6 +600,12 @@ impl AgentPreset {
         if self.program.is_none() {
             return self.args.clone();
         }
+        let mut args = self.model_effort_args();
+        args.extend_from_slice(&self.args);
+        args
+    }
+
+    pub(super) fn model_effort_args(&self) -> Vec<String> {
         let mut out = Vec::new();
         for (flag, value) in [
             (&self.model_flag, &self.model),
@@ -617,7 +623,6 @@ impl AgentPreset {
                 }
             }
         }
-        out.extend(self.args.iter().cloned());
         out
     }
 
