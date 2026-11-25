@@ -2143,6 +2143,41 @@ pub fn dedupe_instances(workspace: &mut Workspace) {
     }
 }
 
+/// Older workspaces included model and effort flags in a shell pane's saved
+/// arguments. Remove that prefix only if the preset accounts for every word.
+pub fn repair_legacy_shell_args(workspace: &mut Workspace, presets: &[AgentPreset]) -> bool {
+    use std::collections::HashMap;
+    let mut by_id = HashMap::new();
+    let mut by_name = HashMap::new();
+    for preset in presets {
+        by_id.insert(preset.id, preset);
+        // A pane saved without an id can identify its preset only by a unique name.
+        by_name
+            .entry(preset.name.as_str())
+            .and_modify(|p| *p = None)
+            .or_insert(Some(preset));
+    }
+    let mut changed = false;
+    for pane in &mut workspace.instances {
+        if pane.kind != InstanceKind::Terminal || pane.program.is_some() || pane.literal_argv {
+            continue;
+        }
+        let preset = match pane.preset_id {
+            Some(id) => by_id.get(&id).copied(),
+            None => by_name.get(pane.preset.as_str()).copied().flatten(),
+        };
+        if let Some(preset) = preset
+            && let Some(prefix) = pane.args.strip_suffix(preset.args.as_slice())
+            && !prefix.is_empty()
+            && prefix == preset.model_effort_args()
+        {
+            pane.args.drain(..prefix.len());
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Keep Codex approval policy in restored panes aligned with its current preset.
 ///
 /// Instances snapshot launch arguments when created. Without this repair, changing

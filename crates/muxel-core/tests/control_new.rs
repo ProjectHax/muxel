@@ -203,6 +203,24 @@ fn new_parameters_freeze_both_plain_and_prompt_launches_without_mutating_preset(
 }
 
 #[test]
+fn blank_program_refuses_model_and_effort_overrides() {
+    use muxel_core::control::ErrorCode;
+    let project = Project::new("repo", std::env::current_dir().unwrap());
+    let preset = AgentPreset {
+        program: None,
+        ..AgentPreset::claude()
+    };
+    for field in ["model", "effort"] {
+        let options: NewOptions = serde_json::from_value(serde_json::json!({field:"low"})).unwrap();
+        let Err(error) = options.instance(&project, std::slice::from_ref(&preset), 0) else {
+            panic!("ctl new accepted --{field} for a preset with no program");
+        };
+        assert_eq!(error.code, Some(ErrorCode::ParameterUnsupported));
+        assert!(error.message.contains("no program"), "{}", error.message);
+    }
+}
+
+#[test]
 fn new_parameters_refuse_missing_flags_literal_commands_and_conflicting_extra_args() {
     use muxel_core::control::ErrorCode;
     let project = Project::new("repo", std::env::current_dir().unwrap());

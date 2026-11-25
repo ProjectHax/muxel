@@ -237,8 +237,8 @@ feature is added or changed, update the matching entry here in the same change**
   **Git Bash** offered as additional presets (instead of the single "Shell"). A
   preset is either a terminal agent or a **Browser** (opens a browser pane at its
   homepage) — switch the type and edit the fields in Settings → Agents.
-  For a direct local launch, leaving Program blank passes the preset's arguments
-  to the default shell.
+  With Program blank, a shell muxel launches directly receives only Extra
+  arguments, while a tmux or SSH pane opens its own shell without them.
 - **Git Bash on Windows** — when Git for Windows is installed, a **Git Bash**
   preset runs its `bash.exe` as an interactive login shell, so the pane gets the
   MSYS tools (`ls`, `grep`, `ssh`, …) rather than a bare shell. muxel finds bash
@@ -1171,8 +1171,8 @@ feature is added or changed, update the matching entry here in the same change**
   that project's toolbar preset. Run from one of that project's panes, the tab
   joins the caller's own group; otherwise it joins the focused group.
   `--model M` and `--effort E` select per-pane values for plain and prompt
-  launches, retained on restart. The preset needs Model flag /
-  Effort flag configured and absent from Extra args; literal argv cannot use
+  launches, retained on restart. The preset needs a Program and the corresponding
+  flag must be configured and absent from Extra args. Literal argv also rejects
   these options (`parameter_unsupported`). Values are 1–64 characters from
   `[A-Za-z0-9._:/@+-]` without a leading `-`. Ask displays the choices before
   directory details; preset overrides remain Allow-eligible. Flag templates

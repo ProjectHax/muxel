@@ -2,11 +2,14 @@
 
 use super::MuxelApp;
 use crate::theme;
-use gpui::TestAppContext;
-use muxel_core::{AgentPreset, Instance, Project, Settings};
+use gpui::{Context, TestAppContext, Window};
+use muxel_core::{AgentPreset, Instance, Project, Settings, Workspace};
 use uuid::Uuid;
 
-fn with_app<R>(settings: &Settings, run: impl FnOnce(&mut MuxelApp) -> R) -> R {
+fn with_app<R>(
+    settings: &Settings,
+    run: impl FnOnce(&mut MuxelApp, &mut Window, &mut Context<MuxelApp>) -> R,
+) -> R {
     let root = std::env::temp_dir().join(format!("muxel-default-preset-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     let storage = muxel_store::test_support::set_root(root.clone());
@@ -21,7 +24,7 @@ fn with_app<R>(settings: &Settings, run: impl FnOnce(&mut MuxelApp) -> R) -> R {
         theme::apply_initial_theme("", cx);
     });
     let window = cx.add_window(MuxelApp::new);
-    let result = window.update(&mut cx, |app, _, _| run(app)).unwrap();
+    let result = window.update(&mut cx, run).unwrap();
     // The app and its tasks go first, then its files, then the lease.
     drop(cx);
     std::fs::remove_dir_all(root).unwrap();
@@ -46,7 +49,7 @@ fn the_default_preset_opened_with_is_the_starred_one_by_id_or_name() {
         } else {
             codex.to_string()
         };
-        let (opened, starred) = with_app(&settings, |app| {
+        let (opened, starred) = with_app(&settings, |app, _, _| {
             (
                 app.presets[app.current_preset].id,
                 app.active_default_preset_id(),
@@ -143,7 +146,7 @@ fn add_shell_copy(app: &mut MuxelApp, mut preset: AgentPreset) -> Uuid {
 
 #[test]
 fn default_shell_launch_receives_preset_arguments() {
-    let args = with_app(&Settings::default(), |app| {
+    let args = with_app(&Settings::default(), |app, _, _| {
         let preset = AgentPreset {
             model: Some("small".into()),
             effort: Some("low".into()),
@@ -153,22 +156,12 @@ fn default_shell_launch_receives_preset_arguments() {
         let iid = add_shell_copy(app, preset);
         app.command_for(iid, None).unwrap().0.args
     });
-    assert_eq!(
-        args,
-        [
-            "--model",
-            "small",
-            "--effort",
-            "low",
-            "-NoLogo",
-            "-NoProfile"
-        ]
-    );
+    assert_eq!(args, ["-NoLogo", "-NoProfile"]);
 }
 
 #[test]
 fn cleared_agent_program_opens_a_plain_shell_on_launch_and_restore() {
-    let (fresh, restored) = with_app(&Settings::default(), |app| {
+    let (fresh, restored) = with_app(&Settings::default(), |app, _, _| {
         let iid = add_shell_copy(app, AgentPreset::claude());
         let fresh = app.command_for(iid, None).unwrap().0.args;
         let pane = app.workspace.instance_mut(iid).unwrap();
@@ -188,4 +181,77 @@ fn cleared_agent_program_opens_a_plain_shell_on_launch_and_restore() {
         (fresh, restored),
         (Vec::<String>::new(), Vec::<String>::new())
     );
+}
+
+#[test]
+fn restore_repairs_only_matching_legacy_shell_arguments() {
+    let extras: &[&str] = &["--model", "small", "--effort=low", "-NoProfile"];
+    let legacy: &[&str] = &[
+        "--model",
+        "small",
+        "--effort=low",
+        "--model",
+        "small",
+        "--effort=low",
+        "-NoProfile",
+    ];
+    let edited: &[&str] = &["--model", "small", "--effort=low", "-NoLogo"];
+    let shell = AgentPreset {
+        name: "Shell copy".into(),
+        program: None,
+        model: Some("small".into()),
+        effort: Some("low".into()),
+        effort_flag: Some("--effort={}".into()),
+        args: extras.iter().copied().map(String::from).collect(),
+        ..AgentPreset::claude()
+    };
+    let named = AgentPreset {
+        id: Uuid::new_v4(),
+        name: "Program set again".into(),
+        program: Some("claude".into()),
+        ..shell.clone()
+    };
+    let settings = Settings {
+        presets: vec![shell.clone(), named.clone()],
+        ..Settings::default()
+    };
+    let cases = [
+        (Some(shell.id), legacy, extras),
+        (Some(named.id), legacy, extras),
+        (Some(shell.id), extras, extras),
+        (Some(Uuid::new_v4()), legacy, legacy),
+        (Some(shell.id), edited, edited),
+        (None, legacy, extras),
+    ];
+    let restored = with_app(&settings, |app, window, cx| {
+        let mut saved = Workspace::default();
+        let root = muxel_store::data_dir().unwrap();
+        // Keep the saved panes in an inactive project so restore does not spawn them.
+        saved.add_project(Project::new("active", root.join("active")));
+        let project = saved.add_project(Project::new("shells", root.join("shells")));
+        let mut ids = Vec::new();
+        for (preset_id, before, _) in cases {
+            let mut pane = Instance::from_preset(project, &shell);
+            pane.preset_id = preset_id;
+            pane.args = before.iter().copied().map(String::from).collect();
+            ids.push(pane.id);
+            saved.add_instance(pane);
+        }
+        let id = Uuid::new_v4();
+        let path = muxel_store::workspace_doc_path(id).unwrap();
+        muxel_store::save_workspace_to(&path, &saved).unwrap();
+        app.current_workspace = Some(id);
+        app.restore(muxel_store::load_workspace_from(&path).unwrap(), window, cx);
+        let persisted = muxel_store::load_workspace_from(&path).unwrap();
+        ids.iter()
+            .map(|id| persisted.instance(*id).unwrap().args.clone())
+            .collect::<Vec<_>>()
+    });
+    for (actual, (preset_id, before, expected)) in restored.iter().zip(cases) {
+        assert_eq!(
+            actual.as_slice(),
+            expected,
+            "preset {preset_id:?}, saved {before:?}"
+        );
+    }
 }

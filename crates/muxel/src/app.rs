@@ -45,9 +45,10 @@ use muxel_core::{
     agent_activity_label, append_agent_instruction, codex_developer_instructions_override,
     file_link_instruction, focus_in_direction, memory_instruction, memory_reference,
     migrate_worktrees, move_into_split, move_into_tabs, move_pane_beside, move_tab_to,
-    muxel_file_reference, reminders_instruction, remove, resolve_launch_for_session, saved_agent,
-    set_active_tab, set_split_sizes, set_tab_order, split, split_beside, ssh, swap_instances,
-    swap_panes, sync_agent_injection_modes, sync_codex_approval_args,
+    muxel_file_reference, reminders_instruction, remove, repair_legacy_shell_args,
+    resolve_launch_for_session, saved_agent, set_active_tab, set_split_sizes, set_tab_order, split,
+    split_beside, ssh, swap_instances, swap_panes, sync_agent_injection_modes,
+    sync_codex_approval_args,
 };
 use muxel_terminal::{
     AgentStatus, CommandSpec, DisplayEpoch, LaunchBinding, TerminalLaunch, TerminalMouseMode,
@@ -9864,6 +9865,7 @@ impl MuxelApp {
         let mut workspace = workspace;
         // Give legacy per-instance worktrees a registry entry (no-op once done).
         migrate_worktrees(&mut workspace);
+        let shell_args_repaired = repair_legacy_shell_args(&mut workspace, &self.presets);
         // Presets can change after a pane is created. Codex approval policy must
         // follow the current preset instead of its stale per-pane argument snapshot.
         sync_codex_approval_args(&mut workspace, &self.presets);
@@ -9886,7 +9888,7 @@ impl MuxelApp {
         let repaired =
             workspace.detach_unused_worktrees(|worktree| local.contains(&worktree.project_id));
         self.workspace = workspace;
-        if repaired {
+        if repaired || shell_args_repaired {
             self.persist();
         }
         let active = self

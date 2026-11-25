@@ -1983,10 +1983,10 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   `--model` and `--effort` override the preset's values for this pane, including
   prompt launches; restarts retain the chosen arguments. Values must contain
   1–64 characters from `[A-Za-z0-9._:/@+-]` with no leading `-`. Each override
-  requires its Model flag / Effort flag in Settings > Agents, and that flag must
-  be absent from Extra args. A flag containing `{}` emits one argument with the
-  value substituted; other flags emit flag then value. Existing presets are not
-  migrated; fill in their flag fields. Literal `-- PROGRAM` cannot use overrides.
+  requires a Program and its Model flag or Effort flag in Settings > Agents.
+  That flag must be absent from Extra args. A flag containing `{}` emits one
+  argument with the value substituted. Other flags emit flag then value.
+  Fill in the flag fields on existing presets. Literal `-- PROGRAM` cannot use overrides.
   New Codex presets use `--config=model_reasoning_effort={}`; existing `-c` or
   `--config` arguments setting that key also conflict with an effort override.
   Unsupported combinations receive `parameter_unsupported`. Parameterized
@@ -2254,7 +2254,7 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
 - `approval_denied` - the user clicked Deny; nothing was created.
 - `approval_timeout` - no approval arrived within 120 seconds; nothing was created.
 - `prompt_unsupported` - prompts require a configured non-shell terminal preset.
-- `parameter_unsupported` - model/effort require a configured preset flag absent from Extra args; literal commands cannot use them.
+- `parameter_unsupported` - model/effort require a preset with a Program and a configured flag absent from Extra args. Literal commands cannot use them.
 
 A failure without a code after the request went out (no answer came back) may or
 may not have been carried out: check `status`, `show` or `screen` before typing

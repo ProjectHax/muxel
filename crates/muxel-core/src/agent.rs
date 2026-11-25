@@ -593,9 +593,19 @@ impl AgentPreset {
         ]
     }
 
-    /// Compose model, effort, then extra args. A flag containing `{}` emits one
-    /// argument with the value substituted; otherwise it emits flag then value.
+    /// A default shell gets only extra args. For a program, prepend model and
+    /// effort. A flag containing `{}` takes the value inline. Other flags are
+    /// followed by a separate value.
     pub fn compose_args(&self) -> Vec<String> {
+        if self.program.is_none() {
+            return self.args.clone();
+        }
+        let mut args = self.model_effort_args();
+        args.extend_from_slice(&self.args);
+        args
+    }
+
+    pub(super) fn model_effort_args(&self) -> Vec<String> {
         let mut out = Vec::new();
         for (flag, value) in [
             (&self.model_flag, &self.model),
@@ -613,7 +623,6 @@ impl AgentPreset {
                 }
             }
         }
-        out.extend(self.args.iter().cloned());
         out
     }
 
@@ -2767,6 +2776,25 @@ mod tests {
                 "--foo",
                 "bar"
             ]
+        );
+    }
+
+    #[test]
+    fn blank_program_keeps_only_extra_args() {
+        let mut preset = AgentPreset::claude();
+        preset.model = Some("small".into());
+        preset.effort = Some("low".into());
+        // A word explicitly entered in Extra arguments always belongs to the user.
+        preset.args = vec!["--model".into(), "my value".into()];
+        let program = preset.program.take();
+        let pane = Instance::from_preset(Uuid::new_v4(), &preset);
+        assert_eq!(pane.args, ["--model", "my value"]);
+
+        preset.program = program;
+        let agent = Instance::from_preset(Uuid::new_v4(), &preset);
+        assert_eq!(
+            agent.args,
+            ["--model", "small", "--effort", "low", "--model", "my value"]
         );
     }
 
