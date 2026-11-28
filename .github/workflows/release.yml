@@ -83,8 +83,14 @@ jobs:
             libxcb1-dev libx11-dev libx11-xcb-dev \
             libasound2-dev libvulkan-dev libdbus-1-dev \
             libwebkit2gtk-4.1-dev libgtk-3-dev
+      # `key` evicts caches holding whisper.cpp built -march=native (ggml's
+      # default) — whisper-rs-sys never rebuilds on its own when GGML_NATIVE in
+      # .cargo/config.toml changes. Bump it whenever that setting changes.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ggml-portable
       - run: cargo build --release -p muxel
+      - run: scripts/check-portable-whisper.sh
       - uses: actions/upload-artifact@v7
         with:
           name: linux-build-bin-${{ matrix.arch }}
@@ -280,11 +286,17 @@ jobs:
       # rust-toolchain.toml pins the channel, so `targets:` above lands on the
       # wrong toolchain — add them to the pinned one that cargo actually uses.
       - run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+      # `key` evicts caches holding whisper.cpp built -march=native (ggml's
+      # default) — whisper-rs-sys never rebuilds on its own when GGML_NATIVE in
+      # .cargo/config.toml changes. Bump it whenever that setting changes.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ggml-portable
       - name: Build both architectures
         run: |
           cargo build --release --target x86_64-apple-darwin -p muxel
           cargo build --release --target aarch64-apple-darwin -p muxel
+      - run: scripts/check-portable-whisper.sh
       - name: Install icon tooling
         run: brew install librsvg
       - name: Build universal muxel.app
@@ -364,8 +376,16 @@ jobs:
       # wrong toolchain — add it to the pinned one that cargo actually uses
       # (the windows-2022 runner only preinstalls the x86_64 target, not arm64).
       - run: rustup target add ${{ matrix.target }}
+      # `key` evicts caches holding whisper.cpp built -march=native (ggml's
+      # default) — whisper-rs-sys never rebuilds on its own when GGML_NATIVE in
+      # .cargo/config.toml changes. Bump it whenever that setting changes.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ggml-portable
       - run: cargo build --release --target ${{ matrix.target }} -p muxel
+      - if: matrix.arch == 'x86_64'
+        shell: bash
+        run: scripts/check-portable-whisper.sh
       - name: Package .zip
         id: package
         shell: pwsh

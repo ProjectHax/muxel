@@ -3,3 +3,17 @@
 # progress better than cargo's built-in libgit2 fetcher.
 [net]
 git-fetch-with-cli = true
+
+# Build whisper.cpp (local speech-to-text, via whisper-rs-sys → cmake) for a
+# portable CPU baseline instead of ggml's default `-march=native`. Native builds
+# bake in whatever the BUILD machine has: a release built on an AVX-512 CI runner
+# dies with SIGILL the moment a Zen 3 (or any non-AVX-512) user dictates. With
+# native off, x86_64 targets SSE4.2/AVX/AVX2/FMA/F16C/BMI2 (any x86-64 CPU since
+# Haswell / Zen 1) and aarch64 the compiler's default. `stt::check_local_cpu`
+# refuses older CPUs with an error instead of crashing.
+#
+# whisper-rs-sys's build script does NOT rerun when this changes — run
+# `cargo clean -p whisper-rs-sys` after editing it, and bump the rust-cache `key`
+# in .github/workflows/release.yml so CI drops its cached ggml objects.
+[env]
+GGML_NATIVE = "OFF"

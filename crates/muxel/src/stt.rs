@@ -295,6 +295,62 @@ fn quiet_whisper_logging() {
     ONCE.call_once(whisper_rs::install_logging_hooks);
 }
 
+/// Refuse local transcription on a CPU that lacks an instruction-set extension
+/// the bundled whisper.cpp was compiled to use, instead of dying with SIGILL
+/// inside it. Release builds target a portable baseline (`GGML_NATIVE=OFF` in
+/// .cargo/config.toml: AVX2/FMA/F16C/BMI2 on x86_64), so this fires on pre-AVX2
+/// CPUs, or if a native-built whisper.cpp ever ships again (0.4.1 shipped one
+/// with AVX-512 baked in). Call it before downloading the model.
+pub fn check_local_transcription_cpu() -> Result<()> {
+    match muxel_core::stt::local_transcription_cpu_error(&whisper_cpu_features()) {
+        Some(message) => Err(anyhow!(message)),
+        None => Ok(()),
+    }
+}
+
+/// `(name, compiled into whisper.cpp, present on this CPU)` for each x86
+/// extension ggml reports. ggml's `ggml_cpu_has_*` are compile-time answers
+/// (`#if defined(__AVX2__)`), not runtime probes, which is what makes the
+/// comparison meaningful. AMX has no stable runtime check, but every build that
+/// enables it also enables AVX-512F, which is checked.
+#[cfg(target_arch = "x86_64")]
+fn whisper_cpu_features() -> Vec<(&'static str, bool, bool)> {
+    use whisper_rs::whisper_rs_sys as sys;
+    // SAFETY: each `ggml_cpu_has_*` takes no arguments, touches no state, and
+    // returns a constant baked in at compile time.
+    macro_rules! feature {
+        ($name:literal, $compiled:ident, $detect:tt) => {
+            (
+                $name,
+                unsafe { sys::$compiled() } != 0,
+                is_x86_feature_detected!($detect),
+            )
+        };
+    }
+    vec![
+        feature!("SSE3", ggml_cpu_has_sse3, "sse3"),
+        feature!("SSSE3", ggml_cpu_has_ssse3, "ssse3"),
+        feature!("AVX", ggml_cpu_has_avx, "avx"),
+        feature!("AVX2", ggml_cpu_has_avx2, "avx2"),
+        feature!("FMA", ggml_cpu_has_fma, "fma"),
+        feature!("F16C", ggml_cpu_has_f16c, "f16c"),
+        feature!("BMI2", ggml_cpu_has_bmi2, "bmi2"),
+        feature!("AVX-VNNI", ggml_cpu_has_avx_vnni, "avxvnni"),
+        feature!("AVX-512F", ggml_cpu_has_avx512, "avx512f"),
+        feature!("AVX-512 VBMI", ggml_cpu_has_avx512_vbmi, "avx512vbmi"),
+        feature!("AVX-512 VNNI", ggml_cpu_has_avx512_vnni, "avx512vnni"),
+        feature!("AVX-512 BF16", ggml_cpu_has_avx512_bf16, "avx512bf16"),
+    ]
+}
+
+/// Non-x86_64: nothing to compare. With native off, aarch64 builds use the
+/// compiler's baseline (armv8-a; apple-m1 on macOS), which every CPU of the
+/// target runs, and Windows on ARM has no whisper.cpp at all.
+#[cfg(not(target_arch = "x86_64"))]
+fn whisper_cpu_features() -> Vec<(&'static str, bool, bool)> {
+    Vec::new()
+}
+
 /// Transcribe 16 kHz mono f32 `samples` with a local whisper.cpp model file.
 #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 pub fn transcribe_local(samples16k: &[f32], model_path: &Path, language: &str) -> Result<String> {
@@ -302,6 +358,7 @@ pub fn transcribe_local(samples16k: &[f32], model_path: &Path, language: &str) -
     if samples16k.is_empty() {
         return Ok(String::new());
     }
+    check_local_transcription_cpu()?;
     quiet_whisper_logging();
     let path = model_path
         .to_str()

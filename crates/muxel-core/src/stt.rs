@@ -163,13 +163,57 @@ pub fn whisper_model_url(model: &str) -> String {
     )
 }
 
+/// Why local (whisper.cpp) transcription can't run on this CPU, or `None` if it
+/// can. `features` lists each instruction-set extension as `(name, compiled,
+/// present)`: whether the bundled whisper.cpp was compiled to use it, and whether
+/// this CPU has it. Running a build that uses a missing one dies with SIGILL,
+/// taking the whole app down, so the caller refuses with this message instead.
+pub fn local_transcription_cpu_error(features: &[(&str, bool, bool)]) -> Option<String> {
+    let missing: Vec<&str> = features
+        .iter()
+        .filter(|(_, compiled, present)| *compiled && !*present)
+        .map(|(name, ..)| *name)
+        .collect();
+    (!missing.is_empty()).then(|| {
+        format!(
+            "this CPU lacks {}, which local transcription was built for — pick a Provider in Settings → Dictation",
+            missing.join(", ")
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DEFAULT_WAKE_PHRASE, DayPart, WHISPER_RATE, build_transcription_multipart, day_part,
-        encode_wav_16k_mono, matches_wake_phrase, normalize_spoken, resample_to_16k_mono,
-        whisper_model_filename, whisper_model_url,
+        encode_wav_16k_mono, local_transcription_cpu_error, matches_wake_phrase, normalize_spoken,
+        resample_to_16k_mono, whisper_model_filename, whisper_model_url,
     };
+
+    #[test]
+    fn local_transcription_cpu_error_names_only_compiled_features_the_cpu_lacks() {
+        // Compiled in and present, or absent from the build, never block.
+        assert_eq!(
+            local_transcription_cpu_error(&[
+                ("AVX2", true, true),
+                ("AVX-512F", false, false),
+                ("FMA", false, true),
+            ]),
+            None
+        );
+        assert_eq!(local_transcription_cpu_error(&[]), None);
+        // An AVX-512 build on a CPU without it (the 0.4.1 SIGILL) is refused,
+        // naming every missing extension in order.
+        let err = local_transcription_cpu_error(&[
+            ("AVX2", true, true),
+            ("AVX-512F", true, false),
+            ("AVX-512 VNNI", true, false),
+        ])
+        .expect("missing features must be refused");
+        assert!(err.contains("AVX-512F, AVX-512 VNNI"), "{err}");
+        assert!(!err.contains("AVX2"), "{err}");
+        assert!(err.contains("Provider"), "{err}");
+    }
 
     #[test]
     fn day_part_splits_the_clock_and_never_panics() {

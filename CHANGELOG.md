@@ -5,6 +5,15 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- **Local dictation no longer crashes muxel** — on Linux x86_64, stopping a
+  dictation with the Local engine crashed the whole app on any CPU without
+  AVX-512, such as an AMD Ryzen 5000. The release's speech model runtime was
+  compiled for the build server's CPU; every release build now targets any
+  x86-64 CPU with AVX2 (Intel since 2013, AMD since 2015). An older CPU gets an
+  error naming what it lacks and pointing to the Provider engine, instead of a
+  crash.
+
 ## [0.4.1] — 2026-11-21
 
 ### Added

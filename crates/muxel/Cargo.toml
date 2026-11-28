@@ -141,8 +141,11 @@ features = ["rt"]
 # for ARM, use clang"). There, local STT is unavailable and the Provider
 # (OpenAI-compatible) engine is the fallback. Keep this cfg in sync with the gates
 # in stt.rs and app.rs.
+#
+# `raw-api` re-exports whisper-rs-sys, for ggml's compile-time `ggml_cpu_has_*`
+# (`stt::check_local_transcription_cpu`); it gates nothing else.
 [target.'cfg(not(all(target_os = "windows", target_arch = "aarch64")))'.dependencies]
-whisper-rs = "0.16"
+whisper-rs = { version = "0.16", features = ["raw-api"] }
 
 # `setrlimit(RLIMIT_NOFILE)` at startup — see `raise_open_file_limit` in main.rs.
 [target.'cfg(unix)'.dependencies]

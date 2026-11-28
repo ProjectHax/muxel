@@ -25514,6 +25514,9 @@ impl MuxelApp {
                     }
                     match engine {
                         muxel_core::SttEngine::Local => {
+                            // Before the download: no point fetching a model this
+                            // CPU can't run (and running it would SIGILL).
+                            crate::stt::check_local_transcription_cpu()?;
                             let dir =
                                 models_dir.ok_or_else(|| anyhow::anyhow!("no data directory"))?;
                             let path = crate::stt::ensure_model(&model, &dir)?;
