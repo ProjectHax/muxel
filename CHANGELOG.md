@@ -5,6 +5,49 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-11-28
+
+### Added
+- **Run any git command from a project's menu** — the project git menu has a
+  new **Git command…** entry. Type a command, with or without the leading
+  `git` (`log --oneline -10`, `rebase --continue`, …), and it runs in the
+  project's repository, on the host for a remote project. The dialog shows the
+  output and exit code and stays open for the next command; Copy output copies
+  all of it, and closing the dialog while a command runs reports its result as
+  a notification. The line is split into arguments but never handed to a
+  shell, so `&&`, `|` and `$(…)` reach git as plain text. No terminal is
+  attached, so an editor git would open keeps the message git prefilled, and a
+  password prompt fails instead of waiting forever. When git runs on Windows,
+  type paths with their usual backslashes and put words with spaces or
+  apostrophes in double quotes. Thanks to [@railapex](https://github.com/railapex)
+  for the Windows path handling ([#199](https://github.com/ProjectHax/muxel/pull/199)).
+- **A worktree's diff shows everything it changed since its branch** — a
+  worktree's diff showed only the edits not yet committed, so once an agent
+  committed its work there, the diff and the Changes panel's Worktrees tab went
+  blank. muxel now remembers the branch each worktree was made from and
+  compares with it the way a pull request does: the worktree's commits and its
+  uncommitted edits, without what that branch gained since. The Worktrees tab
+  lists the committed files above the uncommitted ones, and merging the
+  worktree into its branch refreshes the diff. A worktree made before this
+  release compares with the project's current branch.
+- **Agents on Windows report their status** — on Windows, Claude and
+  Antigravity panes never received the status reports those agents send,
+  because the console host built into Windows swallowed the exchange that turns
+  reporting on. Their working, blocked and done states fell back to reading the
+  screen, and `muxel ctl send` never got a receipt. Windows installers, portable
+  zips and in-app updates now carry Microsoft's newer console host, the same
+  one VS Code and Zed ship, and panes use it. If Windows refuses to start it,
+  muxel falls back to the built-in host; set `MUXEL_SYSTEM_CONSOLE=1` to always
+  use the built-in one. Updating from inside muxel 0.4.1 brings only the new
+  muxel itself, so the console host arrives with the following update, or right
+  away if you run the installer or unpack the full zip. Thanks to
+  [@railapex](https://github.com/railapex) ([#183](https://github.com/ProjectHax/muxel/pull/183)).
+- **Choose the terminal cursor shape** — Settings → Appearance has a new
+  **Terminal cursor** choice of Block, Bar or Underline. Programs that set the
+  cursor themselves, like an editor switching to a bar in insert mode, now get
+  the shape they ask for. The cursor covers both cells of a wide character, and
+  a pane without focus shows a hollow block.
+
 ### Fixed
 - **Local dictation no longer crashes muxel** — on Linux x86_64, stopping a
   dictation with the Local engine crashed the whole app on any CPU without
@@ -13,6 +56,107 @@ All notable changes to muxel are documented here. This project adheres to
   x86-64 CPU with AVX2 (Intel since 2013, AMD since 2015). An older CPU gets an
   error naming what it lacks and pointing to the Provider engine, instead of a
   crash.
+- **Typing with an input method waits until the text is finished** —
+  composing text with an input method, for Chinese, Japanese or Korean or with
+  dead keys, sent every in-between step to the program in the pane, so it
+  received half-built characters. The text being composed now shows at the
+  cursor, the candidate window opens beside it, and only the finished text is
+  sent. Combining accents are kept, and wide characters such as CJK and wide
+  emoji draw at their full width instead of squeezed into one cell.
+- **Windows paths in a preset's Extra arguments keep their backslashes** —
+  saving a Windows preset turned `-File C:\tools\init.ps1` into
+  `-File C:toolsinit.ps1`, because the preset editor read Extra arguments with
+  Unix shell rules. On Windows it now keeps drive and network path separators,
+  accepts single or double quotes around an argument with spaces, and reopens
+  showing what you saved. A path already saved without its backslashes can't be
+  recovered, so type it again. Thanks to [@railapex](https://github.com/railapex)
+  ([#194](https://github.com/ProjectHax/muxel/pull/194)).
+- **A preset with no Program passes its Extra arguments to the shell** — with
+  Program left blank, a pane opens your default shell, but the preset's Extra
+  arguments were dropped, so the built-in PowerShell preset ignored its own.
+  They now reach the shell when the pane opens and after a restart, without the
+  model and effort settings that only an agent understands; a pane saved by an
+  earlier version is tidied up when the workspace loads. tmux and SSH panes
+  still open their own shell without them. Because saved arguments now take
+  effect, a path damaged by the backslash bug above can keep a PowerShell pane
+  from starting until you correct or clear its Extra arguments. Thanks to
+  [@railapex](https://github.com/railapex) ([#194](https://github.com/ProjectHax/muxel/pull/194),
+  [#198](https://github.com/ProjectHax/muxel/pull/198)).
+- **Shortcuts stay quiet behind a dialog** — with "Close pane?" or the Quit
+  question showing, a key with a shortcut still acted on what was behind it:
+  Tab and Shift+Tab were typed into the terminal, the clear-scrollback and
+  terminal-search shortcuts went to the pane, and shortcuts that open, close or
+  move panes ran. Now, while a dialog is up in any muxel window, Escape cancels
+  it, the Quit shortcut still quits, and every other key is ignored. Answer a
+  dialog's buttons with a click; Tab then Enter no longer answers the
+  confirmations in floating Settings or the workspace selector. A text field
+  drawn above a dialog, like the SSH password prompt, keeps its keys. Thanks to
+  [@railapex](https://github.com/railapex) ([#190](https://github.com/ProjectHax/muxel/pull/190)).
+- **Antigravity panes under tmux show idle and done** — Antigravity's status
+  reports don't make it through tmux, and its idle screen redraws itself every
+  couple of seconds, so a tmux Antigravity pane read working most of the time
+  and never read done. muxel now reads Antigravity's footer instead: working
+  while it shows `esc to cancel`, done when the turn ends, and blocked at one of
+  its cards.
+- **Codex's tools can tell which pane they're in** — with Codex set to give its
+  tools only a short list of environment variables
+  (`shell_environment_policy.inherit = "core"` or `"none"`), a `muxel ctl`
+  command Codex ran couldn't tell which pane it came from: a task pane couldn't
+  report on its task, and with `--user-data-dir` the command reached your
+  default profile instead. muxel now hands a local Codex pane's id, and the
+  isolated profile's location, to Codex's tools directly. Thanks to
+  [@railapex](https://github.com/railapex) ([#192](https://github.com/ProjectHax/muxel/pull/192)).
+- **A moved file shows as one rename in Changes** — moving a tracked file and
+  adding it under its new name with `git add -N` listed it twice in the Changes
+  panel: once under the new name with no source, and again as a stray row with
+  the start of the old path cut off. It's now one rename row showing both
+  names. Thanks to [@railapex](https://github.com/railapex)
+  ([#191](https://github.com/ProjectHax/muxel/pull/191)).
+- **Settings → Skills text stays inside its card** — long skill titles and
+  descriptions ran past the edge of their rows. Recommended skills now stack
+  their title and description across the full width, with the link and Install
+  button on a row below.
+
+### Changed
+- **Only a task pane's own agent can report on its task** — with outside
+  control off, another program running as you that knew a task pane's id could
+  update that pane's task with `muxel ctl task`. Each task pane launch now gets
+  a secret of its own in its environment, and only the agent in that pane can
+  use `ctl task` on its task, in a direct or a local tmux pane. A task pane
+  that was already running in tmux before the upgrade is told to relaunch, and
+  an agent that hides the pane's environment from its tools gets a message
+  saying so. Thanks to [@railapex](https://github.com/railapex)
+  ([#193](https://github.com/ProjectHax/muxel/pull/193)).
+- **`muxel ctl new` refuses a model or effort the preset can't use** — on a
+  preset with no Program, `--model` and `--effort` were accepted and shown on
+  the approval card, then had nothing to apply to. They're now refused, and the
+  help text says an override needs a Program. Thanks to
+  [@railapex](https://github.com/railapex) ([#198](https://github.com/ProjectHax/muxel/pull/198)).
+
+### iOS companion app (distributed via TestFlight / App Store, not in these downloads)
+- Watched projects show working, needs-input and finished agents on the home
+  screen, read from the live screen without resizing the desktop's window, and
+  pick up prompts started on the desktop and newly created panes on their own.
+  A shell pane reads working while a command runs and notifies you when the
+  prompt returns.
+- Tapping a notification opens its project with that agent's tab in front,
+  whether the app was open, in the background or not running.
+- The Live Activity keeps the most recently busy projects and agents at the
+  top, keeps projects with the same name on separate lines, and drops a deleted
+  project right away.
+- A one-tap menu in the project header switches between projects and agents,
+  and a project opens on its cached layout at once.
+- Terminal text draws in its own colors instead of all white, and the character
+  under the cursor stays readable.
+- Typing while scrolled up leaves scrollback first, so the keys reach the agent
+  instead of tmux, and a **Jump to bottom** pill brings you back.
+- A failed SSH connect says why: the name doesn't resolve, the port refused the
+  connection, there's no route to the host, the connection timed out, or the
+  login took too long. If cellular data is off for muxel it says so, and on
+  cellular a home-network address is named as reachable only through a VPN.
+- Grok's question card reads as needs input, and Antigravity reads working and
+  idle from its footer, as on the desktop.
+- Pasting `user@host:port` into a host's Hostname field fills in User and Port.
 
 ## [0.4.1] — 2026-11-21
 
