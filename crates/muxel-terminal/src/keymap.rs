@@ -157,11 +157,27 @@ pub fn key_to_bytes(
         _ => {}
     }
 
-    if key.len() == 1 {
+    // Unhandled Command chords must not turn into literal terminal input.
+    if key.len() == 1 && !(cfg!(target_os = "macos") && mods.platform) {
         return Some(key.as_bytes().to_vec());
     }
 
     None
+}
+
+impl KeyModifiers {
+    pub(crate) fn is_platform_only(&self) -> bool {
+        self.platform && !self.control && !self.shift && !self.alt
+    }
+}
+
+/// Legacy xterm keys that survive tmux even when extended keys are disabled.
+pub(crate) fn agent_edit_key(key: &str) -> Option<&'static [u8]> {
+    match key {
+        "a" => Some(b"\x1b[1;2P"), // Shift+F1 (xterm F13)
+        "c" => Some(b"\x1b[2;5~"), // Ctrl+Insert
+        _ => None,
+    }
 }
 
 fn backspace_bytes(mods: &KeyModifiers) -> Vec<u8> {
@@ -258,6 +274,30 @@ mod tests {
             key_to_bytes("backspace", None, &mods(false, false, true), false),
             Some(vec![0x17])
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unhandled_command_letters_are_not_typed_into_the_terminal() {
+        let mods = KeyModifiers {
+            platform: true,
+            ..KeyModifiers::default()
+        };
+        for key in ["a", "b", "x"] {
+            assert_eq!(key_to_bytes(key, None, &mods, false), None, "Cmd+{key}");
+        }
+        let shifted = KeyModifiers {
+            shift: true,
+            ..mods
+        };
+        assert_eq!(key_to_bytes("x", None, &shifted, false), None);
+    }
+
+    #[test]
+    fn agent_edit_keys_use_xterm_sequences() {
+        assert_eq!(agent_edit_key("a"), Some(b"\x1b[1;2P".as_slice()));
+        assert_eq!(agent_edit_key("c"), Some(b"\x1b[2;5~".as_slice()));
+        assert_eq!(agent_edit_key("v"), None);
     }
 
     #[test]
