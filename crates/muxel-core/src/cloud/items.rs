@@ -137,6 +137,8 @@ pub struct Appearance {
     pub ui_font_size: f32,
     pub zoom: f32,
     pub pane_border: String,
+    #[serde(default = "crate::default_cursor_shape")]
+    pub cursor_shape: String,
     #[serde(default)]
     pub diff_split_view: bool,
     pub editor_font_family: String,
@@ -161,6 +163,7 @@ impl Appearance {
             ui_font_size: s.ui_font_size,
             zoom: s.zoom,
             pane_border: s.pane_border.clone(),
+            cursor_shape: s.cursor_shape.clone(),
             diff_split_view: s.diff_split_view,
             editor_font_family: s.editor_font_family.clone(),
             editor_font_size: s.editor_font_size,
@@ -180,6 +183,11 @@ impl Appearance {
         s.ui_font_size = self.ui_font_size;
         s.zoom = self.zoom;
         s.pane_border = self.pane_border.clone();
+        s.cursor_shape = if self.cursor_shape.is_empty() {
+            crate::default_cursor_shape()
+        } else {
+            self.cursor_shape.clone()
+        };
         s.diff_split_view = self.diff_split_view;
         s.editor_font_family = self.editor_font_family.clone();
         s.editor_font_size = self.editor_font_size;

@@ -51,8 +51,8 @@ use muxel_core::{
     sync_codex_approval_args,
 };
 use muxel_terminal::{
-    AgentStatus, CommandSpec, DisplayEpoch, LaunchBinding, TerminalLaunch, TerminalMouseMode,
-    TerminalSession, TerminalView, clean_agent_title,
+    AgentStatus, CommandSpec, DisplayEpoch, LaunchBinding, TerminalCursorShape, TerminalLaunch,
+    TerminalMouseMode, TerminalSession, TerminalView, clean_agent_title,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -11705,6 +11705,7 @@ impl MuxelApp {
         let font_family: SharedString = self.settings.font_family.clone().into();
         let font_size = self.settings.font_size * self.settings.zoom;
         let mouse_mode = TerminalMouseMode::from_setting(&self.settings.terminal_mouse);
+        let cursor_shape = TerminalCursorShape::from_setting(&self.settings.cursor_shape);
         let view = cx.new(move |cx| {
             let mut view = TerminalView::new_with_focus_observer(
                 launch,
@@ -11717,6 +11718,7 @@ impl MuxelApp {
             view.set_palette(palette);
             view.set_config(font_family, font_size);
             view.set_mouse_mode(mouse_mode);
+            view.set_cursor_shape(cursor_shape);
             view
         });
         let has_durable_activity = self
@@ -32015,10 +32017,12 @@ impl MuxelApp {
         let font_family: SharedString = self.settings.font_family.clone().into();
         let font_size = self.settings.font_size * self.settings.zoom;
         let mouse_mode = TerminalMouseMode::from_setting(&self.settings.terminal_mouse);
+        let cursor_shape = TerminalCursorShape::from_setting(&self.settings.cursor_shape);
         for view in self.terminals.values() {
             view.update(cx, |view, cx| {
                 view.set_config(font_family.clone(), font_size);
                 view.set_mouse_mode(mouse_mode);
+                view.set_cursor_shape(cursor_shape);
                 // See refresh_terminal_palettes: cached views need the notify.
                 cx.notify();
             });
@@ -32324,6 +32328,13 @@ impl MuxelApp {
 
     fn set_pane_border(&mut self, value: &str, cx: &mut Context<Self>) {
         self.settings.pane_border = value.to_string();
+        self.persist_settings();
+        cx.notify();
+    }
+
+    fn set_cursor_shape(&mut self, value: &str, cx: &mut Context<Self>) {
+        self.settings.cursor_shape = value.to_string();
+        self.refresh_terminal_config(cx);
         self.persist_settings();
         cx.notify();
     }

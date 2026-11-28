@@ -2373,6 +2373,40 @@ impl TerminalMouseMode {
     }
 }
 
+/// Default cursor shape for a terminal pane (a global setting parsed from
+/// `Settings.cursor_shape`). Programs that emit DECSCUSR (`CSI Ps SP q`) or
+/// `OSC 50` still override this per pane until they reset with `CSI 0 SP q`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TerminalCursorShape {
+    /// Solid block cursor (hollow outline when unfocused).
+    #[default]
+    Block,
+    /// Thin vertical bar (beam) at the leading edge of the cell.
+    Bar,
+    /// Thin horizontal underline at the bottom of the cell.
+    Underline,
+}
+
+impl TerminalCursorShape {
+    /// Parse the persisted setting string; unknown values fall back to the default.
+    pub fn from_setting(s: &str) -> Self {
+        match s {
+            "bar" | "beam" => Self::Bar,
+            "underline" => Self::Underline,
+            _ => Self::Block,
+        }
+    }
+
+    pub(crate) fn to_alacritty(self) -> alacritty_terminal::vte::ansi::CursorShape {
+        use alacritty_terminal::vte::ansi::CursorShape;
+        match self {
+            Self::Block => CursorShape::Block,
+            Self::Bar => CursorShape::Beam,
+            Self::Underline => CursorShape::Underline,
+        }
+    }
+}
+
 /// How a child ended, carried from `ProfiledPtyChunk::Exit` to the view in one piece so
 /// the three same-typed optionals can't be transposed at a call site.
 struct ExitInfo {
@@ -2430,6 +2464,7 @@ pub struct TerminalView {
     font_family: SharedString,
     font_size: f32,
     mouse_mode: TerminalMouseMode,
+    cursor_shape: TerminalCursorShape,
     exited: bool,
     /// The child's exit code once it has exited (`None` = still running or the
     /// code wasn't reported by the OS/PTY). `Some(1)` may mean a signal — see
@@ -3575,6 +3610,9 @@ impl TerminalView {
             if let Some(observer) = focus_observer {
                 observer(instance_id, false, window, cx);
             }
+            if view.session.clear_ime_preedit() {
+                cx.notify();
+            }
             view.session.report_focus(false);
         })
         .detach();
@@ -4058,6 +4096,7 @@ impl TerminalView {
             font_family: SharedString::default(),
             font_size: 14.0,
             mouse_mode: TerminalMouseMode::default(),
+            cursor_shape: TerminalCursorShape::default(),
             exited: false,
             exit_code: None,
             exit_signal: None,
@@ -4556,6 +4595,13 @@ impl TerminalView {
         self.mouse_mode = mode;
     }
 
+    /// Set the default cursor shape (pushed from settings). Programs that emit
+    /// DECSCUSR (`CSI Ps SP q`) still override this per pane.
+    pub fn set_cursor_shape(&mut self, shape: TerminalCursorShape) {
+        self.cursor_shape = shape;
+        self.session.set_default_cursor_shape(shape.to_alacritty());
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let t0 = Instant::now();
         let held = event.is_held;
@@ -4646,12 +4692,13 @@ impl TerminalView {
             // selection was actually cleared. This halves repaints when a key is
             // held down (e.g. Enter), keeping output smooth.
             let cleared = self.session.clear_selection();
+            let cleared_preedit = self.session.clear_ime_preedit();
             if is_submission_input(&bytes) {
                 self.session.mark_turn_submitted();
             }
             profile::key_started(self.instance_id, t0);
             self.session.write_user_input(&bytes);
-            if cleared {
+            if cleared || cleared_preedit {
                 cx.notify();
             }
             // Key path: gpui may sync-draw without presenting — arm the pump.
@@ -6611,7 +6658,7 @@ mod tests {
     use super::{
         AgentStatus, BACKGROUND_PAINT_INTERVAL, CURSOR_HIDE_HOLD, FOCUSED_INTERACTION_INTERVAL,
         FOCUSED_STREAM_INTERVAL, GROK_SCREEN_WORKING_HOLD, PaintSchedule,
-        STATUS_SCREEN_SCAN_INTERVAL, StatusScreenCapture, TerminalMouseMode,
+        STATUS_SCREEN_SCAN_INTERVAL, StatusScreenCapture, TerminalCursorShape, TerminalMouseMode,
         TerminalStatusCoverage, TerminalStatusReason, TitleProvider, can_latch_completion,
         classify, clean_agent_title, combine_title_status, fallback_status_deadline,
         grok_screen_working_state, has_working_to_nonworking_edge, hold_after, hold_grok_blocked,
@@ -7529,6 +7576,19 @@ mod tests {
         assert_eq!(TerminalMouseMode::from_setting(""), CopyPaste);
         assert_eq!(TerminalMouseMode::from_setting("bogus"), CopyPaste);
         assert_eq!(TerminalMouseMode::default(), CopyPaste);
+    }
+
+    #[test]
+    fn cursor_shape_from_setting() {
+        use TerminalCursorShape::*;
+        assert_eq!(TerminalCursorShape::from_setting("block"), Block);
+        assert_eq!(TerminalCursorShape::from_setting("bar"), Bar);
+        assert_eq!(TerminalCursorShape::from_setting("beam"), Bar);
+        assert_eq!(TerminalCursorShape::from_setting("underline"), Underline);
+        // Unknown / empty falls back to the default.
+        assert_eq!(TerminalCursorShape::from_setting(""), Block);
+        assert_eq!(TerminalCursorShape::from_setting("bogus"), Block);
+        assert_eq!(TerminalCursorShape::default(), Block);
     }
 
     #[test]

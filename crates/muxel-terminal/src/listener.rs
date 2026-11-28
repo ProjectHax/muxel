@@ -472,6 +472,10 @@ pub(crate) struct MuxelListener {
     /// OSC-52 copies from the child, drained by the view onto the system
     /// clipboard (a clipboard write needs a gpui context this thread lacks).
     pub clipboard_store: Arc<Mutex<Vec<(ClipboardType, String)>>>,
+    /// Temporarily suppresses synthetic `Event::Title`/`Event::ResetTitle`
+    /// emitted by `alacritty_terminal::Term::set_options` when updating
+    /// non-title config like the default cursor shape.
+    pub suppress_title_events: Arc<AtomicBool>,
 }
 
 pub(crate) fn session_thread_field(title: &str) -> Option<&str> {
@@ -495,6 +499,9 @@ impl EventListener for MuxelListener {
     fn send_event(&self, event: Event) {
         match event {
             Event::Title(title) => {
+                if self.suppress_title_events.load(Ordering::Relaxed) {
+                    return;
+                }
                 let mut hint = self.session_id_hint.lock();
                 let mut evidence = self.evidence.lock();
                 let at = evidence.output_time();
@@ -523,6 +530,9 @@ impl EventListener for MuxelListener {
                 self.title_generation.fetch_add(1, Ordering::Relaxed);
             }
             Event::ResetTitle => {
+                if self.suppress_title_events.load(Ordering::Relaxed) {
+                    return;
+                }
                 {
                     let mut evidence = self.evidence.lock();
                     let at = evidence.output_time();
@@ -579,6 +589,7 @@ mod tests {
             session_id_hint: hint.clone(),
             bell: Arc::new(AtomicBool::new(false)),
             clipboard_store: Arc::new(Mutex::new(Vec::new())),
+            suppress_title_events: Arc::new(AtomicBool::new(false)),
         };
         let first = "019f95d7-db31-7db0-904d-9e08330e0000";
         let resumed = "019f95d7-db31-7db0-904d-9e08330e0001";
@@ -627,6 +638,7 @@ mod tests {
             session_id_hint: Arc::new(Mutex::new(None)),
             bell: Arc::new(AtomicBool::new(false)),
             clipboard_store: Arc::new(Mutex::new(Vec::new())),
+            suppress_title_events: Arc::new(AtomicBool::new(false)),
         }
     }
 

@@ -1673,6 +1673,14 @@ feature is added or changed, update the matching entry here in the same change**
   opens link actions instead of copying or pasting through the PTY.
 - **Focus reporting** — forwards focus in/out to the PTY (DECSET 1004) so agents
   know when their pane is active.
+- **IME composition** — in-progress CJK / dead-key IME preedit text renders
+  inline at the terminal cursor with the OS candidate window positioned there,
+  and only the final committed text is written to the PTY.
+- **Terminal cursor shapes** — respects program cursor-shape escapes (DECSCUSR
+  `CSI Ps SP q` and `OSC 50;CursorShape=`), sizes the cursor to two cells on wide
+  characters, draws unfocused block cursors as hollow outlines, and lets you
+  choose the default cursor shape (Block, Bar, or Underline) in Settings →
+  Appearance.
 - **OSC-52 clipboard** — programs in the terminal (including over SSH/tmux) can
   copy to the system clipboard via `OSC 52`; clipboard *reads* are answered with
   an empty reply, so a remote can probe for support but never see your clipboard.

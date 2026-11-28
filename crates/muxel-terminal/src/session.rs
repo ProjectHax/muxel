@@ -1478,6 +1478,13 @@ pub struct TerminalSession {
     /// OSC-52 copies parsed from output, pending pickup by the view (which owns
     /// the gpui context a clipboard write needs).
     clipboard_store: Arc<Mutex<Vec<(ClipboardType, String)>>>,
+    /// Suppresses synthetic `Event::Title`/`Event::ResetTitle` from
+    /// `Term::set_options` during config updates (such as default cursor shape).
+    suppress_title_events: Arc<AtomicBool>,
+    /// Currently configured default cursor shape pushed into `TermConfig`.
+    default_cursor_shape: Mutex<alacritty_terminal::vte::ansi::CursorShape>,
+    /// Active IME composition (preedit) text, held locally until committed or cancelled.
+    ime_preedit: Mutex<Option<ImePreedit>>,
     /// The palette color queries are answered from (see `replies`); kept
     /// current with the app theme via [`Self::set_palette`].
     palette: Arc<Mutex<TerminalPalette>>,
@@ -1620,6 +1627,15 @@ pub(crate) struct PaintMetrics {
     pub bg: [f32; 4],
 }
 
+/// Active IME composition (preedit) text, held locally until the IME commits
+/// it via `replace_text_in_range` or cancels it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ImePreedit {
+    pub text: String,
+    /// Caret / highlight range inside `text` in UTF-16 code units, if reported.
+    pub selected_range: Option<std::ops::Range<usize>>,
+}
+
 /// One text run ready to paint. After the first full paint, [`Self::shaped`]
 /// holds the gpui layout so sibling-pane replays skip `shape_line`.
 #[derive(Clone, Debug)]
@@ -1633,6 +1649,9 @@ pub(crate) struct CachedRun {
     pub underline: bool,
     pub wavy: bool,
     pub strike: bool,
+    /// True when this run is a single double-width cell (`Flags::WIDE_CHAR`),
+    /// shaped without a 1-cell `force_width` override.
+    pub wide: bool,
     /// Populated during paint (needs the window text system). Replay uses this
     /// and skips re-shaping.
     pub shaped: Option<gpui::ShapedLine>,
@@ -2087,6 +2106,7 @@ impl TerminalSession {
         let session_id_hint = Arc::new(Mutex::new(None));
         let bell = Arc::new(AtomicBool::new(false));
         let clipboard_store = Arc::new(Mutex::new(Vec::new()));
+        let suppress_title_events = Arc::new(AtomicBool::new(false));
         let listener = MuxelListener {
             replies,
             title: title.clone(),
@@ -2096,6 +2116,7 @@ impl TerminalSession {
             session_id_hint: session_id_hint.clone(),
             bell: bell.clone(),
             clipboard_store: clipboard_store.clone(),
+            suppress_title_events: suppress_title_events.clone(),
         };
 
         let term = Term::new(
@@ -2140,6 +2161,9 @@ impl TerminalSession {
             session_id_hint,
             bell,
             clipboard_store,
+            suppress_title_events,
+            default_cursor_shape: Mutex::new(alacritty_terminal::vte::ansi::CursorShape::Block),
+            ime_preedit: Mutex::new(None),
             palette,
             selecting: AtomicBool::new(false),
             mouse_pressed_button: AtomicU8::new(NO_MOUSE_PRESS),
@@ -3319,6 +3343,67 @@ impl TerminalSession {
         })
     }
 
+    /// Update the emulator's default cursor shape (from user settings).
+    /// Programs that sent DECSCUSR (`CSI Ps SP q`) keep their explicit shape
+    /// until they reset with `CSI 0 SP q`.
+    pub(crate) fn set_default_cursor_shape(
+        &self,
+        shape: alacritty_terminal::vte::ansi::CursorShape,
+    ) {
+        let mut default = self.default_cursor_shape.lock();
+        if *default == shape {
+            return;
+        }
+        *default = shape;
+        let mut term = self.term.lock();
+        self.suppress_title_events.store(true, Ordering::Relaxed);
+        term.set_options(term_config_with_cursor(shape));
+        term.reset_damage();
+        self.suppress_title_events.store(false, Ordering::Relaxed);
+    }
+
+    /// Snapshot of the active IME preedit (composing) text, if any.
+    pub(crate) fn ime_preedit(&self) -> Option<ImePreedit> {
+        self.ime_preedit.lock().clone()
+    }
+
+    /// Update the active IME preedit text. An empty string clears it.
+    /// Returns `true` if the preedit state changed.
+    pub(crate) fn set_ime_preedit(
+        &self,
+        text: String,
+        selected_range: Option<std::ops::Range<usize>>,
+    ) -> bool {
+        if text.is_empty() {
+            return self.clear_ime_preedit();
+        }
+        let next = Some(ImePreedit {
+            text,
+            selected_range,
+        });
+        let mut slot = self.ime_preedit.lock();
+        if *slot == next {
+            return false;
+        }
+        *slot = next;
+        true
+    }
+
+    /// Clear any active IME preedit text. Returns `true` if one was cleared.
+    pub(crate) fn clear_ime_preedit(&self) -> bool {
+        self.ime_preedit.lock().take().is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cursor_style(&self) -> alacritty_terminal::vte::ansi::CursorStyle {
+        self.with_term(|term| term.cursor_style())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn title_generation(&self) -> u64 {
+        self.title_generation.load(Ordering::Relaxed)
+    }
+
     /// The visible screen as text (one row per line, newline-separated). Used for
     /// marker-based agent-status detection (e.g. scanning for "esc to interrupt").
     pub(crate) fn visible_text(&self) -> String {
@@ -4437,6 +4522,15 @@ pub(crate) fn term_config() -> TermConfig {
         osc52: Osc52::CopyPaste,
         ..TermConfig::default()
     }
+}
+
+fn term_config_with_cursor(shape: alacritty_terminal::vte::ansi::CursorShape) -> TermConfig {
+    let mut config = term_config();
+    config.default_cursor_style = alacritty_terminal::vte::ansi::CursorStyle {
+        shape,
+        blinking: false,
+    };
+    config
 }
 
 #[cfg(windows)]

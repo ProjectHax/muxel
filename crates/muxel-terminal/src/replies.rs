@@ -398,6 +398,7 @@ mod tests {
                 session_id_hint: Default::default(),
                 bell: Default::default(),
                 clipboard_store: Default::default(),
+                suppress_title_events: Default::default(),
             };
             let reader = ImmediateReplies::new(
                 replies,

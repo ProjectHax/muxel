@@ -2384,6 +2384,10 @@ fn default_pane_border() -> String {
     "subtle".to_string()
 }
 
+pub(crate) fn default_cursor_shape() -> String {
+    "block".to_string()
+}
+
 fn default_terminal_mouse() -> String {
     "copy_paste".to_string()
 }
@@ -2873,6 +2877,10 @@ pub struct Settings {
     /// Pane border intensity: "off" | "subtle" | "bold".
     #[serde(default = "default_pane_border")]
     pub pane_border: String,
+    /// Default terminal cursor shape: "block" | "bar" | "underline".
+    /// Programs that emit DECSCUSR (`CSI Ps SP q`) still override this per pane.
+    #[serde(default = "default_cursor_shape")]
+    pub cursor_shape: String,
     /// Terminal mouse copy/paste mode: "copy_paste" | "menu" | "copy_on_select".
     #[serde(default = "default_terminal_mouse")]
     pub terminal_mouse: String,
@@ -3429,6 +3437,7 @@ impl Default for Settings {
             ui_font_size: 16.0,
             zoom: 1.0,
             pane_border: "subtle".to_string(),
+            cursor_shape: default_cursor_shape(),
             terminal_mouse: "copy_paste".to_string(),
             new_agent_placement: default_new_agent_placement(),
             diff_split_view: false,
@@ -4468,6 +4477,30 @@ mod settings_tests {
                 .terminal_mouse,
             "copy_on_select"
         );
+    }
+
+    #[test]
+    fn settings_cursor_shape_default_and_round_trip() {
+        assert_eq!(Settings::default().cursor_shape, "block");
+        // An old config missing the key still loads, defaulting to block.
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("cursor_shape");
+        let s: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(s.cursor_shape, "block");
+        // Non-default values round-trip.
+        for shape in ["bar", "underline", "block"] {
+            let s2 = Settings {
+                cursor_shape: shape.to_string(),
+                ..Settings::default()
+            };
+            let json = serde_json::to_string(&s2).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Settings>(&json)
+                    .unwrap()
+                    .cursor_shape,
+                shape
+            );
+        }
     }
 }
 

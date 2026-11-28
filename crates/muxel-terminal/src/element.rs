@@ -14,6 +14,7 @@ use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::vte::ansi::CursorShape as TermCursorShape;
 use gpui::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -221,15 +222,6 @@ impl Element for TerminalElement {
         cx: &mut App,
     ) {
         let paint_t0 = Instant::now();
-        // Route typed text (and IME) to this terminal while it's focused.
-        window.handle_input(
-            &self.focus_handle,
-            TerminalInputHandler {
-                instance_id: self.instance_id,
-                session: self.session.clone(),
-            },
-            cx,
-        );
 
         let cell_width = state.cell_width;
         let line_height = state.line_height;
@@ -252,9 +244,43 @@ impl Element for TerminalElement {
             window.request_animation_frame();
         }
 
+        let origin = bounds.origin;
+        let ime_cursor_bounds = self.session.with_term(|term| {
+            let grid = term.grid();
+            let screen_lines = grid.screen_lines() as i32;
+            let display_offset = grid.display_offset() as i32;
+            let cursor = grid.cursor.point;
+            let cursor_visual = cursor.line.0 + display_offset;
+            if cursor_visual >= 0 && cursor_visual < screen_lines {
+                let x = px((f32::from(origin.x) + cursor.column.0 as f32 * cell_w).floor());
+                let y = px((f32::from(origin.y) + cursor_visual as f32 * line_h).floor());
+                Bounds::new(point(x, y), size(cell_width, line_height))
+            } else {
+                // Scrolled into history: anchor the IME candidate popup at the
+                // bottom-left of the pane rather than returning None.
+                let y =
+                    px((f32::from(origin.y) + (screen_lines.max(1) - 1) as f32 * line_h).floor());
+                Bounds::new(point(origin.x, y), size(cell_width, line_height))
+            }
+        });
+
+        // Route typed text (and IME) to this terminal while it's focused.
+        window.handle_input(
+            &self.focus_handle,
+            TerminalInputHandler {
+                instance_id: self.instance_id,
+                session: self.session.clone(),
+                view_id: self.view_id,
+                cursor_bounds: ime_cursor_bounds,
+                pane_left: bounds.origin.x,
+                pane_right: bounds.origin.x + bounds.size.width,
+                cell_width,
+            },
+            cx,
+        );
+
         window.paint_quad(fill(bounds, self.palette.background_hsla()));
 
-        let origin = bounds.origin;
         let palette = self.palette.clone();
         let focused = self.focus_handle.is_focused(window);
 
@@ -362,7 +388,8 @@ impl Element for TerminalElement {
             self.session.store_paint_list(list);
         }
 
-        // Cursor, scrollbar, and link hover stay live (not in the draw-list gen).
+        // Cursor, IME preedit, scrollbar, and link hover stay live (not in the draw-list gen).
+        let ime_preedit = focused.then(|| self.session.ime_preedit()).flatten();
         self.session.with_term(|term| {
             let grid = term.grid();
             let screen_lines = grid.screen_lines();
@@ -384,21 +411,89 @@ impl Element for TerminalElement {
                 window.set_cursor_style(CursorStyle::PointingHand, &link_hitbox);
             }
 
-            // Cursor — only when the app hasn't hidden it (DECTCEM / CSI ?25l).
+            // Cursor & IME composition overlay.
             let cursor = term.grid().cursor.point;
             let cursor_visual = cursor.line.0 + display_offset;
-            if term.mode().contains(TermMode::SHOW_CURSOR)
-                && cursor_visual >= 0
-                && cursor_visual < screen_lines as i32
+            let cursor_on_screen = cursor_visual >= 0 && cursor_visual < screen_lines as i32;
+            let cursor_x = px((f32::from(origin.x) + cursor.column.0 as f32 * cell_w).floor());
+            let cursor_y = px((f32::from(origin.y) + cursor_visual as f32 * line_h).floor());
+
+            if let Some(preedit) = ime_preedit.as_ref().filter(|p| !p.text.is_empty())
+                && cursor_on_screen
             {
-                let x = px((f32::from(origin.x) + cursor.column.0 as f32 * cell_w).floor());
-                let y = px((f32::from(origin.y) + cursor_visual as f32 * line_h).floor());
-                let mut color = palette.cursor_hsla();
-                color.a = if focused { 0.85 } else { 0.4 };
+                let fg = palette.foreground_hsla();
+                let style = TextRun {
+                    len: preedit.text.len(),
+                    font: state.font.clone(),
+                    color: fg,
+                    background_color: None,
+                    underline: Some(UnderlineStyle {
+                        color: Some(fg),
+                        thickness: px(1.0),
+                        wavy: false,
+                    }),
+                    strikethrough: None,
+                };
+                let shaped = window.text_system().shape_line(
+                    preedit.text.clone().into(),
+                    font_size,
+                    &[style],
+                    None,
+                );
+                let box_w = shaped.width.max(cell_width);
+                let max_x = (bounds.origin.x + bounds.size.width - box_w).max(bounds.origin.x);
+                let preedit_x = cursor_x.min(max_x);
                 window.paint_quad(fill(
-                    Bounds::new(point(x, y), size(cell_width, line_height)),
-                    color,
+                    Bounds::new(point(preedit_x, cursor_y), size(box_w, line_height)),
+                    bg,
                 ));
+                let run_half = (shaped.ascent - shaped.descent) * 0.5;
+                let text_pos = point(preedit_x, cursor_y + (base_half - run_half));
+                let _ = shaped.paint(text_pos, line_height, TextAlign::Left, None, window, cx);
+
+                let caret_utf16 = preedit
+                    .selected_range
+                    .as_ref()
+                    .map(|r| r.end)
+                    .unwrap_or_else(|| preedit.text.encode_utf16().count());
+                let caret_byte = utf16_offset_to_byte_index(&preedit.text, caret_utf16);
+                let caret_x = preedit_x + shaped.x_for_index(caret_byte);
+                let mut caret_color = palette.cursor_hsla();
+                caret_color.a = 0.9;
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(caret_x, cursor_y),
+                        size(px(2.0).min(cell_width), line_height),
+                    ),
+                    caret_color,
+                ));
+            } else if term.mode().contains(TermMode::SHOW_CURSOR) && cursor_on_screen {
+                // Cursor — only when the app hasn't hidden it (DECTCEM / CSI ?25l).
+                let is_wide_cell = cursor.column.0 < grid.columns()
+                    && grid[cursor].flags.contains(Flags::WIDE_CHAR);
+                if let Some(spec) = cursor_paint_spec(
+                    term.cursor_style().shape,
+                    focused,
+                    is_wide_cell,
+                    point(cursor_x, cursor_y),
+                    cell_width,
+                    line_height,
+                ) {
+                    let mut color = palette.cursor_hsla();
+                    color.a = spec.alpha;
+                    if spec.outline {
+                        window.paint_quad(quad(
+                            spec.bounds,
+                            Corners::default(),
+                            Hsla::transparent_black(),
+                            Edges::all(px(1.0)),
+                            color,
+                            BorderStyle::default(),
+                        ));
+                    } else {
+                        window.paint_quad(fill(spec.bounds, color));
+                    }
+                }
             }
 
             if let Some(g) = scrollbar_geom(track_h, history, display_offset as usize, screen_lines)
@@ -448,7 +543,7 @@ fn retain_shaped_runs(list: &mut PaintDrawList, prev: &PaintDrawList) -> u64 {
     #[derive(PartialEq, Eq, Hash)]
     struct ShapeKey<'a> {
         text: &'a str,
-        /// bold | italic | underline | wavy | strike, one bit each.
+        /// bold | italic | underline | wavy | strike | wide, one bit each.
         style: u8,
         /// Hsla as raw bits (f32 isn't Hash; palette colors are exact-stable).
         color: [u32; 4],
@@ -460,7 +555,8 @@ fn retain_shaped_runs(list: &mut PaintDrawList, prev: &PaintDrawList) -> u64 {
                 | (run.italic as u8) << 1
                 | (run.underline as u8) << 2
                 | (run.wavy as u8) << 3
-                | (run.strike as u8) << 4,
+                | (run.strike as u8) << 4
+                | (run.wide as u8) << 5,
             color: run.color.map(f32::to_bits),
         }
     }
@@ -600,7 +696,7 @@ fn shape_draw_list(
             run.text.clone().into(),
             font_size,
             &[style],
-            Some(cell_width),
+            (!run.wide).then_some(cell_width),
         ));
     }
 }
@@ -803,10 +899,15 @@ fn build_draw_list_rows(
                     search_rects.push(prev);
                 }
 
-                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
                     continue;
                 }
+                let zerowidth = cell.zerowidth().unwrap_or(&[]);
                 if cell.c == ' '
+                    && zerowidth.is_empty()
                     && !cell
                         .flags
                         .intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT)
@@ -828,16 +929,40 @@ fn build_draw_list_rows(
                     strike: cell.flags.contains(Flags::STRIKEOUT),
                 };
 
+                // Double-width glyphs (CJK, wide emoji, Nerd Font wide icons)
+                // stay in their own run shaped without a 1-cell `force_width`
+                // override so multi-glyph clusters never get split across cells
+                // or collide with adjacent narrow glyphs.
+                if cell.flags.contains(Flags::WIDE_CHAR) {
+                    if let Some(prev) = cur_run.take() {
+                        runs.push(prev);
+                    }
+                    runs.push(BatchedRun::new_wide(
+                        visual_line,
+                        col_i,
+                        cell.c,
+                        zerowidth,
+                        style,
+                    ));
+                    continue;
+                }
+
                 let append = cur_run
                     .as_ref()
                     .is_some_and(|r| r.can_append(style, visual_line, col_i));
                 if append {
-                    cur_run.as_mut().unwrap().append(cell.c);
+                    cur_run.as_mut().unwrap().append(cell.c, zerowidth);
                 } else {
                     if let Some(prev) = cur_run.take() {
                         runs.push(prev);
                     }
-                    cur_run = Some(BatchedRun::new(visual_line, col_i, cell.c, style));
+                    cur_run = Some(BatchedRun::new(
+                        visual_line,
+                        col_i,
+                        cell.c,
+                        zerowidth,
+                        style,
+                    ));
                 }
             }
         }
@@ -866,6 +991,7 @@ fn build_draw_list_rows(
                 underline: r.style.underline,
                 wavy: r.style.wavy,
                 strike: r.style.strike,
+                wide: r.wide,
                 shaped: None,
             })
             .collect();
@@ -1267,6 +1393,101 @@ struct RunStyle {
     strike: bool,
 }
 
+/// Geometry and paint mode for the terminal cursor quad.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CursorPaintSpec {
+    bounds: Bounds<Pixels>,
+    /// True for a 1px hollow outline (unfocused block or `HollowBlock`), false
+    /// for a solid fill.
+    outline: bool,
+    alpha: f32,
+}
+
+fn cursor_paint_spec(
+    shape: TermCursorShape,
+    focused: bool,
+    is_wide_cell: bool,
+    cell_origin: Point<Pixels>,
+    cell_width: Pixels,
+    line_height: Pixels,
+) -> Option<CursorPaintSpec> {
+    let cursor_w = if is_wide_cell {
+        cell_width * 2.0
+    } else {
+        cell_width
+    };
+    match shape {
+        TermCursorShape::Hidden => None,
+        TermCursorShape::Block => Some(CursorPaintSpec {
+            bounds: Bounds::new(cell_origin, size(cursor_w, line_height)),
+            outline: !focused,
+            alpha: if focused { 0.85 } else { 0.5 },
+        }),
+        TermCursorShape::HollowBlock => Some(CursorPaintSpec {
+            bounds: Bounds::new(cell_origin, size(cursor_w, line_height)),
+            outline: true,
+            alpha: if focused { 0.85 } else { 0.4 },
+        }),
+        TermCursorShape::Beam => Some(CursorPaintSpec {
+            bounds: Bounds::new(cell_origin, size(px(2.0).min(cell_width), line_height)),
+            outline: false,
+            alpha: if focused { 0.9 } else { 0.4 },
+        }),
+        TermCursorShape::Underline => {
+            let h = px(2.0).min(line_height);
+            Some(CursorPaintSpec {
+                bounds: Bounds::new(
+                    point(cell_origin.x, cell_origin.y + line_height - h),
+                    size(cursor_w, h),
+                ),
+                outline: false,
+                alpha: if focused { 0.9 } else { 0.4 },
+            })
+        }
+    }
+}
+
+/// Convert a UTF-16 code-unit offset into a valid UTF-8 byte boundary in `text`.
+fn utf16_offset_to_byte_index(text: &str, utf16_offset: usize) -> usize {
+    let mut utf16 = 0;
+    for (byte_idx, ch) in text.char_indices() {
+        if utf16 >= utf16_offset {
+            return byte_idx;
+        }
+        utf16 += ch.len_utf16();
+    }
+    text.len()
+}
+
+/// Extract the substring of `text` covered by `range_utf16`, clamped to char
+/// boundaries, returning `(slice, actual_utf16_range)`.
+fn utf16_slice(
+    text: &str,
+    range_utf16: std::ops::Range<usize>,
+) -> (String, std::ops::Range<usize>) {
+    let total_utf16 = text.encode_utf16().count();
+    let start_req = range_utf16.start.min(total_utf16);
+    let end_req = range_utf16.end.clamp(start_req, total_utf16);
+    let start_byte = utf16_offset_to_byte_index(text, start_req);
+    let end_byte = utf16_offset_to_byte_index(text, end_req);
+    let actual_start = text[..start_byte].encode_utf16().count();
+    let actual_end = text[..end_byte].encode_utf16().count();
+    (
+        text[start_byte..end_byte].to_string(),
+        actual_start..actual_end,
+    )
+}
+
+/// Approximate terminal column advance of `text[..utf16_offset]` for positioning
+/// the OS IME candidate popup near the active preedit caret.
+fn preedit_prefix_cells(text: &str, utf16_offset: usize) -> usize {
+    let byte_idx = utf16_offset_to_byte_index(text, utf16_offset);
+    text[..byte_idx]
+        .chars()
+        .map(|c| if c.is_ascii() { 1 } else { 2 })
+        .sum()
+}
+
 /// A run of adjacent cells sharing the same style, shaped and painted together.
 struct BatchedRun {
     start_line: i32,
@@ -1274,29 +1495,54 @@ struct BatchedRun {
     text: String,
     cell_count: usize,
     style: RunStyle,
+    wide: bool,
 }
 
 impl BatchedRun {
-    fn new(start_line: i32, start_col: i32, c: char, style: RunStyle) -> Self {
+    fn new(start_line: i32, start_col: i32, c: char, zerowidth: &[char], style: RunStyle) -> Self {
         let mut text = String::with_capacity(64);
         text.push(c);
+        text.extend(zerowidth);
         Self {
             start_line,
             start_col,
             text,
             cell_count: 1,
             style,
+            wide: false,
+        }
+    }
+
+    fn new_wide(
+        start_line: i32,
+        start_col: i32,
+        c: char,
+        zerowidth: &[char],
+        style: RunStyle,
+    ) -> Self {
+        let mut text = String::with_capacity(8);
+        text.push(c);
+        text.extend(zerowidth);
+        Self {
+            start_line,
+            start_col,
+            text,
+            cell_count: 2,
+            style,
+            wide: true,
         }
     }
 
     fn can_append(&self, other: RunStyle, line: i32, col: i32) -> bool {
-        self.start_line == line
+        !self.wide
+            && self.start_line == line
             && self.start_col + self.cell_count as i32 == col
             && self.style == other
     }
 
-    fn append(&mut self, c: char) {
+    fn append(&mut self, c: char, zerowidth: &[char]) {
         self.text.push(c);
+        self.text.extend(zerowidth);
         self.cell_count += 1;
     }
 }
@@ -1309,11 +1555,18 @@ struct BgRect {
     color: Hsla,
 }
 
-/// Routes committed text (including IME) to the PTY. Special keys are handled
-/// separately via the view's `on_key_down` + `keymap::key_to_bytes`.
+/// Routes committed text (including IME) to the PTY while holding in-progress
+/// IME composition (preedit) text locally until the IME commits or cancels it.
+/// Special keys are handled separately via the view's `on_key_down` +
+/// `keymap::key_to_bytes`.
 pub struct TerminalInputHandler {
     instance_id: Uuid,
     session: Arc<TerminalSession>,
+    view_id: EntityId,
+    cursor_bounds: Bounds<Pixels>,
+    pane_left: Pixels,
+    pane_right: Pixels,
+    cell_width: Pixels,
 }
 
 impl InputHandler for TerminalInputHandler {
@@ -1323,8 +1576,17 @@ impl InputHandler for TerminalInputHandler {
         _window: &mut Window,
         _cx: &mut App,
     ) -> Option<UTF16Selection> {
+        let range = if let Some(preedit) = self.session.ime_preedit() {
+            let len = preedit.text.encode_utf16().count();
+            preedit
+                .selected_range
+                .map(|r| r.start.min(len)..r.end.min(len))
+                .unwrap_or(len..len)
+        } else {
+            0..0
+        };
         Some(UTF16Selection {
-            range: 0..0,
+            range,
             reversed: false,
         })
     }
@@ -1334,32 +1596,49 @@ impl InputHandler for TerminalInputHandler {
         _window: &mut Window,
         _cx: &mut App,
     ) -> Option<std::ops::Range<usize>> {
-        None
+        self.session.ime_preedit().and_then(|preedit| {
+            let len = preedit.text.encode_utf16().count();
+            (len > 0).then_some(0..len)
+        })
     }
 
     fn text_for_range(
         &mut self,
-        _range: std::ops::Range<usize>,
-        _adjusted: &mut Option<std::ops::Range<usize>>,
+        range: std::ops::Range<usize>,
+        adjusted: &mut Option<std::ops::Range<usize>>,
         _window: &mut Window,
         _cx: &mut App,
     ) -> Option<String> {
-        None
+        let preedit = self.session.ime_preedit()?;
+        let (slice, actual) = utf16_slice(&preedit.text, range);
+        *adjusted = Some(actual);
+        Some(slice)
     }
 
     fn replace_text_in_range(
         &mut self,
         _replacement_range: Option<std::ops::Range<usize>>,
         text: &str,
-        _window: &mut Window,
-        _cx: &mut App,
+        window: &mut Window,
+        cx: &mut App,
     ) {
+        let had_preedit = self.session.clear_ime_preedit();
         if !text.is_empty() {
+            let cleared_selection = self.session.clear_selection();
             let t0 = Instant::now();
             profile::key_started(self.instance_id, t0);
             self.session.write_user_input(text.as_bytes());
             // InputHandler has no is_held; key-repeat for letters often lands here.
             profile::key_finished(false, t0.elapsed());
+            crate::present_flag::mark_present_needed();
+            if had_preedit || cleared_selection {
+                cx.notify(self.view_id);
+            }
+            window.invalidate_character_coordinates();
+        } else if had_preedit {
+            crate::present_flag::mark_present_needed();
+            cx.notify(self.view_id);
+            window.invalidate_character_coordinates();
         }
     }
 
@@ -1367,24 +1646,51 @@ impl InputHandler for TerminalInputHandler {
         &mut self,
         _range_utf16: Option<std::ops::Range<usize>>,
         new_text: &str,
-        _new_selected_range: Option<std::ops::Range<usize>>,
-        _window: &mut Window,
-        _cx: &mut App,
+        new_selected_range: Option<std::ops::Range<usize>>,
+        window: &mut Window,
+        cx: &mut App,
     ) {
-        if !new_text.is_empty() {
-            self.session.write_user_input(new_text.as_bytes());
+        // Hold IME preedit locally instead of writing to the PTY; otherwise
+        // every intermediate composition update (`n`, `ni`, `nih`, `nihao`)
+        // would accumulate into the terminal before the final commit.
+        let cleared_selection = if !new_text.is_empty() {
+            self.session.clear_selection()
+        } else {
+            false
+        };
+        let changed = self
+            .session
+            .set_ime_preedit(new_text.to_string(), new_selected_range);
+        if changed || cleared_selection {
+            crate::present_flag::mark_present_needed();
+            cx.notify(self.view_id);
+            window.invalidate_character_coordinates();
         }
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut App) {}
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut App) {
+        if self.session.clear_ime_preedit() {
+            crate::present_flag::mark_present_needed();
+            cx.notify(self.view_id);
+            window.invalidate_character_coordinates();
+        }
+    }
 
     fn bounds_for_range(
         &mut self,
-        _range_utf16: std::ops::Range<usize>,
+        range_utf16: std::ops::Range<usize>,
         _window: &mut Window,
         _cx: &mut App,
     ) -> Option<Bounds<Pixels>> {
-        None
+        let mut bounds = self.cursor_bounds;
+        if range_utf16.start > 0 {
+            let offset_cells = self.session.ime_preedit().map_or(range_utf16.start, |p| {
+                preedit_prefix_cells(&p.text, range_utf16.start)
+            });
+            let max_x = (self.pane_right - self.cell_width).max(self.pane_left);
+            bounds.origin.x = (bounds.origin.x + self.cell_width * offset_cells as f32).min(max_x);
+        }
+        Some(bounds)
     }
 
     fn character_index_for_point(
@@ -1394,6 +1700,10 @@ impl InputHandler for TerminalInputHandler {
         _cx: &mut App,
     ) -> Option<usize> {
         None
+    }
+
+    fn apple_press_and_hold_enabled(&mut self) -> bool {
+        false
     }
 
     fn accepts_text_input(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
@@ -1881,20 +2191,32 @@ impl TerminalElement {
 
 #[cfg(test)]
 mod tests {
-    use super::build_draw_list;
+    use super::{
+        TerminalInputHandler, build_draw_list, cursor_paint_spec, preedit_prefix_cells,
+        utf16_offset_to_byte_index, utf16_slice,
+    };
     use crate::colors::TerminalPalette;
     use crate::session::{CommandSpec, PaintMetrics, TerminalSession};
+    use alacritty_terminal::vte::ansi::CursorShape as TermCursorShape;
+    use gpui::{Bounds, EntityId, InputHandler, TestAppContext, point, px, size};
+    use std::sync::Arc;
+    use uuid::Uuid;
 
-    /// The text runs the first row paints, as (column, text), once a screen
-    /// has parsed `bytes`.
-    fn first_row_runs(bytes: &[u8]) -> Vec<(i32, String)> {
+    fn spawn_fixture() -> Arc<TerminalSession> {
         // The child's own output is never parsed, so the screen holds only
-        // `bytes`.
+        // bytes fed via `process_output`.
         #[cfg(windows)]
         let spec = CommandSpec::program("cmd.exe", vec!["/D".into(), "/Q".into(), "/K".into()]);
         #[cfg(unix)]
         let spec = CommandSpec::program("/bin/cat", vec![]);
         let (session, _output) = TerminalSession::spawn(spec, 40, 4).expect("spawn fixture");
+        session
+    }
+
+    /// The text runs the first row paints, as (column, text), once a screen
+    /// has parsed `bytes`.
+    fn first_row_runs(bytes: &[u8]) -> Vec<(i32, String)> {
+        let session = spawn_fixture();
         session.process_output(bytes);
         let metrics = PaintMetrics {
             cell_w: 8.0,
@@ -1933,5 +2255,195 @@ mod tests {
         // A space with nothing under or through it paints nothing.
         let plain = first_row_runs(b"a b");
         assert_eq!(plain, [(0, "a".to_string()), (2, "b".to_string())]);
+    }
+
+    #[test]
+    fn wide_chars_and_zerowidth_combiners_stay_aligned() {
+        let session = spawn_fixture();
+        // Narrow text, CJK wide chars, narrow text, and a combining acute accent.
+        session.process_output("a你好be\u{0301}".as_bytes());
+        let metrics = PaintMetrics {
+            cell_w: 8.0,
+            line_h: 17.0,
+            font_size: 13.0,
+            cols: 40,
+            rows: 4,
+            bg: [0.0; 4],
+        };
+        let list = build_draw_list(&session, &TerminalPalette::default(), 0, metrics);
+        session.kill();
+        let row0: Vec<(i32, String, bool)> = list
+            .runs
+            .iter()
+            .filter(|run| run.start_line == 0)
+            .map(|run| (run.start_col, run.text.clone(), run.wide))
+            .collect();
+        assert_eq!(
+            row0,
+            [
+                (0, "a".to_string(), false),
+                (1, "你".to_string(), true),
+                (3, "好".to_string(), true),
+                (5, "be\u{0301}".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn cursor_paint_spec_covers_every_shape_and_wide_cells() {
+        let origin = point(px(10.0), px(20.0));
+        let cw = px(8.0);
+        let lh = px(16.0);
+
+        let focused_block = cursor_paint_spec(TermCursorShape::Block, true, false, origin, cw, lh)
+            .expect("visible");
+        assert!(!focused_block.outline);
+        assert_eq!(focused_block.bounds, Bounds::new(origin, size(cw, lh)));
+
+        let unfocused_block =
+            cursor_paint_spec(TermCursorShape::Block, false, false, origin, cw, lh)
+                .expect("visible");
+        assert!(unfocused_block.outline);
+        assert_eq!(unfocused_block.bounds, Bounds::new(origin, size(cw, lh)));
+
+        let wide_block =
+            cursor_paint_spec(TermCursorShape::Block, true, true, origin, cw, lh).expect("visible");
+        assert_eq!(wide_block.bounds, Bounds::new(origin, size(cw * 2.0, lh)));
+
+        let beam =
+            cursor_paint_spec(TermCursorShape::Beam, true, true, origin, cw, lh).expect("visible");
+        assert!(!beam.outline);
+        assert_eq!(beam.bounds, Bounds::new(origin, size(px(2.0), lh)));
+
+        let underline = cursor_paint_spec(TermCursorShape::Underline, true, true, origin, cw, lh)
+            .expect("visible");
+        assert!(!underline.outline);
+        assert_eq!(
+            underline.bounds,
+            Bounds::new(point(px(10.0), px(34.0)), size(cw * 2.0, px(2.0)))
+        );
+
+        let hollow = cursor_paint_spec(TermCursorShape::HollowBlock, true, false, origin, cw, lh)
+            .expect("visible");
+        assert!(hollow.outline);
+
+        assert!(cursor_paint_spec(TermCursorShape::Hidden, true, false, origin, cw, lh).is_none());
+    }
+
+    #[test]
+    fn decscusr_and_default_cursor_shape_interact_without_spurious_titles() {
+        let session = spawn_fixture();
+        let initial_title_gen = session.title_generation();
+        assert_eq!(session.cursor_style().shape, TermCursorShape::Block);
+
+        // Changing the user default updates panes that haven't overridden it.
+        session.set_default_cursor_shape(TermCursorShape::Beam);
+        assert_eq!(session.cursor_style().shape, TermCursorShape::Beam);
+        assert_eq!(
+            session.title_generation(),
+            initial_title_gen,
+            "default cursor update must not emit synthetic title events"
+        );
+
+        // Program DECSCUSR overrides the default per pane.
+        session.process_output(b"\x1b[4 q");
+        assert_eq!(session.cursor_style().shape, TermCursorShape::Underline);
+
+        // Changing the user default keeps the program's explicit override.
+        session.set_default_cursor_shape(TermCursorShape::Block);
+        assert_eq!(session.cursor_style().shape, TermCursorShape::Underline);
+
+        // CSI 0 SP q resets back to the user's configured default.
+        session.process_output(b"\x1b[0 q");
+        assert_eq!(session.cursor_style().shape, TermCursorShape::Block);
+
+        // OSC 50 CursorShape also works.
+        session.process_output(b"\x1b]50;CursorShape=1\x07");
+        assert_eq!(session.cursor_style().shape, TermCursorShape::Beam);
+
+        session.kill();
+    }
+
+    #[test]
+    fn utf16_preedit_helpers_handle_ascii_cjk_and_emoji() {
+        let text = "ni好😀x";
+        // UTF-16 code units: n(1) i(1) 好(1) 😀(2) x(1) = 6
+        assert_eq!(utf16_offset_to_byte_index(text, 0), 0);
+        assert_eq!(utf16_offset_to_byte_index(text, 2), 2);
+        assert_eq!(utf16_offset_to_byte_index(text, 3), 2 + "好".len());
+        assert_eq!(utf16_offset_to_byte_index(text, 5), 2 + "好😀".len());
+        assert_eq!(utf16_offset_to_byte_index(text, 99), text.len());
+
+        let (slice, range) = utf16_slice(text, 2..5);
+        assert_eq!(slice, "好😀");
+        assert_eq!(range, 2..5);
+
+        assert_eq!(preedit_prefix_cells("ni好", 2), 2);
+        assert_eq!(preedit_prefix_cells("ni好", 3), 4);
+    }
+
+    #[test]
+    fn ime_preedit_holds_composition_locally_and_commits_once() {
+        let mut cx = TestAppContext::single();
+        cx.skip_drawing();
+        let window = cx.add_window(|_window, _cx| gpui::Empty);
+        let session = spawn_fixture();
+        let mut handler = TerminalInputHandler {
+            instance_id: Uuid::new_v4(),
+            session: session.clone(),
+            view_id: EntityId::from(1u64),
+            cursor_bounds: Bounds::new(point(px(20.0), px(40.0)), size(px(8.0), px(16.0))),
+            pane_left: px(10.0),
+            pane_right: px(300.0),
+            cell_width: px(8.0),
+        };
+
+        let rev_before = session.input_rev();
+        window
+            .update(&mut cx, |_, window, cx| {
+                // Step-by-step Chinese pinyin preedit updates must NOT write to the PTY.
+                handler.replace_and_mark_text_in_range(None, "n", Some(1..1), window, cx);
+                handler.replace_and_mark_text_in_range(None, "ni", Some(2..2), window, cx);
+                handler.replace_and_mark_text_in_range(None, "nihao", Some(5..5), window, cx);
+                assert_eq!(handler.marked_text_range(window, cx), Some(0..5));
+                assert_eq!(
+                    handler
+                        .selected_text_range(false, window, cx)
+                        .map(|s| s.range),
+                    Some(5..5)
+                );
+                let mut adjusted = None;
+                assert_eq!(
+                    handler.text_for_range(0..5, &mut adjusted, window, cx),
+                    Some("nihao".to_string())
+                );
+                assert_eq!(adjusted, Some(0..5));
+                assert_eq!(
+                    handler.bounds_for_range(5..5, window, cx),
+                    Some(Bounds::new(
+                        point(px(60.0), px(40.0)),
+                        size(px(8.0), px(16.0))
+                    ))
+                );
+                assert_eq!(
+                    session.input_rev(),
+                    rev_before,
+                    "IME preedit updates must never write intermediate text to the PTY"
+                );
+
+                // Cancelling with empty replacement clears preedit without writing.
+                handler.replace_text_in_range(None, "", window, cx);
+                assert_eq!(handler.marked_text_range(window, cx), None);
+                assert_eq!(session.input_rev(), rev_before);
+
+                // Compose again and commit final Chinese text: writes exactly once.
+                handler.replace_and_mark_text_in_range(None, "nihao", None, window, cx);
+                handler.replace_text_in_range(None, "你好", window, cx);
+                assert_eq!(handler.marked_text_range(window, cx), None);
+                assert_eq!(session.input_rev(), rev_before + 1);
+            })
+            .unwrap();
+
+        session.kill();
     }
 }

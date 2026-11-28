@@ -92,6 +92,16 @@ impl MuxelApp {
         let size = px(self.settings.font_size * self.settings.zoom);
         let (fg, dim) = (th.foreground, th.muted_foreground);
         let (c_blue, c_green, c_yellow, c_red) = (th.blue, th.green, th.yellow, th.red);
+        let cursor_preview = match self.settings.cursor_shape.as_str() {
+            "bar" | "beam" => div().w(px(2.0)).h(size * 1.2).bg(fg),
+            "underline" => div()
+                .flex()
+                .items_end()
+                .w(size * 0.6)
+                .h(size * 1.2)
+                .child(div().w_full().h(px(2.0)).bg(fg)),
+            _ => div().w(size * 0.6).h(size * 1.2).bg(fg.opacity(0.85)),
+        };
         let line = || div().flex().gap_2();
         div()
             .w(form.w)
@@ -139,8 +149,15 @@ impl MuxelApp {
                     )
                     .child(
                         line()
+                            .items_center()
                             .child(div().text_color(c_green).child("❯"))
-                            .child("cargo test --workspace"),
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .child("cargo test --workspace")
+                                    .child(cursor_preview),
+                            ),
                     )
                     .child(
                         line()
@@ -359,6 +376,19 @@ impl MuxelApp {
                 cx.listener(move |this, _e, _w, cx| this.set_pane_border(value, cx)),
             )
         };
+        let cursor_shape = self.settings.cursor_shape.clone();
+        let cursor_seg = |value: &'static str, label: SharedString| {
+            let selected = match value {
+                "bar" => cursor_shape == "bar" || cursor_shape == "beam",
+                "underline" => cursor_shape == "underline",
+                _ => !matches!(cursor_shape.as_str(), "bar" | "beam" | "underline"),
+            };
+            Seg::new(
+                label,
+                selected,
+                cx.listener(move |this, _e, _w, cx| this.set_cursor_shape(value, cx)),
+            )
+        };
         let language = DropdownButton::new("settings-language")
             .small()
             .button(
@@ -388,6 +418,19 @@ impl MuxelApp {
                     ],
                 )
                 .desc(t("The outline around panes you aren't focused on.")),
+                form.choice_row(
+                    t("Terminal cursor"),
+                    "cursor-shape",
+                    vec![
+                        cursor_seg("block", t("Block")),
+                        cursor_seg("bar", t("Bar")),
+                        cursor_seg("underline", t("Underline")),
+                    ],
+                )
+                .desc(t(
+                    "Default cursor shape. Programs can still change it with escape sequences.",
+                ))
+                .keywords("cursor caret shape block bar beam underline"),
                 Row::new(t("Language"), language).keywords("locale translation"),
             ],
         )));
