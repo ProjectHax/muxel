@@ -14,8 +14,12 @@ dir="${1:-target}"
 found=0
 while IFS= read -r cache; do
   found=1
-  # tr: CMake on Windows may write the cache with CRLF line endings.
-  if tr -d '\r' <"$cache" | grep -q '^GGML_NATIVE:BOOL=OFF$'; then
+  # `\r?`: CMake on Windows may write the cache with CRLF line endings. grep
+  # reads the file itself: piping it in (`tr -d '\r' <"$cache" | grep -q`) let
+  # grep's early exit on a match break the pipe, and under pipefail the writer's
+  # failure read as a native build whenever the cache outgrew the pipe buffer
+  # (macOS runners).
+  if grep -Eq $'^GGML_NATIVE:BOOL=OFF\r?$' "$cache"; then
     echo "ok: $cache"
   else
     echo "::error::whisper.cpp was built with GGML_NATIVE ($cache): see .cargo/config.toml, then bump the rust-cache key in release.yml"
